@@ -312,7 +312,11 @@ document in the file's shape: a change to the request timeout, the message
 policies, the thinking defaults or the switch knobs applies at once; a change
 touching anything the load is built from reloads the model with the whole
 patch, as a model switch does. Either way it is written to the config file in
-use once it has taken.
+use once it has taken. `GET /v1/config/fields` says what each of those fields
+is: its key, kind, default, rule, the model families that take it, and whether
+a change is live, needs a reload, or can only be made at start — the same
+declarations as `ignis-server help --fields --format json`, minus the fields
+`GET /v1/config` hides.
 
 ### Model and server
 
@@ -605,6 +609,9 @@ not.
 |---|---|---|
 | `/v1/models` | GET | The loaded model, and `status`: `serving`, `switching` or `failed` ([below](#switching-models)). |
 | `/v1/models/switch` | POST | Replace the loaded model on the running process ([below](#switching-models)). |
+| `/v1/models/catalog` | GET | Every model the server can switch to or fetch, with its state on disk ([below](#switching-models)). |
+| `/v1/config` | GET, PATCH | The running configuration, and a change to it ([configuration](#configuration)). |
+| `/v1/config/fields` | GET | What each visible configuration field is: kind, default, rule, families, whether a change reloads. |
 | `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
 | `/v1/responses` | POST | The OpenAI responses API (non-streaming; `stream: true` is a 400). |
 | `/v1/tokenize` | POST | A body's prompt-token count without serving it ([below](#counting-a-prompt)). |
@@ -641,7 +648,8 @@ CPU mock, which has nothing to capture, is ready at once.
 
 ### Switching models
 
-`POST /v1/models/switch` with `{"artifact": "<path>", "model": "<id>"}` moves
+`POST /v1/models/switch` with `{"artifact": "<path>", "model": "<id>"}` — or
+with `{"model": "<id>"}` alone, see below — moves
 the running server to another model — the 27B to Qwen3.8-Flash-Next and back —
 without a restart. It answers `202 {"status": "switching", "from", "to"}` at
 once; a second switch while one runs is a `409 switch_in_progress`.
@@ -661,6 +669,26 @@ a checksum that is not clean, a model id of the other model — leaves the old
 model serving. One that fails to load after the old model was unloaded has the
 old model loaded again; `GET /v1/models` says `failed`, with a `reason`, until
 one of them serves.
+
+**By id.** With `model` alone the server finds the artifact itself: the
+`--switch-known-models` entry for the id (the model the server started on
+among them), else a [catalog](#the-catalog) entry whose artifact is under
+`--download-path`. `--switch-allow-implicit` does not apply: it gates the
+switch a request triggers by naming a model, not one an operator asked for. An
+id that is neither, or whose artifact is not on disk, is a `404
+model_not_found` naming the id — and, for a catalog entry, the `ignis-server
+model download <id>` that fetches it; a switch never starts a download.
+`GET /v1/models/catalog` lists the models a switch can go to, one row each:
+`id`, `source` (`built-in`, `operator` or `known`), `on_disk` (`complete`,
+`partial` or `absent`), `bytes`, `family`, `loaded` and `switchable`. It
+answers during a switch and while one has failed, and carries no path.
+
+**How the last one ended.** After the first switch or reload since start,
+`GET /v1/models` carries `last_switch: {from, to, outcome, reason?}`:
+`outcome` is `switched`, `refused` (nothing was torn down), `restored` (the
+old model was loaded again) or `failed` (nothing serves), with a `reason` for
+every outcome but the first. A reload from `PATCH /v1/config` is reported the
+same way, with `from` equal to `to`.
 
 **By naming the model.** A client can also just ask for the other model: a
 chat completion, a response (over HTTP or the WebSocket) or a decision whose
