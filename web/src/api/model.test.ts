@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { afterRefresh, readModel, type ModelState } from "./model.ts";
+import { afterRefresh, readModel, switchFollowed, type ModelState } from "./model.ts";
 import { keyRequired, saveKey } from "./auth.ts";
 
 const listing = (id: string, max?: number) =>
   (async () => new Response(JSON.stringify({ data: [{ id, max_model_len: max }] }))) as typeof fetch;
+
+const answering = (body: object) => (async () => new Response(JSON.stringify(body))) as typeof fetch;
 
 describe("readModel", () => {
   it("reads the loaded model and its context limit from GET /v1/models", async () => {
@@ -31,6 +33,32 @@ describe("readModel", () => {
   });
 });
 
+describe("readModel during a switch (spec playground/05)", () => {
+  it("reads `switching` as the switch under way, stamped with when this page first saw it", async () => {
+    saveKey("sk");
+    // The entry is still the old model until the new one serves.
+    const body = { data: [{ id: "qwen3.8-27b", max_model_len: 786432 }], status: "switching", switching: { from: "qwen3.8-27b", to: "qwen3.8-flash-next" } };
+    expect(await readModel(answering(body), 1000)).toEqual({ state: "switching", from: "qwen3.8-27b", to: "qwen3.8-flash-next", since: 1000 });
+  });
+
+  it("reads `failed` as an error carrying the reason, marked as the server's own report", async () => {
+    saveKey("sk");
+    const body = { data: [{ id: "qwen3.8-27b" }], status: "failed", reason: "the artifact is not a file" };
+    expect(await readModel(answering(body))).toEqual({ state: "error", message: "Switch failed: the artifact is not a file", failed: true });
+  });
+
+  it("carries how the last switch ended, on every state", async () => {
+    saveKey("sk");
+    const last = { from: "qwen3.8-27b", to: "qwen3.8-27b-fail", outcome: "restored", reason: "the load failed" };
+    const ready = await readModel(answering({ data: [{ id: "qwen3.8-27b", max_model_len: 1 }], status: "serving", last_switch: last }));
+    expect(ready).toEqual({ state: "ready", id: "qwen3.8-27b", contextLimit: 1, lastSwitch: last });
+    const switching = await readModel(answering({ data: [{ id: "a" }], status: "switching", switching: { from: "a", to: "b" }, last_switch: last }), 5);
+    expect(switching).toMatchObject({ state: "switching", lastSwitch: last });
+    // Before the first switch the key is absent, and so is the field.
+    expect(await readModel(listing("qwen3.8-27b", 1))).not.toHaveProperty("lastSwitch");
+  });
+});
+
 describe("afterRefresh", () => {
   const ready: ModelState = { state: "ready", id: "qwen3.8-27b", contextLimit: null };
   it("takes the model read", () => {
@@ -41,5 +69,35 @@ describe("afterRefresh", () => {
     expect(afterRefresh(ready, { state: "error", message: "x" })).toBe(ready);
     const error: ModelState = { state: "error", message: "x" };
     expect(afterRefresh({ state: "loading" }, error)).toBe(error);
+  });
+
+  const switching: ModelState = { state: "switching", from: "a", to: "b", since: 1000 };
+
+  it("keeps a switch shown through a failed read too", () => {
+    expect(afterRefresh(switching, { state: "error", message: "x" })).toBe(switching);
+  });
+
+  it("shows a failed switch the server reports, never masking it as a blip", () => {
+    const failed: ModelState = { state: "error", message: "Switch failed: r", failed: true };
+    expect(afterRefresh(ready, failed)).toBe(failed);
+    expect(afterRefresh(switching, failed)).toBe(failed);
+  });
+
+  it("keeps when the page first saw a switch while the same one runs, and starts over for another", () => {
+    expect(afterRefresh(switching, { state: "switching", from: "a", to: "b", since: 4000 })).toEqual(switching);
+    expect(afterRefresh(switching, { state: "switching", from: "b", to: "c", since: 4000 })).toEqual({ state: "switching", from: "b", to: "c", since: 4000 });
+  });
+});
+
+describe("switchFollowed", () => {
+  // useModel re-reads each second while this holds: a switch runs, or the
+  // server reports one failed — briefly, while the old model is loaded again,
+  // so the page has to see it through to `serving`.
+  it("holds while switching and while the server reports a failed switch, not for a failed read", () => {
+    expect(switchFollowed({ state: "switching", from: "a", to: "b", since: 0 })).toBe(true);
+    expect(switchFollowed({ state: "error", message: "m", failed: true })).toBe(true);
+    expect(switchFollowed({ state: "error", message: "m" })).toBe(false);
+    expect(switchFollowed({ state: "ready", id: "a", contextLimit: null })).toBe(false);
+    expect(switchFollowed({ state: "loading" })).toBe(false);
   });
 });
