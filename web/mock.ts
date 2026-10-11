@@ -1,12 +1,13 @@
-import type { IncomingMessage } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 import { completionBody, finishFields, mockThinking, readMockBudget } from "./mockChat.ts";
 import { mockDecide } from "./mockDecide.ts";
 import { createMetricsSim } from "./mockMetrics.ts";
+import { createServerSim, type MockAnswer } from "./mockServer.ts";
 
-// A fake ignis for `npm run dev:mock`: enough of /v1/models, streaming
-// /v1/chat/completions and /ui/metrics to work on the Playground without the
-// shared GPU. Development only — never part of the build.
+// A fake ignis for `npm run dev:mock`: enough of /v1/models, /v1/config,
+// streaming /v1/chat/completions and /ui/metrics to work on the Playground
+// without the shared GPU. Development only — never part of the build.
 //
 // Chat: honours the thinking controls (no reasoning for `reasoning_effort`
 // "none" or `enable_thinking` false) and stops on a
@@ -39,6 +40,11 @@ import { createMetricsSim } from "./mockMetrics.ts";
 // Ask: with `ask_user` declared, a prompt containing "/ask" asks which team.
 // Local: "/js", "/plan", "/file" and "/html" call run_js, update_plan and create_file.
 // "/math" answers with formulas; "/long" streams a long reply for scrolling.
+//
+// Server view (mockServer.ts, spec playground/05): /v1/models is the 27B,
+// and a switch or a reload reads `switching` for three seconds. A config
+// value "/error" is a 400 naming its key; a switch to an id containing
+// "fail", or a reload patch holding "/fail", ends `restored` with a reason.
 
 function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -54,20 +60,33 @@ function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   });
 }
 
+function answer(res: ServerResponse, { status, body }: MockAnswer) {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(body));
+}
+
 export function mockIgnis(): Plugin {
   return {
     name: "ignis-mock",
     configureServer(server) {
-      server.middlewares.use("/v1/models", (_req, res) => {
-        res.setHeader("Content-Type", "application/json");
-        // `max_model_len` (vLLM's name for the context length) feeds the
-        // Playground's context bar, as ignis reports it.
-        res.end(
-          JSON.stringify({
-            object: "list",
-            data: [{ id: "mock-model", object: "model", owned_by: "ignis", max_model_len: 40960 }],
-          }),
-        );
+      // The model, its switch and the running configuration. Connect mounts by
+      // prefix, so each longer path is registered before the one it extends.
+      const sim = createServerSim();
+      server.middlewares.use("/v1/models/catalog", (_req, res) => answer(res, { status: 200, body: sim.catalog(Date.now()) }));
+      server.middlewares.use("/v1/models/switch", async (req, res) => {
+        if (req.method !== "POST") return answer(res, { status: 405, body: {} });
+        answer(res, sim.switchTo(await readJson(req), Date.now()));
+      });
+      // `max_model_len` (vLLM's name for the context length) feeds the
+      // Playground's context bar, as ignis reports it.
+      server.middlewares.use("/v1/models", (_req, res) => answer(res, { status: 200, body: sim.models(Date.now()) }));
+      server.middlewares.use("/v1/config/fields", (_req, res) => answer(res, { status: 200, body: sim.fields() }));
+      server.middlewares.use("/v1/config", async (req, res) => {
+        if (req.method === "PATCH") return answer(res, sim.patch(await readJson(req), Date.now()));
+        const { body, status } = sim.config(Date.now());
+        res.setHeader("ignis-model-status", status);
+        answer(res, { status: 200, body });
       });
 
       server.middlewares.use("/v1/chat/completions", async (req, res) => {
