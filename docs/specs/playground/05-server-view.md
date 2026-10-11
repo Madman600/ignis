@@ -48,7 +48,8 @@ shows the `model download` command to copy.
 
 ### `GET /v1/config/fields`
 
-- One object per **visible** field, in declaration order — the same whitelist
+- `{ "object": "list", "data": [ ... ] }`, the envelope of `GET /v1/models`:
+  one object per **visible** field, in declaration order — the same whitelist
   as `GET /v1/config`, so a hidden field (the API key, the download token) is
   absent here too.
 - Built from `all_fields()`, like `help --fields --format json`
@@ -70,7 +71,7 @@ shows the `model download` command to copy.
 
 ### `GET /v1/models/catalog`
 
-- One row per model the server knows of: every catalog entry (built-in, then
+- `{ "object": "list", "data": [ ... ] }`, one row per model the server knows of: every catalog entry (built-in, then
   operator), then every known model (`switch.known_models` and the start model)
   that is not a catalog entry.
 - Row keys:
@@ -80,7 +81,7 @@ shows the `model download` command to copy.
     for an entry (sizes only, never a hash); a known model is `complete` when
     its artifact is a file, else `absent`;
   - `bytes`: the entry's total, or the artifact's size for a known model on
-    disk; absent otherwise;
+    disk; the key is omitted otherwise (as `family` is when unknown);
   - `family`: the scope name the artifact's header names, when it is on disk;
     for the loaded model always the running family;
   - `loaded`: true for exactly the model serving now (the start model before
