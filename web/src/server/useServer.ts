@@ -74,14 +74,18 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
   const modelNow = useRef(model);
   modelNow.current = model;
 
+  // The declarations never change while the server runs: read until one read
+  // answers (the warm-up holds every /v1 route but GET /v1/models).
+  const fieldsRead = useRef(false);
   const reread = useCallback(() => {
+    if (!fieldsRead.current) {
+      void readFields().then((answer) => {
+        fieldsRead.current = answer.ok;
+        setFields(loaded(answer));
+      });
+    }
     void readConfig().then((answer) => setConfig(loaded(answer)));
     void readCatalog().then((answer) => setCatalog(loaded(answer)));
-  }, []);
-
-  // The declarations never change while the server runs: read once.
-  useEffect(() => {
-    void readFields().then((answer) => setFields(loaded(answer)));
   }, []);
 
   // Read on opening the view, and again on each return to it: another client
