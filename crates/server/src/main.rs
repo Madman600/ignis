@@ -319,11 +319,10 @@ async fn main() {
     // through the same path, on the same start options — and so does a
     // request naming a known model (§Implicit switch), the start model among
     // them once its load has said which id and file it is.
-    let known = if allow_model_switch {
-        ignis_server::model_switch::known_models(&known_models, server.active().source.as_ref())
-    } else {
-        Default::default()
-    };
+    // The explicit switch by id (spec playground/05) names them whatever
+    // `--switch-allow-implicit` says; only the implicit one is gated by it.
+    let listed = ignis_server::model_switch::known_models(&known_models, server.active().source.as_ref());
+    let known = if allow_model_switch { listed.clone() } else { Default::default() };
     tracing::info!(
         name: "ignis.config.model_switch",
         allow_model_switch,
@@ -340,6 +339,7 @@ async fn main() {
             std::time::Duration::from_secs(u64::from(switch_drain_timeout_secs)),
         )
         .with_known_models(known)
+        .with_listed_models(listed)
         .with_catalog(catalog_models, allow_model_switch),
     )
     .with_config(config_state);

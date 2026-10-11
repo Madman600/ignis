@@ -203,6 +203,46 @@ pub struct Switcher {
     /// derived, never written anywhere.
     catalog: Option<CatalogModels>,
     catalog_on: AtomicBool,
+    /// The models an explicit switch by id may name (`POST /v1/models/switch`
+    /// with `model` alone, spec playground/05): the operator's list and the
+    /// start model, kept whether or not `known` is — `known` is emptied by
+    /// `--switch-allow-implicit false`, which gates the switch a request
+    /// triggers by naming a model, not one an operator asked for. Read with
+    /// [`Switcher::listed_models`].
+    listed: Mutex<BTreeMap<String, PathBuf>>,
+    /// How the last switch or reload ended, once there has been one
+    /// ([`Switcher::last_switch`]).
+    last: Mutex<Option<LastSwitch>>,
+}
+
+/// How the last switch or reload since start ended, for `GET /v1/models`
+/// (spec playground/05 §`last_switch`): a page polling the status sees a
+/// refused or rolled-back switch for one tick only, and this is how it learns
+/// why afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastSwitch {
+    /// The id served when it began.
+    pub from: String,
+    /// The id it loaded: equal to `from` for a reload from `PATCH /v1/config`.
+    pub to: String,
+    /// How it ended.
+    pub outcome: SwitchOutcome,
+}
+
+/// Why an id named alone cannot be switched to (`POST /v1/models/switch`
+/// with no `artifact`): `404 model_not_found` says which, and how to fix it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unswitchable {
+    /// Neither a known model nor a catalog entry.
+    Unknown,
+    /// A known model whose artifact is not a file.
+    KnownMissing {
+        /// The path the known models name for it.
+        artifact: PathBuf,
+    },
+    /// A catalog entry whose artifact is not under `download.path`: it has to
+    /// be fetched first (`model download`), a switch never starts a download.
+    NotDownloaded,
 }
 
 /// A catalog's entries as known models (spec model-download/02 §Known
@@ -240,7 +280,23 @@ impl Switcher {
             known: Mutex::new(BTreeMap::new()),
             catalog: None,
             catalog_on: AtomicBool::new(false),
+            listed: Mutex::new(BTreeMap::new()),
+            last: Mutex::new(None),
         }
+    }
+
+    /// Let an explicit switch by id name `listed`'s models even with implicit
+    /// switching off; `main` passes [`known_models`]' table, whatever
+    /// `--switch-allow-implicit` says.
+    pub fn with_listed_models(self, listed: BTreeMap<String, PathBuf>) -> Self {
+        *self.listed.lock().expect("listed models lock") = listed;
+        self
+    }
+
+    /// Change the models an explicit switch may name, on a running server
+    /// (see [`Switcher::set_knobs`], which sets the implicit ones).
+    pub fn set_listed_models(&self, listed: BTreeMap<String, PathBuf>) {
+        *self.listed.lock().expect("listed models lock") = listed;
     }
 
     /// Let a request naming one of `known`'s ids switch to it
@@ -278,6 +334,51 @@ impl Switcher {
     /// switchable is decided on disk at each request.
     pub fn known_models(&self) -> BTreeMap<String, PathBuf> {
         self.known.lock().expect("known models lock").clone()
+    }
+
+    /// The models an explicit switch by id may name: the table
+    /// [`Switcher::set_listed_models`] keeps, with the implicit one
+    /// ([`Switcher::known_models`]) over it, so a switcher built with only the
+    /// latter resolves its models too.
+    pub fn listed_models(&self) -> BTreeMap<String, PathBuf> {
+        let mut listed = self.listed.lock().expect("listed models lock").clone();
+        listed.extend(self.known_models());
+        listed
+    }
+
+    /// The catalog a switch can go to, with the directory it is looked up in.
+    pub fn catalog(&self) -> Option<&CatalogModels> {
+        self.catalog.as_ref()
+    }
+
+    /// The artifact an explicit switch with `model` alone loads (spec
+    /// playground/05 §Switch by id): the listed models' entry for it, which
+    /// wins as for an implicit switch, else a catalog entry whose artifact is
+    /// a file under `download.path`. `switch.allow_implicit` does not apply —
+    /// it gates the switch a request triggers by naming a model, not an
+    /// operator's. Looked up at each call: a download landing in the
+    /// directory needs no restart.
+    pub fn resolve(&self, model: &str) -> Result<PathBuf, Unswitchable> {
+        if let Some(listed) = self.listed_models().remove(model) {
+            return if listed.is_file() { Ok(listed) } else { Err(Unswitchable::KnownMissing { artifact: listed }) };
+        }
+        let catalog = self.catalog.as_ref().ok_or(Unswitchable::Unknown)?;
+        let entry = catalog.catalog.entries().iter().find(|entry| entry.id == model).ok_or(Unswitchable::Unknown)?;
+        let artifact = entry.artifact_path(&catalog.dir);
+        if artifact.is_file() { Ok(artifact) } else { Err(Unswitchable::NotDownloaded) }
+    }
+
+    /// How the last switch or reload ended; `None` before the first.
+    pub fn last_switch(&self) -> Option<LastSwitch> {
+        self.last.lock().expect("last switch lock").clone()
+    }
+
+    /// Say how a switch ended. Called **before** the status leaves
+    /// `switching` or `failed`, so a client that reads `serving` finds its
+    /// reason already here.
+    fn record(&self, from: &str, to: &str, outcome: &SwitchOutcome) {
+        *self.last.lock().expect("last switch lock") =
+            Some(LastSwitch { from: from.to_owned(), to: to.to_owned(), outcome: outcome.clone() });
     }
 
     /// The artifact a request naming `model` would switch to, if it is known:
@@ -388,6 +489,9 @@ impl Drop for RunningGuard {
     fn drop(&mut self) {
         if matches!(**self.status.load(), ModelStatus::Switching { .. }) {
             let reason = "the switch ended before it finished (see ignis.model.switch_panicked)".to_owned();
+            if let Some(started) = self.switcher.running.lock().expect("switch lock").as_ref() {
+                self.switcher.record(&started.from, &started.to, &SwitchOutcome::Failed { reason: reason.clone() });
+            }
             tracing::error!(
                 name: "ignis.model.switch_panicked",
                 panicking = std::thread::panicking(),
@@ -588,12 +692,15 @@ async fn run(
             );
             // Failed for one tick (`GET /v1/models` may read it), then the
             // old model, which never stopped, serves again — or, when the
-            // switch began from a failed one, nothing still serves.
-            server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone() }));
+            // switch began from a failed one, nothing still serves. The
+            // reason is kept (`last_switch`) before either is stored.
+            let outcome = SwitchOutcome::Refused { reason: reason.clone() };
+            switcher.record(&from, &to, &outcome);
+            server.status.store(Arc::new(ModelStatus::Failed { reason }));
             if serving_before {
                 server.status.store(Arc::new(ModelStatus::Serving));
             }
-            return SwitchOutcome::Refused { reason };
+            return outcome;
         }
     };
 
@@ -654,6 +761,7 @@ async fn run(
                 took_ms = began.elapsed().as_millis() as u64,
                 "model switched: the API admits requests"
             );
+            switcher.record(&from, &to, &SwitchOutcome::Switched);
             server.status.store(Arc::new(ModelStatus::Serving));
             SwitchOutcome::Switched
         }
@@ -667,7 +775,7 @@ async fn run(
                 "the target failed to load after the old model was torn down; reloading the old model"
             );
             server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone() }));
-            restore(&server, &switcher, &old, reason).await
+            restore(&server, &switcher, &old, (&from, &to), reason).await
         }
     }
 }
@@ -739,13 +847,21 @@ fn publish(server: &Server, model: ActiveModel) {
 
 /// After a failed load: load `old` again from where it came from, so a bad
 /// switch ends with the previous model serving. `reason` is why the target
-/// failed.
-async fn restore(server: &Server, switcher: &Arc<Switcher>, old: &ActiveModel, reason: String) -> SwitchOutcome {
+/// failed; `(from, to)` are the switch's ends, for `last_switch`.
+async fn restore(
+    server: &Server,
+    switcher: &Arc<Switcher>,
+    old: &ActiveModel,
+    (from, to): (&str, &str),
+    reason: String,
+) -> SwitchOutcome {
     let Some(source) = old.source.clone() else {
         let reason = format!("{reason}; the previous model was not loaded from an artifact, so there is nothing to reload");
         tracing::error!(name: "ignis.model.switch_restore_failed", %reason, "nothing is serving until a switch succeeds");
-        server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone() }));
-        return SwitchOutcome::Failed { reason };
+        let outcome = SwitchOutcome::Failed { reason: reason.clone() };
+        switcher.record(from, to, &outcome);
+        server.status.store(Arc::new(ModelStatus::Failed { reason }));
+        return outcome;
     };
     // The running configuration, unchanged: a reload that failed never
     // published its own.
@@ -763,14 +879,18 @@ async fn restore(server: &Server, switcher: &Arc<Switcher>, old: &ActiveModel, r
                 %reason,
                 "the switch failed; the previous model was reloaded and serves again"
             );
+            let outcome = SwitchOutcome::Restored { reason };
+            switcher.record(from, to, &outcome);
             server.status.store(Arc::new(ModelStatus::Serving));
-            SwitchOutcome::Restored { reason }
+            outcome
         }
         Err(again) => {
             let reason = format!("{reason}; reloading {} failed too: {again}", source.model);
             tracing::error!(name: "ignis.model.switch_restore_failed", %reason, "nothing is serving until a switch succeeds");
-            server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone() }));
-            SwitchOutcome::Failed { reason }
+            let outcome = SwitchOutcome::Failed { reason: reason.clone() };
+            switcher.record(from, to, &outcome);
+            server.status.store(Arc::new(ModelStatus::Failed { reason }));
+            outcome
         }
     }
 }

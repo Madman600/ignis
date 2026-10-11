@@ -84,7 +84,9 @@ fn the_document_lists_exactly_the_v1_surface() {
         "get /v1/models",
         // Spec model-switch/01: replace the loaded model.
         "post /v1/models/switch",
-        // Spec playground/05: what each configuration field is.
+        // Spec playground/05: the models a switch can go to or fetch, and
+        // what each configuration field is.
+        "get /v1/models/catalog",
         "get /v1/config/fields",
         // Spec config-v2/02: the running configuration, read and changed.
         "get /v1/config",
@@ -102,6 +104,33 @@ fn the_document_lists_exactly_the_v1_surface() {
     .map(str::to_owned)
     .collect();
     assert_eq!(documented(), expected);
+}
+
+/// Spec playground/05 AC 9: the Server view's routes are in the document
+/// with their responses, and the rows they return are described.
+#[test]
+fn the_server_view_routes_are_documented_with_their_responses() {
+    let document = document();
+    for (path, ok) in [("/v1/models/catalog", "CatalogRow"), ("/v1/config/fields", "FieldDeclaration")] {
+        let get = &document["paths"][path]["get"];
+        for status in ["200", "401"] {
+            assert!(get["responses"][status].is_object(), "{path} documents {status}");
+        }
+        assert_eq!(
+            get["responses"]["200"]["content"]["application/json"]["schema"]["items"]["$ref"],
+            format!("#/components/schemas/{ok}"),
+            "{path}"
+        );
+        assert!(document["components"]["schemas"][ok]["properties"].is_object(), "{ok}");
+    }
+    // The switch takes a model alone, and says what a 404 is.
+    let switch = &document["paths"]["/v1/models/switch"]["post"];
+    assert!(switch["responses"]["404"].is_object());
+    let request = &document["components"]["schemas"]["SwitchRequest"];
+    assert_eq!(request["required"], serde_json::json!(["model"]), "artifact is optional");
+    // `GET /v1/models` carries how the last switch ended.
+    assert!(document["components"]["schemas"]["ModelList"]["properties"]["last_switch"].is_object());
+    assert!(document["components"]["schemas"]["LastSwitchInfo"]["properties"]["outcome"].is_object());
 }
 
 #[test]
