@@ -152,6 +152,8 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         .routes(routes!(switch_model))
         // Spec config-v2/02: the running configuration, read and changed.
         .routes(routes!(crate::config_http::get_config, crate::config_http::patch_config))
+        // Spec playground/05: what each of those fields is.
+        .routes(routes!(crate::config_http::get_config_fields))
         .routes(routes!(chat_completions))
         // GitHub #285: the prompt counted without being served. Neither
         // reaches the scheduler.
@@ -174,6 +176,7 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         .route("/v1/models", options(cors_preflight))
         .route("/v1/models/switch", options(cors_preflight))
         .route("/v1/config", options(cors_preflight))
+        .route("/v1/config/fields", options(cors_preflight))
         .route("/v1/chat/completions", options(cors_preflight))
         .route("/v1/tokenize", options(cors_preflight))
         .route("/v1/detokenize", options(cors_preflight))
@@ -326,12 +329,14 @@ pub(crate) fn implicit_switch_refused(refusal: crate::model_switch::ImplicitRefu
     }
 }
 
-/// `GET /v1/models`, `POST /v1/models/switch` or `GET /v1/config`: the
-/// routes a model switch keeps open ([`require_serving`]) — the two that
-/// report and drive it, and the running configuration, which a reload with
-/// a changed config is changing (spec config-v2/02).
+/// `GET /v1/models`, `POST /v1/models/switch`, `GET /v1/config` and the
+/// static read beside it: the routes a model switch keeps open
+/// ([`require_serving`]) — the two that report and drive it, the running
+/// configuration, which a reload with a changed config is changing (spec
+/// config-v2/02), and the fields' declarations, which a page needs to show
+/// that configuration while the reload runs (spec playground/05).
 fn reports_or_drives_the_switch(method: &axum::http::Method, path: &str) -> bool {
-    (method == axum::http::Method::GET && (path == "/v1/models" || path == "/v1/config"))
+    (method == axum::http::Method::GET && matches!(path, "/v1/models" | "/v1/config" | "/v1/config/fields"))
         || (method == axum::http::Method::POST && path == "/v1/models/switch")
 }
 

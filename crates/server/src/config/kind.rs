@@ -38,6 +38,9 @@ pub trait FieldKind {
     /// The flag may be given more than once, each occurrence one more entry
     /// (`;`-joined, the env var's own separator).
     const REPEATABLE: bool = false;
+    /// The field may be unset ([`Opt`]): `GET /v1/config/fields` says so, so
+    /// a page can show "auto" for a `null` value.
+    const NULLABLE: bool = false;
 
     /// Parse the operator's text (trimmed, never empty: an empty value is an
     /// unset one, and never reaches a kind).
@@ -240,6 +243,7 @@ impl<K: FieldKind> FieldKind for Opt<K> {
     const TAG: &'static str = K::TAG;
     const SWITCH: bool = K::SWITCH;
     const REPEATABLE: bool = K::REPEATABLE;
+    const NULLABLE: bool = true;
 
     fn parse(raw: &str) -> Result<Self::Value, String> {
         K::parse(raw).map(Some)

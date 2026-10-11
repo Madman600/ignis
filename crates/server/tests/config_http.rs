@@ -14,7 +14,9 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
+use ignis_server::config::field::{scope, Applicability, Validator};
 use ignis_server::config::file::{Format, RealFiles};
+use ignis_server::config::schema::all_fields;
 use ignis_core::compute::ModelFamily;
 use ignis_server::config::{resolve_with, Config, ConfigOutcome};
 use ignis_server::config_http::ConfigState;
@@ -424,4 +426,129 @@ async fn a_model_with_no_artifact_takes_live_changes_but_no_reload() {
     assert_eq!(refused["error"]["code"], "reload_unavailable");
     let (status, _) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "server": { "request_timeout": 95 } }))).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+// ── GET /v1/config/fields (spec playground/05) ───────────────────────────────
+
+fn declaration<'a>(fields: &'a Value, file_key: &str) -> &'a Value {
+    fields.as_array().expect("an array").iter().find(|field| field["file_key"] == file_key).unwrap_or_else(|| panic!("{file_key} is not listed"))
+}
+
+/// Spec playground/05 AC 1: every visible field once, in declaration order,
+/// with the documented keys; a field not marked `visible` is absent.
+#[tokio::test]
+async fn the_fields_route_lists_every_visible_field_once_in_declaration_order() {
+    let loader = MockLoader::new();
+    let app = server_on(&loader, started(&[])).app();
+    let (status, fields) = send(&app, Method::GET, "/v1/config/fields", None).await;
+    assert_eq!(status, StatusCode::OK, "{fields}");
+    let listed: Vec<&str> = fields.as_array().unwrap().iter().map(|field| field["file_key"].as_str().unwrap()).collect();
+    let visible: Vec<String> = all_fields().filter(|meta| meta.visible).map(|meta| meta.file_key()).collect();
+    assert_eq!(listed, visible, "the visible fields, in the order they are declared");
+    assert!(all_fields().any(|meta| !meta.visible), "the whitelist hides something");
+    for hidden in ["server.api_key", "download.token"] {
+        assert!(!listed.contains(&hidden), "{hidden} is hidden from GET /v1/config, so from here too");
+    }
+    let mut want = vec![
+        "group", "name", "file_key", "flag", "env", "kind", "nullable", "default", "rule", "rule_text", "families", "scoped", "patchable",
+        "reload_required", "description",
+    ];
+    want.sort_unstable();
+    for field in fields.as_array().unwrap() {
+        let mut have: Vec<&str> = field.as_object().unwrap().keys().map(String::as_str).collect();
+        have.sort_unstable();
+        assert_eq!(have, want, "{}", field["file_key"]);
+    }
+    let chunk = declaration(&fields, "model.prefill_chunk");
+    assert_eq!((chunk["group"].clone(), chunk["name"].clone()), (json!("model"), json!("prefill_chunk")));
+    assert_eq!((chunk["flag"].clone(), chunk["env"].clone()), (json!("--model-prefill-chunk"), json!("IGNIS_MODEL_PREFILL_CHUNK")));
+    assert_eq!(chunk["default"], 1024);
+    assert!(!chunk["description"].as_str().unwrap().contains('\n'), "one line");
+}
+
+/// AC 1: `rule` is structured for each validator, `rule_text` is the sentence
+/// `help --fields` prints, `families` and `nullable` match the declaration.
+#[tokio::test]
+async fn the_fields_rule_families_and_nullable_follow_the_declaration() {
+    let loader = MockLoader::new();
+    let app = server_on(&loader, started(&[])).app();
+    let (_, fields) = send(&app, Method::GET, "/v1/config/fields", None).await;
+    assert_eq!(declaration(&fields, "model.prefill_chunk")["rule"], json!({ "multiple_of": 128 }));
+    assert_eq!(declaration(&fields, "model.prefill_chunk")["rule_text"], "nonzero multiple of 128");
+    assert_eq!(declaration(&fields, "model.kv_format")["rule"], json!({ "one_of": ["bf16", "hq-e8-2b", "hq_e8_2b", "hq"] }));
+    assert_eq!(declaration(&fields, "model.decode_share")["rule"], json!({ "min": 0, "max": 99 }));
+    assert_eq!(declaration(&fields, "model.decode_share")["rule_text"], "0..=99");
+    assert_eq!(declaration(&fields, "vram.budget_bytes")["rule"], json!({ "min": 1, "max": null }), "an open end is null");
+    assert_eq!(declaration(&fields, "vram.budget_bytes")["rule_text"], ">= 1");
+    // Every field agrees with its own declaration, whatever the variant.
+    for meta in all_fields().filter(|meta| meta.visible) {
+        let field = declaration(&fields, &meta.file_key());
+        assert_eq!(field["rule"].is_null(), meta.validator == Validator::None, "{}", meta.file_key());
+        assert_eq!(field["rule_text"], meta.validator.describe(), "{}", meta.file_key());
+        let families = match meta.applies {
+            Applicability::AllFamilies => Value::Null,
+            Applicability::Only(only) => only.iter().map(|family| json!(scope(*family))).collect::<Vec<_>>().into(),
+        };
+        assert_eq!(field["families"], families, "{}", meta.file_key());
+        assert_eq!(field["nullable"], meta.nullable, "{}", meta.file_key());
+        assert_eq!(field["scoped"], meta.scoped);
+        assert_eq!((field["patchable"].clone(), field["reload_required"].clone()), (json!(meta.patchable), json!(meta.reload_required)));
+    }
+    let only: Vec<_> = all_fields().filter(|meta| meta.visible && meta.home_family() == Some(ModelFamily::FlashNext)).collect();
+    assert!(!only.is_empty(), "some visible field is Flash-Next's alone");
+    assert_eq!(declaration(&fields, &only[0].file_key())["families"], json!(["qwen38flashnext"]));
+    assert_eq!(declaration(&fields, "server.request_timeout")["families"], Value::Null, "every family takes it");
+    assert_eq!(declaration(&fields, "model.decode_share")["nullable"], true, "Opt<..> may be unset");
+    assert_eq!(declaration(&fields, "model.prefill_chunk")["nullable"], false);
+}
+
+/// AC 2: static — `200` during a switch, and on a server with no running
+/// configuration; `401` without the API key when one is set.
+#[tokio::test]
+async fn the_fields_route_answers_during_a_switch_without_a_config_and_behind_the_key() {
+    let loader = MockLoader::new();
+    let server = server_on(&loader, started(&[]));
+    let app = server.app();
+    let release = loader.hold_next_load();
+    let (status, _) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "reuse": { "kv_host_pool_bytes": "3G" } }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (_, headers, _) = send_with_headers(&app, Method::GET, "/v1/config", None).await;
+    assert_eq!(headers["ignis-model-status"], "switching");
+    let (status, fields) = send(&app, Method::GET, "/v1/config/fields", None).await;
+    assert_eq!(status, StatusCode::OK, "static: the model's state does not matter: {fields}");
+    assert!(!fields.as_array().unwrap().is_empty());
+    release.send(()).expect("the held load is waiting");
+    until_serving(&app).await;
+
+    let bare = Server::from_active(loader.model("mock-a")).app();
+    let (status, bare_fields) = send(&bare, Method::GET, "/v1/config/fields", None).await;
+    assert_eq!(status, StatusCode::OK, "no running configuration is no reason to refuse a declaration");
+    assert_eq!(bare_fields, fields);
+
+    let keyed = server_on(&loader, started(&[])).with_api_key(ignis_server::config::ApiKey::new("sk-test")).app();
+    let (status, _) = send(&keyed, Method::GET, "/v1/config/fields", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(&keyed, Method::OPTIONS, "/v1/config/fields", None).await;
+    assert_eq!(status, StatusCode::OK, "the preflight passes, like the other /v1 routes");
+}
+
+/// `help --fields --format json` and the route are one declaration: every
+/// key the route serves is the command line's, except `rule` and `families`,
+/// which the command line keeps as the sentence and names it always printed
+/// (the route's `rule_text` is the former).
+#[test]
+fn the_command_line_json_and_the_route_share_each_declaration() {
+    let cli: Vec<Value> = serde_json::from_str(&ignis_server::config::cli::fields_json()).unwrap();
+    let route = ignis_server::config_http::visible_declarations();
+    assert_eq!(cli.iter().filter(|field| field["visible"] == true).count(), route.len());
+    for served in &route {
+        let printed = cli.iter().find(|field| field["file_key"] == served["file_key"]).expect("the CLI lists it too");
+        for (key, value) in served.as_object().unwrap() {
+            if key == "rule" || key == "families" {
+                continue;
+            }
+            assert_eq!(&printed[key], value, "{} {key}", served["file_key"]);
+        }
+        assert_eq!(printed["rule"], served["rule_text"], "the CLI's `rule` is the sentence");
+    }
 }

@@ -200,6 +200,76 @@ pub(crate) async fn get_config(State(server): State<Arc<Server>>) -> Response {
     response
 }
 
+/// One field's declaration as `GET /v1/config/fields` serves it. Documentation
+/// only: the route builds each object with [`FieldMeta::declaration`], the
+/// function `help --fields --format json` builds its objects with too.
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct FieldDeclaration {
+    /// The group, as the file key spells it (`reuse`).
+    group: String,
+    /// The field's name within its group (`kv_host_pool_bytes`).
+    name: String,
+    /// `<group>.<name>`, as a config file nests it: what a `400` from `PATCH
+    /// /v1/config` names.
+    file_key: String,
+    /// The command-line flag (`--reuse-kv-host-pool-bytes`).
+    flag: String,
+    /// The environment variable (`IGNIS_REUSE_KV_HOST_POOL_BYTES`).
+    env: String,
+    /// The value's kind (`bool`, `bytes`, `tokens|off`, …).
+    kind: String,
+    /// The field may be unset: its value is `null`, which a page shows as
+    /// "auto".
+    nullable: bool,
+    /// The default, as `GET /v1/config` writes a value.
+    #[schema(value_type = Object)]
+    default: Value,
+    /// The rule a value must meet: `null`, `{ "min", "max" }` (an open end is
+    /// `null`), `{ "multiple_of" }` or `{ "one_of": [..] }`.
+    #[schema(value_type = Option<Object>)]
+    rule: Option<Value>,
+    /// The rule as a sentence (`1..=8`, `nonzero multiple of 128`, `one of
+    /// bf16, hq-e8-2b`); empty with no rule.
+    rule_text: String,
+    /// `null` for a field every family takes, else the scope names
+    /// (`qwen38`, `qwen38flashnext`) of the families that do.
+    families: Option<Vec<String>>,
+    /// The field may be given per family, in a `qwen38` / `qwen38flashnext`
+    /// section beside the group's own value.
+    scoped: bool,
+    /// `PATCH /v1/config` may change it; else it is set at start.
+    patchable: bool,
+    /// A change takes effect only through a reload of the loaded model.
+    reload_required: bool,
+    /// What the field means, on one line.
+    description: String,
+}
+
+/// The visible fields' declarations, in declaration order — the same
+/// whitelist `GET /v1/config` shows, so a hidden field (the API key, the
+/// download token) is absent here as there.
+pub fn visible_declarations() -> Vec<Value> {
+    all_fields().filter(|meta| meta.visible).map(|meta| Value::Object(meta.declaration())).collect()
+}
+
+/// `GET /v1/config/fields` — what each visible field is.
+#[utoipa::path(
+    get,
+    path = "/v1/config/fields",
+    tag = "config",
+    operation_id = "get_config_fields",
+    summary = "The configuration's fields",
+    description = "One object per field `GET /v1/config` shows, in declaration order: the field's group and name, the key a config file and a `400` from `PATCH /v1/config` spell it by, its kind, its default, the rule a value must meet (structured in `rule`, as a sentence in `rule_text`), the model families that take it (`null` for all), whether it may be unset (`nullable`), given per family (`scoped`), changed while the server runs (`patchable`) and whether a change reloads the model (`reload_required`). The same declarations `ignis-server help --fields --format json` prints, minus the fields `GET /v1/config` hides.\n\nStatic: it answers whatever state the model is in — during a switch, after a failed one — and on a server with no running configuration.",
+    responses(
+        (status = 200, description = "The visible fields, in declaration order.", body = Vec<FieldDeclaration>),
+        (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = ApiError),
+    ),
+)]
+pub(crate) async fn get_config_fields() -> Json<Vec<Value>> {
+    Json(visible_declarations())
+}
+
 /// How a patch was applied.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PatchApplied {
