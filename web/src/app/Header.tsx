@@ -6,7 +6,7 @@ import { MonitorPulse } from "../monitor/MonitorPulse.tsx";
 import { useMemoryNotes } from "../tools/local/memory.ts";
 import { IconSessions, IconSliders } from "../ui/icons.tsx";
 
-export type View = "chat" | "decide" | "monitor";
+export type View = "chat" | "decide" | "monitor" | "server";
 
 /** The kiln bar: brand, the view switch, model status, and the drawer buttons below `lg`. */
 export function Header({
@@ -26,15 +26,15 @@ export function Header({
   onForgetKey?: () => void;
   onOpenMemory: () => void;
   view?: View;
-  /** Switches views. The Decide tab needs no metrics, so this is always present in the app. */
+  /** Switches views. The Decide tab and the Server view need no metrics, so this is always present in the app. */
   onView?: (view: View) => void;
   /** ignis serves metrics, so the Monitor is one of the views on offer. */
   monitorAvailable?: boolean;
 }) {
   const chat = view === "chat";
   // The chat and the bench both have two side columns that are drawers below
-  // `lg`; the Monitor has none.
-  const sided = view !== "monitor";
+  // `lg`; the Monitor and the Server view have none.
+  const sided = view === "chat" || view === "decide";
   return (
     <header className="z-20 shrink-0 bg-kiln text-[#eae8e4]">
       <div className="flex items-center gap-3 px-4 py-3 sm:gap-4 md:px-6">
@@ -77,11 +77,13 @@ export function Header({
 
 function ViewSwitch({ view, onView, monitorAvailable }: { view: View; onView: (view: View) => void; monitorAvailable: boolean }) {
   // The Monitor is only on offer when ignis serves metrics; the Decide tab
-  // talks to /v1/decide and is there either way.
+  // talks to /v1/decide and the Server view to /v1/models and /v1/config
+  // (spec playground/05), so they are there either way.
   const views: [View, string][] = [
     ["chat", "Playground"],
     ["decide", "Decide"],
     ...(monitorAvailable ? ([["monitor", "Monitor"]] as [View, string][]) : []),
+    ["server", "Server"],
   ];
   return (
     <nav aria-label="View" className="flex items-center gap-1 self-stretch">
@@ -142,6 +144,12 @@ function ModelStatus({ model, busy }: { model: ModelState; busy: boolean }) {
         </>
       )}
       {model.state === "loading" && <span className="text-[#939ba4]">Loading model…</span>}
+      {model.state === "switching" && (
+        <>
+          <span className="cut size-2.5 shrink-0 bg-[#ff5a1f] [--cut-size:4px]" aria-hidden />
+          <span className="truncate text-[#eae8e4]">Switching to {model.to}…</span>
+        </>
+      )}
       {model.state === "error" && <span className="truncate text-[#ff7b6b]">{model.message}</span>}
     </span>
   );

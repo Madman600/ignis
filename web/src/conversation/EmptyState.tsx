@@ -7,7 +7,13 @@ export function EmptyState({ model }: { model: ModelState }) {
       <img src={flame} alt="" className="h-44 w-auto drop-shadow-[0_18px_40px_rgb(200_22_29/0.35)]" />
       <div className="flex flex-col gap-2">
         <p className="font-display text-4xl font-semibold tracking-tight text-ink">
-          {model.state === "ready" ? "Light it up" : model.state === "loading" ? "Warming up" : "No model to talk to"}
+          {model.state === "ready"
+            ? "Light it up"
+            : model.state === "loading"
+              ? "Warming up"
+              : model.state === "switching"
+                ? "Switching models"
+                : "No model to talk to"}
         </p>
         <p className="text-sm text-ash">
           {model.state === "ready" && (
@@ -17,7 +23,8 @@ export function EmptyState({ model }: { model: ModelState }) {
             </>
           )}
           {model.state === "loading" && "Asking ignis which model it serves."}
-          {model.state === "error" && "Start ignis-server, then reload this page."}
+          {model.state === "switching" && `Loading ${model.to}. The prompt opens once it serves.`}
+          {model.state === "error" && (model.failed ? "A model switch failed. The Server view says why." : "Start ignis-server, then reload this page.")}
         </p>
       </div>
     </div>

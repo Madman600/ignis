@@ -539,3 +539,15 @@
     animation: none;
   }
 }
+
+/* The Server view (spec playground/05). Its one colour is the heat of the
+   header's bar, which runs while a reload does: the full gradient on the
+   small mark of a field whose change reloads the model, and its bright core
+   behind the action that applies one — dark text on it, 5.3:1 at its
+   darkest, where white on the full gradient's orange would be 2.4:1. */
+@layer components {
+  .heat-fill {
+    background: linear-gradient(90deg, #ff5a1f, #ff8a2a 55%, #ff5a1f);
+    color: #1c2026;
+  }
+}

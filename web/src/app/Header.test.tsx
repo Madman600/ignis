@@ -42,6 +42,31 @@ describe("Header", () => {
   });
 });
 
+describe("Header and the Server view (spec playground/05)", () => {
+  it("always offers the Server view, with or without metrics, and gives it no side drawers", () => {
+    for (const monitorAvailable of [false, true]) {
+      const html = renderToStaticMarkup(<Header {...base} view="chat" onView={() => {}} monitorAvailable={monitorAvailable} />);
+      expect(html).toContain(">Server<");
+    }
+    const server = renderToStaticMarkup(<Header {...base} view="server" onView={() => {}} />);
+    expect(server).toMatch(/aria-current="page"[^>]*>Server</);
+    expect(server).not.toContain('aria-label="Sessions"');
+    expect(server).not.toContain('aria-label="Settings"');
+    expect(server).not.toContain('aria-label="Decisions"');
+  });
+
+  it("reads \"Switching to <id>…\" while a switch runs, and the reason when the server reports it failed", () => {
+    const switching = renderToStaticMarkup(<Header {...base} model={{ state: "switching", from: "qwen3.8-27b", to: "qwen3.8-flash-next", since: 0 }} busy />);
+    expect(switching).toContain("Switching to qwen3.8-flash-next…");
+    // The flame and the heat bar run through `busy`, as during a reply.
+    expect(switching).toMatch(/class="flame[^"]*" data-busy="true"/);
+    expect(switching).toMatch(/class="heat" data-busy="true"/);
+
+    const failed = renderToStaticMarkup(<Header {...base} model={{ state: "error", message: "Switch failed: no file", failed: true }} />);
+    expect(failed).toContain("Switch failed: no file");
+  });
+});
+
 describe("PulseChip", () => {
   it("shows the gauges, the queue only when there is one, and a live decoded-token rate", () => {
     const busy = renderToStaticMarkup(<PulseChip running={3} waiting={2} tokensPerSec={96} live paused={false} onOpen={() => {}} />);
