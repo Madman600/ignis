@@ -1,5 +1,6 @@
 import type { LastSwitch, ModelState } from "../api/model.ts";
-import type { PatchApplied, Refusal } from "./routes.ts";
+import { namedKeys } from "./form.ts";
+import type { Answer, ConfigDocument, FieldDecl, PatchApplied, Refusal } from "./routes.ts";
 
 // What the Server view says once a change or a switch has an answer (spec
 // playground/05 §Applying, §Model band). The result lines are the spec's own
@@ -70,6 +71,52 @@ export function settleReload(pending: PendingReload, model: ModelState): Settled
   }
   if (model.state === "ready" || (fresh && last.outcome === "failed")) return { kind: "done", ok: false, lines: [lastSwitchLine(last)] };
   return { kind: "wait", pending };
+}
+
+/** What an answer to "Apply" does to the view. */
+export type AfterPatch = {
+  /** The change runs: the draft is empty again. */
+  clearDraft: boolean;
+  /** The dock's lines; none while a reload is followed. */
+  result: Line[] | null;
+  /** The file keys of the rows a refusal names. */
+  marked: string[];
+  /** The reload a `202` began. */
+  pending: PendingReload | null;
+  /** The configuration now running, when the answer carries it. */
+  config: ConfigDocument | null;
+  /** Read the model state again: a switch began, or one is under way. */
+  refreshModel: boolean;
+};
+
+/**
+ * An answer to PATCH /v1/config (spec playground/05 §Applying). `200`: the
+ * draft clears and the form shows the answer's configuration. `202`: the
+ * whole patch goes through a reload, followed until it ends, the draft kept
+ * until then. `400`: the server's message, and the rows it names marked.
+ * `409` (a switch under way) and the gate's `503`: named, and the model read
+ * again, so the action waits for the switch to land. Anything else
+ * (`501`): the server's reason. Nothing refused was applied.
+ */
+export function afterPatch(answer: Answer<PatchApplied>, fields: FieldDecl[] | null, before?: LastSwitch): AfterPatch {
+  const kept = { clearDraft: false, marked: [], pending: null, config: null, refreshModel: false };
+  if (answer.ok && answer.value.applied === "reload") {
+    return { ...kept, result: null, pending: pendingReload(answer.value, before), refreshModel: true };
+  }
+  if (answer.ok) return { ...kept, clearDraft: true, result: appliedLines(answer.value), config: answer.value.config ?? null };
+  const marked = answer.status === 400 && fields ? [...namedKeys(answer.message, fields)] : [];
+  return { ...kept, result: refusalLines(answer), marked, refreshModel: answer.status === 409 || answer.status === 503 };
+}
+
+/**
+ * An answer to "Load" (POST /v1/models/switch): a switch that began is
+ * followed — the state still reads `ready` until the next read — and a
+ * refusal (`404 model_not_found`, `409`, `501`) is named in the band; a
+ * `409` reads the model again, so the band shows the switch under way.
+ */
+export function afterSwitch(answer: Answer<{ from: string; to: string }>): { refusal: string | null; follow: boolean; refreshModel: boolean } {
+  if (answer.ok) return { refusal: null, follow: true, refreshModel: true };
+  return { refusal: refusalLines(answer)[0].text, follow: false, refreshModel: answer.status === 409 };
 }
 
 /** How the last switch or reload ended, as the band names it: a failure with its reason. */

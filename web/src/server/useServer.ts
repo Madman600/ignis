@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LastSwitch, ModelState } from "../api/model.ts";
 import { runningFamily } from "./band.ts";
-import { type Draft, editDraft, namedKeys, patchBody, valueInForce } from "./form.ts";
-import { appliedLines, type Line, type PendingReload, pendingReload, refusalLines, settleReload } from "./outcome.ts";
+import { type Draft, editDraft, patchBody, valueInForce } from "./form.ts";
+import { afterPatch, afterSwitch, type Line, type PendingReload, settleReload } from "./outcome.ts";
 import {
   type Answer,
   type CatalogRow,
@@ -151,15 +151,11 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
         setLoadRefusal(null);
         setLoadingId(id);
         void switchTo(id).then((answer) => {
+          const after = afterSwitch(answer);
           setLoadingId(null);
-          if (answer.ok) {
-            setAwaiting({ before: lastSwitchOf(modelNow.current) });
-            refreshModel();
-            return;
-          }
-          setLoadRefusal(refusalLines(answer)[0].text);
-          // A switch under way (409): show it, and the band follows it.
-          if (answer.status === 409) refreshModel();
+          setLoadRefusal(after.refusal);
+          if (after.follow) setAwaiting({ before: lastSwitchOf(modelNow.current) });
+          if (after.refreshModel) refreshModel();
         });
       },
       edit(decl, value) {
@@ -178,25 +174,20 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
         setResult(null);
         setMarked([]);
         void patchConfig(body).then((answer) => {
+          const before = lastSwitchOf(modelNow.current);
+          const after = afterPatch(answer, fieldList, before);
           setApplying(false);
-          if (answer.ok && answer.value.applied === "reload") {
-            // 202: the whole patch goes through a reload; the band shows it as a switch.
-            setPending(pendingReload(answer.value, lastSwitchOf(modelNow.current)));
-            setAwaiting({ before: lastSwitchOf(modelNow.current) });
-            refreshModel();
-            return;
+          setResult(after.result);
+          setMarked(after.marked);
+          if (after.clearDraft) setDraft({});
+          if (after.config) setConfig({ state: "ok", value: after.config });
+          else if (after.clearDraft) reread();
+          if (after.pending) {
+            // The whole patch goes through a reload; the band shows it as a switch.
+            setPending(after.pending);
+            setAwaiting({ before });
           }
-          if (answer.ok) {
-            setDraft({});
-            setResult(appliedLines(answer.value));
-            if (answer.value.config) setConfig({ state: "ok", value: answer.value.config });
-            else reread();
-            return;
-          }
-          setResult(refusalLines(answer));
-          if (answer.status === 400 && fieldList) setMarked([...namedKeys(answer.message, fieldList)]);
-          // A switch under way (409, or the gate's 503): the action waits for it to land.
-          if (answer.status === 409 || answer.status === 503) refreshModel();
+          if (after.refreshModel) refreshModel();
         });
       },
       dismiss() {

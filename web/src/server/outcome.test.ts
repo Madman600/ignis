@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { LastSwitch, ModelState } from "../api/model.ts";
-import { appliedLines, drainNote, lastSwitchLine, pendingReload, refusalLines, settleReload } from "./outcome.ts";
+import { FIELDS } from "./fixture.ts";
+import { afterPatch, afterSwitch, appliedLines, drainNote, lastSwitchLine, pendingReload, refusalLines, settleReload } from "./outcome.ts";
 
 // What the Server view says once a change or a switch has an answer (spec
 // playground/05 §Applying, §Model band), worded as the spec words it.
@@ -116,5 +117,70 @@ describe("drainNote", () => {
     expect(drainNote(1, "The reload")).toBe("A reply is streaming: the reload gives it 1 second to finish, then cancels it.");
     expect(drainNote(0, "The reload")).toBe("A reply is streaming: the reload cancels it at once.");
     expect(drainNote(null, "A switch")).toBe("A reply is streaming: a switch lets it finish first, up to switch.drain_timeout.");
+  });
+});
+
+describe("afterPatch", () => {
+  const fields = FIELDS;
+  const before: LastSwitch = { from: "qwen3.8-27b", to: "qwen3.8-27b", outcome: "switched" };
+
+  it("200: the draft clears and the form shows the configuration the answer carries", () => {
+    const config = { server: { request_timeout: 60 } };
+    const after = afterPatch({ ok: true, status: 200, value: { applied: "live", persisted: true, path: "c.yaml", config } }, fields, before);
+    expect(after).toEqual({
+      clearDraft: true,
+      result: [{ text: "Applied and written to c.yaml", tone: "done" }],
+      marked: [],
+      pending: null,
+      config,
+      refreshModel: false,
+    });
+  });
+
+  it("202: the draft is kept and the reload followed, the model read again so the band shows it", () => {
+    const after = afterPatch(
+      { ok: true, status: 202, value: { applied: "reload", persisted: false, path: "c.yaml", reason: "later", switching: { from: "a", to: "a" } } },
+      fields,
+      before,
+    );
+    expect(after).toEqual({
+      clearDraft: false,
+      result: null,
+      marked: [],
+      pending: { id: "a", path: "c.yaml", reason: "later", shadowed: [], seen: false, before },
+      config: null,
+      refreshModel: true,
+    });
+  });
+
+  it("400: the message, and every row it names marked; nothing applied, the draft kept", () => {
+    const after = afterPatch(
+      { ok: false, status: 400, code: "config_invalid", message: "`model.qwen38.max_context (the request body)` must be at least 1, got 0" },
+      fields,
+      before,
+    );
+    expect(after).toMatchObject({ clearDraft: false, marked: ["model.max_context"], pending: null, refreshModel: false });
+    expect(after.result?.[0].tone).toBe("fault");
+  });
+
+  it("409 and 503: the switch under way is named and the model read again, so the action waits for it", () => {
+    for (const status of [409, 503]) {
+      const after = afterPatch({ ok: false, status, message: "a switch from a to b is already under way; switches are not queued" }, fields, before);
+      expect(after).toMatchObject({ clearDraft: false, refreshModel: true, result: [{ text: "A switch from a to b is already under way; switches are not queued", tone: "fault" }] });
+    }
+  });
+
+  it("501: the server's reason, nothing else", () => {
+    const after = afterPatch({ ok: false, status: 501, code: "config_unavailable", message: "this server was built without a running configuration" }, fields, before);
+    expect(after).toMatchObject({ clearDraft: false, refreshModel: false, marked: [], result: [{ tone: "fault" }] });
+  });
+});
+
+describe("afterSwitch", () => {
+  it("follows a switch that began, and names a refusal in the band", () => {
+    expect(afterSwitch({ ok: true, status: 202, value: { from: "a", to: "b" } })).toEqual({ refusal: null, follow: true, refreshModel: true });
+    const absent = afterSwitch({ ok: false, status: 404, code: "model_not_found", message: "model x is in the catalog but not on disk" });
+    expect(absent).toEqual({ refusal: "Model x is in the catalog but not on disk", follow: false, refreshModel: false });
+    expect(afterSwitch({ ok: false, status: 409, message: "a switch from a to b is already under way" })).toMatchObject({ refreshModel: true });
   });
 });
