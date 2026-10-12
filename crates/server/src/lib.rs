@@ -523,6 +523,16 @@ impl Server {
         }
     }
 
+    /// The idle clock unloaded the model (spec model-switch/02): what
+    /// `--server-metrics` keeps shows nothing reserved, until a load's
+    /// [`Server::observe_load`] writes its own. Nothing without
+    /// `--server-metrics`.
+    pub(crate) fn observe_unload(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.set_unloaded();
+        }
+    }
+
     /// Read a response's `created_at` from `clock` instead of the wall.
     pub fn with_wall_clock(mut self, clock: std::sync::Arc<dyn telemetry::TelemetryClock>) -> Self {
         self.wall_clock = clock;

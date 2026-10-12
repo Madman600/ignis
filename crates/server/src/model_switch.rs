@@ -957,12 +957,15 @@ pub(crate) fn claim_unload(server: &Server) -> Option<Unloading> {
 /// blocking thread that runs them, never split across this future: the
 /// clock awaiting it is stopped when its serve loop ends, and a stop
 /// mid-teardown must not free the slot — and wake a request to load a model
-/// — while the old model still holds the card.
+/// — while the old model still holds the card. `/metrics` stops showing the
+/// model's reservations in the same unit, before a load could write its own.
 pub(crate) async fn unload(server: &Server, unloading: Unloading, idle: Duration) {
     let model = server.active();
+    let server = server.clone();
     let teardown = tokio::task::spawn_blocking(move || {
         let teardown_began = Instant::now();
         model.shut_down();
+        server.observe_unload();
         tracing::info!(
             name: "ignis.model.unloaded",
             model = %model.engine.model_id(),

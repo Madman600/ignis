@@ -256,6 +256,64 @@ async fn polling_the_state_routes_neither_keeps_the_model_nor_loads_it_again() {
     assert!(loader.loads().is_empty(), "{:?}", loader.loads());
 }
 
+/// A series' value in a `/metrics` scrape, if the scrape has it.
+fn gauge(scrape: &str, series: &str) -> Option<u64> {
+    scrape.lines().find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+}
+
+/// The spec's engine audit: the card is free while unloaded, and `/metrics`
+/// says so — what the unloaded model's load reserved, and what was occupied
+/// of it, read zero (the disk tier's series are gone, as on a load without
+/// it) until the next load writes its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn while_unloaded_the_metrics_show_nothing_reserved() {
+    let loader = MockLoader::new();
+    let reserved = ignis_server::metrics::LoadReservations {
+        lines: ignis_core::VramLines { weights: 7 << 30, workspace: 1 << 30, ..Default::default() },
+        budget_bytes: 30 << 30,
+        kv_pool_pages: 1024,
+        kv_page_bytes: 1 << 20,
+        residency_bytes: 0,
+        expert_cache_bytes: 0,
+        kv_ram_arena_bytes: 4 << 30,
+        retained_slots: 4,
+        retained_host_slots: 2,
+        retained_host_bytes: 1 << 30,
+        kv_disk_bytes: Some(8 << 30),
+        flash_next: None,
+    };
+    let server = idle_server(&loader, loader.model("mock-a"), IDLE, &[]).with_metrics().with_load_reservations(reserved);
+    let metrics = server.metrics_app().expect("metrics are on");
+    let scrape = || async { send(&metrics, Method::GET, "/metrics", None).await.1.as_str().expect("text").to_owned() };
+    let series = [
+        ("ignis_vram_reserved_bytes{line=\"weights\"}", 7 << 30),
+        ("ignis_vram_reserved_bytes{line=\"workspace\"}", 1 << 30),
+        ("ignis_vram_budget_bytes", 30 << 30),
+        ("ignis_kv_pool_pages", 1024),
+        ("ignis_kv_page_bytes", 1 << 20),
+        ("ignis_kv_ram_arena_bytes{state=\"capacity\"}", 4 << 30),
+        ("ignis_retained_slots{state=\"capacity\"}", 4),
+        ("ignis_retained_host_slots", 2),
+        ("ignis_retained_host_bytes", 1 << 30),
+    ];
+    let loaded = scrape().await;
+    for (name, value) in series {
+        assert_eq!(gauge(&loaded, name), Some(value), "{name} while loaded");
+    }
+    assert_eq!(gauge(&loaded, "ignis_kv_disk_bytes{state=\"capacity\"}"), Some(8 << 30));
+
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+    unloaded(&server, &loader).await;
+    let unloaded = scrape().await;
+    for (name, _) in series {
+        assert_eq!(gauge(&unloaded, name), Some(0), "{name} while unloaded");
+    }
+    for name in ["ignis_kv_pool_used_pages", "ignis_kv_ram_arena_bytes{state=\"used\"}", "ignis_retained_slots{state=\"in_use\"}"] {
+        assert_eq!(gauge(&unloaded, name), Some(0), "{name} while unloaded");
+    }
+    assert!(!unloaded.contains("ignis_kv_disk_bytes"), "no disk tier while nothing is loaded");
+}
+
 /// AC 6: a chat request while unloaded loads the model — `loading`
 /// meanwhile — and is served; two arriving together share the one load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
