@@ -1,10 +1,11 @@
 import type { LastSwitch } from "./src/api/model.ts";
-import { CATALOG, CONFIG, FIELDS } from "./src/server/fixture.ts";
+import { CATALOG, CONFIG, FIELDS, originRows, PROVENANCE, type Provenance, SCOPES } from "./src/server/fixture.ts";
+import { familyName, resolved, section } from "./src/server/form.ts";
 import type { CatalogRow, ConfigDocument, FieldDecl } from "./src/server/routes.ts";
 
 // A fake of the routes the Server view talks to, for `npm run dev:mock`
 // (spec playground/05 §Mock): GET /v1/config/fields, GET and PATCH
-// /v1/config, GET /v1/models/catalog, POST /v1/models/switch and the model
+// /v1/config, GET /v1/config/origins, GET /v1/models/catalog, POST /v1/models/switch and the model
 // state GET /v1/models reports. Development only — never part of the build.
 //
 // It starts as the 27B under the `rtx5090` profile (src/server/fixture.ts). A
@@ -29,11 +30,17 @@ import type { CatalogRow, ConfigDocument, FieldDecl } from "./src/server/routes.
 // applies again) or a group key (back to the field's default). `GET /v1/config`
 // shows a family's value only where it differs from the group's, as the
 // server does. `?format=yaml` renders the configuration as a YAML document.
+//
+// Origins (spec playground/05 §Follow-up 2): the 27B's `vram.headroom_bytes`
+// is the `rtx5090` profile's and `model.thinking_budget` is set by an env var
+// (src/server/fixture.ts); an edit makes a value `live`. A shared edit
+// replaces a family's value that is not the operator's own, a `null` cannot
+// remove one, and a group-key value for a field only the other family takes
+// is refused, as the server refuses it.
 
 const SWITCH_MS = 3_000;
 const RESTORE_MS = 1_000;
 const CONFIG_PATH = "ignis.yaml";
-const SCOPES = ["qwen38", "qwen38flashnext"];
 const COUNTS = new Set(["tokens", "seconds", "slots", "percent", "lanes", "MiB", "rows", "tokens|off"]);
 
 /** One value of a patch; `remove` is its `null`. */
@@ -63,15 +70,24 @@ function canonical(decl: FieldDecl, value: unknown): unknown {
 
 const sameValue = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
-const section = (doc: ConfigDocument, group: string, scope: string) => {
-  const found = doc[group]?.[scope];
-  return isObject(found) ? found : undefined;
-};
+/** The configuration with every family value, also one equal to the shared one, and where each value was set. */
+type State = { store: ConfigDocument; from: Provenance };
 
-/** The value a family runs a field with: its own section's, else the group's. */
-function resolved(doc: ConfigDocument, decl: FieldDecl, family: string): unknown {
-  const own = section(doc, decl.group, family);
-  return own && decl.name in own ? own[decl.name] : doc[decl.group]?.[decl.name];
+const provenanceKey = (decl: FieldDecl, scope: string | null) => (scope === null ? decl.file_key : `${decl.group}.${scope}.${decl.name}`);
+
+/** What `GET /v1/config` answers: a family's value only where it differs from the group's. */
+function viewOf(store: ConfigDocument): ConfigDocument {
+  const doc = structuredClone(store);
+  for (const decl of FIELDS.filter((d) => d.scoped)) {
+    for (const scope of SCOPES) {
+      const own = section(doc, decl.group, scope);
+      if (own && decl.name in own && sameValue(own[decl.name], doc[decl.group][decl.name])) delete own[decl.name];
+    }
+  }
+  for (const [group, fields] of Object.entries(doc)) {
+    for (const scope of SCOPES) if (section(doc, group, scope) && Object.keys(fields[scope] as object).length === 0) delete fields[scope];
+  }
+  return doc;
 }
 
 const plain = (text: string) => /^[A-Za-z0-9_./~-][A-Za-z0-9_./:~-]*$/.test(text) && !/^(true|false|null|yes|no|on|off|~|[-+]?[0-9.]+)$/i.test(text);
@@ -90,7 +106,7 @@ export function yamlOf(value: Record<string, unknown>, depth = 0): string {
 }
 
 export function createServerSim() {
-  const doc = structuredClone(CONFIG) as ConfigDocument;
+  const state: State = { store: structuredClone(CONFIG) as ConfigDocument, from: structuredClone(PROVENANCE) };
   let loaded = "qwen3.8-27b";
   let running: Running | null = null;
   // A target that did not load: `failed` while the old model is loaded again.
@@ -125,28 +141,42 @@ export function createServerSim() {
 
   const status = () => (running ? "switching" : restoring || dead ? "failed" : "serving");
 
-  function apply(entries: Entry[], into: ConfigDocument = doc) {
+  /** Whether a family's value of a field is the operator's own: the file's or a live change, which a shared edit does not reach. */
+  const ownValue = (into: State, decl: FieldDecl, family: string) => {
+    const source = into.from[provenanceKey(decl, family)]?.source ?? "file";
+    return source === "file" || source === "live";
+  };
+
+  function apply(entries: Entry[], into: State = state) {
     for (const { decl, scope, value, remove } of entries) {
-      const group = (into[decl.group] ??= {});
+      const group = (into.store[decl.group] ??= {});
+      const key = provenanceKey(decl, scope);
       if (remove) {
+        // A profile's, a flag's or an env var's value is not in the file, so nothing removes it.
         if (scope === null) group[decl.name] = decl.default;
-        else if (section(into, decl.group, scope)) delete (group[scope] as Record<string, unknown>)[decl.name];
+        else if (ownValue(into, decl, scope)) delete section(into.store, decl.group, scope)?.[decl.name];
+        else continue;
+        delete into.from[key];
       } else {
         const at = scope === null ? group : ((group[scope] ??= {}) as Record<string, unknown>);
         if (decl.file_key === "switch.known_models" && isObject(value)) at[decl.name] = { ...(at[decl.name] as object), ...value };
         else at[decl.name] = canonical(decl, value);
+        into.from[key] = { source: "live" };
+        // A patched shared value outranks what a family has from the profile, a flag or an env var.
+        if (scope === null) {
+          for (const family of SCOPES) {
+            if (ownValue(into, decl, family)) continue;
+            delete section(into.store, decl.group, family)?.[decl.name];
+            delete into.from[provenanceKey(decl, family)];
+          }
+        }
       }
-      // The server shows a family's value only where it differs from the group's; an emptied section goes.
-      const own = scope === null ? undefined : section(into, decl.group, scope);
-      if (own) {
-        if (decl.scoped && decl.name in own && sameValue(own[decl.name], group[decl.name])) delete own[decl.name];
-        if (Object.keys(own).length === 0) delete group[scope!];
-      }
+      if (scope !== null && section(into.store, decl.group, scope) && Object.keys(group[scope] as object).length === 0) delete group[scope];
     }
   }
 
   /** The changes a PATCH body names, or the 400 the server answers it with. */
-  function readPatch(body: unknown): Entry[] | MockAnswer {
+  function readPatch(body: unknown, running: string): Entry[] | MockAnswer {
     const invalid = (message: string) => refuse(400, "invalid_request_error", "config_invalid", message);
     if (!isObject(body)) return invalid("the body must be a config document: `{ <group>: { <field>: value } }`");
     const find = (group: string, name: string) => FIELDS.find((decl) => decl.group === group && decl.name === name);
@@ -165,8 +195,12 @@ export function createServerSim() {
         }
         const decl = find(group, key);
         if (!decl) return invalid(`unknown field \`${group}.${key}\``);
-        // A field only one family takes lives in that family's section, as the server writes it.
-        entries.push({ decl, scope: decl.families?.length === 1 ? decl.families[0] : null, value, ...(value === null ? { remove: true as const } : {}) });
+        // A field only one family takes lives in that family's section, as the server writes it; a value the running family cannot take is refused.
+        const only = decl.families?.length === 1 ? decl.families[0] : null;
+        if (only !== null && only !== running && value !== null && !sameValue(canonical(decl, value), decl.default)) {
+          return invalid(`\`${decl.file_key} ${String(value)}\`: ${familyName(running)} does not take it (a ${familyName(only)} option)`);
+        }
+        entries.push({ decl, scope: only, value, ...(value === null ? { remove: true as const } : {}) });
       }
     }
     if (entries.length === 0) return invalid("the patch names no field");
@@ -185,7 +219,7 @@ export function createServerSim() {
     /** GET /v1/config: the running configuration, and the model status its header carries. */
     config(now: number): { body: ConfigDocument; status: string } {
       advance(now);
-      return { body: doc, status: status() };
+      return { body: viewOf(state.store), status: status() };
     },
 
     /** GET /v1/config?format=...: `json` (or none) is the document, `yaml` the file it amounts to, any other format a 400. */
@@ -197,10 +231,16 @@ export function createServerSim() {
       return { modelStatus: status, http: 400, type: "application/json", text: JSON.stringify(refused.body) };
     },
 
+    /** GET /v1/config/origins: where each value in force comes from. */
+    origins(now: number): { object: "list"; data: ReturnType<typeof originRows> } {
+      advance(now);
+      return { object: "list", data: originRows(FIELDS, state.store, state.from) };
+    },
+
     models(now: number): Record<string, unknown> {
       advance(now);
       const family = familyOf(loaded);
-      const context = Number((doc.model?.[family] as Record<string, unknown> | undefined)?.max_context ?? doc.model?.max_context);
+      const context = Number((state.store.model?.[family] as Record<string, unknown> | undefined)?.max_context ?? state.store.model?.max_context);
       return {
         object: "list",
         data: dead ? [] : [{ id: loaded, object: "model", owned_by: "ignis", max_model_len: context }],
@@ -230,15 +270,15 @@ export function createServerSim() {
       }
       const unready = restoring ?? dead;
       if (unready) return refuse(503, "server_error", "server_not_ready", `a model switch failed and no model is serving (${unready.reason}); retry shortly`);
-      const entries = readPatch(body);
+      const entries = readPatch(body, familyOf(loaded));
       if (!Array.isArray(entries)) return entries;
       const shadowed = entries.filter((entry) => keyOf(entry) === "model.thinking_budget").map((entry) => `${keyOf(entry)} (set by IGNIS_MODEL_THINKING_BUDGET)`);
       const shadowing = shadowed.length > 0 ? { shadowed_at_restart: shadowed } : {};
       // A reload only for what the loaded model runs with: apply the patch to a copy and compare what the loaded family resolves.
       const family = familyOf(loaded);
-      const after = structuredClone(doc) as ConfigDocument;
+      const after = structuredClone(state);
       apply(entries, after);
-      const reloads = entries.some((entry) => entry.decl.reload_required && !sameValue(resolved(doc, entry.decl, family), resolved(after, entry.decl, family)));
+      const reloads = entries.some((entry) => entry.decl.reload_required && !sameValue(resolved(state.store, entry.decl, family), resolved(after.store, entry.decl, family)));
       if (reloads) {
         const failure = entries.some((entry) => entry.value === "/fail")
           ? `the reload of ${loaded} failed: the mock refuses a value "/fail"; the previous configuration was loaded again`
@@ -257,7 +297,7 @@ export function createServerSim() {
         };
       }
       apply(entries);
-      return { status: 200, body: { applied: "live", persisted: true, path: CONFIG_PATH, ...shadowing, config: doc } };
+      return { status: 200, body: { applied: "live", persisted: true, path: CONFIG_PATH, ...shadowing, config: viewOf(state.store) } };
     },
 
     /** POST /v1/models/switch by id alone (an `artifact` beside it is ignored here). */

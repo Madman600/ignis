@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createServerSim, yamlOf } from "./mockServer.ts";
 import { FIELDS } from "./src/server/fixture.ts";
-import type { CatalogRow, PatchApplied } from "./src/server/routes.ts";
+import type { CatalogRow, OriginRow, PatchApplied } from "./src/server/routes.ts";
 
 // The mock's Server view routes (spec playground/05 §Mock): the shapes the
 // real ones answer with, a switch or a reload that reads `switching` for
@@ -119,11 +119,22 @@ describe("createServerSim: per-model values", () => {
     expect(model(sim).qwen38flashnext.max_context).toBe(524288);
     expect((sim.config(T).body.spec as Record<string, any>).qwen38flashnext.decode_lanes).toBe(4);
     expect(sim.models(T)).toMatchObject({ status: "serving", data: [{ max_model_len: 786432 }] });
-    // A field only that family takes is the same when sent at the group.
-    expect(sim.patch({ spec: { decode_lanes: "5" } }, T).status).toBe(200);
     // The load that follows runs with it.
     sim.switchTo({ model: "qwen3.8-flash-next" }, T);
     expect(sim.models(T + 3_500)).toMatchObject({ data: [{ id: "qwen3.8-flash-next", max_model_len: 524288 }] });
+  });
+
+  it("refuses a group key for a field only the other family takes, as the server does, and homes its removal", () => {
+    const sim = createServerSim();
+    const refused = sim.patch({ spec: { decode_lanes: "5" } }, T);
+    expect(refused.status).toBe(400);
+    expect(JSON.stringify(refused.body)).toContain("`spec.decode_lanes 5`: Qwen3.8-27B does not take it (a Qwen3.8-Flash-Next option)");
+    // The family's section is the way, and a removal at the group key is homed there.
+    expect(sim.patch({ spec: { qwen38flashnext: { decode_lanes: "5" } } }, T).status).toBe(200);
+    expect(sim.patch({ spec: { decode_lanes: null } }, T).status).toBe(200);
+    expect((sim.config(T).body.spec as Record<string, any>).qwen38flashnext).not.toHaveProperty("decode_lanes");
+    // A value it already has is no value to refuse.
+    expect(sim.patch({ spec: { decode_lanes: null } }, T).status).toBe(200);
   });
 
   it("answers a group key the loaded family overrides 200 live, and reloads when it does not", () => {
@@ -199,5 +210,65 @@ describe("createServerSim: the rendered file", () => {
     const bad = sim.configAs("toml", T);
     expect(bad.http).toBe(400);
     expect(JSON.parse(bad.text)).toMatchObject({ error: { code: "config_invalid" } });
+  });
+});
+
+describe("createServerSim: where each value comes from", () => {
+  const model = (sim: ReturnType<typeof createServerSim>, now = T) => sim.config(now).body.model as Record<string, any>;
+  const origins = (sim: ReturnType<typeof createServerSim>, now = T) => sim.origins(now).data as OriginRow[];
+  const row = (sim: ReturnType<typeof createServerSim>, key: string, scope: string | null, now = T) => origins(sim, now).find((r) => r.key === key && r.scope === scope);
+
+  it("lists a row per visible field and scope in the list envelope: the shared value, then each family that takes the field", () => {
+    const sim = createServerSim();
+    expect(sim.origins(T)).toMatchObject({ object: "list" });
+    const rows = origins(sim);
+    expect(rows.filter((r) => r.key === "model.max_context").map((r) => r.scope)).toEqual([null, "qwen38", "qwen38flashnext"]);
+    // A field one family takes has its family's row alone.
+    expect(rows.filter((r) => r.key === "spec.decode_lanes").map((r) => r.scope)).toEqual(["qwen38flashnext"]);
+    expect(new Set(rows.map((r) => r.key))).toEqual(new Set(FIELDS.map((f) => f.file_key)));
+  });
+
+  it("serves a family value from the profile for the 27B: vram.headroom_bytes 1200M from rtx5090", () => {
+    const sim = createServerSim();
+    expect((sim.config(T).body.vram as Record<string, any>).qwen38.headroom_bytes).toBe("1200M");
+    expect(row(sim, "vram.headroom_bytes", "qwen38")).toEqual({ key: "vram.headroom_bytes", scope: "qwen38", source: "profile", scoped: true, spelling: "rtx5090" });
+    expect(row(sim, "vram.headroom_bytes", "qwen38flashnext")).toMatchObject({ source: "default", scoped: false });
+    expect(row(sim, "model.max_context", "qwen38")).toMatchObject({ source: "file", scoped: true, spelling: "model.qwen38.max_context in ignis.yaml" });
+    expect(row(sim, "model.thinking_budget", null)).toMatchObject({ source: "env", spelling: "IGNIS_MODEL_THINKING_BUDGET" });
+  });
+
+  it("makes a patched value live, and a shared edit replaces the profile's value for the family, which reloads the 27B", () => {
+    const sim = createServerSim();
+    expect(sim.patch({ server: { request_timeout: "60" } }, T).status).toBe(200);
+    expect(row(sim, "server.request_timeout", null)).toMatchObject({ source: "live", scoped: false });
+    const answer = sim.patch({ vram: { headroom_bytes: "1G" } }, T);
+    expect(answer.status).toBe(202);
+    const after = sim.config(T + 3_500).body.vram as Record<string, any>;
+    expect(after.headroom_bytes).toBe("1G");
+    expect(after).not.toHaveProperty("qwen38");
+    expect(row(sim, "vram.headroom_bytes", "qwen38", T + 3_500)).toMatchObject({ source: "live", scoped: false });
+  });
+
+  it("makes a family edit live and own, and keeps an own value equal to the shared one, which GET leaves out", () => {
+    const sim = createServerSim();
+    expect(sim.patch({ model: { qwen38flashnext: { kv_format: "bf16" } } }, T).status).toBe(200);
+    expect(row(sim, "model.kv_format", "qwen38flashnext")).toMatchObject({ source: "live", scoped: true });
+    // Set to the shared value: the file's shape shows nothing, the origins still say it is the operator's own.
+    expect(sim.patch({ model: { qwen38flashnext: { kv_format: "hq-e8-2b" } } }, T).status).toBe(200);
+    expect(model(sim).qwen38flashnext).not.toHaveProperty("kv_format");
+    expect(row(sim, "model.kv_format", "qwen38flashnext")).toMatchObject({ source: "live", scoped: true });
+    // A shared edit does not reach it.
+    expect(sim.patch({ model: { kv_format: "bf16" } }, T).status).toBe(202);
+    sim.config(T + 3_500);
+    expect(row(sim, "model.kv_format", "qwen38flashnext")).toMatchObject({ scoped: true });
+    expect(model(sim, T + 3_500).qwen38flashnext.kv_format).toBe("hq-e8-2b");
+  });
+
+  it("does not remove what the profile gave, and returns to the shared value for an own one", () => {
+    const sim = createServerSim();
+    expect(sim.patch({ vram: { qwen38: { headroom_bytes: null } } }, T).status).toBe(200);
+    expect(row(sim, "vram.headroom_bytes", "qwen38")).toMatchObject({ source: "profile", scoped: true });
+    sim.patch({ model: { qwen38flashnext: { max_context: null } } }, T);
+    expect(row(sim, "model.max_context", "qwen38flashnext")).toMatchObject({ scoped: false });
   });
 });

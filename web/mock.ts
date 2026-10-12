@@ -82,6 +82,7 @@ export function mockIgnis(): Plugin {
       // Playground's context bar, as ignis reports it.
       server.middlewares.use("/v1/models", (_req, res) => answer(res, { status: 200, body: sim.models(Date.now()) }));
       server.middlewares.use("/v1/config/fields", (_req, res) => answer(res, { status: 200, body: sim.fields() }));
+      server.middlewares.use("/v1/config/origins", (_req, res) => answer(res, { status: 200, body: sim.origins(Date.now()) }));
       server.middlewares.use("/v1/config", async (req, res) => {
         if (req.method === "PATCH") return answer(res, sim.patch(await readJson(req), Date.now()));
         const format = new URL(req.url ?? "/", "http://mock").searchParams.get("format");
