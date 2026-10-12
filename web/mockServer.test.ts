@@ -84,6 +84,20 @@ describe("createServerSim", () => {
     expect((back as { last_switch: { reason: string } }).last_switch.reason).toContain("qwen3.8-27b-fail");
   });
 
+  it("ends a switch to an id containing \"dead\" with nothing serving: no loaded row, the torn-down model switchable again", () => {
+    const sim = createServerSim();
+    sim.switchTo({ model: "qwen3.8-27b-dead" }, T);
+    const dead = sim.models(T + 5_000);
+    expect(dead).toMatchObject({ status: "failed", data: [], reason: expect.stringContaining("qwen3.8-27b-dead"), last_switch: { outcome: "failed" } });
+    const rows = sim.catalog(T + 5_000).data as CatalogRow[];
+    expect(rows.filter((row) => row.loaded)).toEqual([]);
+    expect(rows.find((row) => row.id === "qwen3.8-27b")).toMatchObject({ switchable: true });
+    expect(sim.patch({ server: { request_timeout: "60" } }, T + 5_000)).toMatchObject({ status: 503 });
+    // A switch to a model that loads is the way out.
+    sim.switchTo({ model: "qwen3.8-flash-next" }, T + 5_000);
+    expect(sim.models(T + 9_000)).toMatchObject({ status: "serving", data: [{ id: "qwen3.8-flash-next" }] });
+  });
+
   it("answers 404 for an id it cannot switch to, naming the download command for an entry not on disk", () => {
     const sim = createServerSim();
     const absent = sim.switchTo({ model: "qwen3.8-27b-custom" }, T);

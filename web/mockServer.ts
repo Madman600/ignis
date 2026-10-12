@@ -14,7 +14,10 @@ import type { CatalogRow, ConfigDocument, FieldDecl } from "./src/server/routes.
 //
 // Triggers: a value "/error" is refused with a 400 naming that field's key;
 // a switch to an id containing "fail" reads `failed` for a second (the old
-// model being loaded again) and ends `restored` with a reason; a reload whose
+// model being loaded again) and ends `restored` with a reason; one to an id
+// containing "dead" ends `failed` for good, the old model gone and nothing
+// serving (no `loaded` row, the torn-down model `switchable` again) until a
+// switch to a model that loads; a reload whose
 // patch holds a value "/fail" ends the same way, the configuration unchanged.
 // A patch of `model.thinking_budget` is shadowed at restart, as if the mock
 // had started with IGNIS_MODEL_THINKING_BUDGET set.
@@ -26,7 +29,7 @@ const SCOPES = ["qwen38", "qwen38flashnext"];
 const COUNTS = new Set(["tokens", "seconds", "slots", "percent", "lanes", "MiB", "rows", "tokens|off"]);
 
 type Entry = { decl: FieldDecl; scope: string | null; value: unknown };
-type Running = { from: string; to: string; until: number; failure?: string; patch?: Entry[] };
+type Running = { from: string; to: string; until: number; failure?: string; dead?: string; patch?: Entry[] };
 export type MockAnswer = { status: number; body: unknown };
 
 const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -56,6 +59,8 @@ export function createServerSim() {
   // A target that did not load: `failed` while the old model is loaded again.
   let restoring: { reason: string; until: number; last: LastSwitch } | null = null;
   let last: LastSwitch | undefined;
+  // A switch that left nothing serving: `loaded` is then only the model torn down.
+  let dead: { reason: string } | null = null;
 
   const familyOf = (id: string) => CATALOG.find((row) => row.id === id)?.family ?? "qwen38";
 
@@ -63,10 +68,14 @@ export function createServerSim() {
     if (running && now >= running.until) {
       const ended = running;
       running = null;
-      if (ended.failure) {
+      if (ended.dead) {
+        dead = { reason: ended.dead };
+        last = { from: ended.from, to: ended.to, outcome: "failed", reason: ended.dead };
+      } else if (ended.failure) {
         restoring = { reason: ended.failure, until: ended.until + RESTORE_MS, last: { from: ended.from, to: ended.to, outcome: "restored", reason: ended.failure } };
       } else {
         loaded = ended.to;
+        dead = null;
         if (ended.patch) apply(ended.patch);
         last = { from: ended.from, to: ended.to, outcome: "switched" };
       }
@@ -77,7 +86,7 @@ export function createServerSim() {
     }
   }
 
-  const status = () => (running ? "switching" : restoring ? "failed" : "serving");
+  const status = () => (running ? "switching" : restoring || dead ? "failed" : "serving");
 
   function apply(entries: Entry[]) {
     for (const { decl, scope, value } of entries) {
@@ -140,10 +149,10 @@ export function createServerSim() {
       const context = Number((doc.model?.[family] as Record<string, unknown> | undefined)?.max_context ?? doc.model?.max_context);
       return {
         object: "list",
-        data: [{ id: loaded, object: "model", owned_by: "ignis", max_model_len: context }],
+        data: dead ? [] : [{ id: loaded, object: "model", owned_by: "ignis", max_model_len: context }],
         status: status(),
         ...(running ? { switching: { from: running.from, to: running.to } } : {}),
-        ...(restoring ? { reason: restoring.reason } : {}),
+        ...(restoring || dead ? { reason: (restoring ?? dead)!.reason } : {}),
         ...(last ? { last_switch: last } : {}),
       };
     },
@@ -153,7 +162,7 @@ export function createServerSim() {
       return {
         object: "list",
         data: CATALOG.map((row) => {
-          const isLoaded = row.id === loaded;
+          const isLoaded = !dead && row.id === loaded;
           // A switch can begin while serving or after a failed one, never during one.
           return { ...row, loaded: isLoaded, switchable: !running && !isLoaded && row.on_disk === "complete" };
         }),
@@ -165,7 +174,8 @@ export function createServerSim() {
       if (running) {
         return refuse(503, "server_error", "model_switching", `the server is switching models from ${running.from} to ${running.to}; retry once GET /v1/models reports \`serving\``);
       }
-      if (restoring) return refuse(503, "server_error", "server_not_ready", `a model switch failed and no model is serving (${restoring.reason}); retry shortly`);
+      const unready = restoring ?? dead;
+      if (unready) return refuse(503, "server_error", "server_not_ready", `a model switch failed and no model is serving (${unready.reason}); retry shortly`);
       const entries = readPatch(body);
       if (!Array.isArray(entries)) return entries;
       const shadowed = entries.filter((entry) => keyOf(entry) === "model.thinking_budget").map((entry) => `${keyOf(entry)} (set by IGNIS_MODEL_THINKING_BUDGET)`);
@@ -214,7 +224,8 @@ export function createServerSim() {
         );
       }
       const failure = id.includes("fail") ? `loading ${id} failed: the mock refuses every id containing "fail"; ${loaded} was loaded again` : undefined;
-      running = { from: loaded, to: id, until: now + SWITCH_MS, failure };
+      const gone = id.includes("dead") ? `loading ${id} failed and ${loaded} could not be loaded again: the mock leaves nothing serving for every id containing "dead"` : undefined;
+      running = { from: loaded, to: id, until: now + SWITCH_MS, failure: gone ? undefined : failure, dead: gone };
       restoring = null;
       return { status: 202, body: { status: "switching", from: loaded, to: id } };
     },

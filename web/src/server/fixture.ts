@@ -200,7 +200,7 @@ export const CONFIG: ConfigDocument = {
   switch: {
     drain_timeout: 30,
     allow_implicit: true,
-    known_models: { "qwen3.8-27b": "models/qwen3_8_27b_nvfp4full-v2.ninfer", "qwen3.8-27b-fail": "F:/scratch/qwen3_8_27b-fail.ninfer" },
+    known_models: { "qwen3.8-27b": "models/qwen3_8_27b_nvfp4full-v2.ninfer", "qwen3.8-27b-dead": "F:/scratch/qwen3_8_27b-dead.ninfer", "qwen3.8-27b-fail": "F:/scratch/qwen3_8_27b-fail.ninfer" },
   },
   spec: {
     backend: null,
@@ -226,5 +226,6 @@ export const CATALOG: CatalogRow[] = [
   { id: "qwen3.8-27b-abliterated", source: "built-in", on_disk: "partial", bytes: 19406984175, loaded: false, switchable: false },
   { id: "qwen3.8-flash-next", source: "built-in", on_disk: "complete", bytes: 72799980571, family: "qwen38flashnext", loaded: false, switchable: true },
   { id: "qwen3.8-27b-custom", source: "operator", on_disk: "absent", bytes: 19406949449, loaded: false, switchable: false },
+  { id: "qwen3.8-27b-dead", source: "known", on_disk: "complete", bytes: 19406942468, family: "qwen38", loaded: false, switchable: true },
   { id: "qwen3.8-27b-fail", source: "known", on_disk: "complete", bytes: 19406942468, family: "qwen38", loaded: false, switchable: true },
 ];
