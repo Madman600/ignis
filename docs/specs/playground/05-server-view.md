@@ -312,8 +312,8 @@ three seconds after a switch or reload, then `last_switch`.
 
 - Downloading a model from the page (an absent model shows the command).
 - Editing `switch.known_models`, profiles, or any field not `patchable`.
-- Returning a nullable field to unset: `PATCH` reads `null` as no change.
-  Kinds that spell `auto`/`off` take those words.
+- ~~Returning a nullable field to unset~~: superseded by the follow-up below,
+  where `null` removes a key.
 - Arbitration between clients switching the same server (spec
   model-switch/01: no router).
 
@@ -374,6 +374,14 @@ still reloads the loaded model for it, and a `PATCH` cannot remove anything.
   - `applied` is `live` for it. A patch that mixes such values with a
     reload-requiring change for the running model reloads as before, and every
     value in it lands.
+- **A patched group value yields to the file's own family section.** What
+  runs is what a start from the rewritten file resolves, so a group key that
+  the running family overrides in its own section stays that section's value.
+  A patch's own family value still wins over the file.
+- **`GET /v1/config` answers in the file's shape**: each group key is the
+  shared value; a section for each family, the running one included, holds
+  every value where that family differs from the shared one. The value in
+  force is the running family's section, else the group's.
 - **`null` removes**, with JSON merge patch semantics.
   - `null` inside a family section removes that family's own value, so the
     group's applies to it again.
