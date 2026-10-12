@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { afterRefresh, canSend, readModel, switchFollowed, type ModelState } from "./model.ts";
+import { afterRefresh, canSend, loadAwaited, readModel, switchFollowed, type ModelState } from "./model.ts";
 import { keyRequired, saveKey } from "./auth.ts";
 
 const listing = (id: string, max?: number) =>
@@ -128,6 +128,17 @@ describe("readModel with idle unload (spec model-switch/02)", () => {
   it("follows a load each second until it serves, and leaves an unloaded model alone", () => {
     expect(switchFollowed({ state: "waking", to: "a", since: 0 })).toBe(true);
     expect(switchFollowed({ state: "unloaded", id: "a", contextLimit: null })).toBe(false);
+  });
+
+  it("reads an unloaded model each second while a turn of the page's own is in flight, which loads it", () => {
+    const unloaded: ModelState = { state: "unloaded", id: "a", contextLimit: null };
+    expect(loadAwaited(unloaded, true)).toBe(true);
+    expect(loadAwaited(unloaded, false)).toBe(false);
+    // The read that says `loading` hands the load to switchFollowed; the one that says `ready` ends both.
+    const waking: ModelState = { state: "waking", to: "a", since: 0 };
+    expect(loadAwaited(waking, true) || switchFollowed(waking)).toBe(true);
+    const ready: ModelState = { state: "ready", id: "a", contextLimit: null };
+    expect(loadAwaited(ready, true) || switchFollowed(ready)).toBe(false);
   });
 
   it("keeps an unloaded model or a load shown through a failed read, and when the page first saw the load", () => {

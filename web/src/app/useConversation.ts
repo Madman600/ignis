@@ -1,5 +1,5 @@
-import { useRef, useState } from "react";
-import { canSend, type ModelState } from "../api/model.ts";
+import { useEffect, useRef, useState } from "react";
+import { canSend, loadAwaited, type ModelState } from "../api/model.ts";
 import { conversationTurns, type Exchange, type Settings, thinkingBudgetOf, type ToolExtras } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { streamChat } from "../api/stream.ts";
@@ -118,6 +118,16 @@ export function useConversation({
   const canRun = canStartTurn(streaming, active.id, parallel) && canSend(model);
   /** Send waits: this session streams, or another one does and turns are not parallel. */
   const sendBlocked = !canStartTurn(streaming, active.id, parallel);
+
+  // A turn sent while the model was unloaded loads it (spec model-switch/02). The read at the turn's start comes
+  // back `unloaded` before its request reaches the server, so the page reads again each second until it sees the
+  // load — which it then follows as it follows a switch — and the header says what the wait is.
+  const awaitingLoad = loadAwaited(model, busy);
+  useEffect(() => {
+    if (!awaitingLoad) return;
+    const timer = setInterval(refreshModel, 1000);
+    return () => clearInterval(timer);
+  }, [awaitingLoad, refreshModel]);
 
   function selectSession(id: number) {
     following.current = true;

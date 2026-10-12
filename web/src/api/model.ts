@@ -114,6 +114,15 @@ export function switchFollowed(model: ModelState): boolean {
   return model.state === "switching" || model.state === "waking" || (model.state === "error" && model.failed === true);
 }
 
+/**
+ * Whether the page reads the model each second for a turn of its own: one is in flight while the model reads
+ * `unloaded`, so that turn's request is loading it (spec model-switch/02). The read that says `loading` hands the
+ * load to `switchFollowed`, and the one that says the model serves ends both, so a long reply is not followed.
+ */
+export function loadAwaited(model: ModelState, sending: boolean): boolean {
+  return sending && model.state === "unloaded";
+}
+
 export function useModel(): [ModelState, () => void] {
   const [model, setModel] = useState<ModelState>({ state: "loading" });
   const { key, needsKey } = useAuth();
