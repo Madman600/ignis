@@ -388,14 +388,16 @@ async fn cors_preflight() -> StatusCode {
 }
 
 /// Adds permissive CORS headers to every response so the API is reachable
-/// from browser-based clients on other origins.
+/// from browser-based clients on other origins. `PATCH` is there for
+/// `PATCH /v1/config` (spec config-v2/02): a browser on another origin sends
+/// nothing its preflight did not allow.
 async fn cors_headers(req: Request, next: Next) -> Response {
     let mut res = next.run(req).await;
     let headers = res.headers_mut();
     headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
     headers.insert(
         "Access-Control-Allow-Methods",
-        HeaderValue::from_static("GET, POST, OPTIONS"),
+        HeaderValue::from_static("GET, POST, PATCH, OPTIONS"),
     );
     headers.insert(
         "Access-Control-Allow-Headers",

@@ -535,6 +535,19 @@ async fn the_fields_route_answers_during_a_switch_without_a_config_and_behind_th
     assert_eq!(status, StatusCode::OK, "the preflight passes, like the other /v1 routes");
 }
 
+/// The preflight of `PATCH /v1/config` from another origin names `PATCH` among
+/// the methods it allows: without it a browser on another origin never sends
+/// the change.
+#[tokio::test]
+async fn the_preflight_allows_the_patch_a_config_change_is() {
+    let loader = MockLoader::new();
+    let app = server_on(&loader, started(&[])).app();
+    let (status, headers, _) = send_with_headers(&app, Method::OPTIONS, "/v1/config", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let allowed = headers["access-control-allow-methods"].to_str().unwrap();
+    assert!(allowed.split(',').map(str::trim).any(|method| method == "PATCH"), "{allowed}");
+}
+
 /// `help --fields --format json` and the route are one declaration: every
 /// key the route serves is the command line's, except `rule` and `families`,
 /// which the command line keeps as the sentence and names it always printed

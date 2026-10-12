@@ -347,6 +347,5 @@ Branch `server-view`, `0a899a2..` (server `d5dee2f`, `5969862`, `1da20a2`,
 - A draft is dropped when another model id serves.
 - Below `sm` the header's views are a native `<select>`, and the wordmark is
   hidden.
-- Not done: the CORS `Access-Control-Allow-Methods` header lists no `PATCH`.
-  The same-origin Playground is unaffected; a cross-origin `PATCH /v1/config`
-  fails its preflight.
+- The CORS `Access-Control-Allow-Methods` header gains `PATCH`, so a
+  cross-origin `PATCH /v1/config` passes its preflight.
