@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { forgetKey, useAuth } from "../api/auth.ts";
-import { canSend, type ModelState, useModel } from "../api/model.ts";
+import { canSend, loadUnderWay, type ModelState, useModel } from "../api/model.ts";
 import { Composer } from "../conversation/Composer.tsx";
 import { imageFromFile, type PromptImage } from "../conversation/images.ts";
 import { DecideView, type Drawer as DecideDrawer } from "../decide/DecideView.tsx";
@@ -71,8 +71,8 @@ export function App() {
   // Mounted from its first visit on, like the Decide tab: a draft of changes
   // and a reload being followed survive a look at the chat.
   const [serverOpened, setServerOpened] = useState(false);
-  // A switch runs the header's flame and heat bar as a reply does (spec playground/05).
-  const busy = chat.busy || model.state === "switching" || model.state === "waking";
+  // A switch or a load runs the header's flame and heat bar as a reply does (spec playground/05).
+  const busy = chat.busy || loadUnderWay(model);
 
   const readerRun: AgentRun | undefined = reader
     ? active.messages.find((m) => m.id === reader.messageId)?.agents?.find((r) => r.callId === reader.callId)
@@ -257,6 +257,6 @@ function Monitor() {
 /** The Server view's state lives here, and its clock ticks only while a switch runs. */
 function Server({ model, refreshModel, streaming, visible }: { model: ModelState; refreshModel: () => void; streaming: boolean; visible: boolean }) {
   const [state, actions] = useServer(model, refreshModel, visible);
-  const now = useTick(model.state === "switching" || model.state === "waking");
+  const now = useTick(loadUnderWay(model));
   return <ServerView model={model} state={state} actions={actions} streaming={streaming} now={now} />;
 }

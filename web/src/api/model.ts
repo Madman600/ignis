@@ -32,14 +32,15 @@ export type LastSwitch = {
 };
 
 export type ModelState =
-  | { state: "loading" }
+  /** The page's own first read of the model, under way. */
+  | { state: "reading" }
   | { state: "ready"; id: string; contextLimit: number | null; lastSwitch?: LastSwitch }
   /** `since`: when this page first saw this switch, for the seconds it has run. */
   | { state: "switching"; from: string; to: string; since: number; lastSwitch?: LastSwitch }
   /** Unloaded while idle (`status: unloaded`): the next message loads `id` again. */
   | { state: "unloaded"; id: string; contextLimit: number | null; lastSwitch?: LastSwitch }
   /** A model loads while none is loaded (`status: loading`): `to` is the one loading, `since` as for a switch. */
-  | { state: "waking"; to: string; since: number; lastSwitch?: LastSwitch }
+  | { state: "loading"; to: string; since: number; lastSwitch?: LastSwitch }
   /** `failed`: the server reports a switch that failed (`status: failed`), not a read that did. */
   | { state: "error"; message: string; failed?: true; lastSwitch?: LastSwitch };
 
@@ -73,7 +74,7 @@ export async function readModel(fetcher: typeof fetch = fetch, now = Date.now())
     if (!id) throw new Error("GET /v1/models: no model listed");
     const contextLimit = body.data?.[0]?.max_model_len ?? null;
     if (body.status === "unloaded") return { state: "unloaded", id, contextLimit, ...last };
-    if (body.status === "loading") return { state: "waking", to: body.switching?.to ?? id, since: now, ...last };
+    if (body.status === "loading") return { state: "loading", to: body.switching?.to ?? id, since: now, ...last };
     return { state: "ready", id, contextLimit, ...last };
   } catch (err) {
     return { state: "error", message: String(err) };
@@ -86,11 +87,11 @@ export async function readModel(fetcher: typeof fetch = fetch, now = Date.now())
  * was first seen. A failed switch the server reports always shows.
  */
 export function afterRefresh(shown: ModelState, read: ModelState): ModelState {
-  if (read.state === "error" && !read.failed && shown.state !== "loading" && shown.state !== "error") return shown;
+  if (read.state === "error" && !read.failed && shown.state !== "reading" && shown.state !== "error") return shown;
   if (read.state === "switching" && shown.state === "switching" && read.from === shown.from && read.to === shown.to) {
     return { ...read, since: shown.since };
   }
-  if (read.state === "waking" && shown.state === "waking" && read.to === shown.to) return { ...read, since: shown.since };
+  if (read.state === "loading" && shown.state === "loading" && read.to === shown.to) return { ...read, since: shown.since };
   return read;
 }
 
@@ -104,6 +105,15 @@ export function canSend(model: ModelState): model is Extract<ModelState, { state
 }
 
 /**
+ * Whether a model is being loaded: a switch replaces the one serving, or one loads while none is loaded (spec
+ * model-switch/02). The header's flame runs and the Server view counts the seconds meanwhile, and no other switch
+ * may begin.
+ */
+export function loadUnderWay(model: ModelState): model is Extract<ModelState, { state: "switching" | "loading" }> {
+  return model.state === "switching" || model.state === "loading";
+}
+
+/**
  * Whether the page follows a switch, re-reading each second: one runs, a model
  * loads while none is loaded, or the server reports one failed — briefly,
  * while the old model is loaded again, or until a switch succeeds — so the
@@ -111,7 +121,7 @@ export function canSend(model: ModelState): model is Extract<ModelState, { state
  * stays so until something sends a request.
  */
 export function switchFollowed(model: ModelState): boolean {
-  return model.state === "switching" || model.state === "waking" || (model.state === "error" && model.failed === true);
+  return loadUnderWay(model) || (model.state === "error" && model.failed === true);
 }
 
 /**
@@ -124,12 +134,12 @@ export function loadAwaited(model: ModelState, sending: boolean): boolean {
 }
 
 export function useModel(): [ModelState, () => void] {
-  const [model, setModel] = useState<ModelState>({ state: "loading" });
+  const [model, setModel] = useState<ModelState>({ state: "reading" });
   const { key, needsKey } = useAuth();
 
   useEffect(() => {
     if (needsKey) return;
-    setModel({ state: "loading" });
+    setModel({ state: "reading" });
     void readModel().then(setModel);
   }, [key, needsKey]);
 

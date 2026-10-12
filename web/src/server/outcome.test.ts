@@ -53,8 +53,8 @@ describe("the reload a 202 began", () => {
 
   it("follows a reload asked of an unloaded model through its load (spec model-switch/02)", () => {
     const pending = pendingReload(accepted, before);
-    const waking: ModelState = { state: "waking", to: "qwen3.8-27b", since: 0, lastSwitch: before };
-    const seen = settleReload(pending, waking);
+    const loading: ModelState = { state: "loading", to: "qwen3.8-27b", since: 0, lastSwitch: before };
+    const seen = settleReload(pending, loading);
     expect(seen).toEqual({ kind: "wait", pending: { ...pending, seen: true } });
     expect(settleReload({ ...pending, seen: true }, ready(before))).toMatchObject({ kind: "done", ok: true });
   });

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { ModelState } from "../api/model.ts";
+import { loadUnderWay, type ModelState } from "../api/model.ts";
 import { diskLabel, downloadCommand, elapsed, rowAction, runningFamily, sourceLabel } from "./band.ts";
 import { familyName } from "./form.ts";
 import { drainNote, lastSwitchLine, type Line } from "./outcome.ts";
@@ -39,7 +39,7 @@ export function ModelBand({
   const family = runningFamily(rows);
   // The last switch's line stays until the next switch begins.
   const last =
-    model.state !== "loading" && model.state !== "switching" && model.state !== "waking" && model.lastSwitch ? lastSwitchLine(model.lastSwitch) : null;
+    model.state !== "reading" && !loadUnderWay(model) && model.lastSwitch ? lastSwitchLine(model.lastSwitch) : null;
   return (
     <section aria-label="Model" className="monitor-kiln cut overflow-hidden text-[#eae8e4] [--cut-size:20px]">
       <div className="flex flex-col gap-4 p-5 md:p-6">
@@ -50,7 +50,7 @@ export function ModelBand({
             <Figure label="Context" value={model.contextLimit === null ? "Not reported" : `${model.contextLimit.toLocaleString("en-US")} tokens`} />
           )}
           {model.state === "ready" && family && <Figure label="Family" value={familyName(family)} />}
-          {(model.state === "switching" || model.state === "waking") && <Figure label="Elapsed" value={elapsed(model.since, now)} />}
+          {loadUnderWay(model) && <Figure label="Elapsed" value={elapsed(model.since, now)} />}
         </dl>
         {(last || refusal || streaming || model.state === "error" || model.state === "unloaded") && (
           <div className="flex flex-col gap-1 text-sm" aria-live="polite">
@@ -77,7 +77,7 @@ function Headline({ model }: { model: ModelState }) {
       </h2>
     );
   }
-  if (model.state === "waking") {
+  if (model.state === "loading") {
     return (
       <h2 className="font-display text-2xl leading-tight font-semibold text-white [overflow-wrap:anywhere] sm:text-[30px]">
         Loading {model.to}
@@ -90,7 +90,7 @@ function Headline({ model }: { model: ModelState }) {
   const text =
     model.state === "ready" || model.state === "unloaded"
       ? model.id
-      : model.state === "loading"
+      : model.state === "reading"
         ? "Reading the model…"
         : model.failed
           ? "No model is serving"
@@ -108,16 +108,16 @@ function Headline({ model }: { model: ModelState }) {
 function stateWord(model: ModelState): string {
   if (model.state === "ready") return "Serving";
   if (model.state === "switching") return "Switching";
-  if (model.state === "waking") return "Loading";
+  if (model.state === "loading") return "Loading";
   if (model.state === "unloaded") return "Unloaded";
-  if (model.state === "loading") return "Reading";
+  if (model.state === "reading") return "Reading";
   return model.failed ? "Not serving" : "Unreachable";
 }
 
 function stateColor(model: ModelState): string {
   if (model.state === "ready") return "var(--good)";
-  if (model.state === "switching" || model.state === "waking") return "#ff5a1f";
-  return model.state === "loading" || model.state === "unloaded" ? "var(--ash)" : "var(--fault)";
+  if (loadUnderWay(model)) return "#ff5a1f";
+  return model.state === "reading" || model.state === "unloaded" ? "var(--ash)" : "var(--fault)";
 }
 
 function Figure({ label, value, dot }: { label: string; value: string; dot?: string }) {

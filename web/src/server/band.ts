@@ -1,4 +1,4 @@
-import type { ModelState } from "../api/model.ts";
+import { loadUnderWay, type ModelState } from "../api/model.ts";
 import { formatBytes, formatSeconds } from "../monitor/format.ts";
 import type { CatalogRow } from "./routes.ts";
 
@@ -47,14 +47,14 @@ export type RowAction =
  * so does an unloaded model (spec model-switch/02), which "Load" loads.
  */
 export function rowAction(row: CatalogRow, model: ModelState): RowAction {
-  const loading = model.state === "switching" || model.state === "waking";
+  const loading = loadUnderWay(model);
   if (loading && row.id === model.to) return { kind: "loading" };
   if (row.loaded) return { kind: "loaded" };
   // `switchable` decides first: the server knows a switch by id alone can begin
   // (a catalog entry fetched since the last read, the model torn down by a
   // failed restore), whatever `on_disk` last said.
   if (row.switchable || row.on_disk === "complete") {
-    return { kind: "load", enabled: row.switchable && !loading && model.state !== "loading" };
+    return { kind: "load", enabled: row.switchable && !loading && model.state !== "reading" };
   }
   return row.source === "known" ? { kind: "missing" } : { kind: "download" };
 }

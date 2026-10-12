@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { canSend, type LastSwitch, type ModelState } from "../api/model.ts";
+import { canSend, type LastSwitch, loadUnderWay, type ModelState } from "../api/model.ts";
 import { dropDraft, type Draft, editDraft, type InForce, patchBody, removeDraft } from "./form.ts";
 import { afterPatch, afterSwitch, type Line, type PendingReload, settleReload } from "./outcome.ts";
 import {
@@ -105,12 +105,12 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
   }, [visible, reread]);
 
   // The model serves again after a switch, a reload or a failure: what it runs with is read again.
-  const lastState = useRef(model.state);
+  const lastModel = useRef(model);
   useEffect(() => {
-    const before = lastState.current;
-    lastState.current = model.state;
-    if (model.state === "ready" && (before === "switching" || before === "waking" || before === "error")) reread();
-  }, [model.state, reread]);
+    const before = lastModel.current;
+    lastModel.current = model;
+    if (model.state === "ready" && (loadUnderWay(before) || before.state === "error")) reread();
+  }, [model, reread]);
 
   // Another model now serves: a draft made against the old one's values is
   // dropped, not applied to the new one. A reload keeps the id, and its draft.
@@ -218,7 +218,7 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
   return [{ fields, config, origins, catalog, draft, marked, result, pending, applying, loadingId, loadRefusal }, actions];
 }
 
-const lastSwitchOf = (model: ModelState) => (model.state === "loading" ? undefined : model.lastSwitch);
+const lastSwitchOf = (model: ModelState) => (model.state === "reading" ? undefined : model.lastSwitch);
 
 /** `Date.now()`, ticking each second while `running` — the switch's elapsed seconds — and still otherwise. */
 export function useTick(running: boolean): number {

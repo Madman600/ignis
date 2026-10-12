@@ -102,7 +102,7 @@ function Dock({
       ? model.id
       : model.state === "switching"
         ? model.from
-        : model.state === "waking"
+        : model.state === "loading"
           ? model.to
           : (state.pending?.id ?? "the model");
   // Every route but GET answers 503 while a switch runs, so the action waits for it to land.

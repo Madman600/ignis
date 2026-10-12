@@ -3,10 +3,10 @@ import flame from "../brand/flame.webp";
 
 const HEADLINE: Record<ModelState["state"], string> = {
   ready: "Light it up",
-  loading: "Warming up",
+  reading: "Warming up",
   switching: "Switching models",
   unloaded: "Light it up",
-  waking: "Warming up",
+  loading: "Warming up",
   error: "No model to talk to",
 };
 
@@ -25,7 +25,7 @@ export function EmptyState({ model }: { model: ModelState }) {
               under it and in this session's log below.
             </>
           )}
-          {model.state === "loading" && "Asking ignis which model it serves."}
+          {model.state === "reading" && "Asking ignis which model it serves."}
           {model.state === "switching" && `Loading ${model.to}. The prompt opens once it serves.`}
           {model.state === "unloaded" && (
             <>
@@ -33,7 +33,7 @@ export function EmptyState({ model }: { model: ModelState }) {
               again first, and the first reply takes as long as the load.
             </>
           )}
-          {model.state === "waking" && `Loading ${model.to}. The prompt opens once it serves.`}
+          {model.state === "loading" && `Loading ${model.to}. The prompt opens once it serves.`}
           {model.state === "error" && (model.failed ? "A model switch failed. The Server view says why." : "Start ignis-server, then reload this page.")}
         </p>
       </div>
