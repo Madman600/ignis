@@ -111,14 +111,14 @@ fn the_document_lists_exactly_the_v1_surface() {
 #[test]
 fn the_server_view_routes_are_documented_with_their_responses() {
     let document = document();
-    for (path, ok) in [("/v1/models/catalog", "CatalogRow"), ("/v1/config/fields", "FieldDeclaration")] {
+    for (path, list, ok) in [("/v1/models/catalog", "CatalogList", "CatalogRow"), ("/v1/config/fields", "FieldList", "FieldDeclaration")] {
         let get = &document["paths"][path]["get"];
         for status in ["200", "401"] {
             assert!(get["responses"][status].is_object(), "{path} documents {status}");
         }
         assert_eq!(
-            get["responses"]["200"]["content"]["application/json"]["schema"]["items"]["$ref"],
-            format!("#/components/schemas/{ok}"),
+            get["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            format!("#/components/schemas/{list}"),
             "{path}"
         );
         assert!(document["components"]["schemas"][ok]["properties"].is_object(), "{ok}");

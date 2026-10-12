@@ -107,7 +107,7 @@ fn server_with(loader: &Arc<MockLoader>, start: &Path, models: CatalogModels, li
 }
 
 fn row<'a>(rows: &'a Value, id: &str) -> &'a Value {
-    rows.as_array().expect("an array of rows").iter().find(|row| row["id"] == id).unwrap_or_else(|| panic!("no row for {id}: {rows}"))
+    rows["data"].as_array().expect("an array of rows").iter().find(|row| row["id"] == id).unwrap_or_else(|| panic!("no row for {id}: {rows}"))
 }
 
 fn file_in(dir: &Path, name: &str, contents: &[u8]) -> PathBuf {
@@ -133,7 +133,7 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
 
     let (status, rows) = send(&app, Method::GET, "/v1/models/catalog", None).await;
     assert_eq!(status, StatusCode::OK, "{rows}");
-    let ids: Vec<&str> = rows.as_array().unwrap().iter().map(|row| row["id"].as_str().unwrap()).collect();
+    let ids: Vec<&str> = rows["data"].as_array().unwrap().iter().map(|row| row["id"].as_str().unwrap()).collect();
     assert_eq!(
         ids,
         [
@@ -162,7 +162,7 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
     assert_eq!((missing["on_disk"].clone(), missing["switchable"].clone()), (json!("absent"), json!(false)));
     assert!(missing.get("bytes").is_none(), "absent: no size: {missing}");
 
-    let loaded: Vec<&str> = rows.as_array().unwrap().iter().filter(|row| row["loaded"] == true).map(|row| row["id"].as_str().unwrap()).collect();
+    let loaded: Vec<&str> = rows["data"].as_array().unwrap().iter().filter(|row| row["loaded"] == true).map(|row| row["id"].as_str().unwrap()).collect();
     assert_eq!(loaded, ["mock-a"], "exactly the model serving");
     assert_eq!(row(&rows, "mock-a")["family"], "qwen38", "the loaded model is always the running family");
     assert_eq!(row(&rows, "mock-a")["switchable"], false, "already loaded");
@@ -171,7 +171,7 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
     for path in [dir.to_string_lossy(), elsewhere.to_string_lossy()] {
         assert!(!text.contains(&*path.replace('\\', "\\\\")) && !text.contains(".ninfer"), "no row carries a path: {text}");
     }
-    for object in rows.as_array().unwrap() {
+    for object in rows["data"].as_array().unwrap() {
         assert!(object.get("path").is_none() && object.get("artifact").is_none(), "{object}");
     }
     let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(elsewhere));
@@ -188,7 +188,7 @@ async fn a_known_model_that_is_also_a_catalog_entry_is_one_row() {
     let own = file_in(&elsewhere, "mock-b.ninfer", b"own copy");
     let app = server_with(&loader, &start, models.clone(), &[("mock-b", &own)], true).app();
     let (_, rows) = send(&app, Method::GET, "/v1/models/catalog", None).await;
-    assert_eq!(rows.as_array().unwrap().iter().filter(|row| row["id"] == "mock-b").count(), 1, "{rows}");
+    assert_eq!(rows["data"].as_array().unwrap().iter().filter(|row| row["id"] == "mock-b").count(), 1, "{rows}");
     let b = row(&rows, "mock-b");
     assert_eq!((b["source"].clone(), b["switchable"].clone()), (json!("operator"), json!(true)), "switchable by the known entry's file");
     let _ = (std::fs::remove_dir_all(models.dir), std::fs::remove_dir_all(elsewhere));
@@ -211,7 +211,7 @@ async fn the_catalog_answers_during_a_switch_and_loaded_follows_the_completed_on
     let (status, rows) = send(&app, Method::GET, "/v1/models/catalog", None).await;
     assert_eq!(status, StatusCode::OK, "answers while every other route is 503: {rows}");
     assert_eq!(row(&rows, "mock-a")["loaded"], true, "the old model serves until the new one does");
-    assert!(rows.as_array().unwrap().iter().all(|row| row["switchable"] == false), "no switch can begin now: {rows}");
+    assert!(rows["data"].as_array().unwrap().iter().all(|row| row["switchable"] == false), "no switch can begin now: {rows}");
     let (status, _) = send(&app, Method::GET, "/v1/config/fields", None).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -458,7 +458,7 @@ async fn a_server_with_no_switcher_lists_the_loaded_model_alone() {
     let app = Server::from_active(loader.model("mock-a")).app();
     let (status, rows) = send(&app, Method::GET, "/v1/models/catalog", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
-    assert_eq!(rows[0]["id"], "mock-a");
-    assert_eq!((rows[0]["loaded"].clone(), rows[0]["switchable"].clone()), (json!(true), json!(false)));
+    assert_eq!(rows["data"].as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!(rows["data"][0]["id"], "mock-a");
+    assert_eq!((rows["data"][0]["loaded"].clone(), rows["data"][0]["switchable"].clone()), (json!(true), json!(false)));
 }

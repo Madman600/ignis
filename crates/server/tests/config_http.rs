@@ -431,7 +431,7 @@ async fn a_model_with_no_artifact_takes_live_changes_but_no_reload() {
 // ── GET /v1/config/fields (spec playground/05) ───────────────────────────────
 
 fn declaration<'a>(fields: &'a Value, file_key: &str) -> &'a Value {
-    fields.as_array().expect("an array").iter().find(|field| field["file_key"] == file_key).unwrap_or_else(|| panic!("{file_key} is not listed"))
+    fields["data"].as_array().expect("an array").iter().find(|field| field["file_key"] == file_key).unwrap_or_else(|| panic!("{file_key} is not listed"))
 }
 
 /// Spec playground/05 AC 1: every visible field once, in declaration order,
@@ -442,7 +442,7 @@ async fn the_fields_route_lists_every_visible_field_once_in_declaration_order() 
     let app = server_on(&loader, started(&[])).app();
     let (status, fields) = send(&app, Method::GET, "/v1/config/fields", None).await;
     assert_eq!(status, StatusCode::OK, "{fields}");
-    let listed: Vec<&str> = fields.as_array().unwrap().iter().map(|field| field["file_key"].as_str().unwrap()).collect();
+    let listed: Vec<&str> = fields["data"].as_array().unwrap().iter().map(|field| field["file_key"].as_str().unwrap()).collect();
     let visible: Vec<String> = all_fields().filter(|meta| meta.visible).map(|meta| meta.file_key()).collect();
     assert_eq!(listed, visible, "the visible fields, in the order they are declared");
     assert!(all_fields().any(|meta| !meta.visible), "the whitelist hides something");
@@ -454,7 +454,7 @@ async fn the_fields_route_lists_every_visible_field_once_in_declaration_order() 
         "reload_required", "description",
     ];
     want.sort_unstable();
-    for field in fields.as_array().unwrap() {
+    for field in fields["data"].as_array().unwrap() {
         let mut have: Vec<&str> = field.as_object().unwrap().keys().map(String::as_str).collect();
         have.sort_unstable();
         assert_eq!(have, want, "{}", field["file_key"]);
@@ -516,7 +516,7 @@ async fn the_fields_route_answers_during_a_switch_without_a_config_and_behind_th
     assert_eq!(headers["ignis-model-status"], "switching");
     let (status, fields) = send(&app, Method::GET, "/v1/config/fields", None).await;
     assert_eq!(status, StatusCode::OK, "static: the model's state does not matter: {fields}");
-    assert!(!fields.as_array().unwrap().is_empty());
+    assert!(!fields["data"].as_array().unwrap().is_empty());
     release.send(()).expect("the held load is waiting");
     until_serving(&app).await;
 
@@ -524,6 +524,7 @@ async fn the_fields_route_answers_during_a_switch_without_a_config_and_behind_th
     let (status, bare_fields) = send(&bare, Method::GET, "/v1/config/fields", None).await;
     assert_eq!(status, StatusCode::OK, "no running configuration is no reason to refuse a declaration");
     assert_eq!(bare_fields, fields);
+    assert_eq!(fields["object"], "list");
 
     let keyed = server_on(&loader, started(&[])).with_api_key(ignis_server::config::ApiKey::new("sk-test")).app();
     let (status, _) = send(&keyed, Method::GET, "/v1/config/fields", None).await;

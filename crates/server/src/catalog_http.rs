@@ -54,6 +54,15 @@ pub(crate) struct CatalogRow {
     switchable: bool,
 }
 
+/// The envelope of `GET /v1/models/catalog`, as `GET /v1/models`' is.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CatalogList {
+    /// Always `list`.
+    object: &'static str,
+    /// The models, catalog entries first.
+    data: Vec<CatalogRow>,
+}
+
 /// The rows, as of now. Reads the filesystem (sizes, and the header of an
 /// artifact that is there), so a caller on the async runtime moves it off
 /// the workers.
@@ -121,13 +130,13 @@ fn rows(server: &Server) -> Vec<CatalogRow> {
     summary = "The models this server can switch to or fetch",
     description = "One row per model the server knows of: every catalog entry (the built-in ones, then the operator's `download.catalog`), then every known model (`switch.known_models`, and the model the server started on) that is not a catalog entry. Each row says where the model is from (`source`), how much of it is under `download.path` (`on_disk`: `complete`, `partial` or `absent` — file sizes only, never a hash, as `ignis-server model list` computes it; a known model is `complete` when its artifact is a file), its size, the model family its artifact's header names, whether it is the model serving now (`loaded`: exactly one row) and whether `POST /v1/models/switch` with this `model` alone would begin a switch now (`switchable`: the id resolves, the artifact is on disk, it is not the loaded one, and no switch is under way). No row carries a path: switch by id. A model not on disk is fetched with `ignis-server model download <id>`; a switch never starts a download.\n\nAnswers during a model switch and while one has failed, like `GET /v1/models`.",
     responses(
-        (status = 200, description = "The models, catalog entries first.", body = Vec<CatalogRow>),
+        (status = 200, description = "The models, catalog entries first.", body = CatalogList),
         (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = ApiError),
         (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`).", body = ApiError),
     ),
 )]
-pub(crate) async fn get_models_catalog(State(server): State<Arc<Server>>) -> Json<Vec<CatalogRow>> {
+pub(crate) async fn get_models_catalog(State(server): State<Arc<Server>>) -> Json<CatalogList> {
     let server = Server::clone(&server);
     let rows = tokio::task::spawn_blocking(move || rows(&server)).await.expect("listing the catalog does not panic");
-    Json(rows)
+    Json(CatalogList { object: "list", data: rows })
 }

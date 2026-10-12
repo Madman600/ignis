@@ -246,6 +246,17 @@ pub(crate) struct FieldDeclaration {
     description: String,
 }
 
+/// The envelope of `GET /v1/config/fields`, as `GET /v1/models`' is: a key
+/// can be added beside `data` without breaking a client.
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct FieldList {
+    /// Always `list`.
+    object: &'static str,
+    /// The visible fields, in declaration order.
+    data: Vec<FieldDeclaration>,
+}
+
 /// The visible fields' declarations, in declaration order — the same
 /// whitelist `GET /v1/config` shows, so a hidden field (the API key, the
 /// download token) is absent here as there.
@@ -262,12 +273,12 @@ pub fn visible_declarations() -> Vec<Value> {
     summary = "The configuration's fields",
     description = "One object per field `GET /v1/config` shows, in declaration order: the field's group and name, the key a config file and a `400` from `PATCH /v1/config` spell it by, its kind, its default, the rule a value must meet (structured in `rule`, as a sentence in `rule_text`), the model families that take it (`null` for all), whether it may be unset (`nullable`), given per family (`scoped`), changed while the server runs (`patchable`) and whether a change reloads the model (`reload_required`). The same declarations `ignis-server help --fields --format json` prints, minus the fields `GET /v1/config` hides.\n\nStatic: it answers whatever state the model is in — during a switch, after a failed one — and on a server with no running configuration.",
     responses(
-        (status = 200, description = "The visible fields, in declaration order.", body = Vec<FieldDeclaration>),
+        (status = 200, description = "The visible fields, in declaration order.", body = FieldList),
         (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = ApiError),
     ),
 )]
-pub(crate) async fn get_config_fields() -> Json<Vec<Value>> {
-    Json(visible_declarations())
+pub(crate) async fn get_config_fields() -> Json<Value> {
+    Json(serde_json::json!({ "object": "list", "data": visible_declarations() }))
 }
 
 /// How a patch was applied.
