@@ -25,7 +25,7 @@
 
 <table align="center">
   <tr>
-    <td align="center"><b>367 tok/s</b><br><sub>one lane, coding prompts</sub></td>
+    <td align="center"><b>~170 tok/s</b><br><sub>one lane, average; peaks ~370</sub></td>
     <td align="center"><b>1,065 tok/s</b><br><sub>eight lanes, aggregate</sub></td>
     <td align="center"><b>~100 tok/s</b><br><sub>Flash-Next 125B MoE, one lane</sub></td>
     <td align="center"><b>7.11x</b><br><sub>KV capacity of BF16</sub></td>
