@@ -1525,11 +1525,10 @@ async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
         switching: match &*status {
             ModelStatus::Switching { from, to } => Some(SwitchIds { from: from.clone(), to: to.clone() }),
             // The load leaving `unloaded` (spec model-switch/02): what loads.
-            ModelStatus::Loading => server
-                .switcher
-                .as_ref()
-                .and_then(|switcher| switcher.running())
-                .map(|running| SwitchIds { from: running.from, to: running.to }),
+            ModelStatus::Loading => match server.switcher.as_ref().and_then(|switcher| switcher.running()) {
+                Some(crate::model_switch::Slot::Switch(running)) => Some(SwitchIds { from: running.from, to: running.to }),
+                Some(crate::model_switch::Slot::Unload { .. }) | None => None,
+            },
             _ => None,
         },
         reason: match &*status {
@@ -1720,6 +1719,16 @@ pub(crate) fn switch_refused(refusal: crate::model_switch::SwitchRefusal) -> Res
             "invalid_request_error",
             "switch_in_progress",
             format!("a switch from {} to {} is already under way; switches are not queued", running.from, running.to),
+        ),
+        // Spec model-switch/02: the unload's teardown holds the slot, and is
+        // seconds long; once it is done a switch loads the model it names.
+        crate::model_switch::SwitchRefusal::Unloading { model } => error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "switch_in_progress",
+            format!(
+                "{model} is being unloaded after going unused (model.idle_unload); switch once GET /v1/models reports `unloaded`"
+            ),
         ),
         crate::model_switch::SwitchRefusal::Unavailable => error_response(
             StatusCode::NOT_IMPLEMENTED,

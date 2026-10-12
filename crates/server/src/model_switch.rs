@@ -210,9 +210,11 @@ pub struct Switcher {
     loader: Arc<dyn ModelLoader>,
     /// `--switch-drain-timeout`; a live `PATCH /v1/config` may change it.
     drain_timeout: Mutex<Duration>,
-    /// The switch under way, if any. Switches are serialized, not queued:
-    /// a second one is refused naming this one (spec model-switch/01).
-    running: Mutex<Option<SwitchStarted>>,
+    /// What holds the switch's slot, if anything. Switches are serialized,
+    /// not queued: a second one is refused naming this one (spec
+    /// model-switch/01) — or the unload whose teardown holds it (spec
+    /// model-switch/02).
+    running: Mutex<Option<Slot>>,
     /// The models a request's own `model` may switch to, each with the
     /// artifact it loads from ([`implicit_switch`]). Empty unless
     /// [`Switcher::with_known_models`] named some — `main` names none under
@@ -334,8 +336,8 @@ impl Switcher {
     }
 
     /// What holds the switch's slot now — a switch, a reload, a load, or an
-    /// unload (whose two ends are the same id) — if anything does.
-    pub fn running(&self) -> Option<SwitchStarted> {
+    /// unload — if anything does.
+    pub fn running(&self) -> Option<Slot> {
         self.running.lock().expect("switch lock").clone()
     }
 
@@ -514,6 +516,21 @@ pub struct SwitchStarted {
     pub to: String,
 }
 
+/// What holds the switch's slot ([`Switcher::running`]): one at a time, so
+/// an unload, a load, a switch and a reload never overlap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Slot {
+    /// A switch, a reload, or the load a request began out of `unloaded`:
+    /// the ids it moves between.
+    Switch(SwitchStarted),
+    /// The idle clock is unloading `model` (spec model-switch/02): held from
+    /// the moment the model is closed until its teardown is done.
+    Unload {
+        /// The id being unloaded.
+        model: String,
+    },
+}
+
 /// Why a switch did not begin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwitchRefusal {
@@ -524,6 +541,13 @@ pub enum SwitchRefusal {
     WarmingUp,
     /// Another switch is under way (`409`): this is it.
     InProgress(SwitchStarted),
+    /// The idle clock is unloading `model` (`409`, spec model-switch/02):
+    /// its teardown holds the slot for as long as it runs, and a switch once
+    /// it is done loads.
+    Unloading {
+        /// The id being unloaded.
+        model: String,
+    },
     /// A reload with a changed config (`PATCH /v1/config`) was asked of a
     /// model not loaded from an artifact (the placeholder start): there is
     /// nothing to load it from again.
@@ -591,7 +615,7 @@ impl Drop for RunningGuard {
             _ => None,
         };
         if let Some(reason) = reason {
-            if let Some(started) = self.switcher.running.lock().expect("switch lock").as_ref().filter(|_| self.records) {
+            if let Some(Slot::Switch(started)) = self.switcher.running.lock().expect("switch lock").as_ref().filter(|_| self.records) {
                 self.switcher.record(&started.from, &started.to, &SwitchOutcome::Failed { reason: reason.clone() });
             }
             tracing::error!(
@@ -617,7 +641,7 @@ pub fn begin(
     server: &Server,
     target: ModelSource,
 ) -> Result<(SwitchStarted, tokio::task::JoinHandle<SwitchOutcome>), SwitchRefusal> {
-    begin_with(server, target, None, false)
+    begin_with(server, target, Run::Switch)
 }
 
 /// A reload asked for by a config change (spec config-v2/02 §`PATCH`).
@@ -647,12 +671,47 @@ pub fn reconfigure(
         return Err(SwitchRefusal::Unavailable);
     }
     let target = server.active().source.clone().ok_or(SwitchRefusal::NotReloadable)?;
-    begin_with(server, target, Some(Reconfigure { config, patch }), false).map(|(started, _task)| started)
+    begin_with(server, target, Run::Reload(Reconfigure { config, patch })).map(|(started, _task)| started)
 }
 
-/// Where a run of the switch's slot begins, which decides its steps.
-#[derive(Debug, Clone)]
+/// What a run of the switch's slot was asked to do: what it logs, what it
+/// records, and when it may begin.
+enum Run {
+    /// A switch: `POST /v1/models/switch`, or a request naming another
+    /// known model ([`implicit_switch`]).
+    Switch,
+    /// A reload with a changed configuration (`PATCH /v1/config`).
+    Reload(Reconfigure),
+    /// The load a request began by needing the unloaded model
+    /// ([`ensure_loaded`], spec model-switch/02): not a switch, so it is
+    /// logged `ignis.model.load_started` and `ignis.model.reloaded` and never
+    /// written to `last_switch` (AC 14). Refused
+    /// ([`SwitchRefusal::NotUnloaded`]) unless the model is still unloaded
+    /// when the slot is taken — one load, never a switch over a model another
+    /// request's load has just published.
+    OnDemand,
+}
+
+impl Run {
+    /// The configuration change a reload carries.
+    fn reconfigure(&self) -> Option<&Reconfigure> {
+        match self {
+            Run::Reload(reconfigure) => Some(reconfigure),
+            Run::Switch | Run::OnDemand => None,
+        }
+    }
+
+    /// Whether how it ends goes to `last_switch`: a switch's or a reload's,
+    /// not a request's load (spec model-switch/02 AC 14).
+    fn records(&self) -> bool {
+        !matches!(self, Run::OnDemand)
+    }
+}
+
+/// A run of the switch's slot as it began, which decides its steps.
 struct Begun {
+    /// What it was asked to do.
+    run: Run,
     /// What a target refused before anything stopped puts back: `serving`
     /// when the old model never stopped, `unloaded` when the unloaded model
     /// is still the one a request loads; nothing after a failure, which
@@ -662,28 +721,23 @@ struct Begun {
     /// model-switch/02): no drain, no teardown, and no previous model to
     /// reload when the load fails.
     unloaded: bool,
-    /// The load a request began by needing the unloaded model
-    /// ([`ensure_loaded`]): not a switch, so it is logged
-    /// `ignis.model.reloaded` and never written to `last_switch` (AC 14).
-    on_demand: bool,
 }
 
-/// [`begin`], with the config change a reload carries, if any; `on_demand`
-/// is the load [`ensure_loaded`] begins, refused
-/// ([`SwitchRefusal::NotUnloaded`]) unless the model is still unloaded when
-/// the slot is taken — one load, never a switch over a model another
-/// request's load has just published.
+/// [`begin`], [`reconfigure`] and the load [`ensure_loaded`] begins, as
+/// `asked` says.
 fn begin_with(
     server: &Server,
     target: ModelSource,
-    reconfigure: Option<Reconfigure>,
-    on_demand: bool,
+    asked: Run,
 ) -> Result<(SwitchStarted, tokio::task::JoinHandle<SwitchOutcome>), SwitchRefusal> {
     let switcher = server.switcher.clone().ok_or(SwitchRefusal::Unavailable)?;
+    let on_demand = matches!(asked, Run::OnDemand);
     let (started, begun) = {
         let mut running = switcher.running.lock().expect("switch lock");
-        if let Some(started) = running.as_ref() {
-            return Err(SwitchRefusal::InProgress(started.clone()));
+        match running.as_ref() {
+            Some(Slot::Switch(started)) => return Err(SwitchRefusal::InProgress(started.clone())),
+            Some(Slot::Unload { model }) => return Err(SwitchRefusal::Unloading { model: model.clone() }),
+            None => {}
         }
         let before = server.status();
         if matches!(*before, ModelStatus::WarmingUp) {
@@ -702,40 +756,47 @@ fn begin_with(
             _ => None,
         };
         let started = SwitchStarted { from: server.active().engine.model_id(), to: target.model.clone() };
-        *running = Some(started.clone());
+        *running = Some(Slot::Switch(started.clone()));
         // The model being replaced is the start model if nothing else said so.
         switcher.note_start(server.active().source.as_ref());
-        if !on_demand {
+        if asked.records() {
             switcher.settled.store(false, Ordering::SeqCst);
         }
-        (started, Begun { back, unloaded, on_demand })
+        (started, Begun { run: asked, back, unloaded })
     };
-    if begun.unloaded {
-        // Nothing to drain: every request is let through, and the ones that
-        // need the model wait for this load (spec model-switch/02).
-        server.status.store(Arc::new(ModelStatus::Loading));
-        tracing::info!(
+    // Nothing resident, nothing to drain: every request is let through, and
+    // the ones that need the model wait for this load (spec model-switch/02).
+    let status = if begun.unloaded {
+        ModelStatus::Loading
+    } else {
+        ModelStatus::Switching { from: started.from.clone(), to: started.to.clone() }
+    };
+    server.status.store(Arc::new(status));
+    match begun.run {
+        Run::OnDemand => tracing::info!(
             name: "ignis.model.load_started",
             from = %started.from,
             to = %started.to,
             artifact = %target.artifact.display(),
-            on_demand,
-            "loading a model while none is loaded: the requests that need it wait for it"
-        );
-    } else {
-        server
-            .status
-            .store(Arc::new(ModelStatus::Switching { from: started.from.clone(), to: started.to.clone() }));
-        tracing::info!(
+            "a request needs the unloaded model: loading it, and the requests that need it wait for it"
+        ),
+        Run::Switch | Run::Reload(_) if begun.unloaded => tracing::info!(
+            name: "ignis.model.switch_started",
+            from = %started.from,
+            to = %started.to,
+            artifact = %target.artifact.display(),
+            "switching models while none is loaded: the requests that need one wait for this load"
+        ),
+        Run::Switch | Run::Reload(_) => tracing::info!(
             name: "ignis.model.switch_started",
             from = %started.from,
             to = %started.to,
             artifact = %target.artifact.display(),
             "switching models: /v1 answers 503 model_switching until it is done"
-        );
+        ),
     }
-    let guard = RunningGuard { switcher, status: Arc::clone(&server.status), records: !begun.on_demand };
-    let task = tokio::spawn(run(server.clone(), guard, target, started.clone(), begun, reconfigure));
+    let guard = RunningGuard { switcher, status: Arc::clone(&server.status), records: begun.run.records() };
+    let task = tokio::spawn(run(server.clone(), guard, target, started.clone(), begun));
     Ok((started, task))
 }
 
@@ -806,11 +867,16 @@ pub async fn implicit_switch(server: &Server, requested: Option<&str>) -> Result
         }
         Err(SwitchRefusal::InProgress(running)) => return Err(ImplicitRefusal::Switching(running)),
         // None reaches a handler: there is a switcher, the gate holds every
-        // request until the warm-up has run, and only a reload refuses a
-        // model with no artifact. Were one to, the request's own model check
-        // refuses it by name.
+        // request until the warm-up has run, only a reload refuses a model
+        // with no artifact, and no unload begins while this request is
+        // counted as use. Were one to, the request's own model check refuses
+        // it by name.
         Err(
-            SwitchRefusal::Unavailable | SwitchRefusal::WarmingUp | SwitchRefusal::NotReloadable | SwitchRefusal::NotUnloaded,
+            SwitchRefusal::Unavailable
+            | SwitchRefusal::WarmingUp
+            | SwitchRefusal::NotReloadable
+            | SwitchRefusal::NotUnloaded
+            | SwitchRefusal::Unloading { .. },
         ) => return Ok(()),
     };
     let failed = |reason: String| Err(ImplicitRefusal::Failed { to: requested.to_owned(), reason });
@@ -875,11 +941,11 @@ pub async fn ensure_loaded(server: &Server, requested: Option<&str>) -> Result<(
                 // unload, which needs one): the torn-down engine answers.
                 return Ok(());
             };
-            match begin_with(server, target, None, true) {
+            match begin_with(server, target, Run::OnDemand) {
                 Ok(_) => waited = true,
                 // The slot is an unload's still tearing down, or another
                 // load or a switch got there first: its end wakes this.
-                Err(SwitchRefusal::InProgress(_) | SwitchRefusal::NotUnloaded) => {}
+                Err(SwitchRefusal::InProgress(_) | SwitchRefusal::Unloading { .. } | SwitchRefusal::NotUnloaded) => {}
                 Err(SwitchRefusal::Unavailable | SwitchRefusal::WarmingUp | SwitchRefusal::NotReloadable) => return Ok(()),
             }
         }
@@ -925,8 +991,7 @@ pub(crate) fn claim_unload(server: &Server) -> Option<Unloading> {
     if running.is_some() || !matches!(*server.status(), ModelStatus::Serving) || server.active().source.is_none() {
         return None;
     }
-    let model = server.active().engine.model_id();
-    *running = Some(SwitchStarted { from: model.clone(), to: model });
+    *running = Some(Slot::Unload { model: server.active().engine.model_id() });
     server.status.store(Arc::new(ModelStatus::Unloaded));
     drop(running);
     Some(Unloading { _slot: RunningGuard { switcher, status: Arc::clone(&server.status), records: false } })
@@ -979,16 +1044,17 @@ async fn run(
     target: ModelSource,
     started: SwitchStarted,
     begun: Begun,
-    reconfigure: Option<Reconfigure>,
 ) -> SwitchOutcome {
     let switcher = Arc::clone(&running.switcher);
     let began = Instant::now();
     let SwitchStarted { from, to } = started;
+    let reconfigure = begun.run.reconfigure();
+    let on_demand = matches!(begun.run, Run::OnDemand);
 
-    let options = reconfigure.as_ref().map(|reconfigure| reconfigure.config.clone());
+    let options = reconfigure.map(|reconfigure| reconfigure.config.clone());
     let prepared = match prepare(&switcher, target.clone(), options).await {
         Ok(prepared) => prepared,
-        Err(reason) if begun.on_demand => {
+        Err(reason) if on_demand => {
             // Spec model-switch/02 AC 7: the requests waiting on this load
             // are answered with its reason, and `failed` stays until a later
             // request or a switch tries again.
@@ -1028,7 +1094,7 @@ async fn run(
 
     // What the configuration will be once this load serves: the patched
     // one for a reload, the one the loader fitted to the target otherwise.
-    let serving_config = match &reconfigure {
+    let serving_config = match reconfigure {
         Some(reconfigure) => Some(reconfigure.config.clone()),
         None => prepared.options().cloned(),
     };
@@ -1071,13 +1137,13 @@ async fn run(
                 server.apply_config(&config);
                 if let Some(state) = &server.config {
                     state.publish(config);
-                    if let Some(reconfigure) = &reconfigure {
+                    if let Some(reconfigure) = reconfigure {
                         state.persist(&reconfigure.patch);
                     }
                 }
             }
             let load_ms = (load_began.elapsed() - warm_up).as_millis() as u64;
-            if begun.on_demand {
+            if on_demand {
                 // Not a switch: logged as the load after an unload, and
                 // `last_switch` is left as it was (spec model-switch/02).
                 tracing::info!(
@@ -1112,7 +1178,7 @@ async fn run(
             // reload: `failed` stays, with the process up, until a request
             // (after an unload) or a switch loads a model.
             let outcome = SwitchOutcome::Failed { reason: reason.clone() };
-            if begun.on_demand {
+            if on_demand {
                 tracing::error!(
                     name: "ignis.model.reload_failed",
                     model = %to,

@@ -893,7 +893,8 @@ impl Drop for HeldTeardown {
 /// AC 12 with the clock stopped mid-teardown, as the serve loop ending under
 /// it stops it: the unload's teardown and the slot it holds end together, so
 /// a request arriving meanwhile loads the model only once the old one is
-/// gone — never a load beside a teardown.
+/// gone — never a load beside a teardown — and a switch meanwhile is refused
+/// `409` naming the unload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_unload_keeps_its_slot_until_its_teardown_ends_even_when_the_clock_stops() {
     let loader = MockLoader::new();
@@ -911,6 +912,11 @@ async fn the_unload_keeps_its_slot_until_its_teardown_ends_even_when_the_clock_s
     assert_eq!(*server.status(), ModelStatus::Unloaded);
     assert_eq!(server.usage.in_flight(), 1, "the request is admitted");
     assert!(!pending.is_finished(), "the request waits for the teardown, then for its load");
+    let switch = json!({ "artifact": "mock-b.ninfer", "model": "mock-b" });
+    let (status, refused) = send(&app, Method::POST, "/v1/models/switch", Some(switch)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"]["code"], "switch_in_progress", "{refused}");
+    assert!(refused["error"]["message"].as_str().unwrap().contains("mock-a is being unloaded"), "{refused}");
 
     release.send(()).expect("the teardown is waiting");
     let (status, completion) = pending.await.unwrap();
