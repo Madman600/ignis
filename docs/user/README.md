@@ -350,6 +350,7 @@ change does not reach and a `null` removes.
 | `model download` / `model list` | — | — | Fetch catalog entries, or list them ([above](#fetching-one-ignis-server-model-download)). |
 | `--server-request-timeout <secs>` | `IGNIS_SERVER_REQUEST_TIMEOUT` | `30` (max `3600`) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
 | `--switch-drain-timeout <secs>` | `IGNIS_SWITCH_DRAIN_TIMEOUT` | `30` (max `3600`) | How long a model switch lets the old model's running requests finish before it cancels them (`0` cancels at once). |
+| `--model-idle-unload <secs>` | `IGNIS_MODEL_IDLE_UNLOAD` | `300` (max `604800`) | Seconds with no request using the model before it is unloaded, the server staying up; the next request loads it again ([below](#idle-unload)). `0` never unloads. Patchable live. |
 | `--switch-allow-implicit <true\|false>` | `IGNIS_SWITCH_ALLOW_IMPLICIT` | `true` | A request whose `model` names another model `--switch-known-models` lists switches the server to it, then is served on it. `false`: such a request is a `404 model_not_found`, as an unknown model is. `POST /v1/models/switch` is not affected. |
 | `--switch-known-models <id>=<path>` (repeatable) | `IGNIS_SWITCH_KNOWN_MODELS` (`;`-separated pairs) | the start model only | A model a request may switch to by naming it, and the artifact it loads from. The model the server starts on is always listed. Any flag replaces the env var whole; an id named twice is refused. |
 | `--config <path>` | `IGNIS_CONFIG` | discovered | The config file ([above](#configuration)). |
@@ -733,6 +734,41 @@ A model nobody listed, or any other model under `--switch-allow-implicit false`,
 is a `404 model_not_found` as before. `/v1/tokenize` never switches: counting
 tokens does not move the card.
 
+### Idle unload
+
+A model nobody uses gives the card back. After `--model-idle-unload` seconds
+(file key `model.idle_unload`, default `300`) with no request in flight and
+nothing waiting or running on the engine, the server unloads the model the way
+a switch does — VRAM, pinned host memory and KV-RAM all freed — and stays up:
+the API, `/metrics` and the Playground keep answering, and `GET /v1/models`
+lists the same model with `status: "unloaded"`.
+
+The next request that needs the model — a chat completion, a response (over
+HTTP or on a WebSocket opened before the unload), a decision — loads it again
+and is answered once it is warm, so the first request after a quiet spell takes
+as long as a cold load (13–33 s on the 5090) and finds no retained prompt
+state. While it loads `GET /v1/models` says `status: "loading"`, and requests
+arriving meanwhile wait for the same load rather than being refused. A request
+naming another model the server lists loads that model instead: one load,
+never two. A load that fails leaves `status: "failed"` with the `reason`, the
+requests that waited on it get `503 model_load_failed`, and the next request
+tries again; `POST /v1/models/switch` (to the same id or another) and a
+`PATCH /v1/config` that needs a reload load a model too. A request without the
+API key is refused `401` as always and loads nothing.
+
+Only use counts: a request is in use from its admission to the end of its
+response (a long stream keeps the model loaded); polling `GET /v1/models`, the
+config and catalog reads or `/metrics` does not, so a Playground left open
+neither keeps the model loaded nor loads it again. An unload and the load after
+it are logged (`ignis.model.unloaded`, `ignis.model.reloaded`) and are not a
+switch: `last_switch` is left as it was.
+
+`0` never unloads. The value is patchable live — `PATCH /v1/config` with
+`{"model": {"idle_unload": 600}}` takes effect at once, counting from the
+change. A measurement should not meet a cold reload: the Makefile's
+`IDLE_UNLOAD=0` passes `--model-idle-unload 0`, and the A/B and TTFT session
+scripts do so themselves.
+
 ### Chat completions
 
 Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
@@ -1077,6 +1113,11 @@ which can change and which reload the model); **Apply** sends the changed
 fields as one `PATCH /v1/config`, which writes them to the config file in use,
 and reads **Apply and reload** when one of them reloads the model.
 
+A model [unloaded while idle](#idle-unload) shows as **unloaded** under its id
+— in the header and the Server view, not as an error — and the page does not
+poll it; **Load** on it loads it now, and a message sent meanwhile loads it and
+is answered once it is warm (the header reads **Loading** until it serves).
+
 For frontend work, `npm --prefix web run dev` proxies `/v1` and `/ui/metrics` to
 a running engine (`IGNIS_URL`, default `http://127.0.0.1:8000`);
 `npm --prefix web run dev:mock` serves a fake engine instead, so no GPU is
@@ -1221,7 +1262,8 @@ speculates with dflash2). `VISION=1` loads the tower; `UNCENSORED=1` loads
 [the uncensored variant](#the-uncensored-variant) in place of the default
 image, served as `qwen3.8-27b-abliterated`; `ROPE_SCALING=yarn:4` rescales the
 envelope further (`none` keeps the trained table); `METRICS=1` starts the metrics listener; `API_KEY=` and `EXPOSE=` set
-the access flags; `ARGS='…'` passes anything verbatim.
+the access flags; `IDLE_UNLOAD=<secs>` sets [idle unload](#idle-unload)
+(`IDLE_UNLOAD=0` for a measurement); `ARGS='…'` passes anything verbatim.
 
 A CUDA `run` or `start` first runs a GPU guard (the preflight plus a check for
 other Ignis GPU work), skippable with `GPU_CHECK=0`.

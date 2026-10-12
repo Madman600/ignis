@@ -126,3 +126,45 @@ that load wait for it. Decisions and trade-offs: ADR 0049.
 17. Tests use a fake loader and an idle value of 1–2 s; no test waits
     minutes. One live check on the 5090 with a few seconds' value after
     the merge (VRAM freed after N s, the next request served).
+
+## As built (2026-10-12, branch `idle-unload`)
+
+Where the implementation chose what the sections above leave open.
+
+- **The count is a layer.** `api.rs`'s `count_use`, inside the key layer,
+  counts `POST` on chat completions, responses, `/v1/decide` (and
+  `/v1/systemone`), `/v1/tokenize` and `/v1/detokenize` from admission until
+  the response body is dropped (`idle::Counted`), streams included; the
+  socket counts per job in `serve()`. The tokenize routes count as use (ADR
+  0049 §2: the gate holds them) but never load: they read the kept
+  template and `max_model_len`, not the engine.
+- **No race with the unload.** The clock decides and stores `unloaded` while
+  holding the count's lock (`Usage::when_idle` → `model_switch::claim_unload`),
+  which an admission takes too: a request admitted around the unload either
+  kept it from happening or reads `unloaded` and loads.
+- **The load on demand** is `model_switch::ensure_loaded`, called first in
+  `api::switch_to_named_model` (chat, responses, the socket's jobs) and in
+  `/v1/decide`. A request naming a model the server does not know loads the
+  unloaded one (its source) and is then refused by name as before: one load,
+  never two, but not none.
+- **Wire.** A failed load out of `unloaded` answers its waiters `503
+  model_load_failed` with the reason, no `Retry-After`. `GET /v1/models`
+  carries `switching: {from, to}` while `loading` too, naming what loads.
+  The catalog lists no row as loaded while unloaded or loading, and the
+  unloaded model as switchable (the Server view's "Load").
+- **What is recorded.** The load a request begins is `ignis.model.reloaded`
+  and leaves `last_switch` alone; an explicit `POST /v1/models/switch` or a
+  reloading `PATCH /v1/config` out of `unloaded` is still a switch or a
+  reload, logged and recorded as one (its status is `loading`, since nothing
+  is drained). A failed load out of `unloaded` sets `failed`; the serving
+  gate lets requests through then (the next one tries again) only while the
+  switcher says nothing is resident — a failed switch with nothing to reload
+  is still held as before.
+- **Off unless configured.** `Live::default()` has `idle_unload` zero: only
+  `main` (the config) and a live `PATCH` turn it on, so tests and in-process
+  harnesses never meet an unload they did not ask for. The clock runs in the
+  serve loops (`Server::spawn_idle_clock`, one-second tick); a test passes a
+  shorter tick. `model_switch_gpu.rs` passes `--model-idle-unload 0`.
+- **Make.** No Make target starts a server for a measurement by itself; the
+  knob is `IDLE_UNLOAD` (passed as `--model-idle-unload`), and
+  `scripts/swarm-ab.sh` and `scripts/vision-ttft-session.sh` pass 0.

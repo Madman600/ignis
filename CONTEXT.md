@@ -285,7 +285,18 @@ When output names a domain concept, use the term as defined here.
   model. Never starts a download.
 - **Last switch** — how the most recent switch or reload ended (`switched`,
   `refused`, `restored`, `failed`, with the reason), kept on `GET /v1/models`
-  after the status itself has moved on.
+  after the status itself has moved on. An **idle unload** and the load after
+  it are not switches and leave it as it was.
+- **Idle unload** — tearing the loaded model down after `model.idle_unload`
+  seconds (default 300, 0 = never) with no request using it and the engine
+  empty, the way a switch tears one down, while the process and the API stay
+  up (ADR 0049). `GET /v1/models` then reports `status: unloaded` under the
+  same id; the next authenticated request that needs the model loads it again
+  (`status: loading`, requests arriving meanwhile wait) and is served. What
+  counts as use is a request in flight on a model route, from admission to
+  the end of its response — per job on a Responses socket — never a poll of
+  the state routes.
+  _Avoid_: sleep, suspend, eviction (that word is a sequence's, not a model's)
 
 ## Prompt rendering
 
