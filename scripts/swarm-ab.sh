@@ -35,7 +35,9 @@ OUT=${OUT:-.scratch/swarm-ab/$(date +%Y%m%d-%H%M%S)}
 SWARM_ARGS=${SWARM_ARGS:-}
 PYTHON=${PYTHON:-python}
 
-common=(UI=0 METRICS=1 LOG_LEVEL=debug "ARTIFACT=$ARTIFACT" "BIND=$BIND" "METRICS_BIND=$METRICS_BIND")
+# IDLE_UNLOAD=0: a leg is a measurement, and a cold reload mid-swarm is not
+# what it measures (ADR 0049).
+common=(UI=0 METRICS=1 LOG_LEVEL=debug IDLE_UNLOAD=0 "ARTIFACT=$ARTIFACT" "BIND=$BIND" "METRICS_BIND=$METRICS_BIND")
 mkdir -p "$OUT"
 git rev-parse HEAD > "$OUT/commit"
 echo "swarm-ab -> $OUT"
