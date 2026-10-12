@@ -80,8 +80,8 @@ ignis-server --model-max-context 524288 --model-rope-scaling yarn:2 \
   --spec-backend dflash2 --spec-draft-tokens 7 --vision-enabled --server-metrics
 ```
 
-No model yet? It offers to fetch one. Those flags are what `make` serves: the
-512K context, DFlash2 speculative decoding, image input, and the Prometheus
+No model yet? It offers to fetch one. Those flags set the 512K context `make`
+serves (YaRN x2), DFlash2 speculative decoding, image input, and the Prometheus
 metrics the Playground's Monitor reads. A bare `ignis-server` already gets
 DFlash2 and image input from the built-in `rtx5090` profile, with a 768K
 context (YaRN x4), but not the metrics. Flash-Next is `--model-id
