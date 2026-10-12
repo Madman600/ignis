@@ -71,8 +71,8 @@ that build it, and the rest of that is what the remaining work is for.
 
 Take a build from **[Releases](https://github.com/gpillon/ignis/releases)** — a
 Windows `.zip`, a Linux `.tar.gz`, or the `linux/amd64` container image on
-`ghcr.io/gpillon/ignis`. Run it on a Blackwell card. (Every push to `main` also
-publishes a rolling development build, **not a release**: the image
+`ghcr.io/gpillon/ignis`. Run it on a Blackwell card. (Every push to `main` that
+changes code also publishes a rolling development build, **not a release**: the image
 `ghcr.io/gpillon/ignis:develop` and the `develop` prerelease.)
 
 ```

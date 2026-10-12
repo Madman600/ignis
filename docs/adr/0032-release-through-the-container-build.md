@@ -107,6 +107,23 @@ addition to running the tests and both builds. It is **not a release**.
 - A `v*` tag release is unchanged: same image tags, same `release` job, same
   body.
 
+## Amendment (2026-10-12, owner decision): a push that changes no behaviour builds nothing
+
+A push to `main` or `ci/**` whose changed files are all Markdown, `docs/`,
+`bench/` or `scripts/` starts no run (`paths-ignore` on the push trigger). None
+of them is compiled, embedded, read by a test or used by the workflow, so the
+~56-minute run would rebuild the same binaries and move `develop` to an
+identical build. Tags are never path-filtered: a release always runs.
+
+- Consequence: `develop` (image and prerelease) stays at the last push that
+  changed code, and the README.md inside its archives and image can lag the
+  repository's until then.
+- `tools/` and `mk/` still trigger: a test runs `tools/flash-next-converter`,
+  the server embeds `mk/kv-pool-tokens.sh`, and the workflow runs
+  `mk/version.sh`. A file that becomes embedded or read by a test must leave
+  the ignore list.
+- `workflow_dispatch` still builds on demand.
+
 ## Considered Options
 
 - **Install the CUDA toolkit on the Linux runner** and build with cargo

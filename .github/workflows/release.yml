@@ -13,6 +13,10 @@
 #                for a release, so a tag is only ever cut on a pipeline
 #                already known to be green.
 #
+# A push to main or ci/** that changes only files no build, image or test
+# reads (paths-ignore below: Markdown, docs, bench data, scripts) starts no
+# run at all (ADR 0032, amended 2026-10-12). Tags are never path-filtered.
+#
 # Nothing builds before the tests pass. The `test` job runs the CPU-only
 # suite on both hosts -- `cargo test` never touches the GPU on its own
 # (docs/agents/testing.md), which is exactly what makes it runnable on a
@@ -35,6 +39,17 @@ on:
   push:
     branches: [main, "ci/**"]
     tags: ["v*.*.*"]
+    # Nothing here is compiled, embedded, packaged as behaviour or read by a
+    # test: no include_str!/include_bytes! names a .md, docs/ or bench/ file,
+    # web/ imports none, and scripts/ only drives local runs. tools/ is not
+    # here (a test runs tools/flash-next-converter), nor mk/ (the server
+    # embeds mk/kv-pool-tokens.sh and this workflow runs mk/version.sh). The
+    # archives' README.md catches up on the next code push.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "bench/**"
+      - "scripts/**"
   workflow_dispatch:
 
 permissions:
