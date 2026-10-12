@@ -60,7 +60,9 @@ shows the `model download` command to copy.
   `description`.
   - `rule` is machine-readable: `null`, `{ "min": n|null, "max": n|null }`,
     `{ "multiple_of": n }` or `{ "one_of": ["…"] }`, plus `rule_text` (the
-    sentence `help --fields` prints).
+    sentence `help --fields` prints). `one_of` lists each value once in the
+    form the field writes it (`canonical`): an alias (`hq_e8_2b`, `hq` for
+    `hq-e8-2b`) is accepted by `PATCH` but not offered.
   - `families` is `null` for a field every family takes, else the list of
     scope names (`qwen38`, `qwen38flashnext`) that take it.
   - `nullable` says the field may be unset (its kind is `Opt<…>`), so a page
@@ -85,7 +87,8 @@ shows the `model download` command to copy.
   - `family`: the scope name the artifact's header names, when it is on disk;
     for the loaded model always the running family;
   - `loaded`: true for exactly the model serving now (the start model before
-    any switch);
+    any switch); no row is `loaded` while nothing serves (a switch whose
+    restore failed), and the model torn down is then `switchable` again;
   - `switchable`: whether `POST /v1/models/switch` with this `model` alone
     would begin a switch now (resolvable, on disk, not the loaded one).
 - No path is in a row: the page switches by id.
@@ -95,8 +98,9 @@ shows the `model download` command to copy.
 
 - `artifact` becomes optional in `POST /v1/models/switch`. With no `artifact`,
   `model` is resolved like this:
-  1. the known models (`switch.known_models`, the start model) — an explicit
-     entry wins, as for an implicit switch;
+  1. the known models (`switch.known_models`, the start model — the start
+     model stays one after any number of switches) — an explicit entry wins,
+     as for an implicit switch;
   2. a catalog entry whose artifact is a file under `download.path`.
 - `switch.allow_implicit` does not apply: it gates the switch a request
   triggers by naming a model, not an explicit one.
@@ -154,7 +158,7 @@ the only switch the Playground makes is the explicit one on this page.
   control. A field whose `families` excludes the running family shows "Not
   used by <family>" and no control. `switch.known_models` is shown read-only
   (a patch only adds to it).
-- A `reload_required` field carries a small heat-gradient mark and the word
+- An editable `reload_required` field carries a small heat-gradient mark and the word
   "reload": the mark is the same heat as the header's bar, the one place
   this page spends colour.
 - **The value in force.** For a `scoped` field, the running family's section
@@ -231,17 +235,21 @@ three seconds after a switch or reload, then `last_switch`.
    order, with the keys above; a field not marked `visible` is absent; `rule`
    is structured for each `Validator` variant; `families` and `nullable` match
    the declaration.
-2. `GET /v1/config/fields` answers `200` during a switch and on a server with
-   no running configuration; `401` without the API key when one is set.
+2. `GET /v1/config/fields` answers `200` during warm-up, during a switch and
+   on a server with no running configuration; `401` without the API key when
+   one is set.
 3. `GET /v1/models/catalog` lists every catalog entry (built-in then operator)
    and every known model that is not one, each once, with `source`, `on_disk`
    (`complete`/`partial`/`absent`), `bytes`, `family`, `loaded` and
-   `switchable` as defined; exactly one row is `loaded`; no row carries a path.
+   `switchable` as defined; exactly one row is `loaded` while a model serves,
+   none while nothing does; no row carries a path.
 4. `GET /v1/models/catalog` answers during a switch, and `loaded` follows a
    completed switch.
 5. `POST /v1/models/switch` with `model` alone switches to a known model and
    to a catalog entry on disk, with `switch.allow_implicit` on or off; a known
-   model's entry wins over a catalog entry of the same id.
+   model's entry wins over a catalog entry of the same id; the start model
+   stays switchable by id after switches through a loader that re-applies the
+   config (not only the mock).
 6. `POST /v1/models/switch` with `model` alone for an unknown id, or a catalog
    entry not on disk, is `404 model_not_found` naming the id (and the `model
    download` command for an entry), and nothing is unloaded or downloaded.
@@ -257,7 +265,8 @@ three seconds after a switch or reload, then `last_switch`.
 ### Playground
 
 10. The header offers a fourth view, Server, always present; it has no side
-    drawers.
+    drawers. Below `sm` the views are one compact menu, so the header fits a
+    phone with the model status, Memory and Lock visible.
 11. The band shows the loaded id, its state and context, and one row per
     catalog row with the actions defined above; "Load" sends
     `POST /v1/models/switch { model }` and the band follows the switch to its
@@ -266,7 +275,8 @@ three seconds after a switch or reload, then `last_switch`.
     the model status reads "Switching to <id>…", and the composer is not ready.
 13. The form shows every visible field in its group with the control its
     declaration calls for; not-patchable, not-applicable and `known_models`
-    rows are read-only as defined; `reload_required` rows carry the mark.
+    rows are read-only as defined; editable `reload_required` rows carry the
+    mark.
 14. A scoped field shows the running family's section value when there is
     one, and an edit to it is sent under that family's section; otherwise
     under the group.
