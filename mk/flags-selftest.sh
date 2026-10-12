@@ -167,6 +167,19 @@ case "$smoke" in *"/v1/images/generations"*'"model":"ignis-image-2.1-turbo"'*) ;
 lacks "smoke MODEL=image" "$smoke" "/v1/chat/completions"
 case "$(make -n smoke 2>/dev/null)" in *"/v1/chat/completions"*) ;; *) fail "smoke: the 27B's chat completion is gone" ;; esac
 
+# Flash-Next's KV-RAM arena is its own (ADR 0046), on every start -- the
+# 27B's included, so a switch to Flash-Next takes 2G, never the 27B's 8G.
+for model in "" "MODEL=flash-next"; do
+    out="$(flags $model)"
+    has "[$model] arena" "$out" "--reuse-kv-host-pool-bytes 8G"
+    has "[$model] arena" "$out" "--qwen38flashnext-reuse-kv-host-pool-bytes 2G"
+done
+has "FN_KV_HOST_POOL_BYTES=0" "$(flags FN_KV_HOST_POOL_BYTES=0)" "--qwen38flashnext-reuse-kv-host-pool-bytes 0"
+has "KV_HOST_POOL_BYTES=16G" "$(flags KV_HOST_POOL_BYTES=16G)" "--qwen38flashnext-reuse-kv-host-pool-bytes 2G"
+# The host plan's margin: the server's 4G unless named.
+lacks "margin default" "$(flags MODEL=flash-next)" "--model-host-margin-bytes"
+has "HOST_MARGIN_BYTES=3G" "$(flags HOST_MARGIN_BYTES=3G)" "--model-host-margin-bytes 3G"
+
 if [ "$failed" -ne 0 ]; then
     printf 'flags-selftest: %d failure(s)\n' "$failed" >&2
     exit 1

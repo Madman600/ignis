@@ -93,7 +93,7 @@ const E_TOKENS: u32 = 64;
 const WIDTH3_TOKENS: usize = 160;
 /// The KV-RAM leg's arena: C's blob is ~1.13 GB. On this host's ~45.9 GB of
 /// available RAM the plan takes it only without the n-gram hot rows (37.8 GB
-/// of pinned experts, the arena, and the 6 GiB margin), so both legs run
+/// of pinned experts, the arena, and the then 6 GiB margin), so both legs run
 /// without them, as AC 25's harness does: a gather reads its rows from the
 /// artifact.
 const ARENA_BYTES: u64 = 1200 << 20;

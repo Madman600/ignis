@@ -352,6 +352,7 @@ change does not reach and a `null` removes.
 | `--server-request-timeout <secs>` | `IGNIS_SERVER_REQUEST_TIMEOUT` | `30` (max `3600`) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
 | `--switch-drain-timeout <secs>` | `IGNIS_SWITCH_DRAIN_TIMEOUT` | `30` (max `3600`) | How long a model switch lets the old model's running requests finish before it cancels them (`0` cancels at once). |
 | `--model-idle-unload <secs>` | `IGNIS_MODEL_IDLE_UNLOAD` | `300` (max `604800`) | Seconds with no request using the model before it is unloaded, the server staying up; the next request loads it again ([below](#idle-unload)). `0` never unloads. Patchable live. |
+| `--model-host-margin-bytes <bytes>` | `IGNIS_MODEL_HOST_MARGIN_BYTES` | `4G` | What Flash-Next's host plan must leave of the RAM available at load (free plus standby): a load whose pinned lines leave less is refused, naming the line to shrink ([Host RAM for Flash-Next](#host-ram-for-flash-next)). Per family as `--qwen38flashnext-model-host-margin-bytes`, which a 27B start takes for a later switch; the 27B makes no host plan. (`make` knob `HOST_MARGIN_BYTES`.) |
 | `--switch-allow-implicit <true\|false>` | `IGNIS_SWITCH_ALLOW_IMPLICIT` | `true` | A request whose `model` names another model `--switch-known-models` lists switches the server to it, then is served on it. `false`: such a request is a `404 model_not_found`, as an unknown model is. `POST /v1/models/switch` is not affected. |
 | `--switch-known-models <id>=<path>` (repeatable) | `IGNIS_SWITCH_KNOWN_MODELS` (`;`-separated pairs) | the start model only | A model a request may switch to by naming it, and the artifact it loads from. The model the server starts on is always listed. Any flag replaces the env var whole; an id named twice is refused. |
 | `--config <path>` | `IGNIS_CONFIG` | discovered | The config file ([above](#configuration)). |
@@ -380,7 +381,7 @@ change does not reach and a `null` removes.
 | `--model-decode-share <percent>` | `IGNIS_MODEL_DECODE_SHARE` | `25` on both models | The part of the time decoding lanes keep while a prompt prefills, 0-99: after a chunk that took `t`, the next chunk of the same prompt waits `t * s / (1 - s)` of wall time while they decode, and nothing waits when no lane decodes or after the prompt's last chunk. It trades the prefilling request's TTFT (about x1.33 at 25, x2 at 50, only while lanes decode) for the lanes' rate (15.6-18.3 tok/s on Flash-Next instead of ~1; why 25: [ADR 0018](../adr/0018-chunk-level-prefill-decode-interleaving.md)). `--model-decode-share 0` restores one decode round per chunk, the pacing before [#92](../findings/2026-10-07-27b-prefill-chunk-width.md); 50 splits time evenly. A prompt alone is unaffected. |
 | `--model-kv-format <fmt>` | `IGNIS_MODEL_KV_FORMAT` | `hq-e8-2b` | `hq-e8-2b` (serving) or `bf16` (retained; the format every correctness oracle runs against — [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md)). Decides what a pool byte budget is worth in tokens. |
 | `--vram-kv-pool-bytes <bytes\|tokens>` | `IGNIS_VRAM_KV_POOL_BYTES` | the KV pool policy's | The KV pool, on both models: a byte count (`K`/`M`/`G` suffixes) or a token count, `<n>tok`, `<n>Ktok` or `<n>Mtok` with binary multipliers (`512Ktok` is 524,288 tokens: the same context on either model and either format, where a byte count is worth a different one on each). It replaces the policy's size ([below](#the-kv-pool)). Smaller than one `--model-max-context` sequence plus a page per retained slot, or past the VRAM budget, fails the load by name. (`make` knob `KV_POOL_BYTES`.) |
-| `--reuse-kv-host-pool-bytes <bytes>` | `IGNIS_REUSE_KV_HOST_POOL_BYTES` | `2G` | The KV-RAM host tier. Page-locked whole at start and held for the life of the load, so it is RAM the process holds even idle — and the figure Windows reports as shared GPU memory. `0` disables the host tier. (`make` sets `8G`.) |
+| `--reuse-kv-host-pool-bytes <bytes>` | `IGNIS_REUSE_KV_HOST_POOL_BYTES` | `2G` | The KV-RAM host tier. Page-locked whole at start and held for the life of the load, so it is RAM the process holds even idle — and the figure Windows reports as shared GPU memory. `0` disables the host tier. (`make` sets `8G`, and Flash-Next's own `2G` as `--qwen38flashnext-reuse-kv-host-pool-bytes`: knob `FN_KV_HOST_POOL_BYTES`.) |
 | `--spec-backend <backend>` | `IGNIS_SPEC_BACKEND` | unset | Speculative decoding backend: `dflash2` (Qwen3.8-27B), `mtp` (Qwen3.8-Flash-Next, see [below](#flash-next-speculation-mtp)), `off`, or unset for none. |
 | `--spec-draft-tokens <n>` | `IGNIS_SPEC_DRAFT_TOKENS` | — | 1..7. Required with `--spec-backend dflash2`; with `--spec-backend mtp` the most drafts a lane verifies per round (default 2). |
 | `--spec-draft-rows <n>` | `IGNIS_SPEC_DRAFT_ROWS` | `0` (= 8) | Flash-Next MTP only: the rows one verify round may take across all lanes, `0` or 2..8. Each lane drafts `min(draft tokens, rows / lanes - 1)`, so `3` drafts at one lane only. (`make` knob `DRAFT_ROWS`.) |
@@ -517,7 +518,7 @@ file when that saves at least the restore floor (8,192 tokens on Flash-Next,
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--ngram-hot-bytes <bytes\|auto>` | `IGNIS_NGRAM_HOT_BYTES` | `1G` | The Flash-Next n-gram rows held in RAM, index included (accepts `K`/`M`/`G`; `0` holds none). Every other row is read from the artifact on NVMe when a step needs it. `auto`: what the host plan leaves after its other lines and the 6 GiB margin (below). The 27B has no n-gram table and refuses the flag. (`make` knob `NGRAM_HOT_BYTES`.) |
+| `--ngram-hot-bytes <bytes\|auto>` | `IGNIS_NGRAM_HOT_BYTES` | `1G` | The Flash-Next n-gram rows held in RAM, index included (accepts `K`/`M`/`G`; `0` holds none). Every other row is read from the artifact on NVMe when a step needs it. `auto`: what the host plan leaves after its other lines and its margin (below). The 27B has no n-gram table and refuses the flag. (`make` knob `NGRAM_HOT_BYTES`.) |
 | `--ngram-persist <true\|false>` | `IGNIS_NGRAM_PERSIST` | `true` | Keep a compact copy of the selected Flash-Next hot rows on disk. `false` reads and writes no persistent n-gram cache. |
 | `--ngram-persist-path <model\|auto\|dir>` | `IGNIS_NGRAM_PERSIST_PATH` | `model` | Cache directory. `model` is the artifact's own directory, on the disk that already holds the model. An explicit relative directory is relative to the server's working directory. |
 
@@ -538,7 +539,7 @@ are the head of that ranking that fits the budget. What a budget holds:
   the artifact already is its copy on disk.
 
 `auto` picks among those, from what the host plan leaves after its other
-lines and the 6 GiB margin, less 256 MiB for the load's own reads: the whole
+lines and its margin, less 256 MiB for the load's own reads: the whole
 table when that holds it, otherwise the whole ranking when it fits, otherwise
 the rest rounded down to whole GiB and never below the 1 GiB default, which
 the plan then refuses exactly where it would refuse the default. So `auto` never refuses a start the
@@ -578,18 +579,19 @@ file per artifact remains. This cache is separate from prompt/KV reuse.
 
 ### Host RAM for Flash-Next
 
-Serving Flash-Next needs about **46-48 GB of available RAM**: 38 GB of pinned
+Serving Flash-Next needs about **46-47 GB of available RAM**: 38 GB of pinned
 experts, 1 GB of n-gram hot rows, ~0.5 GB of staging (KV-disk's 64 MiB
 included: `--kv-disk-bytes 0` drops it), ~1 GB of retained host
-slots, the 2 GiB KV-RAM arena and the 6 GB margin the load refuses to dip into
-(it never lets reuse push Windows into paging). A load below that is refused
+slots, the 2 GiB KV-RAM arena and the 4 GiB margin the load refuses to dip into
+(`--model-host-margin-bytes`: it never lets reuse push Windows into paging). A load below that is refused
 naming the plan line to shrink. The knobs that lower it, with what each costs:
 
 | Knob (`make`) | Flag | Saves | Costs |
 |---|---|---|---|
 | `RETAINED_HOST` | `--reuse-retained-host <n>` | ~125 MiB per slot below the default 8 | Fewer retained prompt checkpoints and shared prefixes: a returning agent or a subagent sharing a system block prefills what no slot kept. `0` retains nothing on the host. |
-| `KV_HOST_POOL_BYTES` | `--reuse-kv-host-pool-bytes <n>` | up to the 2 GiB arena (`0` turns it off) | The KV-RAM tier holds fewer suspended requests: under VRAM pressure a request that cannot be parked there is evicted and prefilled again. |
+| `FN_KV_HOST_POOL_BYTES` | `--qwen38flashnext-reuse-kv-host-pool-bytes <n>` | up to the 2 GiB arena (`0` turns it off) | The KV-RAM tier holds fewer suspended requests: under VRAM pressure a request that cannot be parked there is evicted and prefilled again. |
 | `NGRAM_HOT_BYTES` | `--ngram-hot-bytes <n>` | up to the 1 GiB default (`0` holds none) | Each n-gram row not held in RAM is read from NVMe when a step needs it: more reads per token, and slower prefill. |
+| `HOST_MARGIN_BYTES` | `--model-host-margin-bytes <n>` | what it lowers the 4 GiB default by (`0` leaves none) | Less room for the rest of the machine to grow into: the plan's lines are pinned and cannot be paged, so once other applications outgrow what is left, Windows pages *them* out. |
 
 Check `make config MODEL=flash-next` for the lines a start will use.
 
@@ -1408,7 +1410,10 @@ With `CUDA=1` the server starts with `MAX_CONTEXT=524288` and
 and the YaRN table that stretches the envelope to match (the gate legs ran at
 `MAX_CONTEXT=262144 ROPE_SCALING=none`) -- `KV_FORMAT=hq-e8-2b`,
 `SPEC=dflash2` with
-`DRAFT_TOKENS=7`, `KV_HOST_POOL_BYTES=8G`, `REQUEST_TIMEOUT=1800`.
+`DRAFT_TOKENS=7`, `KV_HOST_POOL_BYTES=8G` (the 27B's; Flash-Next's own arena
+is `FN_KV_HOST_POOL_BYTES=2G`, passed on every start so a switch to it gets it
+too), `REQUEST_TIMEOUT=1800`. `HOST_MARGIN_BYTES` sets Flash-Next's host
+margin (empty: the server's 4G).
 `KV_DISK_BYTES` and `KV_DISK_PATH` set [KV-disk](#kv-disk) (`make config`
 prints its budget and directory). `SPEC=off` turns
 speculation off (`SPEC=` leaves it to the server, and the `rtx5090` profile

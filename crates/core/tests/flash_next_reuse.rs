@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use ignis_core::compute::{ModelConfig, ModelFamily};
-use ignis_core::residency::{HostPlanError, HostPlanRequest, plan_host};
+use ignis_core::residency::{DEFAULT_HOST_MARGIN_BYTES, HostPlanError, HostPlanRequest, plan_host};
 use ignis_core::types::{DecodeParams, RequestClass, RequestInput};
 use ignis_core::{
     ArtifactHash, BlobIdentity, ConcreteScheduler, IdentityField, KvFormat, MockCompute,
@@ -185,6 +185,7 @@ fn spec_host_plan(available: u64) -> HostPlanRequest {
         staging_bytes: GIB / 2,
         retained_host_slots_bytes: u64::from(ModelFamily::FlashNext.default_retained_host_slots()) * image,
         kv_ram_arena_bytes: 2 * GIB,
+        margin_bytes: DEFAULT_HOST_MARGIN_BYTES,
     }
 }
 
@@ -205,9 +206,9 @@ fn the_host_plan_charges_the_retained_slots_and_the_kv_ram_arena() {
 
 #[test]
 fn a_host_plan_short_at_the_retained_slots_names_them() {
-    // 46 GB available, 39.56 GB usable past the 6 GiB margin: the experts,
-    // hot rows and staging fit (39.31 GB), the eight slots cross.
-    let err = plan_host(&spec_host_plan(46_000_000_000)).expect_err("below the margin");
+    // 44 GB available, 39.71 GB usable past the 4 GiB margin: the experts,
+    // hot rows and staging fit (39.31 GB), the eight slots cross (40.35 GB).
+    let err = plan_host(&spec_host_plan(44_000_000_000)).expect_err("below the margin");
     let message = err.to_string();
     let HostPlanError::BelowMargin { crossing_line, .. } = err;
     assert_eq!(crossing_line, "retained_host_slots");
@@ -217,13 +218,34 @@ fn a_host_plan_short_at_the_retained_slots_names_them() {
 
 #[test]
 fn a_host_plan_short_at_the_kv_ram_arena_names_it() {
-    // 48 GB available, 41.56 GB usable: everything but the arena fits.
-    let err = plan_host(&spec_host_plan(48_000_000_000)).expect_err("below the margin");
+    // 46 GB available, 41.71 GB usable: everything but the arena fits.
+    let err = plan_host(&spec_host_plan(46_000_000_000)).expect_err("below the margin");
     let message = err.to_string();
     let HostPlanError::BelowMargin { crossing_line, .. } = err;
     assert_eq!(crossing_line, "kv_ram_arena");
     assert!(message.contains("--reuse-kv-host-pool-bytes"), "{message}");
     assert!(message.contains(&(2 * GIB).to_string()), "{message}");
+}
+
+/// The switch to Flash-Next refused on 2026-10-12, its lines as the log
+/// printed them, at the lower of two attempts' available memory (46.7 GB,
+/// the desktop up): the 27B's 8 GiB arena crosses the margin, Flash-Next's
+/// own 2 GiB fits under the 4 GiB one.
+#[test]
+fn the_logged_switch_fits_with_flash_nexts_own_arena() {
+    let logged = |arena| HostPlanRequest {
+        available_physical_bytes: 46_708_031_488,
+        expert_pool_bytes: 37_795_446_784,
+        ngram_hot_rows_bytes: GIB,
+        staging_bytes: 64 << 20,
+        retained_host_slots_bytes: 1_040_115_712,
+        kv_ram_arena_bytes: arena,
+        margin_bytes: DEFAULT_HOST_MARGIN_BYTES,
+    };
+    let HostPlanError::BelowMargin { crossing_line, .. } = plan_host(&logged(8 * GIB)).expect_err("the 27B's arena");
+    assert_eq!(crossing_line, "kv_ram_arena");
+    let plan = plan_host(&logged(2 * GIB)).expect("Flash-Next's own arena");
+    assert!(plan.left_bytes >= DEFAULT_HOST_MARGIN_BYTES, "{}", plan.left_bytes);
 }
 
 #[test]

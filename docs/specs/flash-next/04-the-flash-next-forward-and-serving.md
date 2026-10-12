@@ -194,7 +194,7 @@ its value-head count fails first and then passes.
   - a RAM hot-row cache loaded from the artifact's hot list (size
     `--ngram-hot-bytes`, default 1 GB);
   - `--ngram-hot-bytes auto` (GitHub #306): the budget is what the host plan
-    leaves after its other lines and the 6 GiB margin, less 256 MiB for the
+    leaves after its other lines and its margin, less 256 MiB for the
     load's own reads -- the whole table when that fits, else the whole hot
     list when it fits, else whole GiB never below the 1 GB default -- so it
     never refuses a start the default would make. The plan's line charges the budget, capped at what the table can

@@ -197,6 +197,11 @@ pub const MEDIA_CACHE_MIB_LIMIT: u32 = 64 * 1024;
 /// blob by blob while serving, so it is RAM the process holds even idle.
 pub const DEFAULT_HOST_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// `--model-host-margin-bytes`'s default: what Flash-Next's host plan
+/// leaves of the physical memory available at load (4 GiB since
+/// 2026-10-12, the owner's call; spec flash-next/03 set 6).
+pub const DEFAULT_HOST_MARGIN_BYTES: u64 = ignis_core::residency::DEFAULT_HOST_MARGIN_BYTES;
+
 /// `--reuse-prompt`'s default (GitHub #186, ADR 0029): on. Cross-request
 /// reuse is the owner's workload — an agent's tool loop re-sends its whole
 /// history every iteration — so it is what the engine does unless asked not
@@ -324,6 +329,11 @@ pub struct Config {
     /// snapshot's fixed GDN floor (~145 MiB) is paid regardless of prompt
     /// length.
     pub host_pool_bytes: u64,
+    /// What Flash-Next's host plan must leave of the physical memory
+    /// available at load (`--model-host-margin-bytes`,
+    /// [`DEFAULT_HOST_MARGIN_BYTES`]): a load whose pinned lines leave less
+    /// is refused, naming the line to shrink. The 27B makes no host plan.
+    pub host_margin_bytes: u64,
     /// Cross-request state reuse (`--reuse-prompt`, GitHub #186, ADR 0029).
     /// On by default. Off means a request captures no prompt checkpoint and
     /// claims none, so a cold bench measures a cold engine and a correctness
@@ -1009,6 +1019,7 @@ fn derive(
         vram,
         allow_expert_cache_below_floor: s.vram.allow_expert_cache_below_floor,
         host_pool_bytes: s.reuse.kv_host_pool_bytes,
+        host_margin_bytes: s.model.host_margin_bytes,
         prompt_reuse,
         retained_device_slots: s
             .reuse

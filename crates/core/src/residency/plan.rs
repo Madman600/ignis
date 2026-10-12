@@ -17,9 +17,12 @@ use super::policy::PrefetchBudget;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// What the host plan must leave of the available physical memory (spec
-/// flash-next/03: "6 GB", taken as GiB): below it, Windows starts paging.
-pub const HOST_MARGIN_BYTES: u64 = 6 * GIB;
+/// What the host plan leaves of the available physical memory unless the
+/// operator names another (`--model-host-margin-bytes`): below it, Windows
+/// starts paging. Spec flash-next/03 set "6 GB", taken as GiB; 4 GiB since
+/// 2026-10-12 (the owner's call): on the 64 GB box with its working desktop,
+/// 6 GiB left Flash-Next no room for its KV-RAM arena.
+pub const DEFAULT_HOST_MARGIN_BYTES: u64 = 4 * GIB;
 
 /// The smallest VRAM expert cache a load accepts (spec flash-next/03: "12
 /// GB", taken as GiB). Below it the hit rate, and with it decode speed,
@@ -45,6 +48,10 @@ pub struct HostPlanRequest {
     /// Prompt reuse's KV-RAM arena (`--reuse-kv-host-pool-bytes`, spec
     /// flash-next/05): materialized blobs the device gave up.
     pub kv_ram_arena_bytes: u64,
+    /// What the plan must leave of `available_physical_bytes`
+    /// (`--model-host-margin-bytes`, [`DEFAULT_HOST_MARGIN_BYTES`] unless
+    /// named): not a line, the room the lines may not take.
+    pub margin_bytes: u64,
 }
 
 /// The host plan the load carries out.
@@ -52,7 +59,7 @@ pub struct HostPlanRequest {
 pub struct HostPlan {
     pub request: HostPlanRequest,
     pub total_bytes: u64,
-    /// What stays available after the plan: at least [`HOST_MARGIN_BYTES`].
+    /// What stays available after the plan: at least the request's margin.
     pub left_bytes: u64,
 }
 
@@ -83,11 +90,12 @@ fn host_lines(request: &HostPlanRequest) -> [(&'static str, u64); HOST_PLAN_LINE
 /// A load the host plan refuses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostPlanError {
-    /// The plan leaves less than [`HOST_MARGIN_BYTES`] of the available
+    /// The plan leaves less than the request's margin of the available
     /// physical memory.
     BelowMargin {
         available_bytes: u64,
         planned_bytes: u64,
+        margin_bytes: u64,
         /// The first line, in plan order, whose running total passes what
         /// the margin leaves usable.
         crossing_line: &'static str,
@@ -100,6 +108,7 @@ impl std::fmt::Display for HostPlanError {
         let Self::BelowMargin {
             available_bytes,
             planned_bytes,
+            margin_bytes,
             crossing_line,
             lines,
         } = self;
@@ -122,13 +131,23 @@ impl std::fmt::Display for HostPlanError {
         write!(
             f,
             ") of the {available_bytes} bytes of physical memory available, and must leave \
-             {HOST_MARGIN_BYTES} (6 GiB) of it so the system does not page; the \
-             {crossing_line} line crosses that margin: {remedy}"
+             {margin_bytes} ({}, --model-host-margin-bytes) of it so the system does not page; \
+             the {crossing_line} line crosses that margin: {remedy}",
+            gib_text(*margin_bytes)
         )
     }
 }
 
 impl std::error::Error for HostPlanError {}
+
+/// `4 GiB`, or `3.50 GiB` for a margin that is not whole GiB.
+fn gib_text(bytes: u64) -> String {
+    if bytes % GIB == 0 {
+        format!("{} GiB", bytes / GIB)
+    } else {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    }
+}
 
 /// Lay the host plan out, or refuse the load.
 pub fn plan_host(request: &HostPlanRequest) -> Result<HostPlan, HostPlanError> {
@@ -136,7 +155,7 @@ pub fn plan_host(request: &HostPlanRequest) -> Result<HostPlan, HostPlanError> {
     let total = lines.iter().fold(0u64, |sum, (_, b)| sum.saturating_add(*b));
     let usable = request
         .available_physical_bytes
-        .saturating_sub(HOST_MARGIN_BYTES);
+        .saturating_sub(request.margin_bytes);
     if total > usable {
         let mut running = 0u64;
         let crossing_line = lines
@@ -149,6 +168,7 @@ pub fn plan_host(request: &HostPlanRequest) -> Result<HostPlan, HostPlanError> {
         return Err(HostPlanError::BelowMargin {
             available_bytes: request.available_physical_bytes,
             planned_bytes: total,
+            margin_bytes: request.margin_bytes,
             crossing_line,
             lines,
         });
@@ -170,7 +190,7 @@ pub fn ngram_hot_rows_room(request: &HostPlanRequest) -> u64 {
         .fold(0u64, |sum, (_, bytes)| sum.saturating_add(*bytes));
     request
         .available_physical_bytes
-        .saturating_sub(HOST_MARGIN_BYTES)
+        .saturating_sub(request.margin_bytes)
         .saturating_sub(others)
 }
 

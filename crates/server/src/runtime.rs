@@ -54,6 +54,9 @@ pub struct EngineShape {
     /// P4-07 GitHub #125): pinned host memory for evicted (suspended)
     /// request snapshots, independent of the GPU-resident pool above.
     pub host_pool_bytes: u64,
+    /// What Flash-Next's host plan must leave of the physical memory
+    /// available at load (`--model-host-margin-bytes`).
+    pub host_margin_bytes: u64,
     /// Cross-request state reuse (`--reuse-prompt`, GitHub #186, ADR 0029).
     pub prompt_reuse: bool,
     /// Whether the generation opener's page rides the checkpoint capture (ADR
@@ -122,6 +125,7 @@ impl Default for EngineShape {
             },
             allow_expert_cache_below_floor: false,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
+            host_margin_bytes: crate::config::DEFAULT_HOST_MARGIN_BYTES,
             prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
             opener_page_rides_capture: false,
             retained_device_slots: crate::config::DEFAULT_RETAINED_DEVICE_SLOTS,
@@ -153,6 +157,7 @@ impl From<&crate::config::Config> for EngineShape {
             vram: config.vram,
             allow_expert_cache_below_floor: config.allow_expert_cache_below_floor,
             host_pool_bytes: config.host_pool_bytes,
+            host_margin_bytes: config.host_margin_bytes,
             prompt_reuse: config.prompt_reuse,
             opener_page_rides_capture: false,
             retained_device_slots: config.retained_device_slots,
@@ -963,6 +968,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
         staging_bytes: kv_disk_staging_bytes,
         retained_host_slots_bytes: pool_plan.retained_host_bytes,
         kv_ram_arena_bytes: options.kv_ram_arena_bytes,
+        margin_bytes: shape.host_margin_bytes,
     });
     // GitHub #306: `--ngram-hot-bytes` as named, or `auto` from the room the
     // other lines leave; the line charges the budget, capped at what the
@@ -989,6 +995,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
             available_bytes = request.available_physical_bytes,
             planned_bytes = host.total_bytes,
             left_bytes = host.left_bytes,
+            margin_bytes = request.margin_bytes,
             ngram_hot_budget = %shape.ngram_hot_bytes,
             ngram_hot_budget_bytes = options.ngram.hot_bytes,
             ngram_hot_rows_bytes,
@@ -1335,6 +1342,7 @@ mod tests {
             vram: EngineShape::default().vram,
             allow_expert_cache_below_floor: true,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
+            host_margin_bytes: crate::config::DEFAULT_HOST_MARGIN_BYTES,
             prompt_reuse: true,
             opener_page_rides_capture: false,
             retained_device_slots: 2,

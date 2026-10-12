@@ -152,7 +152,7 @@ export const FIELDS: FieldDecl[] = [
   decl("ngram", "persist_path", "model|auto|dir", "model", { patchable: true, reload_required: true },
     "Where the n-gram cache goes: `model` (beside the artifact), `auto` (Windows LOCALAPPDATA/ignis/cache/ngram, Linux XDG_CACHE_HOME/ignis/ngram or HOME/.cache/ignis/ngram), or a directory."),
   decl("ngram", "hot_bytes", "bytes|auto", null, { families: ["qwen38flashnext"], patchable: true, reload_required: true },
-    "The n-gram rows held in RAM, every other row read from NVMe when a step needs it: a byte count, or `auto` — what the host plan leaves after its other lines and the 6 GiB margin, less 256 MiB for the load, the whole ~29 GB table when that fits, never below the default. Unset, 1 GiB."),
+    "The n-gram rows held in RAM, every other row read from NVMe when a step needs it: a byte count, or `auto` — what the host plan leaves after its other lines and the margin, less 256 MiB for the load, the whole ~29 GB table when that fits, never below the default. Unset, 1 GiB."),
   decl("kv_disk", "bytes", "bytes", null, { scoped: true, patchable: true, reload_required: true },
     "KV-disk's budget: a ceiling, cut at start to the volume's free space less 10 GiB. Unset, the model's own: 4G on Flash-Next, 0 (off) on the 27B."),
   decl("kv_disk", "path", "model|auto|dir", "model", { patchable: true, reload_required: true },

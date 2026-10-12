@@ -1,13 +1,13 @@
 //! The n-gram hot-row budget (`--ngram-hot-bytes`, GitHub #306): a named
 //! size, the 1 GiB default, or `auto` -- what the host plan leaves the line
-//! once its other lines and the 6 GiB margin are placed, capped at the whole
+//! once its other lines and the margin are placed, capped at the whole
 //! table. Pure arithmetic over the table's shape and the host plan's lines;
 //! the shapes below are the real artifact's (layout.md 7: 320,001,536 rows of
 //! 90 bytes, a hot list of 15,642,665 rows) and the host plan measured on the
 //! 5090 box (`docs/findings/2026-10-06-flash-next-on-the-5090.md`).
 
 use ignis_core::ngram_table::{HotBudget, TableFootprint, AUTO_LOAD_HEADROOM_BYTES, DEFAULT_HOT_BYTES};
-use ignis_core::residency::{ngram_hot_rows_room, plan_host, HostPlanRequest, HOST_MARGIN_BYTES};
+use ignis_core::residency::{ngram_hot_rows_room, plan_host, HostPlanRequest, DEFAULT_HOST_MARGIN_BYTES};
 
 const GIB: u64 = 1 << 30;
 
@@ -23,6 +23,7 @@ fn host(available: u64) -> HostPlanRequest {
         staging_bytes: 0,
         retained_host_slots_bytes: 1_040_115_712,
         kv_ram_arena_bytes: 2 * GIB,
+        margin_bytes: DEFAULT_HOST_MARGIN_BYTES,
     }
 }
 
@@ -129,7 +130,10 @@ fn a_budget_prints_as_an_operator_writes_it() {
 fn the_room_is_what_the_other_lines_and_the_margin_leave() {
     let available = 52_190_724_096;
     let others = 37_795_446_784 + 1_040_115_712 + 2 * GIB;
-    assert_eq!(ngram_hot_rows_room(&host(available)), available - HOST_MARGIN_BYTES - others);
+    assert_eq!(ngram_hot_rows_room(&host(available)), available - DEFAULT_HOST_MARGIN_BYTES - others);
+    // A named margin moves the room by what it differs.
+    let wider = HostPlanRequest { margin_bytes: DEFAULT_HOST_MARGIN_BYTES + GIB, ..host(available) };
+    assert_eq!(ngram_hot_rows_room(&wider), ngram_hot_rows_room(&host(available)) - GIB);
     // The line's own request does not shrink its room.
     let asked = HostPlanRequest { ngram_hot_rows_bytes: 9 * GIB, ..host(available) };
     assert_eq!(ngram_hot_rows_room(&asked), ngram_hot_rows_room(&host(available)));

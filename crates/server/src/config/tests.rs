@@ -947,6 +947,32 @@ fn a_zero_host_pool_budget_is_accepted_and_disables_the_tier() {
     assert_eq!(config(&["--reuse-kv-host-pool-bytes", "0"]).host_pool_bytes, 0);
 }
 
+// ── the host plan's margin (`--model-host-margin-bytes`) ──────────────────
+
+#[test]
+fn the_host_margin_is_four_gib_unless_named() {
+    assert_eq!(DEFAULT_HOST_MARGIN_BYTES, 4 * GIB);
+    assert_eq!(config(&["--profile", "none"]).host_margin_bytes, DEFAULT_HOST_MARGIN_BYTES);
+    assert_eq!(config(&["--model-host-margin-bytes", "3G"]).host_margin_bytes, 3 * GIB);
+    assert_eq!(config(&["--model-host-margin-bytes", "0"]).host_margin_bytes, 0, "no margin is the operator's call");
+    let env = env_map(&[("IGNIS_MODEL_HOST_MARGIN_BYTES", "5G")]);
+    assert_eq!(expect_config(resolve(&[], env).expect("resolve")).host_margin_bytes, 5 * GIB);
+}
+
+/// The owner's flow: the server starts on the 27B and switches to
+/// Flash-Next, so Flash-Next's own margin is named on a 27B start, taken
+/// without refusal, and reaches the load's shape after the switch.
+#[test]
+fn a_27b_start_carries_flash_nexts_own_margin_to_the_switch() {
+    let config = config(&["--profile", "none", "--qwen38flashnext-model-host-margin-bytes", "3G"]);
+    let qwen = config.for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert_eq!(qwen.host_margin_bytes, DEFAULT_HOST_MARGIN_BYTES, "the 27B's is the default");
+    let (switched, dropped) = fit_to_family(&qwen, ModelFamily::FlashNext).unwrap();
+    assert_eq!(switched.host_margin_bytes, 3 * GIB);
+    assert!(dropped.is_empty());
+    assert_eq!(crate::runtime::EngineShape::from(&switched).host_margin_bytes, 3 * GIB);
+}
+
 #[test]
 fn a_malformed_host_pool_budget_is_a_usage_error() {
     assert!(refused(&["--reuse-kv-host-pool-bytes", "not-a-size"]).contains("--reuse-kv-host-pool-bytes"));

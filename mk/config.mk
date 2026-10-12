@@ -60,13 +60,10 @@ ifeq ($(MODEL_FAMILY),flash-next)
   DRAFT_TOKENS ?=
   DRAFT_ROWS ?=
   VISION ?=
-  # The KV-RAM arena spec flash-next/05 sizes for Flash-Next: the 38 GB of
-  # pinned experts leave no room for the 27B's 8G (the host plan refuses it).
-  KV_HOST_POOL_BYTES ?= 2G
   # The n-gram rows held in RAM (--ngram-hot-bytes, GitHub #306): a size (4G),
-  # or auto for what the host plan leaves after its other lines and the 6 GiB
-  # margin -- the whole ~29 GB table when that fits, and then no step reads
-  # the NVMe. Empty = the server's 1G.
+  # or auto for what the host plan leaves after its other lines and its
+  # margin (HOST_MARGIN_BYTES) -- the whole ~29 GB table when that fits, and
+  # then no step reads the NVMe. Empty = the server's 1G.
   NGRAM_HOT_BYTES ?=
   # No Flash-Next headroom of its own: the server's 1536M, as on the 27B (the
   # owner's call, 2026-10-09; it was 4G for spec flash-next/04 AC10's 29 GB
@@ -200,8 +197,19 @@ VISION_MAX_TOKENS ?=
 # included, so MAX_CONTEXT=262144 wants ROPE_SCALING=none beside it.
 ROPE_SCALING ?= yarn:2
 # The KV-RAM host tier's budget (--reuse-kv-host-pool-bytes, P4-07, GitHub #125):
-# 0 disables the host tier entirely (no evict-to-RAM overflow path).
+# 0 disables the host tier entirely (no evict-to-RAM overflow path). The
+# 27B's: Flash-Next takes FN_KV_HOST_POOL_BYTES instead.
 KV_HOST_POOL_BYTES ?= 8G
+# Flash-Next's own KV-RAM arena (--qwen38flashnext-reuse-kv-host-pool-bytes,
+# ADR 0046), passed on every start -- the 27B's too, so a switch to
+# Flash-Next gets it rather than the 27B's 8G: beside the 38 GB of pinned
+# experts the host plan refuses 8G (spec flash-next/05 sizes it at 2G). 0
+# turns Flash-Next's tier off; its evictions then go to KV-disk.
+FN_KV_HOST_POOL_BYTES ?= 2G
+# What Flash-Next's host plan leaves of the RAM available at load
+# (--model-host-margin-bytes): a load whose pinned lines leave less is
+# refused, naming the line to shrink. Empty = the server's 4G.
+HOST_MARGIN_BYTES ?=
 # KV-disk, the tier below KV-RAM (--kv-disk-bytes, spec vram-budget/03):
 # evicted sequences and retained prompt checkpoints kept as files and read
 # back instead of prefilled again. A ceiling the server cuts at start to the

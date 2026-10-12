@@ -151,6 +151,8 @@ async fn main() {
         vram: _,
         allow_expert_cache_below_floor: _,
         host_pool_bytes,
+        // Read through `EngineShape`, like the other load-shape knobs.
+        host_margin_bytes: _,
         prompt_reuse: _,
         retained_device_slots: _,
         retained_host_slots: _,

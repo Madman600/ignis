@@ -4,7 +4,7 @@
 //! numbers the loader has measured or read from the artifact.
 
 use ignis_core::residency::{
-    ExpertCachePlanError, ExpertCacheRequest, ExpertCatalog, ExpertTraffic, HOST_MARGIN_BYTES,
+    ExpertCachePlanError, ExpertCacheRequest, ExpertCatalog, ExpertTraffic, DEFAULT_HOST_MARGIN_BYTES,
     HostPlanError, HostPlanRequest, KBits, MEASURED_ONE_ROW_PREFETCH_BUDGET_BYTES,
     MEASURED_THREE_ROW_PREFETCH_BUDGET_BYTES, Projection, ProjectionId, default_prefetch_budget,
     min_slots_per_class, plan_expert_cache, plan_host, prefill_staging_ring_bytes,
@@ -23,6 +23,7 @@ fn host(available: u64) -> HostPlanRequest {
         staging_bytes: GIB,
         retained_host_slots_bytes: 0,
         kv_ram_arena_bytes: 0,
+        margin_bytes: DEFAULT_HOST_MARGIN_BYTES,
     }
 }
 
@@ -39,33 +40,48 @@ fn the_host_plan_adds_its_lines_and_says_what_it_leaves() {
 }
 
 #[test]
-fn the_host_plan_holds_exactly_at_the_six_gib_margin() {
-    assert_eq!(HOST_MARGIN_BYTES, 6 * GIB);
-    assert!(plan_host(&host(47 * GIB)).is_ok());
-    assert!(plan_host(&host(47 * GIB - 1)).is_err());
+fn the_host_plan_holds_exactly_at_the_four_gib_default_margin() {
+    assert_eq!(DEFAULT_HOST_MARGIN_BYTES, 4 * GIB);
+    assert!(plan_host(&host(45 * GIB)).is_ok());
+    assert!(plan_host(&host(45 * GIB - 1)).is_err());
+}
+
+#[test]
+fn a_named_margin_is_the_one_the_plan_leaves() {
+    // The spec's old 6 GiB: 47 GiB holds the 41 GiB plan, a byte less does not.
+    let six = |available| HostPlanRequest { margin_bytes: 6 * GIB, ..host(available) };
+    assert!(plan_host(&six(47 * GIB)).is_ok());
+    assert!(plan_host(&six(47 * GIB - 1)).is_err());
+    // None at all: the lines may take every available byte.
+    let none = |available| HostPlanRequest { margin_bytes: 0, ..host(available) };
+    assert_eq!(plan_host(&none(41 * GIB)).expect("fits exactly").left_bytes, 0);
+    // A margin that is not whole GiB prints as one.
+    let half = HostPlanRequest { margin_bytes: 3 * GIB + GIB / 2, ..host(44 * GIB) };
+    let message = plan_host(&half).expect_err("below the margin").to_string();
+    assert!(message.contains(&format!("{} (3.50 GiB, --model-host-margin-bytes)", 3 * GIB + GIB / 2)), "{message}");
 }
 
 #[test]
 fn a_host_plan_below_the_margin_refuses_naming_the_line_that_crosses_it() {
-    // 45 GiB available, 39 usable: the pool fits (38), the hot rows cross.
-    let err = plan_host(&host(45 * GIB)).expect_err("below the margin");
+    // 43 GiB available, 39 usable: the pool fits (38), the hot rows cross.
+    let err = plan_host(&host(43 * GIB)).expect_err("below the margin");
     let HostPlanError::BelowMargin {
         available_bytes,
         planned_bytes,
         crossing_line,
         ..
     } = &err;
-    assert_eq!(*available_bytes, 45 * GIB);
+    assert_eq!(*available_bytes, 43 * GIB);
     assert_eq!(*planned_bytes, 41 * GIB);
     assert_eq!(*crossing_line, "ngram_hot_rows");
     let message = err.to_string();
     for needle in [
         "ngram_hot_rows",
         "--ngram-hot-bytes",
-        &(45 * GIB).to_string(),
+        &(43 * GIB).to_string(),
         &(41 * GIB).to_string(),
         &(2 * GIB).to_string(),
-        "6 GiB",
+        &format!("{DEFAULT_HOST_MARGIN_BYTES} (4 GiB, --model-host-margin-bytes)"),
     ] {
         assert!(message.contains(needle), "{needle} missing: {message}");
     }
@@ -92,11 +108,11 @@ fn a_machine_short_of_the_pool_itself_names_the_pool() {
 
 #[test]
 fn the_staging_line_crossing_names_staging_and_its_own_remedy() {
-    // 41.5 GiB available, 35.5 usable: the pool and the hot rows fit (40),
+    // 39.5 GiB available, 35.5 usable: the pool and the hot rows fit (35),
     // the staging buffers cross.
     let request = HostPlanRequest {
         expert_pool_bytes: 33 * GIB,
-        ..host(41 * GIB + GIB / 2)
+        ..host(39 * GIB + GIB / 2)
     };
     let err = plan_host(&request).expect_err("below the margin");
     let message = err.to_string();
