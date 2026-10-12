@@ -42,6 +42,35 @@ describe("Header", () => {
   });
 });
 
+describe("Header on a phone (spec playground/05, AC 10)", () => {
+  const select = (html: string) => html.match(/<select[^>]*aria-label="Choose a view"[\s\S]*?<\/select>/)?.[0] ?? "";
+
+  it("folds the views into one menu below sm, over the same views, the current one selected", () => {
+    const html = renderToStaticMarkup(<Header {...base} view="server" onView={() => {}} monitorAvailable />);
+    const menu = select(html);
+    expect(menu).toContain("sm:hidden");
+    expect(menu.match(/<option/g)).toHaveLength(4);
+    expect(menu).toMatch(/<option value="server" selected="">Server<\/option>/);
+    for (const label of ["Playground", "Decide", "Monitor"]) expect(menu).toContain(`>${label}</option>`);
+    // The tabs are what `sm` and up show.
+    expect(html).toMatch(/<nav aria-label="View" class="hidden[^"]*sm:flex/);
+  });
+
+  it("offers the Monitor in the menu only when ignis serves metrics, and no menu without a view switch", () => {
+    const plain = select(renderToStaticMarkup(<Header {...base} view="chat" onView={() => {}} />));
+    expect(plain).toContain(">Decide</option>");
+    expect(plain).not.toContain("Monitor");
+    expect(select(renderToStaticMarkup(<Header {...base} />))).toBe("");
+  });
+
+  it("keeps the model status, Memory and Lock in the bar", () => {
+    const html = renderToStaticMarkup(<Header {...base} model={{ state: "ready", id: "qwen3.8-27b", contextLimit: null }} view="chat" onView={() => {}} onForgetKey={() => {}} />);
+    expect(html).toContain("ready");
+    expect(html).toContain(">Memory");
+    expect(html).toContain(">Lock<");
+  });
+});
+
 describe("Header and the Server view (spec playground/05)", () => {
   it("always offers the Server view, with or without metrics, and gives it no side drawers", () => {
     for (const monitorAvailable of [false, true]) {

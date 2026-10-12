@@ -37,14 +37,14 @@ export function Header({
   const sided = view === "chat" || view === "decide";
   return (
     <header className="z-20 shrink-0 bg-kiln text-[#eae8e4]">
-      <div className="flex items-center gap-3 px-4 py-3 sm:gap-4 md:px-6">
+      <div className="flex items-center gap-1.5 px-3 py-3 sm:gap-4 sm:px-4 md:px-6">
         {sided && (
           <HeaderButton label={chat ? "Sessions" : "Decisions"} onClick={() => onOpen("sessions")}>
             <IconSessions />
           </HeaderButton>
         )}
         <img src={flame} alt="" className="flame h-9 w-auto" data-busy={busy} />
-        <img src={wordmark} alt="ignis" className="h-[18px] w-auto" />
+        <img src={wordmark} alt="ignis" className="hidden h-[18px] w-auto sm:block" />
         <span className="hidden h-6 w-px bg-kiln-line sm:block" aria-hidden />
         {onView ? (
           <ViewSwitch view={view} onView={onView} monitorAvailable={monitorAvailable} />
@@ -76,6 +76,9 @@ export function Header({
 }
 
 function ViewSwitch({ view, onView, monitorAvailable }: { view: View; onView: (view: View) => void; monitorAvailable: boolean }) {
+  // Below `sm` the views are one native menu: four tabs and the rest of the
+  // bar do not fit a phone. (A native menu, since `.cut` is a clip-path: a
+  // popup of our own inside a clipped box would be cut.)
   // The Monitor is only on offer when ignis serves metrics; the Decide tab
   // talks to /v1/decide and the Server view to /v1/models and /v1/config
   // (spec playground/05), so they are there either way.
@@ -86,20 +89,35 @@ function ViewSwitch({ view, onView, monitorAvailable }: { view: View; onView: (v
     ["server", "Server"],
   ];
   return (
-    <nav aria-label="View" className="flex items-center gap-1 self-stretch">
-      {views.map(([v, label]) => (
-        <button
-          key={v}
-          type="button"
-          aria-current={view === v ? "page" : undefined}
-          onClick={() => onView(v)}
-          className={`relative px-2 font-display text-[15px] font-medium tracking-wide ${view === v ? "text-white" : "text-[#939ba4] hover:text-white"}`}
-        >
-          {label}
-          {view === v && <span className="absolute inset-x-2 -bottom-3 h-[2px] bg-[#ff5a1f]" aria-hidden />}
-        </button>
-      ))}
-    </nav>
+    <>
+      <select
+        name="view"
+        aria-label="Choose a view"
+        value={view}
+        onChange={(e) => onView(e.target.value as View)}
+        className="min-w-0 rounded-[2px] border border-kiln-line bg-kiln py-1 pr-1 pl-1.5 font-display text-[15px] font-medium text-white [color-scheme:dark] focus-visible:outline-2 focus-visible:outline-[#ff5a1f] sm:hidden"
+      >
+        {views.map(([v, label]) => (
+          <option key={v} value={v}>
+            {label}
+          </option>
+        ))}
+      </select>
+      <nav aria-label="View" className="hidden items-center gap-1 self-stretch sm:flex">
+        {views.map(([v, label]) => (
+          <button
+            key={v}
+            type="button"
+            aria-current={view === v ? "page" : undefined}
+            onClick={() => onView(v)}
+            className={`relative px-2 font-display text-[15px] font-medium tracking-wide ${view === v ? "text-white" : "text-[#939ba4] hover:text-white"}`}
+          >
+            {label}
+            {view === v && <span className="absolute inset-x-2 -bottom-3 h-[2px] bg-[#ff5a1f]" aria-hidden />}
+          </button>
+        ))}
+      </nav>
+    </>
   );
 }
 
@@ -125,7 +143,7 @@ function HeaderButton({ label, onClick, children }: { label: string; onClick: ()
       type="button"
       aria-label={label}
       title={label}
-      className="grid size-9 shrink-0 place-items-center text-[#b9bec4] hover:bg-kiln-line hover:text-white lg:hidden"
+      className="grid size-8 shrink-0 place-items-center sm:size-9 text-[#b9bec4] hover:bg-kiln-line hover:text-white lg:hidden"
       onClick={onClick}
     >
       {children}
