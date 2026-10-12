@@ -84,9 +84,12 @@ export function mockIgnis(): Plugin {
       server.middlewares.use("/v1/config/fields", (_req, res) => answer(res, { status: 200, body: sim.fields() }));
       server.middlewares.use("/v1/config", async (req, res) => {
         if (req.method === "PATCH") return answer(res, sim.patch(await readJson(req), Date.now()));
-        const { body, status } = sim.config(Date.now());
-        res.setHeader("ignis-model-status", status);
-        answer(res, { status: 200, body });
+        const format = new URL(req.url ?? "/", "http://mock").searchParams.get("format");
+        const file = sim.configAs(format, Date.now());
+        res.statusCode = file.http;
+        res.setHeader("ignis-model-status", file.modelStatus);
+        res.setHeader("Content-Type", file.type);
+        res.end(file.text);
       });
 
       server.middlewares.use("/v1/chat/completions", async (req, res) => {

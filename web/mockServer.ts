@@ -21,6 +21,14 @@ import type { CatalogRow, ConfigDocument, FieldDecl } from "./src/server/routes.
 // patch holds a value "/fail" ends the same way, the configuration unchanged.
 // A patch of `model.thinking_budget` is shadowed at restart, as if the mock
 // had started with IGNIS_MODEL_THINKING_BUDGET set.
+//
+// Per-model values (spec playground/05 §Follow-up): a patch reloads only if a
+// `reload_required` field resolves differently for the loaded family, so a
+// value in the other family's section, or a group key the loaded family
+// overrides, is a `200` live. `null` removes: a family's own value (the group's
+// applies again) or a group key (back to the field's default). `GET /v1/config`
+// shows a family's value only where it differs from the group's, as the
+// server does. `?format=yaml` renders the configuration as a YAML document.
 
 const SWITCH_MS = 3_000;
 const RESTORE_MS = 1_000;
@@ -28,7 +36,8 @@ const CONFIG_PATH = "ignis.yaml";
 const SCOPES = ["qwen38", "qwen38flashnext"];
 const COUNTS = new Set(["tokens", "seconds", "slots", "percent", "lanes", "MiB", "rows", "tokens|off"]);
 
-type Entry = { decl: FieldDecl; scope: string | null; value: unknown };
+/** One value of a patch; `remove` is its `null`. */
+type Entry = { decl: FieldDecl; scope: string | null; value: unknown; remove?: true };
 type Running = { from: string; to: string; until: number; failure?: string; dead?: string; patch?: Entry[] };
 export type MockAnswer = { status: number; body: unknown };
 
@@ -50,6 +59,34 @@ function canonical(decl: FieldDecl, value: unknown): unknown {
   if (decl.rule && "one_of" in decl.rule) return decl.rule.one_of.find((name) => name.toLowerCase() === text.toLowerCase()) ?? text;
   if (COUNTS.has(decl.kind) && /^\d+$/.test(text)) return Number(text);
   return text;
+}
+
+const sameValue = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+const section = (doc: ConfigDocument, group: string, scope: string) => {
+  const found = doc[group]?.[scope];
+  return isObject(found) ? found : undefined;
+};
+
+/** The value a family runs a field with: its own section's, else the group's. */
+function resolved(doc: ConfigDocument, decl: FieldDecl, family: string): unknown {
+  const own = section(doc, decl.group, family);
+  return own && decl.name in own ? own[decl.name] : doc[decl.group]?.[decl.name];
+}
+
+const plain = (text: string) => /^[A-Za-z0-9_./~-][A-Za-z0-9_./:~-]*$/.test(text) && !/^(true|false|null|yes|no|on|off|~|[-+]?[0-9.]+)$/i.test(text);
+
+const scalar = (value: unknown) => (typeof value === "string" ? (plain(value) ? value : JSON.stringify(value)) : JSON.stringify(value ?? null));
+
+/** A configuration document as YAML, two spaces to a level. */
+export function yamlOf(value: Record<string, unknown>, depth = 0): string {
+  const pad = "  ".repeat(depth);
+  return Object.entries(value)
+    .map(([key, entry]) => {
+      if (!isObject(entry)) return `${pad}${key}: ${scalar(entry)}\n`;
+      return Object.keys(entry).length === 0 ? `${pad}${key}: {}\n` : `${pad}${key}:\n${yamlOf(entry, depth + 1)}`;
+    })
+    .join("");
 }
 
 export function createServerSim() {
@@ -88,12 +125,23 @@ export function createServerSim() {
 
   const status = () => (running ? "switching" : restoring || dead ? "failed" : "serving");
 
-  function apply(entries: Entry[]) {
-    for (const { decl, scope, value } of entries) {
-      const group = (doc[decl.group] ??= {});
-      const at = scope === null ? group : ((group[scope] ??= {}) as Record<string, unknown>);
-      if (decl.file_key === "switch.known_models" && isObject(value)) at[decl.name] = { ...(at[decl.name] as object), ...value };
-      else at[decl.name] = canonical(decl, value);
+  function apply(entries: Entry[], into: ConfigDocument = doc) {
+    for (const { decl, scope, value, remove } of entries) {
+      const group = (into[decl.group] ??= {});
+      if (remove) {
+        if (scope === null) group[decl.name] = decl.default;
+        else if (section(into, decl.group, scope)) delete (group[scope] as Record<string, unknown>)[decl.name];
+      } else {
+        const at = scope === null ? group : ((group[scope] ??= {}) as Record<string, unknown>);
+        if (decl.file_key === "switch.known_models" && isObject(value)) at[decl.name] = { ...(at[decl.name] as object), ...value };
+        else at[decl.name] = canonical(decl, value);
+      }
+      // The server shows a family's value only where it differs from the group's; an emptied section goes.
+      const own = scope === null ? undefined : section(into, decl.group, scope);
+      if (own) {
+        if (decl.scoped && decl.name in own && sameValue(own[decl.name], group[decl.name])) delete own[decl.name];
+        if (Object.keys(own).length === 0) delete group[scope!];
+      }
     }
   }
 
@@ -111,14 +159,14 @@ export function createServerSim() {
             const decl = find(group, name);
             if (!decl) return invalid(`unknown field \`${group}.${key}.${name}\``);
             if (!decl.scoped && !decl.families?.includes(key)) return invalid(`\`${group}.${key}.${name}\`: \`${group}.${name}\` has no family sections`);
-            entries.push({ decl, scope: key, value: scoped });
+            entries.push({ decl, scope: key, value: scoped, ...(scoped === null ? { remove: true as const } : {}) });
           }
           continue;
         }
         const decl = find(group, key);
         if (!decl) return invalid(`unknown field \`${group}.${key}\``);
         // A field only one family takes lives in that family's section, as the server writes it.
-        entries.push({ decl, scope: decl.families?.length === 1 ? decl.families[0] : null, value });
+        entries.push({ decl, scope: decl.families?.length === 1 ? decl.families[0] : null, value, ...(value === null ? { remove: true as const } : {}) });
       }
     }
     if (entries.length === 0) return invalid("the patch names no field");
@@ -126,9 +174,6 @@ export function createServerSim() {
     if (fixed.length > 0) {
       return refuse(400, "invalid_request_error", "config_field_not_patchable", `${fixed.join(", ")} cannot be changed while the server runs (not patchable); nothing in the patch was applied`);
     }
-    const family = familyOf(loaded);
-    const elsewhere = entries.find((entry) => entry.decl.families !== null && !entry.decl.families.includes(family));
-    if (elsewhere) return invalid(`\`${keyOf(elsewhere)}\` is not taken by the loaded model's family (${family}); nothing in the patch was applied`);
     const refused = entries.find((entry) => entry.value === "/error");
     if (refused) return invalid(`\`${keyOf(refused)}\` expects a ${refused.decl.kind} value, got \`/error\` (the mock refuses "/error"); nothing in the patch was applied`);
     return entries;
@@ -141,6 +186,15 @@ export function createServerSim() {
     config(now: number): { body: ConfigDocument; status: string } {
       advance(now);
       return { body: doc, status: status() };
+    },
+
+    /** GET /v1/config?format=...: `json` (or none) is the document, `yaml` the file it amounts to, any other format a 400. */
+    configAs(format: string | null, now: number): { modelStatus: string; http: number; type: string; text: string } {
+      const { body, status } = this.config(now);
+      if (format === null || format === "json") return { modelStatus: status, http: 200, type: "application/json", text: JSON.stringify(body) };
+      if (format === "yaml") return { modelStatus: status, http: 200, type: "application/yaml", text: yamlOf(body) };
+      const refused = refuse(400, "invalid_request_error", "config_invalid", `unknown format \`${format}\`: use \`json\` or \`yaml\``);
+      return { modelStatus: status, http: 400, type: "application/json", text: JSON.stringify(refused.body) };
     },
 
     models(now: number): Record<string, unknown> {
@@ -180,7 +234,12 @@ export function createServerSim() {
       if (!Array.isArray(entries)) return entries;
       const shadowed = entries.filter((entry) => keyOf(entry) === "model.thinking_budget").map((entry) => `${keyOf(entry)} (set by IGNIS_MODEL_THINKING_BUDGET)`);
       const shadowing = shadowed.length > 0 ? { shadowed_at_restart: shadowed } : {};
-      if (entries.some((entry) => entry.decl.reload_required)) {
+      // A reload only for what the loaded model runs with: apply the patch to a copy and compare what the loaded family resolves.
+      const family = familyOf(loaded);
+      const after = structuredClone(doc) as ConfigDocument;
+      apply(entries, after);
+      const reloads = entries.some((entry) => entry.decl.reload_required && !sameValue(resolved(doc, entry.decl, family), resolved(after, entry.decl, family)));
+      if (reloads) {
         const failure = entries.some((entry) => entry.value === "/fail")
           ? `the reload of ${loaded} failed: the mock refuses a value "/fail"; the previous configuration was loaded again`
           : undefined;
