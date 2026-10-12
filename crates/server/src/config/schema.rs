@@ -320,6 +320,12 @@ config_group! {
         /// `yarn:F[,t=..][,bf=..][,bs=..]`, which rescales the checkpoint's
         /// trained 262,144-position envelope — what a context past it needs.
         rope_scaling: Rope = RopeScaling::NONE, NO_RULE, ALL, [Visible, Patchable, ReloadRequired, Scoped];
+        /// Seconds with no request using the model after which it is unloaded
+        /// — VRAM, pinned host memory and KV-RAM given back — while the server
+        /// stays up; the next request loads it again and waits for it. 0 never
+        /// unloads.
+        idle_unload: Secs = super::DEFAULT_MODEL_IDLE_UNLOAD_SECS, between(0, super::MAX_MODEL_IDLE_UNLOAD_SECS as i64), ALL,
+            [Visible, Patchable];
     }
 }
 

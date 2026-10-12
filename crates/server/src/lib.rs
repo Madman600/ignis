@@ -154,11 +154,18 @@ pub struct Live {
     /// templated (`--server-system-message-policy` /
     /// `--server-developer-message-policy`, GitHub #209).
     pub instruction_policy: instruction::InstructionPolicy,
+    /// How long the loaded model may go unused before the idle clock unloads
+    /// it (`--model-idle-unload`, spec model-switch/02); zero never unloads.
+    /// Read by the clock at every tick, so a live change needs no restart.
+    pub idle_unload: Duration,
 }
 
 impl Default for Live {
     /// What a server built without a config runs with: the timeout's
-    /// default, thinking on with no effort or budget, merge / inplace.
+    /// default, thinking on with no effort or budget, merge / inplace — and
+    /// no idle unload: only a configured server (`main`, a live `PATCH`)
+    /// unloads its model, so no test or in-process harness meets a cold
+    /// reload it did not ask for.
     fn default() -> Self {
         Self {
             request_timeout: Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS as u64),
@@ -166,6 +173,7 @@ impl Default for Live {
             default_reasoning_effort: None,
             default_thinking_budget: None,
             instruction_policy: instruction::InstructionPolicy::default(),
+            idle_unload: Duration::ZERO,
         }
     }
 }
@@ -179,6 +187,7 @@ impl Live {
             default_reasoning_effort: config.reasoning_effort,
             default_thinking_budget: config.thinking_budget,
             instruction_policy: config.instruction_policy,
+            idle_unload: Duration::from_secs(u64::from(config.idle_unload_secs)),
         }
     }
 }
@@ -451,6 +460,13 @@ impl Server {
     /// Set the server-wide thinking budget (`--model-thinking-budget`).
     pub fn with_thinking_budget(self, budget: Option<u32>) -> Self {
         self.update_live(|live| live.default_thinking_budget = budget);
+        self
+    }
+
+    /// Unload the model after `after` with no request using it
+    /// (`--model-idle-unload`, spec model-switch/02); zero never does.
+    pub fn with_idle_unload(self, after: Duration) -> Self {
+        self.update_live(|live| live.idle_unload = after);
         self
     }
 
