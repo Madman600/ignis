@@ -349,3 +349,116 @@ Branch `server-view`, `0a899a2..` (server `d5dee2f`, `5969862`, `1da20a2`,
   hidden.
 - The CORS `Access-Control-Allow-Methods` header gains `PATCH`, so a
   cross-origin `PATCH /v1/config` passes its preflight.
+
+## Follow-up: per-model overrides and the rendered file (2026-10-12)
+
+The owner, trying the view, asked two things:
+- where a field both models take is set for one model only;
+- a way to see the configuration as the file it amounts to.
+
+As built, the form edits the value in force and cannot create or remove a
+family's own value. The server keeps a value for the family not loaded, but it
+still reloads the loaded model for it, and a `PATCH` cannot remove anything.
+
+### Decisions
+
+**Server**
+
+- **A reload only for what the loaded model runs with.** A patch needs a
+  reload iff, after it, a `reload_required` field resolves differently for the
+  running family.
+  - A value scoped to the other family, or a group key the running family
+    overrides in its own section, changes nothing running. It is a live
+    change: applied, written to the file, and used when that family next
+    loads.
+  - `applied` is `live` for it. A patch that mixes such values with a
+    reload-requiring change for the running model reloads as before, and every
+    value in it lands.
+- **`null` removes**, with JSON merge patch semantics.
+  - `null` inside a family section removes that family's own value, so the
+    group's applies to it again.
+  - `null` at a group key removes the key, so the next source down applies (a
+    profile, then the hardcoded default).
+  - After a removal, the running value is the one a start with the rewritten
+    file would resolve. A flag or env var that sets the field still outranks
+    it and is named in `shadowed_at_restart`.
+  - The config file loses the key, and a family section or group left empty
+    goes with it.
+  - A removal of a key no source sets is accepted and changes nothing. A body
+    of only removals is a patch.
+- **The rendered file.** `GET /v1/config?format=yaml` answers `application/yaml`:
+  the YAML document `ignis-server config print` writes for the running
+  configuration's visible fields, with the same `ignis-model-status` header.
+  - `format=json`, or no `format`, is today's answer.
+  - Any other value is `400 config_invalid`.
+
+**Playground**
+
+- **Scope selector** at the top of the configuration: "All models", then one
+  entry per family. It opens on the running family, which is marked.
+  - In a family's scope:
+    - each scoped field shows that family's effective value, marked "Own value"
+      when the family has its own section entry, else "Shared";
+    - an edit writes that family's section;
+    - "Use shared value (<v>)" sends `null` there;
+    - a field only that family takes is editable, and its edit goes to its
+      family's section;
+    - a field every family shares (no scope) is editable and marked "Same for
+      every model".
+  - In "All models":
+    - the group values are shown and edited;
+    - a scoped field that a family overrides says "Qwen3.8-27B has its own
+      value: <v>";
+    - a family-only field is listed under its family's name and edits that
+      family's section.
+- **The dock** labels reloads by what reaches the running model.
+  - It reads "Apply and reload <id>" only when a changed or removed
+    `reload_required` value resolves differently for the running family.
+  - Otherwise it reads "Apply". A value that waits for the other model is
+    listed as "Takes effect when <family> loads".
+- **"View as config file"** sits beside the configuration's heading. It opens
+  a modal holding the YAML from `GET /v1/config?format=yaml`, in the code face,
+  with "Copy" and "Download" (`ignis.yaml`).
+  - One line under it says hidden fields (the API key, the download token) are
+    not in it, and that it is the configuration in force, which includes live
+    changes and not the comments of the file on disk.
+  - A pending draft is not in it.
+  - The modal is portalled, traps focus, closes on Esc, and returns focus to
+    its button.
+- **Mock.** `dev:mock` serves all of the above:
+  - a `null` that removes;
+  - a value scoped to the family not loaded, answered `200` live;
+  - `?format=yaml`.
+
+### Acceptance (follow-up)
+
+19. A `PATCH` holding only values that change nothing for the running family
+    is `200` live, even when they are `reload_required`. It is written to the
+    file, and after a switch to that family the load runs with them (driven
+    through a loader that applies the config, not only the mock).
+20. A `PATCH` mixing such values with a reload-requiring change for the running
+    family reloads, and both land.
+21. `null` in a family section removes that family's value, so the group's
+    applies. `null` at a group key falls back to the profile or the default.
+    The file loses the key, and an emptied section or group goes with it. A
+    removal no source sets is a no-op `200`. A flag-set field is named in
+    `shadowed_at_restart`.
+22. `GET /v1/config?format=yaml` answers `application/yaml` equal to what
+    `config print` writes for the same configuration, minus hidden fields;
+    an unknown `format` is `400`.
+23. The scope selector shows "All models" and each family, and opens on the
+    running one. Each scope shows and edits the values defined above, with
+    "Own value", "Shared" and "Same for every model" marked. "Use shared value"
+    sends `null` in that family's section.
+24. A family-only field is editable while the other family runs, and its edit
+    goes to its family's section.
+25. The primary action's label follows what reaches the running model.
+    "Takes effect when <family> loads" lists the values that wait.
+26. "View as config file" opens a modal with the rendered YAML, "Copy" and
+    "Download". It is keyboard-operable (focus trap, Esc, focus return).
+27. `dev:mock` serves every behaviour above. `npm test`, `npm run build` and
+    `cargo test --workspace` pass.
+
+Known limit: `GET /v1/config` shows a family's section only where its value
+differs from the group's. An own value equal to the shared one therefore reads
+as "Shared" and cannot be removed from the page until it differs.
