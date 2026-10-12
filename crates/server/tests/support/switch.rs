@@ -105,6 +105,12 @@ impl MockLoader {
         self.state.broken.lock().unwrap().insert(id.to_owned());
     }
 
+    /// Let `id` load again ([`MockLoader::break_load`] undone): the way a
+    /// test proves a later attempt is made, and can succeed.
+    pub fn mend(&self, id: &str) {
+        self.state.broken.lock().unwrap().remove(id);
+    }
+
     /// Hold the next load until the returned sender sends (or is dropped).
     /// Called again before that load runs, it holds the one after.
     pub fn hold_next_load(&self) -> Sender<()> {

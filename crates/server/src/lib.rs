@@ -33,6 +33,7 @@ pub mod decoder;
 pub mod download;
 pub mod engine;
 pub mod expose;
+pub mod idle;
 pub mod instruction;
 pub mod load;
 pub mod locate;
@@ -60,7 +61,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use axum::Router;
 
-pub use crate::active::{ActiveModel, ModelSource, ModelStatus};
+pub use crate::active::{ActiveModel, ModelSource, ModelStatus, StatusCell};
 use crate::engine::Engine;
 use crate::template::TemplateProvider;
 use crate::thinking::ReasoningEffort;
@@ -117,8 +118,14 @@ pub struct Server {
     /// `server_not_ready` until the first traversal has run, so no request
     /// pays the decode-graph capture on its first token — or a model switch
     /// is under way (`503 model_switching`). Shared by every clone, like the
-    /// active model.
-    pub status: std::sync::Arc<ArcSwap<ModelStatus>>,
+    /// active model. Every store wakes the requests waiting on a load
+    /// ([`StatusCell`], spec model-switch/02).
+    pub status: std::sync::Arc<StatusCell>,
+    /// The requests using the model now, and when it was last used: what the
+    /// idle clock reads to unload a model nobody uses (spec model-switch/02,
+    /// [`idle`]). Shared by every clone — a pinned copy's request counts on
+    /// the server's model.
+    pub usage: std::sync::Arc<idle::Usage>,
     /// What `POST /v1/models/switch` loads models with (spec
     /// model-switch/01): the loader, the drain window, the one switch that
     /// may run at a time. `None` answers the route `501`: a server built in
@@ -261,7 +268,8 @@ impl Server {
             responses: std::sync::Arc::default(),
             wall_clock: std::sync::Arc::new(telemetry::SystemClock),
             seedless_seed: None,
-            status: std::sync::Arc::new(ArcSwap::from_pointee(ModelStatus::Serving)),
+            status: std::sync::Arc::new(StatusCell::new(ModelStatus::Serving)),
+            usage: std::sync::Arc::default(),
             switcher: None,
             config: None,
         }
@@ -620,6 +628,9 @@ impl Server {
 
         let app = self.app();
         self.spawn_warm_up();
+        // Spec model-switch/02: an unused model leaves the card while this
+        // serves; the clock stops when serving does.
+        let _idle_clock = self.spawn_idle_clock(idle::IDLE_TICK);
         let (metrics_listener, metrics_app) = match (metrics_listener, self.metrics_app()) {
             (None, _) => {
                 return axum::serve(listener, app).with_graceful_shutdown(shutdown).await;

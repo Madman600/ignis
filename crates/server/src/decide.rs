@@ -2443,7 +2443,7 @@ Thinking is refused rather than ignored: a decision's prompt ends exactly where 
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = crate::api::ApiError),
         (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set), or a `state` part's reuse marker is not exactly `{\"type\": \"ephemeral\"}` (`malformed_reuse_marker`: retention is by eviction, never by time, so a `ttl` is refused) or there are more than four of them (`too_many_reuse_markers`), or a `locate` cannot be served: the load has no calibrated heads for it (`locate_uncalibrated`), the `state` is content parts (`locate_needs_json_state`), `within` is not a pointer, names nothing, or names a key written twice (`locate_within_malformed`, `locate_within_not_found`, `locate_within_ambiguous`), the target is not a string or a non-empty array (`locate_target_unsegmentable`), fewer than two of its segments own a token (`locate_too_few_segments`), a vote's target is longer than the vote was measured on (`locate_too_long`), a single segment is longer than a window (`locate_segment_too_long`), or the loaded template cannot say where its tokens sit (`locate_unsupported`); a `kind`, `method` or `compression` a locate does not know (`kind_unknown`, `method_unknown`, `compression_unknown`), a fold under `vote` or of prose (`compression_unsupported`), `kind: records` on a state that is not an array of JSON objects or `log`/`prose` on one (`kind_mismatch`); `criteria` and `digits` on a `locate`, and `within`, `kind` and `compression` on anything else (`kind_unsupported`, `compression_unsupported`), are refused too, as is a fold's level-1 text past the context (`context_exceeded`). Nothing reached the engine. (A shortlist step rendered from an earlier step's answer -- a fold's level 2, every `choice` -- can only fault after a prefill, and then answers its own question with an `error`.) A `model` the server neither loads nor may switch to is refused `model_not_found`; one it began switching to that did not load, `model_switch_failed`.",
             body = crate::api::ApiError),
-        (status = 503, description = "The engine is at capacity and the request was not admitted; or a model switch is under way (`model_switching`, with `Retry-After`).", body = crate::api::ApiError),
+        (status = 503, description = "The engine is at capacity and the request was not admitted; or a model switch is under way (`model_switching`, with `Retry-After`); or the model was unloaded while idle and loading it again failed (`model_load_failed`).", body = crate::api::ApiError),
     ),
 )]
 pub async fn decide(
@@ -2456,7 +2456,13 @@ pub async fn decide(
     // server to the model that serves it. A model it may not switch to meets
     // the `model_not_found` refusal in `serve`, as before.
     let named = body.as_ref().ok().and_then(|request| request.0.model.clone());
-    match crate::model_switch::implicit_switch(&server, crate::api::split_model_lane(named).0.as_deref()).await {
+    let named = crate::api::split_model_lane(named).0;
+    // A model the idle clock unloaded is loaded first, the named one when
+    // the server knows it (spec model-switch/02).
+    if let Err(reason) = crate::model_switch::ensure_loaded(&server, named.as_deref()).await {
+        return crate::api::load_failed(&server, &reason);
+    }
+    match crate::model_switch::implicit_switch(&server, named.as_deref()).await {
         Ok(()) => {}
         Err(refusal @ crate::model_switch::ImplicitRefusal::Switching(_)) => {
             return crate::api::implicit_switch_refused(refusal);

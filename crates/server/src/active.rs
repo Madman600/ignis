@@ -177,11 +177,21 @@ pub enum ModelStatus {
     /// model could be kept or reloaded (the switch stores `Serving` again
     /// right after); it stays only when nothing could be loaded at all,
     /// and then `/v1` answers `503 server_not_ready` until a switch
-    /// succeeds.
+    /// succeeds — or, when it was the load leaving [`ModelStatus::Unloaded`]
+    /// that failed, until a request or a switch loads one (spec
+    /// model-switch/02 AC 7).
     Failed {
         /// Why, as the switch's log line says it.
         reason: String,
     },
+    /// Nobody used the model for `model.idle_unload` seconds, so it was torn
+    /// down the way a switch tears one down (spec model-switch/02, ADR 0049):
+    /// the process and the API are up, the model's id and source are kept,
+    /// and the next request that needs it loads it again.
+    Unloaded,
+    /// The load that leaves [`ModelStatus::Unloaded`] is running: requests
+    /// that need the model wait for it rather than being refused.
+    Loading,
 }
 
 impl ModelStatus {
@@ -192,20 +202,66 @@ impl ModelStatus {
             Self::Serving => "serving",
             Self::Switching { .. } => "switching",
             Self::Failed { .. } => "failed",
+            Self::Unloaded => "unloaded",
+            Self::Loading => "loading",
         }
     }
 
     /// The `503` code a `/v1` request is refused with in this state, or
-    /// `None` while serving: `server_not_ready` for the warm-up (the wire
-    /// contract GitHub #129 set) and for a failed switch — by the time a
+    /// `None` when it is admitted: `server_not_ready` for the warm-up (the
+    /// wire contract GitHub #129 set) and for a failed switch — by the time a
     /// client could see that one, the previous model is usually serving
     /// again, so it needs no code of its own — and `model_switching` while
-    /// a switch runs.
+    /// a switch runs. Unloaded or loading, every request is admitted: the
+    /// one that needs the model loads it, behind the API key, and waits
+    /// (`crate::model_switch::ensure_loaded`).
     pub fn refusal(&self) -> Option<&'static str> {
         match self {
-            Self::Serving => None,
+            Self::Serving | Self::Unloaded | Self::Loading => None,
             Self::WarmingUp | Self::Failed { .. } => Some("server_not_ready"),
             Self::Switching { .. } => Some("model_switching"),
         }
+    }
+}
+
+/// The server's [`ModelStatus`]: read wait-free like the `ArcSwap` it wraps,
+/// and every store wakes whoever waits for it to change (spec
+/// model-switch/02) — the requests holding on a load that leaves
+/// [`ModelStatus::Unloaded`], which need a signal, not a poll. Firing on the
+/// store itself, rather than at each call site, is what keeps a new store
+/// from being one nobody hears.
+pub struct StatusCell {
+    current: arc_swap::ArcSwap<ModelStatus>,
+    changed: tokio::sync::watch::Sender<()>,
+}
+
+impl StatusCell {
+    /// A cell holding `status`.
+    pub fn new(status: ModelStatus) -> Self {
+        Self { current: arc_swap::ArcSwap::from_pointee(status), changed: tokio::sync::watch::Sender::new(()) }
+    }
+
+    /// The status, as of now (wait-free).
+    pub fn load_full(&self) -> Arc<ModelStatus> {
+        self.current.load_full()
+    }
+
+    /// Replace the status and wake every waiter.
+    pub fn store(&self, status: Arc<ModelStatus>) {
+        self.current.store(status);
+        self.wake();
+    }
+
+    /// A receiver that changes at every store from now on. Take it
+    /// **before** reading the status it is to wait past, so a store between
+    /// the read and the wait is not missed.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changed.subscribe()
+    }
+
+    /// Wake every waiter without a store: what the switch's slot does when
+    /// it is freed, since a waiter that found it taken waits for that too.
+    pub(crate) fn wake(&self) {
+        self.changed.send_replace(());
     }
 }
