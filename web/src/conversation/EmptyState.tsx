@@ -5,6 +5,8 @@ const HEADLINE: Record<ModelState["state"], string> = {
   ready: "Light it up",
   loading: "Warming up",
   switching: "Switching models",
+  unloaded: "Light it up",
+  waking: "Warming up",
   error: "No model to talk to",
 };
 
@@ -25,6 +27,13 @@ export function EmptyState({ model }: { model: ModelState }) {
           )}
           {model.state === "loading" && "Asking ignis which model it serves."}
           {model.state === "switching" && `Loading ${model.to}. The prompt opens once it serves.`}
+          {model.state === "unloaded" && (
+            <>
+              <span className="font-display text-ink">{model.id}</span> was unloaded while idle. Send a prompt: it loads
+              again first, and the first reply takes as long as the load.
+            </>
+          )}
+          {model.state === "waking" && `Loading ${model.to}. The prompt opens once it serves.`}
           {model.state === "error" && (model.failed ? "A model switch failed. The Server view says why." : "Start ignis-server, then reload this page.")}
         </p>
       </div>

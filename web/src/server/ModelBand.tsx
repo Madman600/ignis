@@ -38,22 +38,26 @@ export function ModelBand({
   const rows = catalog.state === "ok" ? catalog.value : null;
   const family = runningFamily(rows);
   // The last switch's line stays until the next switch begins.
-  const last = model.state !== "loading" && model.state !== "switching" && model.lastSwitch ? lastSwitchLine(model.lastSwitch) : null;
+  const last =
+    model.state !== "loading" && model.state !== "switching" && model.state !== "waking" && model.lastSwitch ? lastSwitchLine(model.lastSwitch) : null;
   return (
     <section aria-label="Model" className="monitor-kiln cut overflow-hidden text-[#eae8e4] [--cut-size:20px]">
       <div className="flex flex-col gap-4 p-5 md:p-6">
         <Headline model={model} />
         <dl className="flex flex-wrap gap-x-8 gap-y-3">
           <Figure label="State" value={stateWord(model)} dot={stateColor(model)} />
-          {model.state === "ready" && (
+          {(model.state === "ready" || model.state === "unloaded") && (
             <Figure label="Context" value={model.contextLimit === null ? "Not reported" : `${model.contextLimit.toLocaleString("en-US")} tokens`} />
           )}
           {model.state === "ready" && family && <Figure label="Family" value={familyName(family)} />}
-          {model.state === "switching" && <Figure label="Elapsed" value={elapsed(model.since, now)} />}
+          {(model.state === "switching" || model.state === "waking") && <Figure label="Elapsed" value={elapsed(model.since, now)} />}
         </dl>
-        {(last || refusal || streaming || model.state === "error") && (
+        {(last || refusal || streaming || model.state === "error" || model.state === "unloaded") && (
           <div className="flex flex-col gap-1 text-sm" aria-live="polite">
             {model.state === "error" && <p className="text-fault [overflow-wrap:anywhere]">{model.message}</p>}
+            {model.state === "unloaded" && (
+              <p className="text-[#b9bec4]">Unloaded after going unused (model.idle_unload). The next message loads it again; Load does it now.</p>
+            )}
             {last && <p className={`${TONE[last.tone]} [overflow-wrap:anywhere]`}>{last.text}</p>}
             {refusal && <p className="text-fault [overflow-wrap:anywhere]">{refusal}</p>}
             {streaming && <p className="text-[#b9bec4]">{drainNote(drain, model.state === "switching" ? "The switch" : "A switch")}</p>}
@@ -73,11 +77,24 @@ function Headline({ model }: { model: ModelState }) {
       </h2>
     );
   }
+  if (model.state === "waking") {
+    return (
+      <h2 className="font-display text-2xl leading-tight font-semibold text-white [overflow-wrap:anywhere] sm:text-[30px]">
+        Loading {model.to}
+      </h2>
+    );
+  }
   // A reported failure lasts while the old model is loaded again, or until a
   // switch succeeds: either way nothing serves meanwhile (a refused switch
   // reads `failed` for one tick only).
   const text =
-    model.state === "ready" ? model.id : model.state === "loading" ? "Reading the model…" : model.failed ? "No model is serving" : "ignis is not answering";
+    model.state === "ready" || model.state === "unloaded"
+      ? model.id
+      : model.state === "loading"
+        ? "Reading the model…"
+        : model.failed
+          ? "No model is serving"
+          : "ignis is not answering";
   const muted = model.state !== "ready";
   return (
     <h2
@@ -91,14 +108,16 @@ function Headline({ model }: { model: ModelState }) {
 function stateWord(model: ModelState): string {
   if (model.state === "ready") return "Serving";
   if (model.state === "switching") return "Switching";
+  if (model.state === "waking") return "Loading";
+  if (model.state === "unloaded") return "Unloaded";
   if (model.state === "loading") return "Reading";
   return model.failed ? "Not serving" : "Unreachable";
 }
 
 function stateColor(model: ModelState): string {
   if (model.state === "ready") return "var(--good)";
-  if (model.state === "switching") return "#ff5a1f";
-  return model.state === "loading" ? "var(--ash)" : "var(--fault)";
+  if (model.state === "switching" || model.state === "waking") return "#ff5a1f";
+  return model.state === "loading" || model.state === "unloaded" ? "var(--ash)" : "var(--fault)";
 }
 
 function Figure({ label, value, dot }: { label: string; value: string; dot?: string }) {

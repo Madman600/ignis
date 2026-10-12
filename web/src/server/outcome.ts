@@ -59,7 +59,7 @@ const sameSwitch = (a: LastSwitch | undefined, b: LastSwitch | undefined) => JSO
  * while the old model is loaded again, unless the record says nothing serves.
  */
 export function settleReload(pending: PendingReload, model: ModelState): Settled {
-  if (model.state === "switching") return { kind: "wait", pending: pending.seen ? pending : { ...pending, seen: true } };
+  if (model.state === "switching" || model.state === "waking") return { kind: "wait", pending: pending.seen ? pending : { ...pending, seen: true } };
   const last = model.state === "ready" || model.state === "error" ? model.lastSwitch : undefined;
   const fresh = last !== undefined && !sameSwitch(last, pending.before);
   if (!last || !(pending.seen || fresh)) return { kind: "wait", pending };

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { afterRefresh, readModel, switchFollowed, type ModelState } from "./model.ts";
+import { afterRefresh, canSend, readModel, switchFollowed, type ModelState } from "./model.ts";
 import { keyRequired, saveKey } from "./auth.ts";
 
 const listing = (id: string, max?: number) =>
@@ -99,5 +99,43 @@ describe("switchFollowed", () => {
     expect(switchFollowed({ state: "error", message: "m" })).toBe(false);
     expect(switchFollowed({ state: "ready", id: "a", contextLimit: null })).toBe(false);
     expect(switchFollowed({ state: "loading" })).toBe(false);
+  });
+});
+
+describe("readModel with idle unload (spec model-switch/02)", () => {
+  it("reads `unloaded` as a state naming the model and its context, never an error", async () => {
+    saveKey("sk");
+    const body = { data: [{ id: "qwen3.8-27b", max_model_len: 786432 }], status: "unloaded" };
+    expect(await readModel(answering(body))).toEqual({ state: "unloaded", id: "qwen3.8-27b", contextLimit: 786432 });
+  });
+
+  it("reads `loading` as the load under way, naming what loads, stamped with when this page first saw it", async () => {
+    saveKey("sk");
+    const body = { data: [{ id: "qwen3.8-27b" }], status: "loading", switching: { from: "qwen3.8-27b", to: "qwen3.8-flash-next" } };
+    expect(await readModel(answering(body), 7)).toEqual({ state: "waking", to: "qwen3.8-flash-next", since: 7 });
+    // Without the ids, what loads is the model listed.
+    expect(await readModel(answering({ data: [{ id: "qwen3.8-27b" }], status: "loading" }), 7)).toEqual({ state: "waking", to: "qwen3.8-27b", since: 7 });
+  });
+
+  it("lets a message go while unloaded, which loads the model, and not while one loads or switches", () => {
+    expect(canSend({ state: "ready", id: "a", contextLimit: null })).toBe(true);
+    expect(canSend({ state: "unloaded", id: "a", contextLimit: null })).toBe(true);
+    expect(canSend({ state: "waking", to: "a", since: 0 })).toBe(false);
+    expect(canSend({ state: "switching", from: "a", to: "b", since: 0 })).toBe(false);
+    expect(canSend({ state: "loading" })).toBe(false);
+  });
+
+  it("follows a load each second until it serves, and leaves an unloaded model alone", () => {
+    expect(switchFollowed({ state: "waking", to: "a", since: 0 })).toBe(true);
+    expect(switchFollowed({ state: "unloaded", id: "a", contextLimit: null })).toBe(false);
+  });
+
+  it("keeps an unloaded model or a load shown through a failed read, and when the page first saw the load", () => {
+    const unloaded: ModelState = { state: "unloaded", id: "a", contextLimit: null };
+    const waking: ModelState = { state: "waking", to: "a", since: 1000 };
+    expect(afterRefresh(unloaded, { state: "error", message: "x" })).toBe(unloaded);
+    expect(afterRefresh(waking, { state: "error", message: "x" })).toBe(waking);
+    expect(afterRefresh(waking, { state: "waking", to: "a", since: 4000 })).toEqual(waking);
+    expect(afterRefresh(waking, { state: "waking", to: "b", since: 4000 })).toEqual({ state: "waking", to: "b", since: 4000 });
   });
 });

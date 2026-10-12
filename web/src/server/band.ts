@@ -42,17 +42,19 @@ export type RowAction =
 
 /**
  * The row's one action. "Load" follows the server's `switchable`, and is out
- * of reach while a switch runs whatever the last catalog read said; a failed
- * switch is left by switching again, so it stays in reach then.
+ * of reach while a switch or a load runs whatever the last catalog read said;
+ * a failed switch is left by switching again, so it stays in reach then, and
+ * so does an unloaded model (spec model-switch/02), which "Load" loads.
  */
 export function rowAction(row: CatalogRow, model: ModelState): RowAction {
-  if (model.state === "switching" && row.id === model.to) return { kind: "loading" };
+  const loading = model.state === "switching" || model.state === "waking";
+  if (loading && row.id === model.to) return { kind: "loading" };
   if (row.loaded) return { kind: "loaded" };
   // `switchable` decides first: the server knows a switch by id alone can begin
   // (a catalog entry fetched since the last read, the model torn down by a
   // failed restore), whatever `on_disk` last said.
   if (row.switchable || row.on_disk === "complete") {
-    return { kind: "load", enabled: row.switchable && model.state !== "switching" && model.state !== "loading" };
+    return { kind: "load", enabled: row.switchable && !loading && model.state !== "loading" };
   }
   return row.source === "known" ? { kind: "missing" } : { kind: "download" };
 }

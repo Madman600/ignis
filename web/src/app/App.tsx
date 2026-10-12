@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { forgetKey, useAuth } from "../api/auth.ts";
-import { type ModelState, useModel } from "../api/model.ts";
+import { canSend, type ModelState, useModel } from "../api/model.ts";
 import { Composer } from "../conversation/Composer.tsx";
 import { imageFromFile, type PromptImage } from "../conversation/images.ts";
 import { DecideView, type Drawer as DecideDrawer } from "../decide/DecideView.tsx";
@@ -72,7 +72,7 @@ export function App() {
   // and a reload being followed survive a look at the chat.
   const [serverOpened, setServerOpened] = useState(false);
   // A switch runs the header's flame and heat bar as a reply does (spec playground/05).
-  const busy = chat.busy || model.state === "switching";
+  const busy = chat.busy || model.state === "switching" || model.state === "waking";
 
   const readerRun: AgentRun | undefined = reader
     ? active.messages.find((m) => m.id === reader.messageId)?.agents?.find((r) => r.callId === reader.callId)
@@ -152,7 +152,7 @@ export function App() {
           holds a whole typed request, and a glance at the Monitor is not a
           reason to lose it. Nothing here fetches on mount. */}
       <div className={deciding ? "contents" : "hidden"}>
-        <DecideView ready={model.state === "ready"} drawer={decideDrawer} onDrawer={setDecideDrawer} />
+        <DecideView ready={canSend(model)} drawer={decideDrawer} onDrawer={setDecideDrawer} />
       </div>
 
       {serverOpened && (
@@ -194,10 +194,10 @@ export function App() {
             <Composer
               value={input}
               onChange={setInput}
-              ready={model.state === "ready"}
+              ready={canSend(model)}
               busy={chat.sendBlocked}
               streamingHere={chat.streamingHere}
-              usage={contextUsage(active.log, settings.maxTokens, model.state === "ready" ? model.contextLimit : null)}
+              usage={contextUsage(active.log, settings.maxTokens, canSend(model) ? model.contextLimit : null)}
               onSend={send}
               onStop={chat.stop}
               canAttach={tools.enabled && tools.readFiles}
@@ -257,6 +257,6 @@ function Monitor() {
 /** The Server view's state lives here, and its clock ticks only while a switch runs. */
 function Server({ model, refreshModel, streaming, visible }: { model: ModelState; refreshModel: () => void; streaming: boolean; visible: boolean }) {
   const [state, actions] = useServer(model, refreshModel, visible);
-  const now = useTick(model.state === "switching");
+  const now = useTick(model.state === "switching" || model.state === "waking");
   return <ServerView model={model} state={state} actions={actions} streaming={streaming} now={now} />;
 }

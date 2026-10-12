@@ -11,6 +11,14 @@ import { authHeaders, keyRequired, useAuth } from "./auth.ts";
 // ids) and every other /v1 route answers 503; the page reads it again each
 // second until the switch lands, so every view sees it — the header's flame
 // and heat bar, its model status, the composer that is not ready meanwhile.
+//
+// A model nobody used for `model.idle_unload` seconds is unloaded (spec
+// model-switch/02): `status: unloaded`, the same id listed. That is a state,
+// not an error, and it is not followed — polling GET /v1/models neither keeps
+// a model loaded nor loads it — so the page shows it until a turn starts and
+// reads again. A message sent meanwhile loads the model and is answered once
+// it is warm; while that load runs (`status: loading`) the page follows it
+// each second, as it follows a switch.
 
 /** How the last switch or reload since start ended (`last_switch`, spec playground/05). */
 export type LastSwitch = {
@@ -28,6 +36,10 @@ export type ModelState =
   | { state: "ready"; id: string; contextLimit: number | null; lastSwitch?: LastSwitch }
   /** `since`: when this page first saw this switch, for the seconds it has run. */
   | { state: "switching"; from: string; to: string; since: number; lastSwitch?: LastSwitch }
+  /** Unloaded while idle (`status: unloaded`): the next message loads `id` again. */
+  | { state: "unloaded"; id: string; contextLimit: number | null; lastSwitch?: LastSwitch }
+  /** A model loads while none is loaded (`status: loading`): `to` is the one loading, `since` as for a switch. */
+  | { state: "waking"; to: string; since: number; lastSwitch?: LastSwitch }
   /** `failed`: the server reports a switch that failed (`status: failed`), not a read that did. */
   | { state: "error"; message: string; failed?: true; lastSwitch?: LastSwitch };
 
@@ -59,7 +71,10 @@ export async function readModel(fetcher: typeof fetch = fetch, now = Date.now())
     }
     const id = body.data?.[0]?.id;
     if (!id) throw new Error("GET /v1/models: no model listed");
-    return { state: "ready", id, contextLimit: body.data?.[0]?.max_model_len ?? null, ...last };
+    const contextLimit = body.data?.[0]?.max_model_len ?? null;
+    if (body.status === "unloaded") return { state: "unloaded", id, contextLimit, ...last };
+    if (body.status === "loading") return { state: "waking", to: body.switching?.to ?? id, since: now, ...last };
+    return { state: "ready", id, contextLimit, ...last };
   } catch (err) {
     return { state: "error", message: String(err) };
   }
@@ -71,20 +86,32 @@ export async function readModel(fetcher: typeof fetch = fetch, now = Date.now())
  * was first seen. A failed switch the server reports always shows.
  */
 export function afterRefresh(shown: ModelState, read: ModelState): ModelState {
-  if (read.state === "error" && !read.failed && (shown.state === "ready" || shown.state === "switching")) return shown;
+  if (read.state === "error" && !read.failed && shown.state !== "loading" && shown.state !== "error") return shown;
   if (read.state === "switching" && shown.state === "switching" && read.from === shown.from && read.to === shown.to) {
     return { ...read, since: shown.since };
   }
+  if (read.state === "waking" && shown.state === "waking" && read.to === shown.to) return { ...read, since: shown.since };
   return read;
 }
 
 /**
- * Whether the page follows a switch, re-reading each second: one runs, or the
- * server reports one failed — briefly, while the old model is loaded again,
- * or until a switch succeeds — so the page sees it through to `serving`.
+ * Whether a message may be sent now: a model serves, or one was unloaded while
+ * idle and the message loads it again (spec model-switch/02). Not while a
+ * switch or a load runs: the composer opens once the model serves.
+ */
+export function canSend(model: ModelState): model is Extract<ModelState, { state: "ready" | "unloaded" }> {
+  return model.state === "ready" || model.state === "unloaded";
+}
+
+/**
+ * Whether the page follows a switch, re-reading each second: one runs, a model
+ * loads while none is loaded, or the server reports one failed — briefly,
+ * while the old model is loaded again, or until a switch succeeds — so the
+ * page sees it through to `serving`. An unloaded model is not followed: it
+ * stays so until something sends a request.
  */
 export function switchFollowed(model: ModelState): boolean {
-  return model.state === "switching" || (model.state === "error" && model.failed === true);
+  return model.state === "switching" || model.state === "waking" || (model.state === "error" && model.failed === true);
 }
 
 export function useModel(): [ModelState, () => void] {

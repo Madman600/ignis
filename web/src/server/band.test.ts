@@ -41,6 +41,14 @@ describe("rowAction", () => {
     // A failed switch is left by switching again.
     expect(rowAction(row("qwen3.8-27b-fail"), { state: "error", message: "Switch failed: x", failed: true })).toEqual({ kind: "load", enabled: true });
   });
+  it("offers Load on the unloaded model, marks it loading while it loads, and offers no Load meanwhile (spec model-switch/02)", () => {
+    const unloaded: ModelState = { state: "unloaded", id: "qwen3.8-27b", contextLimit: 786432 };
+    const asleep = { ...row("qwen3.8-27b"), loaded: false, switchable: true };
+    expect(rowAction(asleep, unloaded)).toEqual({ kind: "load", enabled: true });
+    const waking: ModelState = { state: "waking", to: "qwen3.8-27b", since: 0 };
+    expect(rowAction(asleep, waking)).toEqual({ kind: "loading" });
+    expect(rowAction(row("qwen3.8-flash-next"), waking)).toEqual({ kind: "load", enabled: false });
+  });
 });
 
 describe("row labels", () => {

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { LastSwitch, ModelState } from "../api/model.ts";
+import { canSend, type LastSwitch, type ModelState } from "../api/model.ts";
 import { dropDraft, type Draft, editDraft, type InForce, patchBody, removeDraft } from "./form.ts";
 import { afterPatch, afterSwitch, type Line, type PendingReload, settleReload } from "./outcome.ts";
 import {
@@ -109,7 +109,7 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
   useEffect(() => {
     const before = lastState.current;
     lastState.current = model.state;
-    if (model.state === "ready" && (before === "switching" || before === "error")) reread();
+    if (model.state === "ready" && (before === "switching" || before === "waking" || before === "error")) reread();
   }, [model.state, reread]);
 
   // Another model now serves: a draft made against the old one's values is
@@ -127,7 +127,8 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
 
   useEffect(() => {
     if (!awaiting) return;
-    if (model.state !== "ready" || !sameSwitch(model.lastSwitch, awaiting.before)) {
+    // An unloaded model is followed too: Load on it answers 202 before it loads.
+    if (!canSend(model) || !sameSwitch(model.lastSwitch, awaiting.before)) {
       setAwaiting(null);
       return;
     }
