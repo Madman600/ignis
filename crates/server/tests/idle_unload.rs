@@ -198,7 +198,6 @@ async fn a_request_in_flight_keeps_the_model_and_the_clock_starts_when_it_ends()
     drop(gated);
     let server = idle_server(&loader, model, IDLE, &[]);
     let app = server.app();
-    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
     let mut body = chat(None);
     body["stream"] = json!(true);
     let streaming = tokio::spawn({
@@ -211,6 +210,8 @@ async fn a_request_in_flight_keeps_the_model_and_the_clock_starts_when_it_ends()
     })
     .await
     .unwrap();
+    // The clock starts with the stream already held: no race to admit it.
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
 
     tokio::time::sleep(IDLE * 2).await;
     assert_eq!(*server.status(), ModelStatus::Serving, "a stream held mid-decode is use");
@@ -479,9 +480,10 @@ async fn a_request_admitted_but_not_yet_submitted_is_not_unloaded_under() {
     model.template = Arc::new(template);
     let server = idle_server(&loader, model, IDLE, &[]);
     let app = server.app();
-    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
     let pending = chat_task(&app, None);
     tokio::task::spawn_blocking(move || entered.recv_timeout(PATIENT).expect("the render began")).await.unwrap();
+    // The clock starts with the request already admitted: no race to admit it.
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
 
     tokio::time::sleep(IDLE * 2).await;
     let counters = server.active().engine.interval_counters();
@@ -552,11 +554,12 @@ async fn an_unload_due_while_a_switch_runs_waits_for_it() {
     let loader = MockLoader::new();
     let server = idle_server(&loader, loader.model("mock-a"), IDLE, &[]);
     let app = server.app();
-    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
     let release = loader.hold_next_load();
     let switch = json!({ "artifact": "mock-b.ninfer", "model": "mock-b" });
     let (status, _) = send(&app, Method::POST, "/v1/models/switch", Some(switch)).await;
     assert_eq!(status, StatusCode::ACCEPTED);
+    // The clock starts with the switch already holding the slot.
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
 
     tokio::time::sleep(IDLE * 2).await;
     assert!(matches!(*server.status(), ModelStatus::Switching { .. }), "no unload under a switch: {:?}", server.status());
@@ -593,12 +596,13 @@ async fn a_live_patch_turning_idle_unload_on_unloads_after_the_new_seconds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_live_patch_turning_idle_unload_off_stops_a_pending_unload() {
     let loader = MockLoader::new();
-    let server = configured_server(&loader, started("off", &["--model-idle-unload", "2"]));
+    let server = configured_server(&loader, started("off", &["--model-idle-unload", "3"]));
     let app = server.app();
     let _clock = server.spawn_idle_clock(TICK).expect("a clock");
     tokio::time::sleep(IDLE).await;
     let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "model": { "idle_unload": 0 } }))).await;
     assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(*server.status(), ModelStatus::Serving, "changed before it was due");
     tokio::time::sleep(IDLE * 3).await;
     assert_eq!(*server.status(), ModelStatus::Serving);
     assert_eq!(loader.resident(), 1);
@@ -643,10 +647,10 @@ async fn the_catalog_offers_the_unloaded_model_to_load() {
         .with_known_models(BTreeMap::from([("mock-a".to_owned(), artifact)]));
     let server = Server::from_active(loader.model("mock-a")).with_switcher(switcher).with_idle_unload(IDLE);
     let app = server.app();
-    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
     let (_, catalog) = send(&app, Method::GET, "/v1/models/catalog", None).await;
     let row = |catalog: &Value| catalog["data"].as_array().unwrap().iter().find(|row| row["id"] == "mock-a").cloned().unwrap();
     assert_eq!((row(&catalog)["loaded"].clone(), row(&catalog)["switchable"].clone()), (json!(true), json!(false)), "{catalog}");
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
     unloaded(&server, &loader).await;
     let (_, catalog) = send(&app, Method::GET, "/v1/models/catalog", None).await;
     assert_eq!((row(&catalog)["loaded"].clone(), row(&catalog)["switchable"].clone()), (json!(false), json!(true)), "{catalog}");
