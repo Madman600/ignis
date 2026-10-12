@@ -366,17 +366,19 @@ async fn count_use(State(server): State<Arc<Server>>, req: Request, next: Next) 
     next.run(req).await.map(|body| axum::body::Body::new(crate::idle::Counted::new(body, in_use)))
 }
 
-/// The routes whose requests use the model (ADR 0049 §2: what the serving
+/// The routes whose `POST` uses the model (ADR 0049 §2: what the serving
 /// gate holds, apart from the routes that only report state or drive a
 /// switch): the completions, the decision and its alias, and the counting
 /// routes, which read the model's tokenizer. The Responses socket's upgrade
-/// is not one: its jobs count, one by one (`crate::responses::socket`).
+/// is not one: its jobs count, one by one (`crate::responses::socket`). A
+/// test classifies every documented `/v1` operation as one of these or as
+/// one that does not use the model, so a new route is never left out unseen.
+const MODEL_ROUTES: [&str; 6] =
+    ["/v1/chat/completions", "/v1/responses", "/v1/decide", "/v1/systemone", "/v1/tokenize", "/v1/detokenize"];
+
+/// Whether a request uses the model ([`MODEL_ROUTES`]), for idle unload.
 fn uses_the_model(method: &axum::http::Method, path: &str) -> bool {
-    method == axum::http::Method::POST
-        && matches!(
-            path,
-            "/v1/chat/completions" | "/v1/responses" | "/v1/decide" | "/v1/systemone" | "/v1/tokenize" | "/v1/detokenize"
-        )
+    method == axum::http::Method::POST && MODEL_ROUTES.contains(&path)
 }
 
 /// The response refusing a request whose `model` did not get it served on
@@ -2901,6 +2903,57 @@ pub(crate) struct ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec model-switch/02: every `/v1` operation the reference documents
+    /// is classified for idle unload — it uses the model ([`uses_the_model`],
+    /// counted as use) or it is listed here as one that does not — so a
+    /// route added to [`v1_parts`] without a side fails here rather than
+    /// going uncounted, and an unload never lands under its request.
+    #[test]
+    fn every_documented_v1_operation_is_classified_for_idle_unload() {
+        // The operations that do not use the model, and why.
+        let not_the_model = [
+            // They report state: a page polling them must neither keep the
+            // model loaded nor load it again (AC 5).
+            ("GET", "/v1/models"),
+            ("GET", "/v1/models/catalog"),
+            ("GET", "/v1/config"),
+            ("GET", "/v1/config/fields"),
+            ("GET", "/v1/config/origins"),
+            // They drive a switch or a reload, which holds the switch's slot.
+            ("POST", "/v1/models/switch"),
+            ("PATCH", "/v1/config"),
+            // The Responses socket's upgrade: its jobs count, one by one.
+            ("GET", "/v1/responses"),
+        ];
+        let (_, document) = v1_parts();
+        let document = serde_json::to_value(&document).expect("the document serializes");
+        let mut operations = Vec::new();
+        for (path, item) in document["paths"].as_object().expect("paths") {
+            for method in item.as_object().expect("a path item").keys() {
+                if let Ok(method) = axum::http::Method::from_bytes(method.to_uppercase().as_bytes()) {
+                    operations.push((method, path.clone()));
+                }
+            }
+        }
+        assert!(operations.len() > not_the_model.len(), "{operations:?}");
+        for (method, path) in &operations {
+            let listed = not_the_model.contains(&(method.as_str(), path.as_str()));
+            assert_ne!(
+                uses_the_model(method, path),
+                listed,
+                "{method} {path}: classify it for idle unload, as a model route (MODEL_ROUTES) or one that is not"
+            );
+        }
+        for (method, path) in not_the_model {
+            assert!(operations.iter().any(|(m, p)| m.as_str() == method && p == path), "{method} {path} is not documented");
+        }
+        // Every model route is a documented `POST`, or the decision's alias.
+        for path in MODEL_ROUTES {
+            let documented = operations.iter().any(|(m, p)| *m == axum::http::Method::POST && p == path);
+            assert!(documented || path == "/v1/systemone", "{path} is not a documented POST");
+        }
+    }
 
     #[test]
     fn a_chunk_serializes_in_the_openai_shape() {
