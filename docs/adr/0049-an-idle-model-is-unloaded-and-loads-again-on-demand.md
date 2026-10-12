@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-10-12, owner). Spec `docs/specs/model-switch/02-idle-unload.md`.
+Accepted (2026-10-12, owner). GitHub #317, spec `docs/specs/model-switch/02-idle-unload.md`.
 Builds on the runtime model switch (spec model-switch/01, #305) and on
 config v2 (ADR 0046) for the knob.
 

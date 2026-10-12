@@ -1,6 +1,6 @@
 # 02 — idle unload: the model leaves the GPU when nobody uses it
 
-GitHub: #TBD. ADR 0049. Builds on spec 01 (runtime model switch) and on
+GitHub: #317. ADR 0049. Builds on spec 01 (runtime model switch) and on
 config v2 (spec `docs/specs/config-v2/`).
 
 ## Problem
