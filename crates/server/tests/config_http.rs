@@ -1070,6 +1070,74 @@ async fn a_family_flag_that_outranks_a_patched_group_value_at_restart_is_named()
     assert_eq!(restarted.settings().vram.headroom_bytes, 1 << 30, "the flag's value at the next start");
 }
 
+/// The text of `GET /v1/config?format=yaml`.
+async fn yaml_of(app: &axum::Router) -> String {
+    let request = Request::builder().uri("/v1/config?format=yaml").body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
+}
+
+/// What `ignis-server config print` writes for the config file at `path`
+/// and `flags`, minus the hidden fields.
+fn printed(path: &str, flags: &[&str]) -> String {
+    let argv: Vec<String> = ["config", "print", "--file", path].iter().chain(flags).map(|s| s.to_string()).collect();
+    let ConfigOutcome::Print(printed) = resolve_with(&argv, |_| None, &RealFiles).unwrap() else { panic!("config print prints") };
+    let mut printed = Format::Yaml.read(&printed).unwrap();
+    ignis_server::config_http::remove_invisible(&mut printed, all_fields());
+    Format::Yaml.write(&printed)
+}
+
+/// Spec playground/05 AC 31: on a running configuration fitted to its
+/// family — the built-in `rtx5090` profile with its per-family numbers, a
+/// file with a family section, a flag — `GET /v1/config?format=yaml` is the
+/// file `config print` writes for the same sources, whichever family runs;
+/// and after a live change, the file `config print` writes from the
+/// rewritten config file.
+#[tokio::test]
+async fn get_config_as_yaml_on_a_fitted_configuration_is_what_config_print_writes() {
+    for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
+        let path = config_file(
+            &format!("yaml-fitted-{}", scope(family)),
+            "reuse:\n  kv_host_pool_bytes: 3G\n  qwen38:\n    kv_host_pool_bytes: 4G\nmodel:\n  qwen38flashnext:\n    max_context: 65536\n",
+        );
+        let path = path.to_str().unwrap();
+        let flags = ["--model-prefill-chunk", "2048"];
+        let loader = MockLoader::new();
+        let server = family_server(&loader, family, started(&[&["--config", path][..], &flags].concat()));
+        assert_eq!(server.config.as_ref().unwrap().current().basis.family(), Some(family), "fitted");
+        let app = server.app();
+        assert_eq!(yaml_of(&app).await, printed(path, &flags), "{family:?}: the start's sources");
+
+        let other = if family == ModelFamily::FlashNext { "qwen38" } else { "qwen38flashnext" };
+        let body = json!({ "reuse": { other: { "prompt": false } }, "server": { "request_timeout": 45 } });
+        let applied = patched(&app, body).await;
+        assert_eq!((applied["applied"].clone(), applied["persisted"].clone()), (json!("live"), json!(true)), "{applied}");
+        assert_eq!(yaml_of(&app).await, printed(path, &flags), "{family:?}: the rewritten file's");
+    }
+}
+
+/// Spec playground/05 AC 31: a removal names its keys — a whole group or a
+/// family's whole section set to `null` is `400 config_invalid`, and nothing
+/// in the patch applies.
+#[tokio::test]
+async fn a_whole_group_or_section_set_to_null_is_refused_and_nothing_applies() {
+    let path = config_file("null-whole", "server:\n  request_timeout: 30\nreuse:\n  qwen38:\n    prompt: false\n");
+    let loader = MockLoader::new();
+    let server = qwen_server(&loader, &["--config", path.to_str().unwrap(), "--profile", "none"]);
+    let app = server.app();
+    let before = std::fs::read_to_string(&path).unwrap();
+    for (removal, says) in [(json!(null), "`reuse: null`"), (json!({ "qwen38": null }), "`reuse.qwen38: null`")] {
+        let body = json!({ "server": { "request_timeout": 92 }, "reuse": removal });
+        let (status, refused) = send(&app, Method::PATCH, "/v1/config", Some(body.clone())).await;
+        assert_eq!((status, refused["error"]["code"].clone()), (StatusCode::BAD_REQUEST, json!("config_invalid")), "{body}: {refused}");
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(message.contains(says) && message.contains("one field at a time"), "{message}");
+    }
+    assert_eq!(server.live().request_timeout, Duration::from_secs(30), "nothing applied");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "nothing written");
+}
+
 /// Spec playground/05 AC 28: the origins answer as `GET /v1/config` does —
 /// during a switch, behind the API key, the preflight passed — and `501` on
 /// a server with no running configuration.
