@@ -741,7 +741,11 @@ A model nobody uses gives the card back. After `--model-idle-unload` seconds
 nothing waiting or running on the engine, the server unloads the model the way
 a switch does — VRAM, pinned host memory and KV-RAM all freed — and stays up:
 the API, `/metrics` and the Playground keep answering, and `GET /v1/models`
-lists the same model with `status: "unloaded"`.
+lists the same model with `status: "unloaded"`. Meanwhile `/metrics` shows
+nothing reserved: the VRAM-plan, KV pool and KV-RAM gauges read zero until the
+next load. A switch sent during the seconds the unload tears the model down is
+refused `409 switch_in_progress` naming the unload; send it again once
+`GET /v1/models` says `unloaded`.
 
 The next request that needs the model — a chat completion, a response (over
 HTTP or on a WebSocket opened before the unload), a decision — loads it again

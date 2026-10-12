@@ -141,7 +141,18 @@ Where the implementation chose what the sections above leave open.
 - **No race with the unload.** The clock decides and stores `unloaded` while
   holding the count's lock (`Usage::when_idle` → `model_switch::claim_unload`),
   which an admission takes too: a request admitted around the unload either
-  kept it from happening or reads `unloaded` and loads.
+  kept it from happening or reads `unloaded` and loads. The unload holds the
+  switch's slot as `Slot::Unload` until its teardown is done; the teardown,
+  its line and the slot's release run as one unit on the blocking thread,
+  so a clock stopped mid-unload (its serve loop ending) never frees the slot
+  under a teardown still running. A switch or a reloading `PATCH` arriving
+  meanwhile is refused `409 switch_in_progress` naming the unload.
+- **The engine audit.** Nothing calls the torn-down engine: the gate's
+  routes load first, and the tokenize routes read only what the model kept.
+  `/metrics` answers throughout, and the unload sets what the last load
+  reserved and occupied to no load at all (reservations and occupancy zero,
+  no disk tier, no Flash-Next counters), in the same unit as its teardown;
+  the next load's `observe_load` writes its own.
 - **The load on demand** is `model_switch::ensure_loaded`, called first in
   `api::switch_to_named_model` (chat, responses, the socket's jobs) and in
   `/v1/decide`. A request naming a model the server does not know loads the
@@ -153,13 +164,14 @@ Where the implementation chose what the sections above leave open.
   The catalog lists no row as loaded while unloaded or loading, and the
   unloaded model as switchable (the Server view's "Load").
 - **What is recorded.** AC 14's "the load after it" is the load a request
-  begins: `ignis.model.reloaded`, and `last_switch` is left alone. An
+  begins: `ignis.model.load_started` and `ignis.model.reloaded` (or
+  `ignis.model.reload_failed`), and `last_switch` is left alone. An
   explicit `POST /v1/models/switch` or a reloading `PATCH /v1/config` out of
-  `unloaded` is still a switch or a reload, logged and recorded in
-  `last_switch` as one: ADR 0049 §5's reason (the field tells what the last
-  switch did) makes it one, and the Server view settles a switch or reload
-  it began on that record. Its status is `loading`, since nothing is
-  drained. A failed load out of `unloaded` sets `failed`; the serving gate
+  `unloaded` is still a switch or a reload, logged (`switch_started`,
+  `switched`) and recorded in `last_switch` as one: ADR 0049 §5's reason
+  (the field tells what the last switch did) makes it one, and the Server
+  view settles a switch or reload it began on that record. Its status is
+  `loading`, since nothing is drained. A failed load out of `unloaded` sets `failed`; the serving gate
   lets requests through then (the next one tries again) because the status
   says the failed run left `unloaded` (`ModelStatus::Failed`'s
   `from_unloaded`, which `refusal()` reads) — a failed switch with nothing
