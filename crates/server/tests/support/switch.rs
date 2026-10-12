@@ -38,9 +38,15 @@ struct State {
     refused: Mutex<HashSet<String>>,
     /// Ids whose load fails after prepare accepted them.
     broken: Mutex<HashSet<String>>,
-    /// When set, the next load waits for a message on it before it builds:
-    /// how a test holds a switch inside its load step.
-    hold: Mutex<Option<Receiver<()>>>,
+    /// Each load takes the first of these and waits for a message on it
+    /// before it builds: how a test holds a switch inside its load step (a
+    /// second one holds the reload that follows a failed load).
+    hold: Mutex<std::collections::VecDeque<Receiver<()>>>,
+    /// The configuration every prepared load reports as the one it runs
+    /// with ([`PreparedLoad::options`]), as the production loader does:
+    /// what makes a switch re-apply the server-level values once a model
+    /// serves.
+    serving: Mutex<Option<ignis_server::config::Config>>,
     /// The options each prepare was handed (spec config-v2/02: a reload
     /// with a changed config hands its patched config; a switch none).
     options: Mutex<Vec<Option<ignis_server::config::Config>>>,
@@ -91,10 +97,17 @@ impl MockLoader {
     }
 
     /// Hold the next load until the returned sender sends (or is dropped).
+    /// Called again before that load runs, it holds the one after.
     pub fn hold_next_load(&self) -> Sender<()> {
         let (release, hold) = channel();
-        *self.state.hold.lock().unwrap() = Some(hold);
+        self.state.hold.lock().unwrap().push_back(hold);
         release
+    }
+
+    /// Have every prepared load report `config` as the one it runs with, as
+    /// the production loader does.
+    pub fn serve_with(&self, config: ignis_server::config::Config) {
+        *self.state.serving.lock().unwrap() = Some(config);
     }
 
     /// How many built models were alive as each load began.
@@ -142,18 +155,20 @@ impl ModelLoader for MockLoader {
         if self.state.refused.lock().unwrap().contains(&target.model) {
             return Err(format!("{} refused at prepare (simulated)", target.model));
         }
-        Ok(Box::new(MockPrepared { state: Arc::clone(&self.state), id: target.model.clone() }))
+        let options = self.state.serving.lock().unwrap().clone();
+        Ok(Box::new(MockPrepared { state: Arc::clone(&self.state), id: target.model.clone(), options }))
     }
 }
 
 struct MockPrepared {
     state: Arc<State>,
     id: String,
+    options: Option<ignis_server::config::Config>,
 }
 
 impl PreparedLoad for MockPrepared {
     fn load(self: Box<Self>) -> Result<LoadedModel, String> {
-        let hold = self.state.hold.lock().unwrap().take();
+        let hold = self.state.hold.lock().unwrap().pop_front();
         if let Some(hold) = hold {
             let _ = hold.recv();
         }
@@ -163,5 +178,9 @@ impl PreparedLoad for MockPrepared {
             return Err(format!("{} failed to load (simulated kernel load error)", self.id));
         }
         Ok(LoadedModel { model: build(&self.state, &self.id, Arc::new(MockCompute::new())), reservations: None })
+    }
+
+    fn options(&self) -> Option<&ignis_server::config::Config> {
+        self.options.as_ref()
     }
 }

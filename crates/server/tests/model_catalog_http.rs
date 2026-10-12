@@ -243,6 +243,8 @@ async fn the_catalog_answers_while_failed_and_offers_the_way_out() {
     let (status, rows) = send(&app, Method::GET, "/v1/models/catalog", None).await;
     assert_eq!(status, StatusCode::OK, "{rows}");
     assert_eq!(row(&rows, "mock-c")["switchable"], true, "a switch recovers a failed server");
+    assert!(rows["data"].as_array().unwrap().iter().all(|row| row["loaded"] == false), "nothing serves, so no row is loaded: {rows}");
+    assert_eq!(row(&rows, "mock-a")["switchable"], true, "the torn-down model is a way out too");
     let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(elsewhere));
 }
 
@@ -461,4 +463,57 @@ async fn a_server_with_no_switcher_lists_the_loaded_model_alone() {
     assert_eq!(rows["data"].as_array().unwrap().len(), 1, "{rows}");
     assert_eq!(rows["data"][0]["id"], "mock-a");
     assert_eq!((rows["data"][0]["loaded"].clone(), rows["data"][0]["switchable"].clone()), (json!(true), json!(false)));
+}
+
+/// The start model stays switchable by id for the server's life: every
+/// switch that lands re-applies the server-level values (`apply_config`), and
+/// the table it rebuilds must still hold the model the server started on.
+#[tokio::test]
+async fn the_start_model_stays_switchable_by_id_after_a_switch_re_applies_the_config() {
+    let loader = MockLoader::new();
+    let argv: Vec<String> = Vec::new();
+    let config = match resolve_with(&argv, |_| None, &RealFiles).unwrap() {
+        ConfigOutcome::Config(config) => config,
+        other => panic!("{other:?}"),
+    };
+    loader.serve_with(config);
+    let models = catalog_in("start-stays", &[("mock-cat", Disk::Absent)]);
+    let elsewhere = fresh_dir("start-stays-elsewhere");
+    let start = file_in(&elsewhere, "mock-a.ninfer", b"start");
+    let dir = models.dir.clone();
+    let app = server_with(&loader, &start, models, &[], true).app();
+
+    switch_to(&app, "mock-b").await;
+    until_status(&app, "serving").await;
+    let (_, rows) = send(&app, Method::GET, "/v1/models/catalog", None).await;
+    assert_eq!(row(&rows, "mock-a")["switchable"], true, "the way back to the start model: {rows}");
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(json!({ "model": "mock-a" }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    assert_eq!(until_status(&app, "serving").await["data"][0]["id"], "mock-a");
+    assert_eq!(loader.prepared_artifacts().last(), Some(&start));
+    let _ = (std::fs::remove_dir_all(dir), std::fs::remove_dir_all(elsewhere));
+}
+
+/// A switch task that dies while the old model is being reloaded leaves
+/// `failed` and says so in `last_switch`: the status is already `failed`
+/// then, so the guard that records a task dying mid-switch must not wait for
+/// `switching`.
+#[tokio::test]
+async fn last_switch_is_recorded_when_the_switch_task_dies_during_the_reload() {
+    let loader = MockLoader::new();
+    loader.break_load("mock-b");
+    let server = plain(&loader);
+    let app = server.app();
+    let release = loader.hold_next_load();
+    let (_, task) = ignis_server::model_switch::begin(&server, switch_support::source("mock-b")).expect("a switch begins");
+    let _held_reload = loader.hold_next_load();
+    release.send(()).expect("the held load is waiting");
+    until_status(&app, "failed").await;
+    task.abort();
+    assert!(task.await.expect_err("the task was aborted").is_cancelled());
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!(models["status"], "failed", "{models}");
+    assert_eq!(models["last_switch"]["outcome"], "failed", "{models}");
+    assert_eq!(models["last_switch"]["reason"], models["reason"]);
+    assert_eq!((models["last_switch"]["from"].clone(), models["last_switch"]["to"].clone()), (json!("mock-a"), json!("mock-b")));
 }

@@ -213,6 +213,27 @@ pub struct Switcher {
     /// How the last switch or reload ended, once there has been one
     /// ([`Switcher::last_switch`]).
     last: Mutex<Option<LastSwitch>>,
+    /// Whether the switch under way has said how it ended
+    /// ([`Switcher::record`]): a task that dies without having is recorded
+    /// as failed by its guard.
+    settled: AtomicBool,
+    /// The model the server started on, kept for the server's life: a switch
+    /// replaces the loaded model, but the way back to this one must stay
+    /// listed ([`Switcher::tables`]). Set once, by the start or by the first
+    /// switch, whichever sees it first.
+    start: Mutex<Option<ModelSource>>,
+}
+
+/// The two tables a server's models are named by, computed together from the
+/// operator's list ([`Switcher::tables`]).
+#[derive(Debug, Clone, Default)]
+pub struct SwitchTables {
+    /// The models an explicit switch by id may name: the operator's and the
+    /// start model, whatever `switch.allow_implicit` says.
+    pub listed: BTreeMap<String, PathBuf>,
+    /// The models a request naming one switches to: `listed`, or none with
+    /// implicit switching off.
+    pub known: BTreeMap<String, PathBuf>,
 }
 
 /// How the last switch or reload since start ended, for `GET /v1/models`
@@ -282,11 +303,40 @@ impl Switcher {
             catalog_on: AtomicBool::new(false),
             listed: Mutex::new(BTreeMap::new()),
             last: Mutex::new(None),
+            settled: AtomicBool::new(true),
+            start: Mutex::new(None),
         }
     }
 
+    /// Remember `start`, the model the server started on, as one the server
+    /// can always switch back to. The first one remembered stays: it is the
+    /// start, not a model a switch brought.
+    pub fn note_start(&self, start: Option<&ModelSource>) {
+        let mut kept = self.start.lock().expect("start model lock");
+        if kept.is_none() {
+            *kept = start.cloned();
+        }
+    }
+
+    /// The model the server started on, once it is known.
+    pub fn start(&self) -> Option<ModelSource> {
+        self.start.lock().expect("start model lock").clone()
+    }
+
+    /// The tables of models a switch may name, from the operator's list
+    /// `named` and the start model: what `main` sets at start and
+    /// [`Server::apply_config`] rebuilds after every switch and config
+    /// change, so the two can never disagree. `allow_implicit` is
+    /// `switch.allow_implicit`: it empties the table a request's own `model`
+    /// reads and leaves the one an explicit switch by id reads.
+    pub fn tables(&self, named: &BTreeMap<String, PathBuf>, allow_implicit: bool) -> SwitchTables {
+        let listed = known_models(named, self.start().as_ref());
+        let known = if allow_implicit { listed.clone() } else { BTreeMap::new() };
+        SwitchTables { listed, known }
+    }
+
     /// Let an explicit switch by id name `listed`'s models even with implicit
-    /// switching off; `main` passes [`known_models`]' table, whatever
+    /// switching off; `main` passes [`Switcher::tables`]' table, whatever
     /// `--switch-allow-implicit` says.
     pub fn with_listed_models(self, listed: BTreeMap<String, PathBuf>) -> Self {
         *self.listed.lock().expect("listed models lock") = listed;
@@ -377,6 +427,7 @@ impl Switcher {
     /// `switching` or `failed`, so a client that reads `serving` finds its
     /// reason already here.
     fn record(&self, from: &str, to: &str, outcome: &SwitchOutcome) {
+        self.settled.store(true, Ordering::SeqCst);
         *self.last.lock().expect("last switch lock") =
             Some(LastSwitch { from: from.to_owned(), to: to.to_owned(), outcome: outcome.clone() });
     }
@@ -487,8 +538,15 @@ struct RunningGuard {
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
-        if matches!(**self.status.load(), ModelStatus::Switching { .. }) {
-            let reason = "the switch ended before it finished (see ignis.model.switch_panicked)".to_owned();
+        // Mid-switch, or in the reload after a failed load (the status is
+        // already `failed` then, but the switch has not said how it ended).
+        let status = self.status.load_full();
+        let reason = match &*status {
+            ModelStatus::Switching { .. } => Some("the switch ended before it finished (see ignis.model.switch_panicked)".to_owned()),
+            ModelStatus::Failed { reason } if !self.switcher.settled.load(Ordering::SeqCst) => Some(reason.clone()),
+            _ => None,
+        };
+        if let Some(reason) = reason {
             if let Some(started) = self.switcher.running.lock().expect("switch lock").as_ref() {
                 self.switcher.record(&started.from, &started.to, &SwitchOutcome::Failed { reason: reason.clone() });
             }
@@ -562,6 +620,9 @@ fn begin_with(
         }
         let started = SwitchStarted { from: server.active().engine.model_id(), to: target.model.clone() };
         *running = Some(started.clone());
+        // The model being replaced is the start model if nothing else said so.
+        switcher.note_start(server.active().source.as_ref());
+        switcher.settled.store(false, Ordering::SeqCst);
         (started, before)
     };
     server

@@ -498,3 +498,14 @@ async fn the_preflight_still_answers_on_every_v1_route() {
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
     }
 }
+
+#[test]
+fn the_field_declaration_schema_names_exactly_the_keys_a_declaration_has() {
+    // ADR 0046: the route builds each object with `FieldMeta::declaration`;
+    // the schema restating it by hand must not drift from it silently.
+    let document = document();
+    let schema: BTreeSet<String> =
+        document["components"]["schemas"]["FieldDeclaration"]["properties"].as_object().expect("properties").keys().cloned().collect();
+    let declared: BTreeSet<String> = ignis_server::config::schema::all_fields().next().expect("a field").declaration().keys().cloned().collect();
+    assert_eq!(schema, declared);
+}

@@ -124,12 +124,29 @@ impl Validator {
     /// own shape — `{ "min", "max" }` (an open end is `null`),
     /// `{ "multiple_of" }` or `{ "one_of": [..] }`. [`Validator::describe`] is
     /// the same rule as the sentence a person reads.
-    pub fn to_json(&self) -> Value {
+    ///
+    /// A [`Validator::OneOf`] lists the spellings the field *accepts*, which
+    /// may name one value twice (`hq` and `hq-e8-2b`); `canonical` is the
+    /// field's own ([`FieldMeta::canonical`]), and each value is listed once,
+    /// as the config writes it, in the order first seen.
+    pub fn to_json(&self, canonical: fn(&str) -> Result<Value, String>) -> Value {
         match *self {
             Validator::None => Value::Null,
             Validator::Range { min, max } => serde_json::json!({ "min": min, "max": max }),
             Validator::MultipleOf(step) => serde_json::json!({ "multiple_of": step }),
-            Validator::OneOf(allowed) => serde_json::json!({ "one_of": allowed }),
+            Validator::OneOf(allowed) => {
+                let mut values: Vec<String> = Vec::new();
+                for spelling in allowed {
+                    let written = match canonical(spelling) {
+                        Ok(Value::String(written)) => written,
+                        _ => (*spelling).to_owned(),
+                    };
+                    if !values.contains(&written) {
+                        values.push(written);
+                    }
+                }
+                serde_json::json!({ "one_of": values })
+            }
         }
     }
 }
@@ -343,7 +360,7 @@ impl FieldMeta {
             "kind": self.kind,
             "nullable": self.nullable,
             "default": (self.default)(),
-            "rule": self.validator.to_json(),
+            "rule": self.validator.to_json(self.canonical),
             "rule_text": self.validator.describe(),
             "families": self.applies.to_json(),
             "scoped": self.scoped,

@@ -475,7 +475,9 @@ async fn the_fields_rule_families_and_nullable_follow_the_declaration() {
     let (_, fields) = send(&app, Method::GET, "/v1/config/fields", None).await;
     assert_eq!(declaration(&fields, "model.prefill_chunk")["rule"], json!({ "multiple_of": 128 }));
     assert_eq!(declaration(&fields, "model.prefill_chunk")["rule_text"], "nonzero multiple of 128");
-    assert_eq!(declaration(&fields, "model.kv_format")["rule"], json!({ "one_of": ["bf16", "hq-e8-2b", "hq_e8_2b", "hq"] }));
+    // Each value once, in the form the config writes it: the spellings a
+    // parser also takes (`hq`, `hq_e8_2b`) are not values.
+    assert_eq!(declaration(&fields, "model.kv_format")["rule"], json!({ "one_of": ["bf16", "hq-e8-2b"] }));
     assert_eq!(declaration(&fields, "model.decode_share")["rule"], json!({ "min": 0, "max": 99 }));
     assert_eq!(declaration(&fields, "model.decode_share")["rule_text"], "0..=99");
     assert_eq!(declaration(&fields, "vram.budget_bytes")["rule"], json!({ "min": 1, "max": null }), "an open end is null");
@@ -551,5 +553,40 @@ fn the_command_line_json_and_the_route_share_each_declaration() {
             assert_eq!(&printed[key], value, "{} {key}", served["file_key"]);
         }
         assert_eq!(printed["rule"], served["rule_text"], "the CLI's `rule` is the sentence");
+    }
+}
+
+/// Spec playground/05: the declarations are static, so the warm-up does not
+/// hold them either — a page reads them while the first traversal runs.
+#[tokio::test]
+async fn the_fields_route_answers_during_the_warm_up() {
+    let loader = MockLoader::new();
+    let app = server_on(&loader, started(&[])).with_warm_up().app();
+    let (status, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "the gate is shut: {models}");
+    let (status, fields) = send(&app, Method::GET, "/v1/config/fields", None).await;
+    assert_eq!(status, StatusCode::OK, "{fields}");
+    assert!(!fields["data"].as_array().unwrap().is_empty());
+}
+
+/// Every `one_of` value appears once, in canonical form, whatever spellings
+/// the field's parser also takes.
+#[tokio::test]
+async fn a_one_of_rule_lists_each_value_once_in_canonical_form() {
+    let loader = MockLoader::new();
+    let app = server_on(&loader, started(&[])).app();
+    let (_, fields) = send(&app, Method::GET, "/v1/config/fields", None).await;
+    for meta in all_fields().filter(|meta| meta.visible) {
+        let Validator::OneOf(allowed) = meta.validator else { continue };
+        let listed = declaration(&fields, &meta.file_key())["rule"]["one_of"].clone();
+        let listed: Vec<&str> = listed.as_array().expect("a list").iter().map(|value| value.as_str().unwrap()).collect();
+        let mut canonical: Vec<String> = Vec::new();
+        for spelling in allowed {
+            let written = (meta.canonical)(spelling).ok().and_then(|value| value.as_str().map(str::to_owned)).unwrap_or_else(|| spelling.to_string());
+            if !canonical.contains(&written) {
+                canonical.push(written);
+            }
+        }
+        assert_eq!(listed, canonical, "{}", meta.file_key());
     }
 }

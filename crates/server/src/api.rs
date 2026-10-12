@@ -258,7 +258,8 @@ impl<B> MakeSpan<B> for RootSpanMaker {
 /// it stay open — `GET /v1/models` (whose `status` says what is happening)
 /// and `POST /v1/models/switch` (which answers a second switch `409`, and
 /// is how a failed one is recovered from). During the warm-up they are held
-/// like every other route, as they always were.
+/// like every other route, as they always were. `GET /v1/config/fields` is
+/// static and is never held.
 async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
     let status = server.status();
     let Some(code) = status.refusal() else {
@@ -266,7 +267,10 @@ async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: 
     };
     let switch_route = matches!(*status, ModelStatus::Switching { .. } | ModelStatus::Failed { .. })
         && reports_or_drives_the_switch(req.method(), req.uri().path());
-    if switch_route || req.method() == axum::http::Method::OPTIONS {
+    // The field declarations are static (spec playground/05): nothing about
+    // the model's state changes them, so no state holds them back.
+    let static_route = req.method() == axum::http::Method::GET && req.uri().path() == "/v1/config/fields";
+    if switch_route || static_route || req.method() == axum::http::Method::OPTIONS {
         return next.run(req).await;
     }
     let message = match &*status {
@@ -1495,20 +1499,33 @@ struct LastSwitchInfo {
     /// `switched`; `refused` (refused before anything was torn down: the old
     /// model never stopped); `restored` (the target failed to load and the old
     /// model was loaded again); or `failed` (nothing serves).
-    outcome: &'static str,
+    outcome: LastOutcome,
     /// Why, for every outcome but `switched`.
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+}
+
+/// How a switch or a reload ended: `switched`; `refused` (refused before
+/// anything was torn down: the old model never stopped); `restored` (the
+/// target failed to load and the old model was loaded again); or `failed`
+/// (nothing serves).
+#[derive(Serialize, ToSchema, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum LastOutcome {
+    Switched,
+    Refused,
+    Restored,
+    Failed,
 }
 
 impl LastSwitchInfo {
     fn of(last: crate::model_switch::LastSwitch) -> Self {
         use crate::model_switch::SwitchOutcome;
         let (outcome, reason) = match last.outcome {
-            SwitchOutcome::Switched => ("switched", None),
-            SwitchOutcome::Refused { reason } => ("refused", Some(reason)),
-            SwitchOutcome::Restored { reason } => ("restored", Some(reason)),
-            SwitchOutcome::Failed { reason } => ("failed", Some(reason)),
+            SwitchOutcome::Switched => (LastOutcome::Switched, None),
+            SwitchOutcome::Refused { reason } => (LastOutcome::Refused, Some(reason)),
+            SwitchOutcome::Restored { reason } => (LastOutcome::Restored, Some(reason)),
+            SwitchOutcome::Failed { reason } => (LastOutcome::Failed, Some(reason)),
         };
         Self { from: last.from, to: last.to, outcome, reason }
     }

@@ -282,10 +282,10 @@ impl Server {
             // The explicit switch by id (spec playground/05) names these
             // whether or not implicit switching is on; only the implicit one
             // is gated by `switch.allow_implicit`.
-            let listed = model_switch::known_models(&config.known_models, self.active().source.as_ref());
-            let known = if config.allow_model_switch { listed.clone() } else { Default::default() };
-            switcher.set_listed_models(listed);
-            switcher.set_knobs(Duration::from_secs(u64::from(config.switch_drain_timeout_secs)), known, config.allow_model_switch);
+            switcher.note_start(self.active().source.as_ref());
+            let tables = switcher.tables(&config.known_models, config.allow_model_switch);
+            switcher.set_listed_models(tables.listed);
+            switcher.set_knobs(Duration::from_secs(u64::from(config.switch_drain_timeout_secs)), tables.known, config.allow_model_switch);
         }
     }
 
