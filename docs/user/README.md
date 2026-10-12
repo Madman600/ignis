@@ -322,7 +322,9 @@ anything the loaded model's load is built from reloads it with the whole
 patch, as a model switch does. A `null` removes a key: in a family's section,
 so the group's value applies to that model again; at a group key, so the
 profile's or the built-in default applies — a flag or an env var that sets the
-field still outranks the file, and the answer names it. Either way it is
+field still outranks the file, and the answer names it. A field only one
+model takes (`spec.decode_lanes`) is set and removed in that model's section,
+whichever key names it. Either way it is
 written to the config file in use once it has taken, a removed key and the
 section it empties taken out. `GET /v1/config/fields` says what each of those fields
 is: its key, kind, default, rule, the model families that take it, and whether
