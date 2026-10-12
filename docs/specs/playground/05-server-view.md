@@ -469,4 +469,105 @@ still reloads the loaded model for it, and a `PATCH` cannot remove anything.
 
 Known limit: `GET /v1/config` shows a family's section only where its value
 differs from the group's. An own value equal to the shared one therefore reads
-as "Shared" and cannot be removed from the page until it differs.
+as "Shared" and cannot be removed from the page until it differs. Lifted by
+the origins below (follow-up 2).
+
+## Follow-up 2: where each value comes from (2026-10-12)
+
+The second review found that a family's section in `GET /v1/config` mixes two
+kinds of value:
+- **The operator's own**, written in a family section or in a live family
+  value. A shared edit does not reach it, and a `null` removes it.
+- **A family-scoped value from a source that is not the operator's**:
+  - the profile's per-family numbers, e.g. `rtx5090`'s `vram.headroom_bytes`
+    1200M for the 27B;
+  - a `--<family>-…` flag or `IGNIS_<FAMILY>_…` env var.
+
+  A shared edit does reach the profile's value, because a profile is a
+  default, never an override (ADR 0046). A `null` cannot remove any of them.
+
+The page could not tell the two apart, so it labelled a reload "Apply" and
+offered a "Use shared value" that changed nothing. The owner chose to show each
+value's origin. The precedence is unchanged.
+
+### Decisions
+
+**Server**
+
+- **`GET /v1/config/origins`** answers `{ "object": "list", "data": [row, ...] }`.
+  - There is one row per visible field and per scope: `null` for the shared
+    value, then each family that takes the field.
+  - A row is `{ key: "<group>.<name>", scope: null | "<family>", source,
+    scoped, spelling? }`:
+    - `source` is the source of the value that resolves for that scope:
+      `default`, `profile`, `file`, `env`, `flag` or `live` (a `PATCH`);
+    - `scoped` is true when that value was set for this family specifically
+      (a family section, a family flag or env var, a profile's family value,
+      a live family value);
+    - `spelling` says where, as the startup source log spells it: the flag,
+      the env var, the file key and path, or the profile's name.
+  - It answers like `GET /v1/config`: during a switch, with the API key, and
+    `501` with no running configuration. Hidden fields are absent.
+- **A removal goes where a value goes.** A `null` for a family-only field at a
+  group key is homed to that family's section, as a value is. What runs after
+  any removal is what a start from the rewritten file resolves; a test drives
+  the family-only case both ways.
+- **`shadowed_at_restart` names a family-scoped flag or env var** that
+  outranks a patched group value or family value at the next start.
+- **A YAML test on a fitted configuration.** `GET /v1/config?format=yaml` on a
+  running, family-fitted configuration is held equal to the file's shape that
+  `config print` writes for the same sources.
+- **A whole group or section cannot be removed.** `{group: null}` and
+  `{group: {family: null}}` are `400`: a removal names its keys.
+
+**Playground**
+
+- **Labels from the origins.** A family's value:
+  - with `scoped` and `source` `file` or `live` is "Own value", offering "Use
+    shared value";
+  - with `scoped` and `source` `profile` reads "From profile <name>", and
+    has no remove;
+  - with `scoped` and `source` `flag` or `env` reads "Set by <spelling>".
+    An edit applies until restart, and the answer's `shadowed_at_restart`
+    says so. It has no remove.
+  - without `scoped` is "Shared".
+
+  An own value equal to the shared one is now shown as own.
+- **"All models" notes** what a shared edit does to each family with a scoped
+  value:
+  - "<family> has its own value: <v>" when the shared edit does not reach it;
+  - "Replaces the profile's <v> for <family>" when it does;
+  - "<family> is set by <spelling>" for a flag or env var.
+- **The reload prediction** follows the server's rule. A group edit reaches a
+  family unless that family's value is `scoped` with `source` `file` or
+  `live`.
+- **Families** are derived from the declarations (`families`) and the catalog,
+  never listed by hand. The modal's note says "Hidden fields are not in it"
+  without naming them (ADR 0046).
+- **The modal** focuses its close button, or the dialog itself, on open, never
+  a disabled button.
+- **Mock.** `dev:mock` serves `GET /v1/config/origins`, including a
+  profile-sourced family value for the 27B. It refuses a group-key value for
+  a field only the other family takes, as the server does.
+
+### Acceptance (follow-up 2)
+
+28. `GET /v1/config/origins` lists every visible field once per scope with
+    `source`, `scoped` and `spelling` as defined. Rows are right for a
+    default, a profile family value, a file group and a file family value,
+    a flag, a family flag, an env var and a live change. It answers during a
+    switch, behind the key, and `501` without a configuration.
+29. A `null` for a family-only field at a group key removes it from its
+    family's section. Afterwards the running value equals a start from the
+    rewritten file. Both orders are tested: set then remove, file then remove.
+30. `shadowed_at_restart` names a family-scoped flag or env var that outranks
+    the patched value at restart.
+31. The fitted-config YAML test holds. `{group: null}` and
+    `{group: {family: null}}` are `400`.
+32. The page labels each family value by its origin and offers "Use shared
+    value" only for `file`/`live` own values. Each "All models" note and the
+    reload label follow the server's rule. With the `rtx5090` profile, a
+    shared `vram.headroom_bytes` edit on the 27B reads "Apply and reload".
+33. No hand-kept family list or hidden-field names in `web/`. The modal
+    focuses a focusable control on open. `dev:mock` serves the origins.
+    `npm test`, `npm run build` and `cargo test --workspace` pass.
