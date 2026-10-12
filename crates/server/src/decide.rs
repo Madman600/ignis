@@ -2458,9 +2458,13 @@ pub async fn decide(
     let named = body.as_ref().ok().and_then(|request| request.0.model.clone());
     let named = crate::api::split_model_lane(named).0;
     // A model the idle clock unloaded is loaded first, the named one when
-    // the server knows it (spec model-switch/02).
-    if let Err(reason) = crate::model_switch::ensure_loaded(&server, named.as_deref()).await {
-        return crate::api::load_failed(&server, &reason);
+    // the server knows it (spec model-switch/02) — only for a body that
+    // parsed: a malformed one is refused `422` below and must not cost a
+    // load first.
+    if body.is_ok() {
+        if let Err(reason) = crate::model_switch::ensure_loaded(&server, named.as_deref()).await {
+            return crate::api::load_failed(&server, &reason);
+        }
     }
     match crate::model_switch::implicit_switch(&server, named.as_deref()).await {
         Ok(()) => {}
