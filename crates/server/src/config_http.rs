@@ -115,7 +115,7 @@ impl ConfigState {
             });
         match written {
             Ok(()) => {
-                tracing::info!(name: "ignis.config.persisted", path = %path.display(), "the config change is written to the config file");
+                tracing::info!(name: "ignis.config.persisted", path = %path.display(), "the config file holds the change (written, or held already)");
                 Persisted::Yes(path.display().to_string())
             }
             Err(error) => {
