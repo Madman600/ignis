@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 
 use super::field::{family_of_scope, scope, FieldMeta, FAMILIES};
 use super::schema::{self, all_fields};
-use super::source::{resolve_settings, Candidate, Fit, Layer};
+use super::source::{resolve_settings, Candidate, Fit, Layer, Resolution};
 use super::{Config, ConfigError};
 
 /// A config file's format.
@@ -334,19 +334,36 @@ fn set(layer: &mut Layer, meta: &'static FieldMeta, family: Option<ModelFamily>,
     }
 }
 
+/// The resolutions `config`'s document is written from: the shared one,
+/// resolved for no family, then each family's own in [`FAMILIES`] order —
+/// what [`effective_document`] writes the values of and `GET
+/// /v1/config/origins` the sources of (spec playground/05 follow-up 2), so a
+/// value and the origin given for it cannot come from two resolutions.
+///
+/// The shared one is resolved for no family even when `config` is fitted to
+/// one (a running server's): a fitted config's settings hold that family's
+/// values, which would read as the group's (GitHub #316). A family whose
+/// values do not resolve is left out; a start refuses those before any of
+/// them serves.
+pub fn resolutions(config: &Config) -> (Resolution, Vec<(ModelFamily, Resolution)>) {
+    let sources = config.basis.sources();
+    let shared = resolve_settings(sources, None, Fit::Switch).unwrap_or_else(|_| config.basis.resolution().clone());
+    let families = FAMILIES
+        .into_iter()
+        .filter_map(|family| resolve_settings(sources, Some(family), Fit::Switch).ok().map(|resolution| (family, resolution)))
+        .collect();
+    (shared, families)
+}
+
 /// `config`'s settings as a document: every field's value for no family in
 /// particular, and beside it, in each family's section, every scoped field
 /// whose value differs for that family — what the sources say, written so a
 /// start reading it back resolves the same values. What `config generate`
-/// and `config print` write and `GET /v1/config` shows.
-///
-/// The general values are always the shared ones, resolved for no family:
-/// a config fitted to a family (a running server's) holds that family's
-/// values in its settings, which would read as the group's and leave the
-/// family without a section of its own (GitHub #316).
+/// and `config print` write and `GET /v1/config` shows. The values are
+/// [`resolutions`]'.
 pub fn effective_document(config: &Config) -> Value {
-    let shared = config.basis.family().and_then(|_| resolve_settings(config.basis.sources(), None, Fit::Switch).ok());
-    let mut general = shared.as_ref().map_or_else(|| config.settings(), |resolution| &resolution.settings).render();
+    let (shared, families) = resolutions(config);
+    let mut general = shared.settings.render();
     // A field only one family takes is never written at the general scope,
     // even when that family's own value is the one it already has there:
     // the general section is read by every family, and this one refuses it
@@ -361,10 +378,7 @@ pub fn effective_document(config: &Config) -> Value {
         }
     }
     let mut changes = Vec::new();
-    for family in FAMILIES {
-        let Ok(resolution) = resolve_settings(config.basis.sources(), Some(family), Fit::Switch) else {
-            continue;
-        };
+    for (family, resolution) in families {
         let scoped = resolution.settings.render();
         for meta in all_fields().filter(|meta| meta.takes_scope(family)) {
             let at = |groups: &Map<String, Value>| groups.get(meta.group).and_then(|group| group.get(meta.name)).cloned();

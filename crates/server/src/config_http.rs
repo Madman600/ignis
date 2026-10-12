@@ -35,9 +35,10 @@ use crate::config::field::{scope, FieldMeta, FAMILIES};
 use crate::config::file::{self, Files};
 use crate::config::kind::{FieldKind, KnownModels};
 use crate::config::schema::{self, all_fields};
-use crate::config::source::{Candidate, Layer};
+use crate::config::source::{Candidate, Layer, Resolution, Source};
 use crate::config::{Config, ConfigError};
 use crate::Server;
+use ignis_core::compute::ModelFamily;
 
 /// The running configuration and where a change to it is written down,
 /// shared by the server and the model loader.
@@ -307,6 +308,122 @@ pub fn visible_declarations() -> Vec<Value> {
 )]
 pub(crate) async fn get_config_fields() -> Json<Value> {
     Json(serde_json::json!({ "object": "list", "data": visible_declarations() }))
+}
+
+/// The source of a value, as `GET /v1/config/origins` names it: the
+/// resolver's [`Source`], a live patch called what it is to a client.
+#[derive(Serialize, ToSchema, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum OriginSource {
+    /// The field's hardcoded default: no source sets it.
+    Default,
+    /// The hardware profile in use: a default, never an override.
+    Profile,
+    /// The config file.
+    File,
+    /// An environment variable.
+    Env,
+    /// A command-line flag.
+    Flag,
+    /// A `PATCH /v1/config` since the server started.
+    Live,
+}
+
+impl From<Source> for OriginSource {
+    fn from(source: Source) -> Self {
+        match source {
+            Source::Patch => Self::Live,
+            Source::Flag => Self::Flag,
+            Source::Env => Self::Env,
+            Source::File => Self::File,
+            Source::Profile => Self::Profile,
+            Source::Default => Self::Default,
+        }
+    }
+}
+
+/// Where one field's value in one scope comes from.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct OriginRow {
+    /// The field, as a config file keys it (`reuse.kv_host_pool_bytes`).
+    key: String,
+    /// `null` for the shared value (the group key), else the scope name of
+    /// a family that takes the field (`qwen38`, `qwen38flashnext`).
+    scope: Option<&'static str>,
+    /// The source of the value that resolves in this scope.
+    source: OriginSource,
+    /// The value was set for this family itself: a family section of the
+    /// config file or of the profile, a `--<family>-…` flag, an
+    /// `IGNIS_<FAMILY>_…` env var, a live family value. Never on the shared
+    /// value's row.
+    scoped: bool,
+    /// Where the value was set, as the startup log spells it: the flag, the
+    /// env var, the file key and the file's path, or the profile's name.
+    /// Absent for a default and for a live change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spelling: Option<String>,
+}
+
+/// The envelope of `GET /v1/config/origins`, as `GET /v1/models`' is.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct OriginList {
+    /// Always `list`.
+    object: &'static str,
+    /// For each visible field in declaration order, the shared value's row,
+    /// then one per family that takes the field.
+    data: Vec<OriginRow>,
+}
+
+/// Every visible field's origin in each scope (spec playground/05
+/// follow-up 2), read off the very resolutions [`visible_document`]'s values
+/// come from ([`file::resolutions`]): the source the resolver recorded for
+/// the winning value, so a value and its origin cannot disagree. A field
+/// the resolver recorded nothing for is at its hardcoded default.
+fn visible_origins(config: &Config) -> Vec<OriginRow> {
+    let (shared, families) = file::resolutions(config);
+    let profile = &config.basis.sources().profile_name;
+    let row = |meta: &FieldMeta, family: Option<ModelFamily>, resolution: &Resolution| {
+        let origin = resolution.origin(meta.group, meta.name);
+        let source = origin.map_or(Source::Default, |origin| origin.source);
+        // A profile's values arrive spelled by their key in the profile's
+        // definition; the operator chose the profile, by name.
+        let spelling = match (source, origin) {
+            (Source::Profile, _) => Some(profile.clone()),
+            (Source::Flag | Source::Env | Source::File, Some(origin)) => Some(origin.spelling.clone()),
+            _ => None,
+        };
+        let scoped = origin.is_some_and(|origin| origin.scoped);
+        OriginRow { key: meta.file_key(), scope: family.map(scope), source: source.into(), scoped, spelling }
+    };
+    let mut rows = Vec::new();
+    for meta in all_fields().filter(|meta| meta.visible) {
+        rows.push(row(meta, None, &shared));
+        for (family, resolution) in families.iter().filter(|(family, _)| meta.applies.to(*family)) {
+            rows.push(row(meta, Some(*family), resolution));
+        }
+    }
+    rows
+}
+
+/// `GET /v1/config/origins` — where each running value comes from.
+#[utoipa::path(
+    get,
+    path = "/v1/config/origins",
+    tag = "config",
+    operation_id = "get_config_origins",
+    summary = "Where each configuration value comes from",
+    description = "One row per field `GET /v1/config` shows and per scope: `scope: null` for the shared value (the group key), then one row per model family that takes the field (`qwen38`, `qwen38flashnext`). `source` is where the value in force in that scope comes from: `default` (the hardcoded default), `profile` (the hardware profile in use, a default and never an override), `file` (the config file), `env`, `flag`, or `live` (a `PATCH /v1/config` since the server started). `scoped` is true when the value was set for that family itself — a family section of the file or of the profile, a `--<family>-…` flag, an `IGNIS_<FAMILY>_…` env var, a live family value. `spelling` names where, as the startup log does: the flag, the env var, the file key and the file's path, or the profile's name; it is absent for a default and a live change.\n\nThe value each row describes is the one `GET /v1/config` shows in that scope: one resolution decides both. A family's own value from the file or a live change (`scoped`, `source` `file` or `live`) is the operator's: a patched group value does not reach that family, and a `null` in the family's section removes it. A family's value from a profile, a flag or an env var is not removed by a `null`: a patched group value replaces it while the server runs, and a flag or an env var takes it back at the next start (`shadowed_at_restart` says so).\n\nAnswers during a model switch, showing the configuration still running.",
+    responses(
+        (status = 200, description = "Each visible field's origin, shared value first, then each family's.", body = OriginList),
+        (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = ApiError),
+        (status = 501, description = "This server was built without a running configuration (`config_unavailable`).", body = ApiError),
+    ),
+)]
+pub(crate) async fn get_config_origins(State(server): State<Arc<Server>>) -> Response {
+    let Some(state) = &server.config else {
+        return no_config();
+    };
+    Json(OriginList { object: "list", data: visible_origins(&state.current()) }).into_response()
 }
 
 /// How a patch was applied.

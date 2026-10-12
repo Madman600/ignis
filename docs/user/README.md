@@ -328,7 +328,12 @@ section it empties taken out. `GET /v1/config/fields` says what each of those fi
 is: its key, kind, default, rule, the model families that take it, and whether
 a change is live, needs a reload, or can only be made at start — the same
 declarations as `ignis-server help --fields --format json`, minus the fields
-`GET /v1/config` hides.
+`GET /v1/config` hides. `GET /v1/config/origins` says where each value in force
+comes from, for the shared value and for each model family: the default, the
+profile, the file, an env var, a flag or a live change, whether it was set for
+that family itself, and the flag, env var, file key or profile that set it.
+A family's own value in the file or from a live change is the one a group
+change does not reach and a `null` removes.
 
 ### Model and server
 
@@ -624,6 +629,7 @@ not.
 | `/v1/models/catalog` | GET | Every model the server can switch to or fetch, with its state on disk ([below](#switching-models)). |
 | `/v1/config` | GET, PATCH | The running configuration, and a change to it ([configuration](#configuration)). |
 | `/v1/config/fields` | GET | What each visible configuration field is: kind, default, rule, families, whether a change reloads. |
+| `/v1/config/origins` | GET | Where each visible value in force comes from, shared and per model family: default, profile, file, env, flag or live. |
 | `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
 | `/v1/responses` | POST | The OpenAI responses API (non-streaming; `stream: true` is a 400). |
 | `/v1/tokenize` | POST | A body's prompt-token count without serving it ([below](#counting-a-prompt)). |

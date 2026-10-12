@@ -154,8 +154,10 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         .routes(routes!(crate::catalog_http::get_models_catalog))
         // Spec config-v2/02: the running configuration, read and changed.
         .routes(routes!(crate::config_http::get_config, crate::config_http::patch_config))
-        // Spec playground/05: what each of those fields is.
+        // Spec playground/05: what each of those fields is, and where each
+        // running value comes from.
         .routes(routes!(crate::config_http::get_config_fields))
+        .routes(routes!(crate::config_http::get_config_origins))
         .routes(routes!(chat_completions))
         // GitHub #285: the prompt counted without being served. Neither
         // reaches the scheduler.
@@ -180,6 +182,7 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         .route("/v1/models/catalog", options(cors_preflight))
         .route("/v1/config", options(cors_preflight))
         .route("/v1/config/fields", options(cors_preflight))
+        .route("/v1/config/origins", options(cors_preflight))
         .route("/v1/chat/completions", options(cors_preflight))
         .route("/v1/tokenize", options(cors_preflight))
         .route("/v1/detokenize", options(cors_preflight))
@@ -336,16 +339,16 @@ pub(crate) fn implicit_switch_refused(refusal: crate::model_switch::ImplicitRefu
     }
 }
 
-/// `GET /v1/models`, `POST /v1/models/switch`, `GET /v1/config` and the two
-/// static reads beside them: the routes a model switch keeps open
+/// `GET /v1/models`, `POST /v1/models/switch`, `GET /v1/config` and the
+/// reads beside them: the routes a model switch keeps open
 /// ([`require_serving`]) — the two that report and drive it, the running
 /// configuration, which a reload with a changed config is changing (spec
 /// config-v2/02), and what a page needs to show the switch and the
-/// configuration while it runs: the fields' declarations and the models a
-/// switch can go to (spec playground/05).
+/// configuration while it runs: the fields' declarations, where each value
+/// comes from and the models a switch can go to (spec playground/05).
 fn reports_or_drives_the_switch(method: &axum::http::Method, path: &str) -> bool {
     (method == axum::http::Method::GET
-        && matches!(path, "/v1/models" | "/v1/models/catalog" | "/v1/config" | "/v1/config/fields"))
+        && matches!(path, "/v1/models" | "/v1/models/catalog" | "/v1/config" | "/v1/config/fields" | "/v1/config/origins"))
         || (method == axum::http::Method::POST && path == "/v1/models/switch")
 }
 

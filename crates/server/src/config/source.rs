@@ -86,6 +86,13 @@ pub struct Origin {
     /// default (`vision.enabled: false`, `server.metrics_bind:
     /// 127.0.0.1:9464`) starts either model, as no file at all would.
     pub at_default: bool,
+    /// The value was given for the family resolved for, not the group: a
+    /// family section of a file or a profile, a `--<family>-…` flag, an
+    /// `IGNIS_<FAMILY>_…` env var, a live family value. What `GET
+    /// /v1/config/origins` tells apart (spec playground/05 follow-up 2): a
+    /// family's own value in a file or a patch is the operator's, which a
+    /// group value does not reach and a `null` removes.
+    pub scoped: bool,
 }
 
 /// One raw value and the spelling it arrived under.
@@ -378,7 +385,7 @@ impl Resolver<'_> {
                 Source::Patch => self.patch_candidate(meta),
                 _ => self.candidate(layer, meta),
             };
-            let Some(candidate) = found else {
+            let Some((candidate, scoped)) = found else {
                 continue;
             };
             let value = parse_candidate::<K>(meta, candidate)?;
@@ -396,17 +403,17 @@ impl Resolver<'_> {
                 self.dropped.borrow_mut().push(meta.flag());
                 return Ok(default);
             }
-            self.record(meta, source, candidate, at_default);
+            self.record(meta, source, candidate, scoped, at_default);
             return Ok(value);
         }
         // A profile is a default, never an override: a value of it the
         // family cannot take is passed over in silence, as a hardcoded
         // default for a field the family ignores would be.
         if self.family.is_none_or(|family| meta.applies.to(family)) {
-            if let Some(candidate) = self.candidate(&sources.profile, meta) {
+            if let Some((candidate, scoped)) = self.candidate(&sources.profile, meta) {
                 let value = parse_candidate::<K>(meta, candidate)?;
                 let at_default = value == default;
-                self.record(meta, Source::Profile, candidate, at_default);
+                self.record(meta, Source::Profile, candidate, scoped, at_default);
                 return Ok(value);
             }
         }
@@ -414,10 +421,13 @@ impl Resolver<'_> {
     }
 
     /// `layer`'s value for `meta`: the family-scoped one first, then the
-    /// general one.
-    fn candidate<'l>(&self, layer: &'l Layer, meta: &FieldMeta) -> Option<&'l Candidate> {
+    /// general one — and whether it was the family-scoped one.
+    fn candidate<'l>(&self, layer: &'l Layer, meta: &FieldMeta) -> Option<(&'l Candidate, bool)> {
         let scoped = self.family.filter(|family| meta.takes_scope(*family)).and_then(|family| layer.get(meta, Some(family)));
-        scoped.or_else(|| layer.get(meta, None))
+        match scoped {
+            Some(candidate) => Some((candidate, true)),
+            None => layer.get(meta, None).map(|candidate| (candidate, false)),
+        }
     }
 
     /// The live patch's value for `meta`: as [`Resolver::candidate`] picks
@@ -429,23 +439,23 @@ impl Resolver<'_> {
     /// family the file gives its own would run a value no start from the
     /// rewritten file runs (spec playground/05 §Decisions). Whatever
     /// outranks the file's own section then decides, as at a start.
-    fn patch_candidate(&self, meta: &FieldMeta) -> Option<&Candidate> {
+    fn patch_candidate(&self, meta: &FieldMeta) -> Option<(&Candidate, bool)> {
         let (patch, file) = (&self.sources.patch, &self.sources.file);
         if let Some(family) = self.family.filter(|family| meta.takes_scope(*family)) {
             if let Some(scoped) = patch.get(meta, Some(family)) {
-                return Some(scoped);
+                return Some((scoped, true));
             }
             if file.get(meta, Some(family)).is_some() {
                 return None;
             }
         }
-        patch.get(meta, None)
+        patch.get(meta, None).map(|candidate| (candidate, false))
     }
 
-    fn record(&self, meta: &'static FieldMeta, source: Source, candidate: &Candidate, at_default: bool) {
+    fn record(&self, meta: &'static FieldMeta, source: Source, candidate: &Candidate, scoped: bool, at_default: bool) {
         self.origins
             .borrow_mut()
-            .insert((meta.group, meta.name), Origin { source, spelling: candidate.spelling.clone(), at_default });
+            .insert((meta.group, meta.name), Origin { source, spelling: candidate.spelling.clone(), at_default, scoped });
     }
 }
 
@@ -675,6 +685,29 @@ mod tests {
             assert_eq!(resolved.settings.reuse.kv_host_pool_bytes, want, "{name}");
             assert_eq!(resolved.origin("reuse", "kv_host_pool_bytes").map_or(Source::Default, |o| o.source), from, "{name}");
         }
+    }
+
+    /// Spec playground/05 follow-up 2: an origin says whether the value that
+    /// won was the family's own or the group's, whatever the source — and a
+    /// patched group value that yields to the file's own section leaves the
+    /// file's, scoped, as the origin.
+    #[test]
+    fn an_origin_says_whether_the_familys_own_value_won() {
+        let meta = field("reuse", "kv_host_pool_bytes").unwrap();
+        let (q, f) = (Some(ModelFamily::Qwen38_27b), Some(ModelFamily::FlashNext));
+        let origin = |sources: &Sources, family| {
+            let resolved = resolve_settings(sources, family, Fit::Start).unwrap();
+            resolved.origin("reuse", "kv_host_pool_bytes").map(|origin| (origin.source, origin.scoped))
+        };
+        let profile = Sources { profile: layer(meta, &[(None, "3G"), (q, "1G")]), ..Sources::default() };
+        assert_eq!((origin(&profile, q), origin(&profile, f), origin(&profile, None)), (Some((Source::Profile, true)), Some((Source::Profile, false)), Some((Source::Profile, false))));
+        let flags = Sources { flags: layer(meta, &[(f, "7G")]), ..profile.clone() };
+        assert_eq!((origin(&flags, q), origin(&flags, f)), (Some((Source::Profile, true)), Some((Source::Flag, true))));
+        let patched = Sources { patch: layer(meta, &[(None, "5G")]), file: layer(meta, &[(q, "4G")]), ..Sources::default() };
+        assert_eq!((origin(&patched, q), origin(&patched, f)), (Some((Source::File, true)), Some((Source::Patch, false))));
+        let own = Sources { patch: layer(meta, &[(q, "6G")]), ..patched.clone() };
+        assert_eq!(origin(&own, q), Some((Source::Patch, true)));
+        assert_eq!(origin(&Sources::default(), q), None, "the hardcoded default has no origin");
     }
 
     /// Spec playground/05 §Decisions: a live patch is a change to the config

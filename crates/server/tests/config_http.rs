@@ -42,8 +42,14 @@ fn config_file(test: &str, text: &str) -> PathBuf {
 }
 
 fn started(argv: &[&str]) -> Config {
+    started_with(argv, &[])
+}
+
+/// [`started`] with `env` as the whole environment.
+fn started_with(argv: &[&str], env: &'static [(&'static str, &'static str)]) -> Config {
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-    match resolve_with(&argv, |_| None, &RealFiles).expect("the start options resolve") {
+    let env = move |key: &str| env.iter().find(|(name, _)| *name == key).map(|(_, value)| value.to_string());
+    match resolve_with(&argv, env, &RealFiles).expect("the start options resolve") {
         ConfigOutcome::Config(config) => config,
         other => panic!("{other:?}"),
     }
@@ -610,12 +616,21 @@ async fn a_one_of_rule_lists_each_value_once_in_canonical_form() {
 /// whose loader fits every load from the running configuration as the
 /// production loader does, `mock-b` being a Flash-Next artifact.
 fn qwen_server(loader: &Arc<MockLoader>, argv: &[&str]) -> Server {
-    let config = started(argv).for_family(ModelFamily::Qwen38_27b).expect("the 27B takes the start options");
+    family_server(loader, ModelFamily::Qwen38_27b, started(argv))
+}
+
+/// `mock-a`, a model of `family`, serving `start` fitted to that family, on
+/// a server whose loader fits every load from the running configuration as
+/// the production loader does, `mock-b` being a model of the other family.
+fn family_server(loader: &Arc<MockLoader>, family: ModelFamily, start: Config) -> Server {
+    let config = start.for_family(family).expect("the family takes the start options");
+    let other = if family == ModelFamily::FlashNext { ModelFamily::Qwen38_27b } else { ModelFamily::FlashNext };
     let state = Arc::new(ConfigState::new(config.clone(), Arc::new(RealFiles)));
-    loader.fit_from(Arc::clone(&state), &[("mock-b", ModelFamily::FlashNext)]);
+    loader.fit_from(Arc::clone(&state), &[("mock-a", family), ("mock-b", other)]);
     let server = Server::from_active(loader.model("mock-a"))
         .with_switcher(Switcher::new(Arc::clone(loader) as _, PATIENT))
         .with_config(state);
+    server.update_active(|model| model.family = family);
     server.apply_config(&config);
     server
 }
@@ -854,4 +869,140 @@ async fn get_config_as_yaml_is_what_config_print_writes_minus_the_hidden_fields(
     assert_eq!((status, refused["error"]["code"].clone()), (StatusCode::BAD_REQUEST, json!("config_invalid")), "{refused}");
     let message = refused["error"]["message"].as_str().unwrap();
     assert!(message.contains("toml") && message.contains("json") && message.contains("yaml"), "{message}");
+}
+
+// ── where each value comes from (spec playground/05 follow-up 2) ─────────────
+
+/// The rows `GET /v1/config/origins` gives `key`, as `(scope, source,
+/// scoped, spelling)`, in the order served.
+fn origins_of(origins: &Value, key: &str) -> Vec<(Value, String, bool, Option<String>)> {
+    let rows = origins["data"].as_array().expect("a list of rows");
+    let rows = rows.iter().filter(|row| row["key"] == key);
+    rows.map(|row| {
+        let spelling = row.get("spelling").map(|spelling| spelling.as_str().expect("a spelling is text").to_owned());
+        (row["scope"].clone(), row["source"].as_str().unwrap().to_owned(), row["scoped"].as_bool().unwrap(), spelling)
+    })
+    .collect()
+}
+
+/// Spec playground/05 AC 28: every visible field once per scope — `null`,
+/// then each family that takes it — with the source of the value that
+/// resolves there, whether it was set for that family, and where, spelled
+/// as the startup source log spells it: a default (no spelling), a profile's
+/// family value and its group value (the profile's name), a file's group
+/// and family values (the key and the file), a flag and a family flag, an
+/// env var, and a live change (no spelling). An own value equal to the
+/// shared one is still the family's own.
+#[tokio::test]
+async fn the_origins_say_where_each_value_comes_from() {
+    let path = config_file(
+        "origins",
+        "reuse:\n  kv_host_pool_bytes: 3G\n  prompt: false\n  qwen38:\n    kv_host_pool_bytes: 4G\n    prompt: false\n",
+    );
+    let file = path.display().to_string();
+    let argv = ["--config", path.to_str().unwrap(), "--model-prefill-chunk", "2048", "--qwen38flashnext-model-max-context", "65536"];
+    let loader = MockLoader::new();
+    let start = started_with(&argv, &[("IGNIS_SWITCH_DRAIN_TIMEOUT", "7")]);
+    let server = family_server(&loader, ModelFamily::Qwen38_27b, start);
+    let app = server.app();
+    let (status, origins) = send(&app, Method::GET, "/v1/config/origins", None).await;
+    assert_eq!(status, StatusCode::OK, "{origins}");
+    assert_eq!(origins["object"], "list");
+
+    let (shared, qwen, flash) = (Value::Null, json!("qwen38"), json!("qwen38flashnext"));
+    let some = |text: &str| Some(text.to_owned());
+    let row = |scope: &Value, source: &str, scoped: bool, spelling: Option<String>| (scope.clone(), source.to_owned(), scoped, spelling);
+    assert_eq!(
+        origins_of(&origins, "server.request_timeout"),
+        [row(&shared, "default", false, None), row(&qwen, "default", false, None), row(&flash, "default", false, None)]
+    );
+    assert_eq!(
+        origins_of(&origins, "vram.headroom_bytes"),
+        [row(&shared, "profile", false, some("rtx5090")), row(&qwen, "profile", true, some("rtx5090")), row(&flash, "profile", false, some("rtx5090"))],
+        "the rtx5090 profile's group value, and its own for the 27B"
+    );
+    assert_eq!(
+        origins_of(&origins, "reuse.kv_host_pool_bytes"),
+        [
+            row(&shared, "file", false, some(&format!("reuse.kv_host_pool_bytes ({file})"))),
+            row(&qwen, "file", true, some(&format!("reuse.qwen38.kv_host_pool_bytes ({file})"))),
+            row(&flash, "file", false, some(&format!("reuse.kv_host_pool_bytes ({file})"))),
+        ]
+    );
+    assert_eq!(
+        origins_of(&origins, "reuse.prompt")[1],
+        row(&qwen, "file", true, some(&format!("reuse.qwen38.prompt ({file})"))),
+        "an own value equal to the shared one is the family's own"
+    );
+    assert_eq!(
+        origins_of(&origins, "model.prefill_chunk"),
+        [row(&shared, "flag", false, some("--model-prefill-chunk")), row(&qwen, "flag", false, some("--model-prefill-chunk")), row(&flash, "flag", false, some("--model-prefill-chunk"))]
+    );
+    assert_eq!(
+        origins_of(&origins, "model.max_context"),
+        [row(&shared, "default", false, None), row(&qwen, "profile", true, some("rtx5090")), row(&flash, "flag", true, some("--qwen38flashnext-model-max-context"))]
+    );
+    assert_eq!(origins_of(&origins, "switch.drain_timeout")[0], row(&shared, "env", false, some("IGNIS_SWITCH_DRAIN_TIMEOUT")));
+    assert_eq!(
+        origins_of(&origins, "spec.decode_lanes"),
+        [row(&shared, "profile", false, some("rtx5090")), row(&flash, "profile", false, some("rtx5090"))],
+        "a field only Flash-Next takes has no 27B row"
+    );
+
+    // Every visible field, once per scope, and nothing hidden.
+    let keys: Vec<&str> = origins["data"].as_array().unwrap().iter().map(|row| row["key"].as_str().unwrap()).collect();
+    for meta in all_fields() {
+        let rows = keys.iter().filter(|key| **key == meta.file_key()).count();
+        let families = [ModelFamily::Qwen38_27b, ModelFamily::FlashNext].into_iter().filter(|family| meta.applies.to(*family)).count();
+        assert_eq!(rows, if meta.visible { 1 + families } else { 0 }, "{}", meta.file_key());
+    }
+    for row in origins["data"].as_array().unwrap() {
+        let mut have: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+        have.sort_unstable();
+        let want: &[&str] = if row.get("spelling").is_some() { &["key", "scope", "scoped", "source", "spelling"] } else { &["key", "scope", "scoped", "source"] };
+        assert_eq!(have, want, "{row}");
+    }
+
+    // A live change, the group's and the family not loaded's.
+    let body = json!({ "server": { "request_timeout": 60 }, "reuse": { "qwen38flashnext": { "kv_host_pool_bytes": "1G" } } });
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+    assert_eq!((status, applied["applied"].clone()), (StatusCode::OK, json!("live")), "{applied}");
+    let (_, origins) = send(&app, Method::GET, "/v1/config/origins", None).await;
+    assert_eq!(
+        origins_of(&origins, "server.request_timeout"),
+        [row(&shared, "live", false, None), row(&qwen, "live", false, None), row(&flash, "live", false, None)]
+    );
+    let pool = origins_of(&origins, "reuse.kv_host_pool_bytes");
+    assert_eq!(pool[1], row(&qwen, "file", true, some(&format!("reuse.qwen38.kv_host_pool_bytes ({file})"))));
+    assert_eq!(pool[2], row(&flash, "live", true, None));
+}
+
+/// Spec playground/05 AC 28: the origins answer as `GET /v1/config` does —
+/// during a switch, behind the API key, the preflight passed — and `501` on
+/// a server with no running configuration.
+#[tokio::test]
+async fn the_origins_answer_during_a_switch_behind_the_key_and_501_without_a_config() {
+    let loader = MockLoader::new();
+    let server = server_on(&loader, started(&["--profile", "none"]));
+    let app = server.app();
+    let release = loader.hold_next_load();
+    let (status, _) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "reuse": { "kv_host_pool_bytes": "3G" } }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, origins) = send(&app, Method::GET, "/v1/config/origins", None).await;
+    assert_eq!(status, StatusCode::OK, "it answers during a switch: {origins}");
+    assert_eq!(origins_of(&origins, "reuse.kv_host_pool_bytes")[0].1, "default", "the configuration still running");
+    release.send(()).expect("the held load is waiting");
+    until_serving(&app).await;
+    let (_, origins) = send(&app, Method::GET, "/v1/config/origins", None).await;
+    assert_eq!(origins_of(&origins, "reuse.kv_host_pool_bytes")[0].1, "live", "the reload's change, once it serves");
+
+    let bare = Server::from_active(loader.model("mock-a")).app();
+    let (status, body) = send(&bare, Method::GET, "/v1/config/origins", None).await;
+    assert_eq!((status, body["error"]["code"].clone()), (StatusCode::NOT_IMPLEMENTED, json!("config_unavailable")), "{body}");
+
+    let keyed = server_on(&loader, started(&[])).with_api_key(ignis_server::config::ApiKey::new("sk-test")).app();
+    let (status, _) = send(&keyed, Method::GET, "/v1/config/origins", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(&keyed, Method::OPTIONS, "/v1/config/origins", None).await;
+    assert_eq!(status, StatusCode::OK, "the preflight passes, like the other /v1 routes");
 }

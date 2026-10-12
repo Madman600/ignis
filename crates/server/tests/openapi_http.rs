@@ -88,6 +88,9 @@ fn the_document_lists_exactly_the_v1_surface() {
         // what each configuration field is.
         "get /v1/models/catalog",
         "get /v1/config/fields",
+        // Spec playground/05 follow-up 2: where each of those values comes
+        // from.
+        "get /v1/config/origins",
         // Spec config-v2/02: the running configuration, read and changed.
         "get /v1/config",
         "patch /v1/config",
@@ -111,7 +114,7 @@ fn the_document_lists_exactly_the_v1_surface() {
 #[test]
 fn the_server_view_routes_are_documented_with_their_responses() {
     let document = document();
-    for (path, list, ok) in [("/v1/models/catalog", "CatalogList", "CatalogRow"), ("/v1/config/fields", "FieldList", "FieldDeclaration")] {
+    for (path, list, ok) in [("/v1/models/catalog", "CatalogList", "CatalogRow"), ("/v1/config/fields", "FieldList", "FieldDeclaration"), ("/v1/config/origins", "OriginList", "OriginRow")] {
         let get = &document["paths"][path]["get"];
         for status in ["200", "401"] {
             assert!(get["responses"][status].is_object(), "{path} documents {status}");
@@ -123,6 +126,12 @@ fn the_server_view_routes_are_documented_with_their_responses() {
         );
         assert!(document["components"]["schemas"][ok]["properties"].is_object(), "{ok}");
     }
+    // An origin's source is one of six, each named; no configuration is a 501.
+    assert_eq!(
+        document["components"]["schemas"]["OriginSource"]["enum"],
+        serde_json::json!(["default", "profile", "file", "env", "flag", "live"])
+    );
+    assert!(document["paths"]["/v1/config/origins"]["get"]["responses"]["501"].is_object());
     // The switch takes a model alone, and says what a 404 is.
     let switch = &document["paths"]["/v1/models/switch"]["post"];
     assert!(switch["responses"]["404"].is_object());
