@@ -45,6 +45,19 @@
 //! operator listed ([`implicit_switch`]), which waits for that same switch and
 //! is then served on the model it named. Both run [`begin`]: one mechanism,
 //! two callers.
+//!
+//! **Idle unload** (spec model-switch/02, ADR 0049). The idle clock
+//! (`crate::idle`) tears a model nobody uses down through this module's own
+//! slot and teardown (`claim_unload`, `unload`): the status is
+//! [`ModelStatus::Unloaded`], the [`ActiveModel`] is kept — its id and its
+//! source — and its engine is never called again. Leaving that state is a
+//! load and nothing more, [`ModelStatus::Loading`]: whatever begins it — a
+//! request that needs the model ([`ensure_loaded`]), `POST
+//! /v1/models/switch`, a reloading `PATCH /v1/config` — runs `run` with no
+//! drain and no teardown (nothing is resident), and a load that fails leaves
+//! [`ModelStatus::Failed`], since there is no previous model to reload. An
+//! unload and a switch, a reload or a load never overlap: they share
+//! [`Switcher::running`].
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -54,7 +67,7 @@ use std::time::{Duration, Instant};
 
 use crate::engine::Engine;
 use crate::load::LoadedModel;
-use crate::{ActiveModel, ModelSource, ModelStatus, Server};
+use crate::{ActiveModel, ModelSource, ModelStatus, Server, StatusCell};
 
 /// How often the drain reads the old engine's in-flight counts. A switch is
 /// an operator's action, seconds long; 10 ms of latency on noticing the last
@@ -197,9 +210,11 @@ pub struct Switcher {
     loader: Arc<dyn ModelLoader>,
     /// `--switch-drain-timeout`; a live `PATCH /v1/config` may change it.
     drain_timeout: Mutex<Duration>,
-    /// The switch under way, if any. Switches are serialized, not queued:
-    /// a second one is refused naming this one (spec model-switch/01).
-    running: Mutex<Option<SwitchStarted>>,
+    /// What holds the switch's slot, if anything. Switches are serialized,
+    /// not queued: a second one is refused naming this one (spec
+    /// model-switch/01) — or the unload whose teardown holds it (spec
+    /// model-switch/02).
+    running: Mutex<Option<Slot>>,
     /// The models a request's own `model` may switch to, each with the
     /// artifact it loads from ([`implicit_switch`]). Empty unless
     /// [`Switcher::with_known_models`] named some — `main` names none under
@@ -318,6 +333,12 @@ impl Switcher {
             settled: AtomicBool::new(true),
             start: Mutex::new(None),
         }
+    }
+
+    /// What holds the switch's slot now — a switch, a reload, a load, or an
+    /// unload — if anything does.
+    pub fn running(&self) -> Option<Slot> {
+        self.running.lock().expect("switch lock").clone()
     }
 
     /// Remember `start`, the model the server started on, as one the server
@@ -495,6 +516,21 @@ pub struct SwitchStarted {
     pub to: String,
 }
 
+/// What holds the switch's slot ([`Switcher::running`]): one at a time, so
+/// an unload, a load, a switch and a reload never overlap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Slot {
+    /// A switch, a reload, or the load a request began out of `unloaded`:
+    /// the ids it moves between.
+    Switch(SwitchStarted),
+    /// The idle clock is unloading `model` (spec model-switch/02): held from
+    /// the moment the model is closed until its teardown is done.
+    Unload {
+        /// The id being unloaded.
+        model: String,
+    },
+}
+
 /// Why a switch did not begin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwitchRefusal {
@@ -505,10 +541,22 @@ pub enum SwitchRefusal {
     WarmingUp,
     /// Another switch is under way (`409`): this is it.
     InProgress(SwitchStarted),
+    /// The idle clock is unloading `model` (`409`, spec model-switch/02):
+    /// its teardown holds the slot for as long as it runs, and a switch once
+    /// it is done loads.
+    Unloading {
+        /// The id being unloaded.
+        model: String,
+    },
     /// A reload with a changed config (`PATCH /v1/config`) was asked of a
     /// model not loaded from an artifact (the placeholder start): there is
     /// nothing to load it from again.
     NotReloadable,
+    /// The load a request began by needing an unloaded model
+    /// ([`ensure_loaded`]) found one loaded, or loading, already — another
+    /// request's load or a switch got there first. Never answered: the
+    /// request looks at the status again.
+    NotUnloaded,
 }
 
 /// How a switch ended.
@@ -542,10 +590,16 @@ pub enum SwitchOutcome {
 /// [`Switcher::running`] is cleared so the next switch may begin, and a task
 /// that ended without settling the status — a panic, or a runtime shutting
 /// down under it — leaves [`ModelStatus::Failed`] rather than a gate stuck
-/// at `Switching` with nobody left to open it.
+/// at `Switching` (or `Loading`) with nobody left to open it. Freeing the
+/// slot wakes the requests waiting on the status: one that found the slot
+/// taken by an unload loads the model now (spec model-switch/02).
 struct RunningGuard {
     switcher: Arc<Switcher>,
-    status: Arc<arc_swap::ArcSwap<ModelStatus>>,
+    status: Arc<StatusCell>,
+    /// Whether how it ended goes to `last_switch`: a switch or a reload,
+    /// not an unload nor the load a request began after one (spec
+    /// model-switch/02 AC 14).
+    records: bool,
 }
 
 impl Drop for RunningGuard {
@@ -554,12 +608,14 @@ impl Drop for RunningGuard {
         // already `failed` then, but the switch has not said how it ended).
         let status = self.status.load_full();
         let reason = match &*status {
-            ModelStatus::Switching { .. } => Some("the switch ended before it finished (see ignis.model.switch_panicked)".to_owned()),
-            ModelStatus::Failed { reason } if !self.switcher.settled.load(Ordering::SeqCst) => Some(reason.clone()),
+            ModelStatus::Switching { .. } | ModelStatus::Loading => {
+                Some("the switch ended before it finished (see ignis.model.switch_panicked)".to_owned())
+            }
+            ModelStatus::Failed { reason, .. } if self.records && !self.switcher.settled.load(Ordering::SeqCst) => Some(reason.clone()),
             _ => None,
         };
         if let Some(reason) = reason {
-            if let Some(started) = self.switcher.running.lock().expect("switch lock").as_ref() {
+            if let Some(Slot::Switch(started)) = self.switcher.running.lock().expect("switch lock").as_ref().filter(|_| self.records) {
                 self.switcher.record(&started.from, &started.to, &SwitchOutcome::Failed { reason: reason.clone() });
             }
             tracing::error!(
@@ -567,9 +623,13 @@ impl Drop for RunningGuard {
                 panicking = std::thread::panicking(),
                 "the switch task ended mid-switch; a switch to a model that loads is the way back"
             );
-            self.status.store(Arc::new(ModelStatus::Failed { reason }));
+            // A load out of `unloaded` (status `loading`, or already failed
+            // so) had nothing resident: a request may load the model again.
+            let from_unloaded = matches!(*status, ModelStatus::Loading) || status.is_unloaded();
+            self.status.store(Arc::new(ModelStatus::Failed { reason, from_unloaded }));
         }
         *self.switcher.running.lock().expect("switch lock") = None;
+        self.status.wake();
     }
 }
 
@@ -581,7 +641,7 @@ pub fn begin(
     server: &Server,
     target: ModelSource,
 ) -> Result<(SwitchStarted, tokio::task::JoinHandle<SwitchOutcome>), SwitchRefusal> {
-    begin_with(server, target, None)
+    begin_with(server, target, Run::Switch)
 }
 
 /// A reload asked for by a config change (spec config-v2/02 §`PATCH`).
@@ -611,45 +671,132 @@ pub fn reconfigure(
         return Err(SwitchRefusal::Unavailable);
     }
     let target = server.active().source.clone().ok_or(SwitchRefusal::NotReloadable)?;
-    begin_with(server, target, Some(Reconfigure { config, patch })).map(|(started, _task)| started)
+    begin_with(server, target, Run::Reload(Reconfigure { config, patch })).map(|(started, _task)| started)
 }
 
-/// [`begin`], with the config change a reload carries, if any.
+/// What a run of the switch's slot was asked to do: what it logs, what it
+/// records, and when it may begin.
+enum Run {
+    /// A switch: `POST /v1/models/switch`, or a request naming another
+    /// known model ([`implicit_switch`]).
+    Switch,
+    /// A reload with a changed configuration (`PATCH /v1/config`).
+    Reload(Reconfigure),
+    /// The load a request began by needing the unloaded model
+    /// ([`ensure_loaded`], spec model-switch/02): not a switch, so it is
+    /// logged `ignis.model.load_started` and `ignis.model.reloaded` and never
+    /// written to `last_switch` (AC 14). Refused
+    /// ([`SwitchRefusal::NotUnloaded`]) unless the model is still unloaded
+    /// when the slot is taken — one load, never a switch over a model another
+    /// request's load has just published.
+    OnDemand,
+}
+
+impl Run {
+    /// The configuration change a reload carries.
+    fn reconfigure(&self) -> Option<&Reconfigure> {
+        match self {
+            Run::Reload(reconfigure) => Some(reconfigure),
+            Run::Switch | Run::OnDemand => None,
+        }
+    }
+
+    /// Whether how it ends goes to `last_switch`: a switch's or a reload's,
+    /// not a request's load (spec model-switch/02 AC 14).
+    fn records(&self) -> bool {
+        !matches!(self, Run::OnDemand)
+    }
+}
+
+/// A run of the switch's slot as it began, which decides its steps.
+struct Begun {
+    /// What it was asked to do.
+    run: Run,
+    /// What a target refused before anything stopped puts back: `serving`
+    /// when the old model never stopped, `unloaded` when the unloaded model
+    /// is still the one a request loads; nothing after a failure, which
+    /// stays.
+    back: Option<ModelStatus>,
+    /// Nothing is resident — the idle clock unloaded the model (spec
+    /// model-switch/02): no drain, no teardown, and no previous model to
+    /// reload when the load fails.
+    unloaded: bool,
+}
+
+/// [`begin`], [`reconfigure`] and the load [`ensure_loaded`] begins, as
+/// `asked` says.
 fn begin_with(
     server: &Server,
     target: ModelSource,
-    reconfigure: Option<Reconfigure>,
+    asked: Run,
 ) -> Result<(SwitchStarted, tokio::task::JoinHandle<SwitchOutcome>), SwitchRefusal> {
     let switcher = server.switcher.clone().ok_or(SwitchRefusal::Unavailable)?;
-    let (started, before) = {
+    let on_demand = matches!(asked, Run::OnDemand);
+    let (started, begun) = {
         let mut running = switcher.running.lock().expect("switch lock");
-        if let Some(started) = running.as_ref() {
-            return Err(SwitchRefusal::InProgress(started.clone()));
+        match running.as_ref() {
+            Some(Slot::Switch(started)) => return Err(SwitchRefusal::InProgress(started.clone())),
+            Some(Slot::Unload { model }) => return Err(SwitchRefusal::Unloading { model: model.clone() }),
+            None => {}
         }
         let before = server.status();
         if matches!(*before, ModelStatus::WarmingUp) {
             return Err(SwitchRefusal::WarmingUp);
         }
+        // Unloaded, or a load out of `unloaded` that failed: nothing is
+        // resident, so this run only loads.
+        let unloaded = before.is_unloaded();
+        if on_demand && !unloaded {
+            return Err(SwitchRefusal::NotUnloaded);
+        }
+        let back = match &*before {
+            _ if on_demand => None,
+            ModelStatus::Serving => Some(ModelStatus::Serving),
+            ModelStatus::Unloaded => Some(ModelStatus::Unloaded),
+            _ => None,
+        };
         let started = SwitchStarted { from: server.active().engine.model_id(), to: target.model.clone() };
-        *running = Some(started.clone());
+        *running = Some(Slot::Switch(started.clone()));
         // The model being replaced is the start model if nothing else said so.
         switcher.note_start(server.active().source.as_ref());
-        switcher.settled.store(false, Ordering::SeqCst);
-        (started, before)
+        if asked.records() {
+            switcher.settled.store(false, Ordering::SeqCst);
+        }
+        (started, Begun { run: asked, back, unloaded })
     };
-    server
-        .status
-        .store(Arc::new(ModelStatus::Switching { from: started.from.clone(), to: started.to.clone() }));
-    tracing::info!(
-        name: "ignis.model.switch_started",
-        from = %started.from,
-        to = %started.to,
-        artifact = %target.artifact.display(),
-        "switching models: /v1 answers 503 model_switching until it is done"
-    );
-    let serving_before = matches!(*before, ModelStatus::Serving);
-    let guard = RunningGuard { switcher, status: Arc::clone(&server.status) };
-    let task = tokio::spawn(run(server.clone(), guard, target, started.clone(), serving_before, reconfigure));
+    // Nothing resident, nothing to drain: every request is let through, and
+    // the ones that need the model wait for this load (spec model-switch/02).
+    let status = if begun.unloaded {
+        ModelStatus::Loading
+    } else {
+        ModelStatus::Switching { from: started.from.clone(), to: started.to.clone() }
+    };
+    server.status.store(Arc::new(status));
+    match begun.run {
+        Run::OnDemand => tracing::info!(
+            name: "ignis.model.load_started",
+            from = %started.from,
+            to = %started.to,
+            artifact = %target.artifact.display(),
+            "a request needs the unloaded model: loading it, and the requests that need it wait for it"
+        ),
+        Run::Switch | Run::Reload(_) if begun.unloaded => tracing::info!(
+            name: "ignis.model.switch_started",
+            from = %started.from,
+            to = %started.to,
+            artifact = %target.artifact.display(),
+            "switching models while none is loaded: the requests that need one wait for this load"
+        ),
+        Run::Switch | Run::Reload(_) => tracing::info!(
+            name: "ignis.model.switch_started",
+            from = %started.from,
+            to = %started.to,
+            artifact = %target.artifact.display(),
+            "switching models: /v1 answers 503 model_switching until it is done"
+        ),
+    }
+    let guard = RunningGuard { switcher, status: Arc::clone(&server.status), records: begun.run.records() };
+    let task = tokio::spawn(run(server.clone(), guard, target, started.clone(), begun));
     Ok((started, task))
 }
 
@@ -720,10 +867,17 @@ pub async fn implicit_switch(server: &Server, requested: Option<&str>) -> Result
         }
         Err(SwitchRefusal::InProgress(running)) => return Err(ImplicitRefusal::Switching(running)),
         // None reaches a handler: there is a switcher, the gate holds every
-        // request until the warm-up has run, and only a reload refuses a
-        // model with no artifact. Were one to, the request's own model check
-        // refuses it by name.
-        Err(SwitchRefusal::Unavailable | SwitchRefusal::WarmingUp | SwitchRefusal::NotReloadable) => return Ok(()),
+        // request until the warm-up has run, only a reload refuses a model
+        // with no artifact, and no unload begins while this request is
+        // counted as use. Were one to, the request's own model check refuses
+        // it by name.
+        Err(
+            SwitchRefusal::Unavailable
+            | SwitchRefusal::WarmingUp
+            | SwitchRefusal::NotReloadable
+            | SwitchRefusal::NotUnloaded
+            | SwitchRefusal::Unloading { .. },
+        ) => return Ok(()),
     };
     let failed = |reason: String| Err(ImplicitRefusal::Failed { to: requested.to_owned(), reason });
     match task.await {
@@ -735,25 +889,185 @@ pub async fn implicit_switch(server: &Server, requested: Option<&str>) -> Result
     }
 }
 
-/// The switch itself, steps 2 to 5 of the module doc. `serving_before` is
-/// whether a model was serving when it began: a switch may also begin from
-/// [`ModelStatus::Failed`], the way out of a switch that left nothing
-/// serving, and a refusal then must not reopen the gate over a dead engine.
+/// Load the model a request needs when the idle clock unloaded it, and wait
+/// until it serves (spec model-switch/02, ADR 0049): what lets the first
+/// request after a quiet spell simply take as long as a cold load, rather
+/// than be refused for a state the server leaves by itself.
+///
+/// From [`ModelStatus::Unloaded`] this loads the model `requested` names
+/// when it is one a request may switch to — the implicit switch's target
+/// resolved here, so leaving `unloaded` is one load, never a load and then
+/// a switch — else the unloaded model again, from its source. A request
+/// arriving while that load runs ([`ModelStatus::Loading`]) waits for it:
+/// concurrent arrivals share one load. Woken by the status itself
+/// ([`StatusCell::subscribe`]), never by polling it.
+///
+/// `Ok` once a model serves — or at once in any other state, which is the
+/// gate's and the request's own business, as before. `Err` with the reason
+/// when the load this request waited on failed (AC 7); a failed load the
+/// request did not wait on is one it tries again.
+///
+/// Called where [`implicit_switch`] is, after the API key and before
+/// [`crate::Server::pinned`]: an unauthenticated request never costs a load
+/// (the serving gate, outside the key, lets every route through while
+/// unloaded), and the pin then takes the loaded model.
+pub async fn ensure_loaded(server: &Server, requested: Option<&str>) -> Result<(), String> {
+    let Some(switcher) = server.switcher.clone() else {
+        return Ok(());
+    };
+    // Whether a load this request can count as its own has run: a failure
+    // seen after one is this request's answer.
+    let mut waited = false;
+    loop {
+        let mut changed = server.status.subscribe();
+        let status = server.status();
+        let begin = match &*status {
+            ModelStatus::Loading => {
+                waited = true;
+                false
+            }
+            ModelStatus::Failed { reason, from_unloaded: true } => {
+                if waited {
+                    return Err(reason.clone());
+                }
+                true
+            }
+            ModelStatus::Unloaded => true,
+            _ => return Ok(()),
+        };
+        if begin {
+            let Some(target) = load_target(server, &switcher, requested) else {
+                // Nothing names an artifact to load (never so after an
+                // unload, which needs one): the torn-down engine answers.
+                return Ok(());
+            };
+            match begin_with(server, target, Run::OnDemand) {
+                Ok(_) => waited = true,
+                // The slot is an unload's still tearing down, or another
+                // load or a switch got there first: its end wakes this.
+                Err(SwitchRefusal::InProgress(_) | SwitchRefusal::Unloading { .. } | SwitchRefusal::NotUnloaded) => {}
+                Err(SwitchRefusal::Unavailable | SwitchRefusal::WarmingUp | SwitchRefusal::NotReloadable) => return Ok(()),
+            }
+        }
+        if changed.changed().await.is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// What a request needing the unloaded model loads ([`ensure_loaded`]): the
+/// model it names when that is one a request may switch to and not the
+/// unloaded one, else the unloaded one from its source.
+fn load_target(server: &Server, switcher: &Switcher, requested: Option<&str>) -> Option<ModelSource> {
+    let unloaded = server.active().source.clone();
+    let other = requested
+        .filter(|model| !model.is_empty())
+        .filter(|model| unloaded.as_ref().map_or(true, |source| source.model != *model));
+    other
+        .and_then(|model| switcher.known(model).map(|artifact| ModelSource { artifact, model: model.to_owned() }))
+        .or(unloaded)
+}
+
+/// The switch's slot, held by an idle unload from the moment it closes the
+/// model to new work until its teardown is done ([`claim_unload`]).
+pub(crate) struct Unloading {
+    _slot: RunningGuard,
+}
+
+/// Take the switch's slot for an idle unload (spec model-switch/02) and
+/// close the model: the status is [`ModelStatus::Unloaded`] from now, so a
+/// request admitted after this loads the model again rather than reaching an
+/// engine about to go. `None` — the unload waits for a later tick — while a
+/// switch, a reload or a load holds the slot (AC 12), when the model is not
+/// serving, or when it was not loaded from an artifact and could not be
+/// loaded again.
+///
+/// The idle clock calls it holding the in-flight count's lock
+/// ([`crate::idle::Usage`]), which a request's admission takes too: the
+/// count it saw at zero stays zero until the status says `unloaded`.
+pub(crate) fn claim_unload(server: &Server) -> Option<Unloading> {
+    let switcher = server.switcher.clone()?;
+    let mut running = switcher.running.lock().expect("switch lock");
+    if running.is_some() || !matches!(*server.status(), ModelStatus::Serving) || server.active().source.is_none() {
+        return None;
+    }
+    *running = Some(Slot::Unload { model: server.active().engine.model_id() });
+    server.status.store(Arc::new(ModelStatus::Unloaded));
+    drop(running);
+    Some(Unloading { _slot: RunningGuard { switcher, status: Arc::clone(&server.status), records: false } })
+}
+
+/// Tear the model down the way a switch does ([`ActiveModel::shut_down`]:
+/// the model thread drops its scheduler, and with it every GPU buffer and
+/// pinned arena), after [`claim_unload`] closed it, `idle` after its last
+/// use. The [`ActiveModel`] stays published — its id and its source are
+/// what `GET /v1/models` names and what the next load reads — and its
+/// engine is never called again. Not a switch: `ignis.model.unloaded`, and
+/// `last_switch` is left as it was (AC 14). The slot is freed, and the
+/// requests that arrived meanwhile woken, once the teardown is done.
+///
+/// The teardown, its line and the slot's release are one unit on the
+/// blocking thread that runs them, never split across this future: the
+/// clock awaiting it is stopped when its serve loop ends, and a stop
+/// mid-teardown must not free the slot — and wake a request to load a model
+/// — while the old model still holds the card. `/metrics` stops showing the
+/// model's reservations in the same unit, before a load could write its own.
+pub(crate) async fn unload(server: &Server, unloading: Unloading, idle: Duration) {
+    let model = server.active();
+    let server = server.clone();
+    let teardown = tokio::task::spawn_blocking(move || {
+        let teardown_began = Instant::now();
+        model.shut_down();
+        server.observe_unload();
+        tracing::info!(
+            name: "ignis.model.unloaded",
+            model = %model.engine.model_id(),
+            idle_secs = idle.as_secs(),
+            teardown_ms = teardown_began.elapsed().as_millis() as u64,
+            "nobody used the model for model.idle_unload seconds: it is unloaded, and the next request that needs it loads it again"
+        );
+        drop(unloading);
+    });
+    if let Err(panicked) = teardown.await {
+        tracing::error!(name: "ignis.model.teardown_panicked", error = %panicked, "tearing the unloaded model down panicked");
+    }
+}
+
+/// The switch itself, steps 2 to 5 of the module doc, from where `begun`
+/// says it began: a switch may also begin from [`ModelStatus::Failed`], the
+/// way out of a switch that left nothing serving, and a refusal then must
+/// not reopen the gate over a dead engine; and from
+/// [`ModelStatus::Unloaded`], where it only loads (spec model-switch/02).
 async fn run(
     server: Server,
     running: RunningGuard,
     target: ModelSource,
     started: SwitchStarted,
-    serving_before: bool,
-    reconfigure: Option<Reconfigure>,
+    begun: Begun,
 ) -> SwitchOutcome {
     let switcher = Arc::clone(&running.switcher);
     let began = Instant::now();
     let SwitchStarted { from, to } = started;
+    let reconfigure = begun.run.reconfigure();
+    let on_demand = matches!(begun.run, Run::OnDemand);
 
-    let options = reconfigure.as_ref().map(|reconfigure| reconfigure.config.clone());
+    let options = reconfigure.map(|reconfigure| reconfigure.config.clone());
     let prepared = match prepare(&switcher, target.clone(), options).await {
         Ok(prepared) => prepared,
+        Err(reason) if on_demand => {
+            // Spec model-switch/02 AC 7: the requests waiting on this load
+            // are answered with its reason, and `failed` stays until a later
+            // request or a switch tries again.
+            tracing::error!(
+                name: "ignis.model.reload_failed",
+                model = %to,
+                stage = "prepare",
+                %reason,
+                "loading the unloaded model failed; the next request tries again"
+            );
+            server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone(), from_unloaded: true }));
+            return SwitchOutcome::Failed { reason };
+        }
         Err(reason) => {
             tracing::error!(
                 name: "ignis.model.switch_failed",
@@ -764,14 +1078,15 @@ async fn run(
                 "the switch was refused before anything stopped; the old model is as it was"
             );
             // Failed for one tick (`GET /v1/models` may read it), then the
-            // old model, which never stopped, serves again — or, when the
-            // switch began from a failed one, nothing still serves. The
-            // reason is kept (`last_switch`) before either is stored.
+            // old model, which never stopped, serves again — or stays
+            // unloaded, for a request to load — or, when the switch began
+            // from a failed one, nothing still serves. The reason is kept
+            // (`last_switch`) before either is stored.
             let outcome = SwitchOutcome::Refused { reason: reason.clone() };
             switcher.record(&from, &to, &outcome);
-            server.status.store(Arc::new(ModelStatus::Failed { reason }));
-            if serving_before {
-                server.status.store(Arc::new(ModelStatus::Serving));
+            server.status.store(Arc::new(ModelStatus::Failed { reason, from_unloaded: begun.unloaded }));
+            if let Some(back) = begun.back {
+                server.status.store(Arc::new(back));
             }
             return outcome;
         }
@@ -779,33 +1094,38 @@ async fn run(
 
     // What the configuration will be once this load serves: the patched
     // one for a reload, the one the loader fitted to the target otherwise.
-    let serving_config = match &reconfigure {
+    let serving_config = match reconfigure {
         Some(reconfigure) => Some(reconfigure.config.clone()),
         None => prepared.options().cloned(),
     };
     let old = server.active();
-    let drain_began = Instant::now();
-    let drain_timeout = switcher.drain_timeout();
-    if let Err(left) = drain(&old.engine, drain_timeout).await {
-        // The window is over: what is still running is cut now, before the
-        // line saying so — whoever reads it can count on the cut being under
-        // way. The join below waits for it.
-        old.engine.shutdown();
-        tracing::warn!(
-            name: "ignis.model.switch_drain_timed_out",
-            from = %from,
-            to = %to,
-            waiting = left.waiting,
-            running = left.running,
-            drain_timeout_ms = drain_timeout.as_millis() as u64,
-            "requests still on the old model past the drain window are cancelled"
-        );
-    }
-    let drain_ms = drain_began.elapsed().as_millis() as u64;
+    // An unloaded model has nothing in flight and was already torn down.
+    let (drain_ms, teardown_ms) = if begun.unloaded {
+        (0, 0)
+    } else {
+        let drain_began = Instant::now();
+        let drain_timeout = switcher.drain_timeout();
+        if let Err(left) = drain(&old.engine, drain_timeout).await {
+            // The window is over: what is still running is cut now, before
+            // the line saying so — whoever reads it can count on the cut
+            // being under way. The join below waits for it.
+            old.engine.shutdown();
+            tracing::warn!(
+                name: "ignis.model.switch_drain_timed_out",
+                from = %from,
+                to = %to,
+                waiting = left.waiting,
+                running = left.running,
+                drain_timeout_ms = drain_timeout.as_millis() as u64,
+                "requests still on the old model past the drain window are cancelled"
+            );
+        }
+        let drain_ms = drain_began.elapsed().as_millis() as u64;
 
-    let teardown_began = Instant::now();
-    shut_down(&old).await;
-    let teardown_ms = teardown_began.elapsed().as_millis() as u64;
+        let teardown_began = Instant::now();
+        shut_down(&old).await;
+        (drain_ms, teardown_began.elapsed().as_millis() as u64)
+    };
 
     let load_began = Instant::now();
     match load_and_warm(&server, prepared).await {
@@ -817,26 +1137,68 @@ async fn run(
                 server.apply_config(&config);
                 if let Some(state) = &server.config {
                     state.publish(config);
-                    if let Some(reconfigure) = &reconfigure {
+                    if let Some(reconfigure) = reconfigure {
                         state.persist(&reconfigure.patch);
                     }
                 }
             }
-            tracing::info!(
-                name: "ignis.model.switched",
-                from = %from,
-                to = %to,
-                artifact = %target.artifact.display(),
-                drain_ms,
-                teardown_ms,
-                load_ms = (load_began.elapsed() - warm_up).as_millis() as u64,
-                warm_up_ms = warm_up.as_millis() as u64,
-                took_ms = began.elapsed().as_millis() as u64,
-                "model switched: the API admits requests"
-            );
-            switcher.record(&from, &to, &SwitchOutcome::Switched);
+            let load_ms = (load_began.elapsed() - warm_up).as_millis() as u64;
+            if on_demand {
+                // Not a switch: logged as the load after an unload, and
+                // `last_switch` is left as it was (spec model-switch/02).
+                tracing::info!(
+                    name: "ignis.model.reloaded",
+                    model = %to,
+                    artifact = %target.artifact.display(),
+                    load_ms,
+                    warm_up_ms = warm_up.as_millis() as u64,
+                    took_ms = began.elapsed().as_millis() as u64,
+                    "the model is loaded again: the requests waiting on it are served"
+                );
+            } else {
+                tracing::info!(
+                    name: "ignis.model.switched",
+                    from = %from,
+                    to = %to,
+                    artifact = %target.artifact.display(),
+                    drain_ms,
+                    teardown_ms,
+                    load_ms,
+                    warm_up_ms = warm_up.as_millis() as u64,
+                    took_ms = began.elapsed().as_millis() as u64,
+                    "model switched: the API admits requests"
+                );
+                switcher.record(&from, &to, &SwitchOutcome::Switched);
+            }
             server.status.store(Arc::new(ModelStatus::Serving));
             SwitchOutcome::Switched
+        }
+        Err(reason) if begun.unloaded => {
+            // Nothing was resident before this load, so there is nothing to
+            // reload: `failed` stays, with the process up, until a request
+            // (after an unload) or a switch loads a model.
+            let outcome = SwitchOutcome::Failed { reason: reason.clone() };
+            if on_demand {
+                tracing::error!(
+                    name: "ignis.model.reload_failed",
+                    model = %to,
+                    stage = "load",
+                    %reason,
+                    "loading the unloaded model failed; the next request tries again"
+                );
+            } else {
+                tracing::error!(
+                    name: "ignis.model.switch_failed",
+                    from = %from,
+                    to = %to,
+                    stage = "load",
+                    %reason,
+                    "the target failed to load and no model was loaded before it; nothing is serving"
+                );
+                switcher.record(&from, &to, &outcome);
+            }
+            server.status.store(Arc::new(ModelStatus::Failed { reason, from_unloaded: true }));
+            outcome
         }
         Err(reason) => {
             tracing::error!(
@@ -847,7 +1209,7 @@ async fn run(
                 %reason,
                 "the target failed to load after the old model was torn down; reloading the old model"
             );
-            server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone() }));
+            server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone(), from_unloaded: false }));
             restore(&server, &switcher, &old, (&from, &to), reason).await
         }
     }
@@ -911,10 +1273,13 @@ async fn load_and_warm(server: &Server, prepared: Box<dyn PreparedLoad>) -> Resu
 }
 
 /// Make `model` the one every request reads, with a fresh fork history: the
-/// old one's match keys name KV the new model never computed.
+/// old one's match keys name KV the new model never computed. A model is
+/// resident again, and its idle clock starts now (spec model-switch/02):
+/// a model loaded after a long quiet spell is not unloaded at the next tick.
 fn publish(server: &Server, model: ActiveModel) {
     *server.fork_history.lock().expect("fork history lock") = crate::reuse::ForkHistory::default();
     server.active.store(Arc::new(model));
+    server.usage.touch();
     crate::decide::log_load_heads(&server.active());
 }
 
@@ -933,7 +1298,7 @@ async fn restore(
         tracing::error!(name: "ignis.model.switch_restore_failed", %reason, "nothing is serving until a switch succeeds");
         let outcome = SwitchOutcome::Failed { reason: reason.clone() };
         switcher.record(from, to, &outcome);
-        server.status.store(Arc::new(ModelStatus::Failed { reason }));
+        server.status.store(Arc::new(ModelStatus::Failed { reason, from_unloaded: false }));
         return outcome;
     };
     // The running configuration, unchanged: a reload that failed never
@@ -962,7 +1327,7 @@ async fn restore(
             tracing::error!(name: "ignis.model.switch_restore_failed", %reason, "nothing is serving until a switch succeeds");
             let outcome = SwitchOutcome::Failed { reason: reason.clone() };
             switcher.record(from, to, &outcome);
-            server.status.store(Arc::new(ModelStatus::Failed { reason }));
+            server.status.store(Arc::new(ModelStatus::Failed { reason, from_unloaded: false }));
             outcome
         }
     }

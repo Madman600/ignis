@@ -87,6 +87,9 @@ pub const TEXT_REQUEST_BODY_LIMIT: usize = 16 << 20;
 pub fn router(state: Arc<Server>) -> Router {
     let (v1, document) = v1_parts();
     let mut router = v1
+        // Innermost: a request that passed the key and uses the model counts
+        // as its use until its response ends (spec model-switch/02).
+        .route_layer(middleware::from_fn_with_state(state.clone(), count_use))
         // Only the `/v1` routes above: the Playground's static pages, and
         // the API reference merged below, stay reachable without a key.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key))
@@ -263,6 +266,12 @@ impl<B> MakeSpan<B> for RootSpanMaker {
 /// is how a failed one is recovered from). During the warm-up they are held
 /// like every other route, as they always were. `GET /v1/config/fields` is
 /// static and is never held.
+///
+/// Unloaded, loading, or failed while leaving `unloaded` (spec
+/// model-switch/02, [`ModelStatus::refusal`]), every route passes: the
+/// request that needs the model loads it, or waits for the load under way,
+/// **behind** the key ([`switch_to_named_model`]) — never here, where a
+/// request without a key would cost a load.
 async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
     let status = server.status();
     let Some(code) = status.refusal() else {
@@ -278,10 +287,10 @@ async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: 
     }
     let message = match &*status {
         ModelStatus::Switching { from, to } => switching_message(from, to),
-        ModelStatus::Failed { reason } => {
+        ModelStatus::Failed { reason, .. } => {
             format!("a model switch failed and no model is serving ({reason}); retry shortly")
         }
-        ModelStatus::WarmingUp | ModelStatus::Serving => {
+        ModelStatus::WarmingUp | ModelStatus::Serving | ModelStatus::Unloaded | ModelStatus::Loading => {
             "the model is loaded but the first traversal (decode graph capture) has not finished; retry shortly"
                 .to_owned()
         }
@@ -312,9 +321,59 @@ fn switching_message(from: &str, to: &str) -> String {
 /// (template, thinking capabilities, media, engine) is the named model's.
 /// Run before any other look at the request: the gate closes the moment the
 /// mismatch is seen.
+///
+/// A model the idle clock unloaded is loaded first — the one the request
+/// names when the server knows it, so that is one load — and the request
+/// waits for it ([`crate::model_switch::ensure_loaded`], spec
+/// model-switch/02).
 pub(crate) async fn switch_to_named_model(server: &Server, model: Option<&str>) -> Result<(), Response> {
     let (named, _) = split_model_lane(model.map(str::to_owned));
+    crate::model_switch::ensure_loaded(server, named.as_deref()).await.map_err(|reason| load_failed(server, &reason))?;
     crate::model_switch::implicit_switch(server, named.as_deref()).await.map_err(implicit_switch_refused)
+}
+
+/// The answer to a request that waited on the load leaving `unloaded` (spec
+/// model-switch/02 AC 7) when that load failed: `503 model_load_failed` with
+/// its reason. No `Retry-After`: nothing says a retry fares better, though
+/// the next request does try the load again.
+pub(crate) fn load_failed(server: &Server, reason: &str) -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server_error",
+        "model_load_failed",
+        format!(
+            "{} was unloaded while idle and loading a model again failed, so the request was not served: {reason}",
+            server.active().engine.model_id()
+        ),
+    )
+}
+
+/// Counts a request that uses the model ([`uses_the_model`]) as its use, for
+/// idle unload (spec model-switch/02, `crate::idle`): from here — past the
+/// key — until its response body ends, a stream included. A request that
+/// only reads state is not counted, so a page polling it neither keeps the
+/// model loaded nor stops it from being unloaded.
+async fn count_use(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
+    if !uses_the_model(req.method(), req.uri().path()) {
+        return next.run(req).await;
+    }
+    let in_use = server.usage.admit();
+    next.run(req).await.map(|body| axum::body::Body::new(crate::idle::Counted::new(body, in_use)))
+}
+
+/// The routes whose `POST` uses the model (ADR 0049 §2: what the serving
+/// gate holds, apart from the routes that only report state or drive a
+/// switch): the completions, the decision and its alias, and the counting
+/// routes, which read the model's tokenizer. The Responses socket's upgrade
+/// is not one: its jobs count, one by one (`crate::responses::socket`). A
+/// test classifies every documented `/v1` operation as one of these or as
+/// one that does not use the model, so a new route is never left out unseen.
+const MODEL_ROUTES: [&str; 6] =
+    ["/v1/chat/completions", "/v1/responses", "/v1/decide", "/v1/systemone", "/v1/tokenize", "/v1/detokenize"];
+
+/// Whether a request uses the model ([`MODEL_ROUTES`]), for idle unload.
+fn uses_the_model(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::POST && MODEL_ROUTES.contains(&path)
 }
 
 /// The response refusing a request whose `model` did not get it served on
@@ -1442,7 +1501,7 @@ pub(crate) fn now() -> u64 {
     tag = "models",
     operation_id = "list_models",
     summary = "The loaded model",
-    description = "One entry: the model this server loaded, with the context a single request may spend (`max_model_len`, prompt plus completion). A server serves one model at a time; `POST /v1/models/switch` replaces it.\n\n`status` beside the entry says what the API is doing: `serving`; `switching` while a switch replaces the model (`switching` names both ids, and the entry is still the old model until the new one serves); or `failed` when the last switch failed (`reason` says why) — briefly, while the previous model is reloaded, or until a switch succeeds when it could not be. While switching or failed this route answers; every other `/v1` route answers 503.",
+    description = "One entry: the model this server loaded, with the context a single request may spend (`max_model_len`, prompt plus completion). A server serves one model at a time; `POST /v1/models/switch` replaces it.\n\n`status` beside the entry says what the API is doing: `serving`; `switching` while a switch replaces the model (`switching` names both ids, and the entry is still the old model until the new one serves); or `failed` when the last switch failed (`reason` says why) — briefly, while the previous model is reloaded, or until a switch succeeds when it could not be. While switching or failed this route answers; every other `/v1` route answers 503.\n\n`unloaded` when nobody used the model for `model.idle_unload` seconds and it was unloaded (the entry still names it, and the API stays up): the next request that needs it loads it again and is served once it is warm. `loading` while that load runs, `switching` naming what loads; requests arriving meanwhile wait for it. A load out of `unloaded` that fails is `failed`, and the next request tries again.",
     responses(
         (status = 200, description = "The loaded model.", body = ModelList),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
@@ -1465,10 +1524,15 @@ async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
         status: status.as_str(),
         switching: match &*status {
             ModelStatus::Switching { from, to } => Some(SwitchIds { from: from.clone(), to: to.clone() }),
+            // The load leaving `unloaded` (spec model-switch/02): what loads.
+            ModelStatus::Loading => match server.switcher.as_ref().and_then(|switcher| switcher.running()) {
+                Some(crate::model_switch::Slot::Switch(running)) => Some(SwitchIds { from: running.from, to: running.to }),
+                Some(crate::model_switch::Slot::Unload { .. }) | None => None,
+            },
             _ => None,
         },
         reason: match &*status {
-            ModelStatus::Failed { reason } => Some(reason.clone()),
+            ModelStatus::Failed { reason, .. } => Some(reason.clone()),
             _ => None,
         },
         last_switch: server.switcher.as_ref().and_then(|switcher| switcher.last_switch()).map(LastSwitchInfo::of),
@@ -1480,9 +1544,11 @@ async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
 struct ModelList {
     object: &'static str,
     data: Vec<ModelInfo>,
-    /// `serving`, `switching` or `failed` (spec model-switch/01).
+    /// `serving`, `switching` or `failed` (spec model-switch/01); `unloaded`
+    /// or `loading` (spec model-switch/02).
     status: &'static str,
-    /// The switch under way, while `status` is `switching`.
+    /// The switch under way, while `status` is `switching`; the load under
+    /// way, while it is `loading`.
     #[serde(skip_serializing_if = "Option::is_none")]
     switching: Option<SwitchIds>,
     /// Why the last switch failed, while `status` is `failed`.
@@ -1654,6 +1720,16 @@ pub(crate) fn switch_refused(refusal: crate::model_switch::SwitchRefusal) -> Res
             "switch_in_progress",
             format!("a switch from {} to {} is already under way; switches are not queued", running.from, running.to),
         ),
+        // Spec model-switch/02: the unload's teardown holds the slot, and is
+        // seconds long; once it is done a switch loads the model it names.
+        crate::model_switch::SwitchRefusal::Unloading { model } => error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "switch_in_progress",
+            format!(
+                "{model} is being unloaded after going unused (model.idle_unload); switch once GET /v1/models reports `unloaded`"
+            ),
+        ),
         crate::model_switch::SwitchRefusal::Unavailable => error_response(
             StatusCode::NOT_IMPLEMENTED,
             "server_error",
@@ -1663,6 +1739,14 @@ pub(crate) fn switch_refused(refusal: crate::model_switch::SwitchRefusal) -> Res
         crate::model_switch::SwitchRefusal::WarmingUp => {
             unavailable("server_not_ready", "the loaded model's first traversal has not finished; retry shortly")
         }
+        // Only the load a request begins is refused so, and that refusal is
+        // never answered: the request looks at the status again.
+        crate::model_switch::SwitchRefusal::NotUnloaded => error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "switch_in_progress",
+            "a model was loaded meanwhile; there is nothing to load",
+        ),
         crate::model_switch::SwitchRefusal::NotReloadable => error_response(
             StatusCode::CONFLICT,
             "invalid_request_error",
@@ -1791,7 +1875,7 @@ Tool calls come back whole -- one complete `tool_calls` delta per call, never a 
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 413, description = "The prompt is longer than this server's `--model-max-context`.", body = ApiError),
-        (status = 503, description = "The engine is at capacity and the request was not admitted (`engine_full`); or a model switch is under way (`model_switching`, with `Retry-After`); or the switch this request's `model` began did not land (`model_switch_failed`).", body = ApiError),
+        (status = 503, description = "The engine is at capacity and the request was not admitted (`engine_full`); or a model switch is under way (`model_switching`, with `Retry-After`); or the switch this request's `model` began did not land (`model_switch_failed`); or the model was unloaded while idle and loading it again failed (`model_load_failed`).", body = ApiError),
         (status = 504, description = "The engine did not finish the request within `--server-request-timeout`.", body = ApiError),
     ),
 )]
@@ -2823,6 +2907,57 @@ pub(crate) struct ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec model-switch/02: every `/v1` operation the reference documents
+    /// is classified for idle unload — it uses the model ([`uses_the_model`],
+    /// counted as use) or it is listed here as one that does not — so a
+    /// route added to [`v1_parts`] without a side fails here rather than
+    /// going uncounted, and an unload never lands under its request.
+    #[test]
+    fn every_documented_v1_operation_is_classified_for_idle_unload() {
+        // The operations that do not use the model, and why.
+        let not_the_model = [
+            // They report state: a page polling them must neither keep the
+            // model loaded nor load it again (AC 5).
+            ("GET", "/v1/models"),
+            ("GET", "/v1/models/catalog"),
+            ("GET", "/v1/config"),
+            ("GET", "/v1/config/fields"),
+            ("GET", "/v1/config/origins"),
+            // They drive a switch or a reload, which holds the switch's slot.
+            ("POST", "/v1/models/switch"),
+            ("PATCH", "/v1/config"),
+            // The Responses socket's upgrade: its jobs count, one by one.
+            ("GET", "/v1/responses"),
+        ];
+        let (_, document) = v1_parts();
+        let document = serde_json::to_value(&document).expect("the document serializes");
+        let mut operations = Vec::new();
+        for (path, item) in document["paths"].as_object().expect("paths") {
+            for method in item.as_object().expect("a path item").keys() {
+                if let Ok(method) = axum::http::Method::from_bytes(method.to_uppercase().as_bytes()) {
+                    operations.push((method, path.clone()));
+                }
+            }
+        }
+        assert!(operations.len() > not_the_model.len(), "{operations:?}");
+        for (method, path) in &operations {
+            let listed = not_the_model.contains(&(method.as_str(), path.as_str()));
+            assert_ne!(
+                uses_the_model(method, path),
+                listed,
+                "{method} {path}: classify it for idle unload, as a model route (MODEL_ROUTES) or one that is not"
+            );
+        }
+        for (method, path) in not_the_model {
+            assert!(operations.iter().any(|(m, p)| m.as_str() == method && p == path), "{method} {path} is not documented");
+        }
+        // Every model route is a documented `POST`, or the decision's alias.
+        for path in MODEL_ROUTES {
+            let documented = operations.iter().any(|(m, p)| *m == axum::http::Method::POST && p == path);
+            assert!(documented || path == "/v1/systemone", "{path} is not a documented POST");
+        }
+    }
 
     #[test]
     fn a_chunk_serializes_in_the_openai_shape() {

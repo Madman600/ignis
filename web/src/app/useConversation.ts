@@ -1,5 +1,5 @@
-import { useRef, useState } from "react";
-import type { ModelState } from "../api/model.ts";
+import { useEffect, useRef, useState } from "react";
+import { canSend, loadAwaited, type ModelState } from "../api/model.ts";
 import { conversationTurns, type Exchange, type Settings, thinkingBudgetOf, type ToolExtras } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { streamChat } from "../api/stream.ts";
@@ -115,9 +115,19 @@ export function useConversation({
   const busy = streaming.size > 0;
   const streamingHere = streaming.has(active.id);
   /** A new turn can start in the session on screen, and the model is known. */
-  const canRun = canStartTurn(streaming, active.id, parallel) && model.state === "ready";
+  const canRun = canStartTurn(streaming, active.id, parallel) && canSend(model);
   /** Send waits: this session streams, or another one does and turns are not parallel. */
   const sendBlocked = !canStartTurn(streaming, active.id, parallel);
+
+  // A turn sent while the model was unloaded loads it (spec model-switch/02). The read at the turn's start comes
+  // back `unloaded` before its request reaches the server, so the page reads again each second until it sees the
+  // load — which it then follows as it follows a switch — and the header says what the wait is.
+  const awaitingLoad = loadAwaited(model, busy);
+  useEffect(() => {
+    if (!awaitingLoad) return;
+    const timer = setInterval(refreshModel, 1000);
+    return () => clearInterval(timer);
+  }, [awaitingLoad, refreshModel]);
 
   function selectSession(id: number) {
     following.current = true;
@@ -147,7 +157,7 @@ export function useConversation({
    * ends the whole turn, agents included.
    */
   async function exchange(sessionId: number, history: Message[], prompt: string | null, images: PromptImage[] = []) {
-    if (!canStartTurn(running(), sessionId, parallel) || model.state !== "ready") return;
+    if (!canStartTurn(running(), sessionId, parallel) || !canSend(model)) return;
     // A request names no model: the server serves the one it has loaded, and a name could only switch it. The
     // page asks again which that is, so the header follows a switch another client made.
     refreshModel();
@@ -430,7 +440,7 @@ export function useConversation({
    */
   function rerun(messageId: number, prompt: string | null) {
     const index = active.messages.findIndex((m) => m.id === messageId);
-    if (index === -1 || !canStartTurn(running(), active.id, parallel) || model.state !== "ready") return;
+    if (index === -1 || !canStartTurn(running(), active.id, parallel) || !canSend(model)) return;
     const sessionId = active.id;
     const images = active.messages[index].images ?? [];
     setList((l) => ({ ...l, sessions: truncateFrom(l.sessions, sessionId, messageId) }));

@@ -556,8 +556,14 @@ async fn serve(
     emit: &impl Fn(JsonValue),
     cancel: impl std::future::Future<Output = ()>,
 ) -> Outcome {
+    // This job uses the model until it ends (spec model-switch/02): counted
+    // per job, never per connection, so an idle socket does not keep the
+    // model loaded — an open socket never re-enters the HTTP layer that
+    // counts the other routes.
+    let _in_use = server.usage.admit();
     // A `model` naming another known model switches to it first, as over
-    // HTTP (spec model-switch/01 §Implicit switch).
+    // HTTP (spec model-switch/01 §Implicit switch) — and a model the idle
+    // clock unloaded is loaded first (spec model-switch/02).
     if let Err(refusal) = input::switch_to_named_model(server, &job.body).await {
         emit(refusal_event(refusal).await);
         return Outcome::Failed;

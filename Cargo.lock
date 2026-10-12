@@ -1099,6 +1099,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "getrandom 0.3.4",
+ "http-body",
  "http-body-util",
  "ignis-artifact",
  "ignis-bench",

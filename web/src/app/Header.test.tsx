@@ -5,7 +5,7 @@ import { Header } from "./Header.tsx";
 
 // The header's view switch (GitHub #165, #247) and the engine pulse.
 
-const base = { model: { state: "loading" } as const, busy: false, onOpen: () => {}, onOpenMemory: () => {} };
+const base = { model: { state: "reading" } as const, busy: false, onOpen: () => {}, onOpenMemory: () => {} };
 
 describe("Header", () => {
   it("shows the plain Playground label with no switch at all", () => {

@@ -51,9 +51,11 @@ const MODEL_FLASH_NEXT: &str = "qwen3.8-flash-next";
 /// measured here (it is the switch's wall time and the 27B's arena, not
 /// Flash-Next's reuse), so they are zeroed to leave the host plan's margin
 /// check a little more room on a machine running other things at the same
-/// time.
+/// time. Idle unload is off (ADR 0049): a measurement must not meet a cold
+/// reload of its own.
 fn options() -> ignis_server::config::Config {
-    let args: Vec<String> = ["--model-max-context", "16384", "--reuse-retained-host", "0"].map(String::from).to_vec();
+    let args: Vec<String> =
+        ["--model-max-context", "16384", "--reuse-retained-host", "0", "--model-idle-unload", "0"].map(String::from).to_vec();
     match ignis_server::config::resolve(&args, |_| None).expect("the options resolve") {
         ignis_server::config::ConfigOutcome::Config(config) => config,
         _ => unreachable!("flags without --help are a config"),

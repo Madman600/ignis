@@ -177,11 +177,27 @@ pub enum ModelStatus {
     /// model could be kept or reloaded (the switch stores `Serving` again
     /// right after); it stays only when nothing could be loaded at all,
     /// and then `/v1` answers `503 server_not_ready` until a switch
-    /// succeeds.
+    /// succeeds — or, when it was the load leaving [`ModelStatus::Unloaded`]
+    /// that failed (`from_unloaded`), every request is admitted and the next
+    /// one that needs the model tries the load again (spec model-switch/02
+    /// AC 7).
     Failed {
         /// Why, as the switch's log line says it.
         reason: String,
+        /// The run that failed left [`ModelStatus::Unloaded`]: nothing was
+        /// resident before it, and nothing is to be reloaded, so a request
+        /// may load the model again. False after a failed switch, which only
+        /// a switch recovers from.
+        from_unloaded: bool,
     },
+    /// Nobody used the model for `model.idle_unload` seconds, so it was torn
+    /// down the way a switch tears one down (spec model-switch/02, ADR 0049):
+    /// the process and the API are up, the model's id and source are kept,
+    /// and the next request that needs it loads it again.
+    Unloaded,
+    /// The load that leaves [`ModelStatus::Unloaded`] is running: requests
+    /// that need the model wait for it rather than being refused.
+    Loading,
 }
 
 impl ModelStatus {
@@ -192,20 +208,109 @@ impl ModelStatus {
             Self::Serving => "serving",
             Self::Switching { .. } => "switching",
             Self::Failed { .. } => "failed",
+            Self::Unloaded => "unloaded",
+            Self::Loading => "loading",
         }
     }
 
     /// The `503` code a `/v1` request is refused with in this state, or
-    /// `None` while serving: `server_not_ready` for the warm-up (the wire
-    /// contract GitHub #129 set) and for a failed switch — by the time a
+    /// `None` when it is admitted: `server_not_ready` for the warm-up (the
+    /// wire contract GitHub #129 set) and for a failed switch — by the time a
     /// client could see that one, the previous model is usually serving
     /// again, so it needs no code of its own — and `model_switching` while
-    /// a switch runs.
+    /// a switch runs. Unloaded, loading, or failed while leaving unloaded,
+    /// every request is admitted: the one that needs the model loads it,
+    /// behind the API key, and waits (`crate::model_switch::ensure_loaded`).
     pub fn refusal(&self) -> Option<&'static str> {
         match self {
-            Self::Serving => None,
-            Self::WarmingUp | Self::Failed { .. } => Some("server_not_ready"),
+            Self::Serving | Self::Unloaded | Self::Loading | Self::Failed { from_unloaded: true, .. } => None,
+            Self::WarmingUp | Self::Failed { from_unloaded: false, .. } => Some("server_not_ready"),
             Self::Switching { .. } => Some("model_switching"),
+        }
+    }
+
+    /// Whether nothing is resident because the idle clock unloaded the
+    /// model (spec model-switch/02): [`ModelStatus::Unloaded`], or a load out
+    /// of it that failed. A request that needs the model loads it from here,
+    /// and a run of the switch's slot only loads — nothing to drain, tear
+    /// down, or reload when it fails.
+    pub fn is_unloaded(&self) -> bool {
+        matches!(self, Self::Unloaded | Self::Failed { from_unloaded: true, .. })
+    }
+
+    /// Whether no model is on the card for the API to serve: a switch or a
+    /// load failed, the model was unloaded, or a load out of that runs. The
+    /// model `active` still names was torn down, so the catalog marks no row
+    /// loaded.
+    pub fn no_model_loaded(&self) -> bool {
+        matches!(self, Self::Failed { .. } | Self::Unloaded | Self::Loading)
+    }
+}
+
+/// The server's [`ModelStatus`]: read wait-free like the `ArcSwap` it wraps,
+/// and every store wakes whoever waits for it to change (spec
+/// model-switch/02) — the requests holding on a load that leaves
+/// [`ModelStatus::Unloaded`], which need a signal, not a poll. Firing on the
+/// store itself, rather than at each call site, is what keeps a new store
+/// from being one nobody hears.
+pub struct StatusCell {
+    current: arc_swap::ArcSwap<ModelStatus>,
+    changed: tokio::sync::watch::Sender<()>,
+}
+
+impl StatusCell {
+    /// A cell holding `status`.
+    pub fn new(status: ModelStatus) -> Self {
+        Self { current: arc_swap::ArcSwap::from_pointee(status), changed: tokio::sync::watch::Sender::new(()) }
+    }
+
+    /// The status, as of now (wait-free).
+    pub fn load_full(&self) -> Arc<ModelStatus> {
+        self.current.load_full()
+    }
+
+    /// Replace the status and wake every waiter.
+    pub fn store(&self, status: Arc<ModelStatus>) {
+        self.current.store(status);
+        self.wake();
+    }
+
+    /// A receiver that changes at every store from now on. Take it
+    /// **before** reading the status it is to wait past, so a store between
+    /// the read and the wait is not missed.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changed.subscribe()
+    }
+
+    /// Wake every waiter without a store: what the switch's slot does when
+    /// it is freed, since a waiter that found it taken waits for that too.
+    pub(crate) fn wake(&self) {
+        self.changed.send_replace(());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec model-switch/02: a load out of `unloaded` that failed is a state
+    /// the gate admits — the next request tries the load again — and the
+    /// status says so itself, the way it says every other state; a failed
+    /// switch is still refused.
+    #[test]
+    fn a_failed_load_out_of_unloaded_is_admitted_and_a_failed_switch_is_not() {
+        let failed = |from_unloaded| ModelStatus::Failed { reason: "x".into(), from_unloaded };
+        assert_eq!(failed(true).refusal(), None);
+        assert_eq!(failed(false).refusal(), Some("server_not_ready"));
+        assert_eq!((failed(true).as_str(), failed(false).as_str()), ("failed", "failed"));
+        assert!(failed(true).is_unloaded() && ModelStatus::Unloaded.is_unloaded());
+        assert!(!failed(false).is_unloaded() && !ModelStatus::Loading.is_unloaded() && !ModelStatus::Serving.is_unloaded());
+        for status in [failed(true), failed(false), ModelStatus::Unloaded, ModelStatus::Loading] {
+            assert!(status.no_model_loaded(), "{status:?}");
+        }
+        let switching = ModelStatus::Switching { from: "a".into(), to: "b".into() };
+        for status in [ModelStatus::Serving, ModelStatus::WarmingUp, switching] {
+            assert!(!status.no_model_loaded(), "{status:?}");
         }
     }
 }

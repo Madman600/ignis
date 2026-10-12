@@ -103,6 +103,17 @@ pub const DEFAULT_SWITCH_DRAIN_TIMEOUT_SECS: u32 = 30;
 /// fat-fingered value, as [`MAX_REQUEST_TIMEOUT_SECS`] is for its flag.
 pub const MAX_SWITCH_DRAIN_TIMEOUT_SECS: u32 = 3600;
 
+/// How long the loaded model may go unused before it is unloaded, in seconds
+/// (`--model-idle-unload`, spec model-switch/02, ADR 0049): five minutes
+/// gives the card back to whoever else needs it without paying a cold load
+/// between the turns of one conversation. 0 never unloads.
+pub const DEFAULT_MODEL_IDLE_UNLOAD_SECS: u32 = 300;
+
+/// The upper bound `--model-idle-unload` accepts: a week, a ceiling against a
+/// fat-fingered value as [`MAX_SWITCH_DRAIN_TIMEOUT_SECS`] is for its flag —
+/// whoever wants the model never unloaded says 0.
+pub const MAX_MODEL_IDLE_UNLOAD_SECS: u32 = 7 * 24 * 3600;
+
 /// Whether a request naming another model may switch the server to it
 /// without anyone saying so (`--switch-allow-implicit`, spec model-switch/01
 /// §Implicit switch). On: the owner's clients name the model they want and
@@ -353,6 +364,10 @@ pub struct Config {
     /// (`--switch-drain-timeout`). In `[0, MAX_SWITCH_DRAIN_TIMEOUT_SECS]`;
     /// 0 cuts them at once.
     pub switch_drain_timeout_secs: u32,
+    /// How long the loaded model may go unused before it is unloaded, the
+    /// server staying up (`--model-idle-unload`, spec model-switch/02). In
+    /// `[0, MAX_MODEL_IDLE_UNLOAD_SECS]`; 0 never unloads.
+    pub idle_unload_secs: u32,
     /// Whether a request whose `model` names another model listed in
     /// [`Config::known_models`] switches the server to it, and is then
     /// served on it (`--switch-allow-implicit`, spec model-switch/01
@@ -986,6 +1001,7 @@ fn derive(
         media,
         request_timeout_secs: s.server.request_timeout,
         switch_drain_timeout_secs: s.switch.drain_timeout,
+        idle_unload_secs: s.model.idle_unload,
         allow_model_switch: s.switch.allow_implicit,
         known_models: s.switch.known_models.clone(),
         ui: s.server.ui,

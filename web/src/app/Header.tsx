@@ -161,7 +161,22 @@ function ModelStatus({ model, busy }: { model: ModelState; busy: boolean }) {
           <span className="sr-only">{busy ? "generating" : "ready"}</span>
         </>
       )}
-      {model.state === "loading" && <span className="text-[#939ba4]">Loading model…</span>}
+      {model.state === "reading" && <span className="text-[#939ba4]">Loading model…</span>}
+      {model.state === "unloaded" && (
+        <>
+          <span className="cut size-2.5 shrink-0 bg-[#939ba4] [--cut-size:4px]" aria-hidden />
+          <span className="hidden truncate text-[#b9bec4] sm:inline" title="Unloaded while idle: the next message loads it again">
+            {model.id} · unloaded
+          </span>
+          <span className="sr-only">unloaded</span>
+        </>
+      )}
+      {model.state === "loading" && (
+        <>
+          <span className="cut size-2.5 shrink-0 bg-[#ff5a1f] [--cut-size:4px]" aria-hidden />
+          <span className="truncate text-[#eae8e4]">Loading {model.to}…</span>
+        </>
+      )}
       {model.state === "switching" && (
         <>
           <span className="cut size-2.5 shrink-0 bg-[#ff5a1f] [--cut-size:4px]" aria-hidden />

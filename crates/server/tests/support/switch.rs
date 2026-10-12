@@ -94,6 +94,12 @@ impl MockLoader {
         (model, gated, controller)
     }
 
+    /// [`MockLoader::model`] over `compute`, a test's own (counted as
+    /// resident like every compute this loader builds).
+    pub fn model_over(&self, id: &str, compute: Arc<dyn Compute>) -> ActiveModel {
+        build(&self.state, id, compute)
+    }
+
     /// Refuse `id` at prepare, as a path with no file would be.
     pub fn refuse(&self, id: &str) {
         self.state.refused.lock().unwrap().insert(id.to_owned());
@@ -103,6 +109,12 @@ impl MockLoader {
     /// would.
     pub fn break_load(&self, id: &str) {
         self.state.broken.lock().unwrap().insert(id.to_owned());
+    }
+
+    /// Let `id` load again ([`MockLoader::break_load`] undone): the way a
+    /// test proves a later attempt is made, and can succeed.
+    pub fn mend(&self, id: &str) {
+        self.state.broken.lock().unwrap().remove(id);
     }
 
     /// Hold the next load until the returned sender sends (or is dropped).

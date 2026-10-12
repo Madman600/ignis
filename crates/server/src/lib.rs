@@ -33,6 +33,7 @@ pub mod decoder;
 pub mod download;
 pub mod engine;
 pub mod expose;
+pub mod idle;
 pub mod instruction;
 pub mod load;
 pub mod locate;
@@ -60,7 +61,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use axum::Router;
 
-pub use crate::active::{ActiveModel, ModelSource, ModelStatus};
+pub use crate::active::{ActiveModel, ModelSource, ModelStatus, StatusCell};
 use crate::engine::Engine;
 use crate::template::TemplateProvider;
 use crate::thinking::ReasoningEffort;
@@ -117,8 +118,14 @@ pub struct Server {
     /// `server_not_ready` until the first traversal has run, so no request
     /// pays the decode-graph capture on its first token — or a model switch
     /// is under way (`503 model_switching`). Shared by every clone, like the
-    /// active model.
-    pub status: std::sync::Arc<ArcSwap<ModelStatus>>,
+    /// active model. Every store wakes the requests waiting on a load
+    /// ([`StatusCell`], spec model-switch/02).
+    pub status: std::sync::Arc<StatusCell>,
+    /// The requests using the model now, and when it was last used: what the
+    /// idle clock reads to unload a model nobody uses (spec model-switch/02,
+    /// [`idle`]). Shared by every clone — a pinned copy's request counts on
+    /// the server's model.
+    pub usage: std::sync::Arc<idle::Usage>,
     /// What `POST /v1/models/switch` loads models with (spec
     /// model-switch/01): the loader, the drain window, the one switch that
     /// may run at a time. `None` answers the route `501`: a server built in
@@ -154,11 +161,18 @@ pub struct Live {
     /// templated (`--server-system-message-policy` /
     /// `--server-developer-message-policy`, GitHub #209).
     pub instruction_policy: instruction::InstructionPolicy,
+    /// How long the loaded model may go unused before the idle clock unloads
+    /// it (`--model-idle-unload`, spec model-switch/02); zero never unloads.
+    /// Read by the clock at every tick, so a live change needs no restart.
+    pub idle_unload: Duration,
 }
 
 impl Default for Live {
     /// What a server built without a config runs with: the timeout's
-    /// default, thinking on with no effort or budget, merge / inplace.
+    /// default, thinking on with no effort or budget, merge / inplace — and
+    /// no idle unload: only a configured server (`main`, a live `PATCH`)
+    /// unloads its model, so no test or in-process harness meets a cold
+    /// reload it did not ask for.
     fn default() -> Self {
         Self {
             request_timeout: Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS as u64),
@@ -166,6 +180,7 @@ impl Default for Live {
             default_reasoning_effort: None,
             default_thinking_budget: None,
             instruction_policy: instruction::InstructionPolicy::default(),
+            idle_unload: Duration::ZERO,
         }
     }
 }
@@ -179,6 +194,7 @@ impl Live {
             default_reasoning_effort: config.reasoning_effort,
             default_thinking_budget: config.thinking_budget,
             instruction_policy: config.instruction_policy,
+            idle_unload: Duration::from_secs(u64::from(config.idle_unload_secs)),
         }
     }
 }
@@ -252,7 +268,8 @@ impl Server {
             responses: std::sync::Arc::default(),
             wall_clock: std::sync::Arc::new(telemetry::SystemClock),
             seedless_seed: None,
-            status: std::sync::Arc::new(ArcSwap::from_pointee(ModelStatus::Serving)),
+            status: std::sync::Arc::new(StatusCell::new(ModelStatus::Serving)),
+            usage: std::sync::Arc::default(),
             switcher: None,
             config: None,
         }
@@ -454,6 +471,13 @@ impl Server {
         self
     }
 
+    /// Unload the model after `after` with no request using it
+    /// (`--model-idle-unload`, spec model-switch/02); zero never does.
+    pub fn with_idle_unload(self, after: Duration) -> Self {
+        self.update_live(|live| live.idle_unload = after);
+        self
+    }
+
     /// Serve the Playground from `assets` under `/ui/` (`main` passes
     /// [`playground::EMBEDDED`] when `--server-ui` is set; tests inject their own
     /// table, including the empty one that selects the fallback page).
@@ -496,6 +520,16 @@ impl Server {
         model.engine.install_metrics(std::sync::Arc::clone(metrics));
         if let Some(reserved) = reserved {
             self.install_reservations(model, reserved);
+        }
+    }
+
+    /// The idle clock unloaded the model (spec model-switch/02): what
+    /// `--server-metrics` keeps shows nothing reserved, until a load's
+    /// [`Server::observe_load`] writes its own. Nothing without
+    /// `--server-metrics`.
+    pub(crate) fn observe_unload(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.set_unloaded();
         }
     }
 
@@ -604,6 +638,9 @@ impl Server {
 
         let app = self.app();
         self.spawn_warm_up();
+        // Spec model-switch/02: an unused model leaves the card while this
+        // serves; the clock stops when serving does.
+        let _idle_clock = self.spawn_idle_clock(idle::IDLE_TICK);
         let (metrics_listener, metrics_app) = match (metrics_listener, self.metrics_app()) {
             (None, _) => {
                 return axum::serve(listener, app).with_graceful_shutdown(shutdown).await;

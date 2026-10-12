@@ -1,4 +1,4 @@
-import type { ModelState } from "../api/model.ts";
+import { canSend, type ModelState } from "../api/model.ts";
 import { IconClose } from "../ui/icons.tsx";
 import { ConfigForm } from "./ConfigForm.tsx";
 import { actionInk, actionShape } from "../ui/classes.ts";
@@ -97,14 +97,21 @@ function Dock({
   const basis = { fields, doc: config, origins, family, families: familiesOf(fields, catalog, family) };
   const reload = needsReload(state.draft, basis);
   const later = waitingForOthers(state.draft, basis);
-  const id = model.state === "ready" ? model.id : model.state === "switching" ? model.from : (state.pending?.id ?? "the model");
+  const id =
+    model.state === "ready" || model.state === "unloaded"
+      ? model.id
+      : model.state === "switching"
+        ? model.from
+        : model.state === "loading"
+          ? model.to
+          : (state.pending?.id ?? "the model");
   // Every route but GET answers 503 while a switch runs, so the action waits for it to land.
   const waiting =
     state.pending !== null
       ? `Reloading ${state.pending.id}…`
       : model.state === "switching"
         ? `A switch from ${model.from} to ${model.to} is under way. Apply once it lands.`
-        : model.state !== "ready"
+        : !canSend(model)
           ? "Apply once a model serves."
           : null;
   const blocked = count === 0 || state.applying || waiting !== null;

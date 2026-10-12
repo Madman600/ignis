@@ -93,13 +93,15 @@ fn rows(server: &Server) -> Vec<CatalogRow> {
     let active = server.active();
     let loaded_id = active.engine.model_id();
     let switcher = server.switcher.as_deref();
-    // A switch beginning now: serving, or failed (the way out of a failure
-    // is a switch). Not during one, not before the warm-up has run.
+    // A switch beginning now: serving, failed (the way out of a failure
+    // is a switch), or unloaded (a switch loads, spec model-switch/02). Not
+    // during one or a load, not before the warm-up has run.
     let status = server.status();
-    let free = matches!(*status, ModelStatus::Serving | ModelStatus::Failed { .. });
-    // After a failed switch nothing serves: the engine `active` still holds
-    // is the torn-down one, so no row is loaded and its model is a way out.
-    let serving = !matches!(*status, ModelStatus::Failed { .. });
+    let free = matches!(*status, ModelStatus::Serving | ModelStatus::Failed { .. } | ModelStatus::Unloaded);
+    // After a failed switch, or an unload, nothing is resident: the engine
+    // `active` still holds is the torn-down one, so no row is loaded and its
+    // model is a way out — "Load" on the unloaded model loads it.
+    let serving = !status.no_model_loaded();
     let size_of = |path: &Path| std::fs::metadata(path).ok().filter(|meta| meta.is_file()).map(|meta| meta.len());
     let family_of = |path: &Path| crate::loader::artifact_family(path).ok().flatten();
     let row = |id: &str, source, on_disk: OnDisk, bytes, family| {

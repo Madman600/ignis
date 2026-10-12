@@ -116,6 +116,11 @@ DEVELOPER_MESSAGE_POLICY ?= inplace
 # the server's 38912; 0 = none, a request may generate to the end of the
 # context. An explicit max_tokens always wins.
 DEFAULT_MAX_TOKENS ?=
+# Seconds with no request using the model before it is unloaded, the server
+# staying up (--model-idle-unload, ADR 0049); the next request loads it again.
+# Empty = the server's 300; 0 = never. A measurement (a bench, a gate leg, an
+# A/B leg) passes 0: a cold reload mid-run is not what it measures.
+IDLE_UNLOAD ?=
 
 # The GPU engine configuration (CUDA=1 only; the CPU mock gets none of it).
 # Defaults: a 524288-token context -- twice the checkpoint's trained 262,144

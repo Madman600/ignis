@@ -51,6 +51,14 @@ describe("the reload a 202 began", () => {
     expect(seen).toEqual({ kind: "wait", pending: { ...pending, seen: true } });
   });
 
+  it("follows a reload asked of an unloaded model through its load (spec model-switch/02)", () => {
+    const pending = pendingReload(accepted, before);
+    const loading: ModelState = { state: "loading", to: "qwen3.8-27b", since: 0, lastSwitch: before };
+    const seen = settleReload(pending, loading);
+    expect(seen).toEqual({ kind: "wait", pending: { ...pending, seen: true } });
+    expect(settleReload({ ...pending, seen: true }, ready(before))).toMatchObject({ kind: "done", ok: true });
+  });
+
   it("reports the reload once the model serves with `switched`, naming the file it was written to", () => {
     const pending = { ...pendingReload(accepted, before), seen: true };
     expect(settleReload(pending, ready(before))).toEqual({

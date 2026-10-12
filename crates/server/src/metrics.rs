@@ -73,6 +73,28 @@ pub struct LoadReservations {
     pub flash_next: Option<Arc<FlashNextCounterSource>>,
 }
 
+impl LoadReservations {
+    /// What no load reserved: every series at its zero, and no disk tier.
+    /// What the gauges read while the idle clock has unloaded the model
+    /// (spec model-switch/02, [`Metrics::set_unloaded`]).
+    fn none() -> Self {
+        Self {
+            lines: ignis_core::VramLines::default(),
+            budget_bytes: 0,
+            kv_pool_pages: 0,
+            kv_page_bytes: 0,
+            residency_bytes: 0,
+            expert_cache_bytes: 0,
+            kv_ram_arena_bytes: 0,
+            retained_slots: 0,
+            retained_host_slots: 0,
+            retained_host_bytes: 0,
+            kv_disk_bytes: None,
+            flash_next: None,
+        }
+    }
+}
+
 /// The exposition's content type: Prometheus text format 0.0.4.
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -846,6 +868,21 @@ impl Metrics {
         self.retained_host_bytes.store(reserved.retained_host_bytes, Ordering::Relaxed);
         self.kv_disk_loaded.store(u64::from(reserved.kv_disk_bytes.is_some()), Ordering::Relaxed);
         self.kv_disk_capacity_bytes.store(reserved.kv_disk_bytes.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Nothing is loaded (spec model-switch/02: the idle clock unloaded the
+    /// model, and the card is free): what the last load reserved, what was
+    /// occupied of it and its own counters read as no load at all, until the
+    /// next load's reservations replace them. Written after the teardown has
+    /// joined the model thread of an engine that sat idle for
+    /// `model.idle_unload` seconds, so no tick of its is left to write over
+    /// it.
+    pub(crate) fn set_unloaded(&self) {
+        self.set_load_reservations(LoadReservations::none());
+        self.set_occupancy(ignis_core::Occupancy::default());
+        self.set_retained_slots_in_use(0);
+        self.set_scheduler_requests(0, 0);
+        self.set_flash_next(None);
     }
 
     /// A request's first token came `ms` after its submission.

@@ -20,6 +20,10 @@ serde_yaml = "0.9"
 # `ws`: the Responses API's WebSocket mode (GitHub #282), `tokio-tungstenite`
 # 0.29 underneath; a probe on 2026-09-29 found it adds no host `windows-sys`.
 axum = { workspace = true, features = ["ws"] }
+# The body trait itself (axum re-exports it, not its `Frame`): a response
+# body that holds its request's in-flight count until it ends, for idle
+# unload (spec model-switch/02, `idle.rs`). Already in the tree under axum.
+http-body = "1"
 tokio = { workspace = true }
 futures-core = { workspace = true }
 utoipa = { workspace = true }
