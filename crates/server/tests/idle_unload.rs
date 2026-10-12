@@ -254,9 +254,23 @@ async fn a_client_hanging_up_mid_stream_releases_its_use() {
     let app = server.app();
     let mut body = chat(None);
     body["stream"] = json!(true);
+    // The response's head is handed over before its body is read, so the
+    // hang-up below provably drops a body mid-stream — the counted body's
+    // own way of ending the use — not a handler still running.
+    let (began, head) = tokio::sync::oneshot::channel();
     let streaming = tokio::spawn({
         let app = app.clone();
-        async move { send(&app, Method::POST, "/v1/chat/completions", Some(body)).await }
+        async move {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            let _ = began.send(response.status());
+            response.into_body().collect().await.map(|_| ())
+        }
     });
     let gate = tokio::task::spawn_blocking(move || {
         gate.wait_entered();
@@ -264,6 +278,8 @@ async fn a_client_hanging_up_mid_stream_releases_its_use() {
     })
     .await
     .unwrap();
+    let status = tokio::time::timeout(PATIENT, head).await.expect("the stream began").unwrap();
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(server.usage.in_flight(), 1, "the stream is in use");
 
     // The client goes away mid-stream: its response body is dropped unread.
