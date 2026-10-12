@@ -84,6 +84,11 @@ impl ConfigState {
     /// apply to that family, so there it is both right and enough, and a
     /// start of the other model from the same file never sees it instead of
     /// being refused for it. Every other field goes where the patch put it.
+    ///
+    /// A removal (`null`) takes its key out, and the family section or group
+    /// it empties (spec playground/05 §Decisions). A patch that leaves the
+    /// document as it was — a removal of a key the file does not hold — does
+    /// not rewrite it: the file keeps its comments and its layout.
     pub fn persist(&self, patch: &Layer) -> Persisted {
         let current = self.current();
         let Some(path) = current.file_path() else {
@@ -95,10 +100,15 @@ impl ConfigState {
                 .map(|(meta, family, value)| (meta, family.or_else(|| meta.home_family()), value))
                 .collect::<Vec<_>>()
         };
+        let removals = patch.removals().map(|(meta, family, _)| (meta, family)).collect();
         let written = file::changes_of(patch)
             .map(homed)
-            .and_then(|changes| file::rewrite(&*self.files, path, changes, None))
+            .and_then(|changes| file::rewrite(&*self.files, path, changes, removals, None))
             .and_then(|text| {
+                let (before, _) = file::load(&*self.files, path)?;
+                if file::Format::of_path(path).unwrap_or(file::Format::Yaml).read(&text).ok() == Some(before) {
+                    return Ok(());
+                }
                 self.files
                     .write(path, &text)
                     .map_err(|e| ConfigError(format!("{} cannot be written: {e}", path.display())))
@@ -328,7 +338,9 @@ fn refused(code: &str, message: impl Into<String>) -> Response {
 
 /// Read a `PATCH` body into a layer, refusing — whole — what a patch may not
 /// carry: a profile (profiles are config-file content), a field that is not
-/// `patchable`, a field or a value the config file would refuse.
+/// `patchable`, a field or a value the config file would refuse. A `null`
+/// removes the field's key ([`file::read_merge_patch`]), and is refused as
+/// a value would be.
 pub fn read_patch(body: &Value) -> Result<Layer, (&'static str, String)> {
     if let Some(key) = ["profile", "profiles"].into_iter().find(|key| body.get(key).is_some()) {
         return Err(("config_invalid", format!("`{key}` is config-file content, not a live change: edit the file and restart")));
@@ -336,12 +348,12 @@ pub fn read_patch(body: &Value) -> Result<Layer, (&'static str, String)> {
     if !body.is_object() {
         return Err(("config_invalid", "the body must be a config document: `{ <group>: { <field>: value } }`".to_owned()));
     }
-    let document = file::read_document(body, "the request body").map_err(|e| ("config_invalid", e.0))?;
-    if document.values.is_empty() {
+    let patch = file::read_merge_patch(body, "the request body").map_err(|e| ("config_invalid", e.0))?;
+    if patch.is_empty() {
         return Err(("config_invalid", "the patch names no field".to_owned()));
     }
-    let refused: Vec<String> =
-        document.values.entries().filter(|(meta, _, _)| !meta.patchable).map(|(meta, _, _)| meta.file_key()).collect();
+    let mut refused: Vec<String> = patch.named().filter(|(meta, _)| !meta.patchable).map(|(meta, _)| meta.file_key()).collect();
+    refused.dedup();
     if !refused.is_empty() {
         return Err((
             "config_field_not_patchable",
@@ -351,7 +363,7 @@ pub fn read_patch(body: &Value) -> Result<Layer, (&'static str, String)> {
             ),
         ));
     }
-    Ok(document.values)
+    Ok(patch)
 }
 
 /// A patch naming `switch.known_models` adds to the models already known
@@ -371,17 +383,25 @@ pub fn add_known_models(patch: &mut Layer, running: &Config) -> Result<(), Confi
     patch.set(meta, None, Candidate { raw, spelling: candidate.spelling })
 }
 
-/// The fields of `patch` that a flag or an env var of `running`'s start also
-/// sets, each with the spelling that sets it: written to the file, they are
-/// outranked again at the next start (spec config-v2/01 AC 6), so the
-/// answer says so rather than promise a change that will not survive it.
+/// The fields of `patch`, set or removed, that a flag or an env var of
+/// `running`'s start also sets — in the patched key's own scope, or the
+/// general one, which outranks the file's family section too — each with
+/// the spelling that sets it: written to the file, they are outranked again
+/// at the next start (spec config-v2/01 AC 6), so the answer says so rather
+/// than promise a change that will not survive it. After a removal the flag
+/// or env var is in force at once (spec playground/05 §Decisions).
 pub fn shadowed_at_restart(patch: &Layer, running: &Config) -> Vec<String> {
     let sources = running.basis.sources();
+    let set_at_start = |meta: &FieldMeta, family| {
+        let scopes = [family, None];
+        let mut found = [&sources.flags, &sources.env].into_iter().flat_map(|layer| scopes.into_iter().filter_map(move |scope| layer.get(meta, scope)));
+        found.next()
+    };
     patch
-        .entries()
-        .filter_map(|(meta, family, _)| {
+        .named()
+        .filter_map(|(meta, family)| {
             let key = family.map_or_else(|| meta.file_key(), |family| meta.scoped_file_key(family));
-            let by = sources.flags.get(meta, family).or_else(|| sources.env.get(meta, family))?;
+            let by = set_at_start(meta, family)?;
             Some(format!("{key} (set by {})", by.spelling))
         })
         .collect()
@@ -409,7 +429,7 @@ pub fn needs_reload(running: &Config, next: &Config) -> bool {
 /// and the budget's check only on a model loaded from an artifact, as at
 /// start: the placeholder has no tokenizer to close with.
 fn check_thinking(server: &Server, next: &Config, patch: &Layer) -> Result<(), String> {
-    let named = |name: &str| patch.entries().any(|(meta, _, _)| meta.group == "model" && meta.name == name);
+    let named = |name: &str| patch.named().any(|(meta, _)| meta.group == "model" && meta.name == name);
     let active = server.active();
     if named("enable_thinking") || named("reasoning_effort") {
         let defaults = crate::thinking::ThinkingDefaults {
@@ -434,7 +454,7 @@ fn check_thinking(server: &Server, next: &Config, patch: &Layer) -> Result<(), S
     tag = "config",
     operation_id = "patch_config",
     summary = "Change the running configuration",
-    description = "The body is a partial config document in the config file's own shape — only the fields being changed, a `qwen38` / `qwen38flashnext` section for a family's own value. Each value is checked as the config file's would be; a field the loaded model's family cannot take, or one not patchable (the API key, the bind addresses, the Playground), refuses the **whole** patch, nothing in it applied. `switch.known_models` adds to the models already known.\n\nApplied one way, never two. When nothing the patch changes for the loaded model needs a reload — its fields take effect live (the request timeout, the message policies, the thinking defaults, the model switch's own knobs), or the reload fields it names resolve as before for the loaded model's family (a value in the other family's section, a group value the loaded family overrides in its own) — it takes effect at once, no model touched: `200`, with the configuration now running; a value for the other family is used when that family next loads. When a reload field resolves differently for the loaded model, the whole patch — its other fields included — goes through a reload of the loaded model with the patched configuration: the same switch `POST /v1/models/switch` runs, `202` at once, every other `/v1` route answering `503 model_switching` until it lands, and `GET /v1/models` reporting it. A reload that fails leaves the previous model serving with the previous configuration.\n\nA change is written to the config file in use once it has taken — at once, or when the reloaded model serves — keeping every other key in the file. With no config file in use it still applies, and `persisted: false` says why. `shadowed_at_restart` names the fields a flag or an env var also sets: they outrank the file at the next start.",
+    description = "The body is a partial config document in the config file's own shape — only the fields being changed, a `qwen38` / `qwen38flashnext` section for a family's own value. Each value is checked as the config file's would be; a field the loaded model's family cannot take, or one not patchable (the API key, the bind addresses, the Playground), refuses the **whole** patch, nothing in it applied. `switch.known_models` adds to the models already known.\n\nA `null` removes the key (JSON merge patch): in a family's section, that family's own value, so the group's applies to it again; at a group key, the group's value, so the profile's or the hardcoded default applies — or a flag or an env var that sets the field, which outranks the file (named in `shadowed_at_restart`). The value in force after a removal is the one a start from the rewritten file resolves; the file loses the key, and a family section or group left empty with it. A removal of a key nothing sets changes nothing. Only a field may be `null`, not a whole group or section.\n\nApplied one way, never two. When nothing the patch changes for the loaded model needs a reload — its fields take effect live (the request timeout, the message policies, the thinking defaults, the model switch's own knobs), or the reload fields it names resolve as before for the loaded model's family (a value in the other family's section, a group value the loaded family overrides in its own) — it takes effect at once, no model touched: `200`, with the configuration now running; a value for the other family is used when that family next loads. When a reload field resolves differently for the loaded model, the whole patch — its other fields included — goes through a reload of the loaded model with the patched configuration: the same switch `POST /v1/models/switch` runs, `202` at once, every other `/v1` route answering `503 model_switching` until it lands, and `GET /v1/models` reporting it. A reload that fails leaves the previous model serving with the previous configuration.\n\nA change is written to the config file in use once it has taken — at once, or when the reloaded model serves — keeping every other key in the file. With no config file in use it still applies, and `persisted: false` says why. `shadowed_at_restart` names the fields a flag or an env var also sets: they outrank the file at the next start.",
     request_body(content = ConfigDocument, description = "The fields to change, nested as the config file nests them."),
     responses(
         (status = 200, description = "Applied live.", body = PatchApplied),
@@ -603,6 +623,21 @@ mod tests {
             read_patch(&json!({ "server": { "request_timeout": 60, "api_key": "k", "bind": "x" } })).unwrap_err();
         assert_eq!(code, "config_field_not_patchable");
         assert!(message.contains("`server.api_key`") && message.contains("`server.bind`") && !message.contains("request_timeout"), "{message}");
+    }
+
+    /// Spec playground/05 AC 21: a `null` is held to what a value there
+    /// would be — a field not patchable, or a family section with no place
+    /// for it, refuses the patch — and a body of only removals is a patch.
+    #[test]
+    fn a_removal_is_refused_where_a_value_would_be() {
+        let (code, message) = read_patch(&json!({ "server": { "request_timeout": null, "api_key": null } })).unwrap_err();
+        assert_eq!(code, "config_field_not_patchable");
+        assert!(message.contains("`server.api_key`") && !message.contains("request_timeout"), "{message}");
+        let (code, message) = read_patch(&json!({ "spec": { "qwen38": { "decode_lanes": null } } })).unwrap_err();
+        assert_eq!(code, "config_invalid");
+        assert!(message.contains("spec.qwen38.decode_lanes") && message.contains("does not take"), "{message}");
+        let removals = read_patch(&json!({ "reuse": { "prompt": null } })).unwrap();
+        assert_eq!(removals.removals().count(), 1);
     }
 
     /// Spec playground/05 AC 19-20: a patch reloads only when a field that

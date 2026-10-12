@@ -682,3 +682,101 @@ async fn a_patch_mixing_the_other_familys_value_with_a_running_change_reloads_an
     assert_eq!(written["reuse"]["qwen38"]["kv_host_pool_bytes"], "3G", "{written:?}");
     assert_eq!(written["reuse"]["qwen38flashnext"]["kv_host_pool_bytes"], "1G", "{written:?}");
 }
+
+/// Spec playground/05 AC 21: `null` in a family's section removes that
+/// family's own value, so the group's applies to it again — live for the
+/// family not loaded, through a reload for the running one — and `null` at
+/// a group key removes it, so the default applies. The file loses each key,
+/// and the section and the group a removal empties go with it.
+#[tokio::test]
+async fn null_removes_a_familys_own_value_then_the_groups_and_the_file_loses_each() {
+    let path = config_file(
+        "null-removes",
+        "server:\n  request_timeout: 30\nreuse:\n  kv_host_pool_bytes: 3G\n  qwen38:\n    kv_host_pool_bytes: 4G\n  qwen38flashnext:\n    kv_host_pool_bytes: 1G\n",
+    );
+    let loader = MockLoader::new();
+    let server = qwen_server(&loader, &["--config", path.to_str().unwrap(), "--profile", "none"]);
+    let app = server.app();
+    let pool = |config: &Value| config["reuse"]["kv_host_pool_bytes"].clone();
+
+    let body = json!({ "reuse": { "qwen38flashnext": { "kv_host_pool_bytes": null } } });
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+    assert_eq!((status, applied["applied"].clone()), (StatusCode::OK, json!("live")), "the family not loaded: {applied}");
+    assert_eq!(applied["config"]["reuse"]["qwen38flashnext"]["kv_host_pool_bytes"], "3G", "the group's applies to it: {applied}");
+    let written = read_yaml(&path);
+    assert!(written["reuse"].get("qwen38flashnext").is_none(), "the emptied section goes: {written:?}");
+    assert_eq!(written["reuse"]["qwen38"]["kv_host_pool_bytes"], "4G", "{written:?}");
+
+    let body = json!({ "reuse": { "qwen38": { "kv_host_pool_bytes": null } } });
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+    assert_eq!((status, applied["applied"].clone()), (StatusCode::ACCEPTED, json!("reload")), "the running family's: {applied}");
+    until_serving(&app).await;
+    assert_eq!(loader.fitted_options().last().unwrap().host_pool_bytes, 3 << 30, "the reload runs with the group's");
+    let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
+    assert_eq!(pool(&document), "3G", "{document}");
+    assert_eq!(read_yaml(&path)["reuse"], json!({ "kv_host_pool_bytes": "3G" }));
+
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "reuse": { "kv_host_pool_bytes": null } }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{applied}");
+    until_serving(&app).await;
+    let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
+    assert_eq!(pool(&document), "2G", "the hardcoded default: {document}");
+    let written = read_yaml(&path);
+    assert!(written.get("reuse").is_none(), "the emptied group goes: {written:?}");
+    assert_eq!(written["server"]["request_timeout"], 30, "the rest of the file is kept");
+}
+
+/// Spec playground/05 AC 21: `null` at a group key falls back to the
+/// profile in use, as a start from the rewritten file would.
+#[tokio::test]
+async fn null_at_a_group_key_falls_back_to_the_profile() {
+    let path = config_file("null-profile", "vram:\n  headroom_bytes: 2G\n");
+    let loader = MockLoader::new();
+    let server = qwen_server(&loader, &["--config", path.to_str().unwrap()]);
+    let app = server.app();
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "vram": { "headroom_bytes": null } }))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{applied}");
+    until_serving(&app).await;
+    let running = server.config.as_ref().unwrap().current();
+    let restarted = started(&["--config", path.to_str().unwrap()]).for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert_eq!(running.settings().vram.headroom_bytes, 1200 << 20, "the rtx5090 profile's own for the 27B");
+    assert_eq!(running.settings(), restarted.settings(), "what a start from the rewritten file resolves");
+}
+
+/// Spec playground/05 AC 21: a removal of a key no source sets is accepted
+/// and changes nothing — not the configuration, not a byte of the file —
+/// and a body of only removals is a patch.
+#[tokio::test]
+async fn a_removal_no_source_sets_is_a_no_op_200() {
+    let text = "# the operator's own notes\nserver:\n  request_timeout: 30\n";
+    let path = config_file("null-no-op", text);
+    let loader = MockLoader::new();
+    let server = qwen_server(&loader, &["--config", path.to_str().unwrap(), "--profile", "none"]);
+    let app = server.app();
+    let (_, before) = send(&app, Method::GET, "/v1/config", None).await;
+    let body = json!({ "model": { "qwen38": { "max_context": null } }, "reuse": { "kv_host_pool_bytes": null } });
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+    assert_eq!((status, applied["applied"].clone(), applied["persisted"].clone()), (StatusCode::OK, json!("live"), json!(true)), "{applied}");
+    assert_eq!(applied["config"], before);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "the file untouched, its comment kept");
+    assert!(loader.prepared_options().is_empty());
+}
+
+/// Spec playground/05 AC 21: a removal leaves the value a start from the
+/// rewritten file resolves, so a flag that sets the field is in force again
+/// — and named, as it outranks the file at the next start too.
+#[tokio::test]
+async fn a_removed_field_a_flag_sets_runs_the_flags_value_and_is_named_as_shadowed() {
+    let path = config_file("null-flag", "server:\n  request_timeout: 60\n");
+    let loader = MockLoader::new();
+    let server = qwen_server(&loader, &["--config", path.to_str().unwrap(), "--server-request-timeout", "40"]);
+    let app = server.app();
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "server": { "request_timeout": 90 } }))).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(server.live().request_timeout, Duration::from_secs(90), "a patch outranks the command line while the server runs");
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "server": { "request_timeout": null } }))).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(applied["shadowed_at_restart"], json!(["server.request_timeout (set by --server-request-timeout)"]), "{applied}");
+    assert_eq!(server.live().request_timeout, Duration::from_secs(40), "the flag's value, as at a start");
+    assert!(read_yaml(&path).get("server").is_none(), "the file loses the key");
+}

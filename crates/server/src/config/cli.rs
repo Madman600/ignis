@@ -210,7 +210,7 @@ fn patch(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files: &d
     let mut changes = file::changes_of(&sources.file)?;
     changes.extend(file::changes_of(&sources.env)?);
     changes.extend(file::changes_of(&sources.flags)?);
-    let contents = file::rewrite(files, &path, changes, profile.as_deref())?;
+    let contents = file::rewrite(files, &path, changes, Vec::new(), profile.as_deref())?;
     let target = out.unwrap_or_else(|| path.clone());
     // An `--out` of the other format gets the same document in its own.
     let contents = match (Format::of_path(&path).unwrap_or(Format::Yaml), Format::of_path(&target)) {

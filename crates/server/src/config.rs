@@ -738,12 +738,21 @@ impl Config {
     pub fn general_with(&self, patch: &source::Layer) -> Result<Config, ConfigError> {
         let mut sources = self.basis.sources().clone();
         sources.patch.overlay(patch);
+        // A removal (`null`) takes the key out of the config file as well as
+        // out of the patches before it, as the rewritten file will not hold
+        // it: what runs after it is what a start from that file resolves —
+        // the profile or the default, or a flag or an env var that sets the
+        // field, which outranks the file (spec playground/05 §Decisions).
+        for (meta, family, _) in patch.removals() {
+            sources.file.unset(meta, family);
+        }
         Config::from_sources(sources)
     }
 
-    /// This config with `patch`'s values over everything else — a live
-    /// `PATCH /v1/config`, or a switch target's own artifact and id — and
-    /// resolved again from the same sources for the same family.
+    /// This config with `patch`'s values over everything else, and its
+    /// removals taken out ([`Config::general_with`]) — a live `PATCH
+    /// /v1/config`, or a switch target's own artifact and id — and resolved
+    /// again from the same sources for the same family.
     ///
     /// Always from the sources, never from this config's fitted values, and
     /// only `patch` itself is judged against the family running: one of its

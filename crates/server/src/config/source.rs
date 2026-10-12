@@ -102,18 +102,30 @@ pub struct Candidate {
 /// the group's general value.
 type Key = (&'static str, &'static str, Option<&'static str>);
 
-/// One source's raw values, general and per family.
+/// One source's raw values, general and per family — and, for a live
+/// patch only, the keys it removes.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Layer {
     values: BTreeMap<Key, Candidate>,
+    /// The keys a patch's `null` removes, each with the spelling it was
+    /// given under (spec playground/05 §Decisions). Never kept by a source:
+    /// [`Layer::overlay`] and [`super::Config::general_with`] apply them.
+    removed: BTreeMap<Key, String>,
 }
 
 impl std::fmt::Debug for Layer {
-    /// The spellings set, never their values: a layer holds the API key's
-    /// raw text, and a `Config` dumped into a log line must not leak it.
+    /// The spellings set or removed, never their values: a layer holds the
+    /// API key's raw text, and a `Config` dumped into a log line must not
+    /// leak it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.values.values().map(|candidate| &candidate.spelling)).finish()
+        f.debug_list().entries(self.values.values().map(|candidate| &candidate.spelling).chain(self.removed.values())).finish()
     }
+}
+
+/// The field a layer's key names, and its scope.
+fn of_key((group, name, scope_name): &Key) -> (&'static FieldMeta, Option<ModelFamily>) {
+    let meta = super::schema::field(group, name).expect("a layer only holds declared fields");
+    (meta, scope_name.and_then(super::field::family_of_scope))
 }
 
 impl Layer {
@@ -134,32 +146,34 @@ impl Layer {
     /// it is written. A field only one family takes may sit in that family's
     /// section, which is where `PATCH /v1/config` writes it.
     pub fn set(&mut self, meta: &'static FieldMeta, family: Option<ModelFamily>, candidate: Candidate) -> Result<(), ConfigError> {
-        if let Some(family) = family {
-            if !meta.applies.to(family) {
-                return Err(ConfigError(format!(
-                    "`{}`: {} does not take {} (a {} option)",
-                    candidate.spelling,
-                    family.name(),
-                    meta.file_key(),
-                    meta.applies.describe()
-                )));
-            }
-            if !meta.takes_scope(family) {
-                return Err(ConfigError(format!(
-                    "`{}`: {} has no per-family value; set `{}` instead",
-                    candidate.spelling,
-                    meta.file_key(),
-                    meta.file_key()
-                )));
-            }
-        }
+        check_scope(meta, family, &candidate.spelling)?;
         let key = (meta.group, meta.name, family.map(scope));
+        self.removed.remove(&key);
         if candidate.raw.trim().is_empty() {
             self.values.remove(&key);
         } else {
             self.values.insert(key, candidate);
         }
         Ok(())
+    }
+
+    /// Remove `meta`'s value in `family`'s scope — a live patch's `null`
+    /// (spec playground/05 §Decisions, JSON merge patch): overlaid on the
+    /// patches before it, the key's value is gone from them, and the config
+    /// file loses the key too. Its key is checked as a value's would be: a
+    /// `null` where no value can be is as wrong as a value there.
+    pub fn remove(&mut self, meta: &'static FieldMeta, family: Option<ModelFamily>, spelling: String) -> Result<(), ConfigError> {
+        check_scope(meta, family, &spelling)?;
+        let key = (meta.group, meta.name, family.map(scope));
+        self.values.remove(&key);
+        self.removed.insert(key, spelling);
+        Ok(())
+    }
+
+    /// Take `meta`'s value in `family`'s scope out of this layer, if it has
+    /// one.
+    pub fn unset(&mut self, meta: &FieldMeta, family: Option<ModelFamily>) {
+        self.values.remove(&(meta.group, meta.name, family.map(scope)));
     }
 
     /// Append to a repeatable field's value (`;`-joined).
@@ -171,25 +185,68 @@ impl Layer {
         self.set(meta, family, joined)
     }
 
-    /// Whether the layer sets nothing (a patch that names no field).
+    /// Whether the layer names nothing, set or removed (a patch that names no
+    /// field).
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.values.is_empty() && self.removed.is_empty()
     }
 
     /// Every value set, with its field and scope.
     pub fn entries(&self) -> impl Iterator<Item = (&'static FieldMeta, Option<ModelFamily>, &Candidate)> + '_ {
-        self.values.iter().map(|((group, name, scope_name), candidate)| {
-            let meta = super::schema::field(group, name).expect("a layer only holds declared fields");
-            (meta, scope_name.and_then(super::field::family_of_scope), candidate)
+        self.values.iter().map(|(key, candidate)| {
+            let (meta, family) = of_key(key);
+            (meta, family, candidate)
         })
     }
 
-    /// `other`'s values over this layer's.
+    /// Every key removed, with its field, scope and spelling.
+    pub fn removals(&self) -> impl Iterator<Item = (&'static FieldMeta, Option<ModelFamily>, &str)> + '_ {
+        self.removed.iter().map(|(key, spelling)| {
+            let (meta, family) = of_key(key);
+            (meta, family, spelling.as_str())
+        })
+    }
+
+    /// Every key the layer names, set or removed, in key order.
+    pub fn named(&self) -> impl Iterator<Item = (&'static FieldMeta, Option<ModelFamily>)> + '_ {
+        let keys: std::collections::BTreeSet<&Key> = self.values.keys().chain(self.removed.keys()).collect();
+        keys.into_iter().map(of_key)
+    }
+
+    /// `other`'s values over this layer's, and its removals taken out of it.
     pub fn overlay(&mut self, other: &Layer) {
         for (key, candidate) in &other.values {
             self.values.insert(*key, candidate.clone());
         }
+        for key in other.removed.keys() {
+            self.values.remove(key);
+        }
     }
+}
+
+/// Refuse a value — or a removal — of `meta` in `family`'s section when the
+/// family cannot take the field, or the field has no per-family value
+/// ([`Layer::set`]).
+fn check_scope(meta: &FieldMeta, family: Option<ModelFamily>, spelling: &str) -> Result<(), ConfigError> {
+    let Some(family) = family else {
+        return Ok(());
+    };
+    if !meta.applies.to(family) {
+        return Err(ConfigError(format!(
+            "`{spelling}`: {} does not take {} (a {} option)",
+            family.name(),
+            meta.file_key(),
+            meta.applies.describe()
+        )));
+    }
+    if !meta.takes_scope(family) {
+        return Err(ConfigError(format!(
+            "`{spelling}`: {} has no per-family value; set `{}` instead",
+            meta.file_key(),
+            meta.file_key()
+        )));
+    }
+    Ok(())
 }
 
 /// Where the config file in use came from (spec config-v2/02 §Config-file
@@ -638,6 +695,26 @@ mod tests {
         assert_eq!(resolved(&flagged, q), 6 * GIB, "what outranks the file's own section still does");
         let scoped_flag = Sources { patch: layer(meta, &[(None, "3G")]), flags: layer(meta, &[(q, "5G")]), ..Sources::default() };
         assert_eq!(resolved(&scoped_flag, q), 3 * GIB, "with nothing in the file a patch still outranks the command line");
+    }
+
+    /// Spec playground/05 §Decisions: a patch's `null` is a removal — it
+    /// names its key, checked as a value there would be, sets nothing, and
+    /// overlaid on the patches before it takes their value for that key away.
+    #[test]
+    fn a_removal_names_its_key_sets_nothing_and_takes_an_earlier_patchs_value_away() {
+        let meta = field("reuse", "kv_host_pool_bytes").unwrap();
+        let q = Some(ModelFamily::Qwen38_27b);
+        let mut removal = Layer::default();
+        removal.remove(meta, q, "reuse.qwen38.kv_host_pool_bytes".into()).unwrap();
+        assert!(!removal.is_empty() && removal.entries().next().is_none(), "a body of only removals is a patch");
+        let named: Vec<_> = removal.named().map(|(meta, family)| (meta.file_key(), family)).collect();
+        assert_eq!(named, [("reuse.kv_host_pool_bytes".to_owned(), q)]);
+        let mut earlier = layer(meta, &[(None, "3G"), (q, "1G")]);
+        earlier.overlay(&removal);
+        assert!(earlier.get(meta, q).is_none() && earlier.get(meta, None).is_some(), "only the key removed: {earlier:?}");
+        assert_eq!(earlier.removals().count(), 0, "a removal is applied, never kept");
+        let err = Layer::default().remove(field("server", "bind").unwrap(), q, "server.qwen38.bind".into()).unwrap_err();
+        assert!(err.0.contains("server.qwen38.bind") && err.0.contains("per-family"), "{err}");
     }
 
     /// Before an artifact names a family, only the general values count.

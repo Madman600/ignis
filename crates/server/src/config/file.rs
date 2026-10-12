@@ -241,19 +241,52 @@ pub fn read_document(value: &Value, origin: &str) -> Result<Document, ConfigErro
                     };
                     let mut layer = Layer::default();
                     for (group, fields) in body {
-                        read_group(group, fields, &format!("profile {name} in {origin}"), &mut layer)?;
+                        read_group(group, fields, &format!("profile {name} in {origin}"), &mut layer, Nulls::Unset)?;
                     }
                     document.profiles.insert(name.clone(), layer);
                 }
             }
-            group => read_group(group, value, origin, &mut document.values)?,
+            group => read_group(group, value, origin, &mut document.values, Nulls::Unset)?,
         }
     }
     Ok(document)
 }
 
+/// What a `null` value means in the document being read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nulls {
+    /// A config file's: the key is not set, as if it were absent.
+    Unset,
+    /// A live patch's: the key is removed ([`Layer::remove`]).
+    Remove,
+}
+
+/// A live patch's body as a layer (`PATCH /v1/config`): its groups read as
+/// a config file's are, except that `null` removes the key — JSON merge
+/// patch — where a file's `null` leaves it unset (spec playground/05
+/// §Decisions). Only a field's value may be `null`: a whole group or family
+/// section is not removed at once, since it would take the fields no patch
+/// may change with the rest.
+pub fn read_merge_patch(value: &Value, origin: &str) -> Result<Layer, ConfigError> {
+    let Value::Object(top) = value else {
+        return Err(ConfigError(format!("{origin} must be a map of groups")));
+    };
+    let mut layer = Layer::default();
+    for (group, fields) in top {
+        read_group(group, fields, origin, &mut layer, Nulls::Remove)?;
+    }
+    Ok(layer)
+}
+
+/// A whole group or family section set to `null` in a patch.
+fn whole_removal(key: &str, origin: &str) -> ConfigError {
+    ConfigError(format!(
+        "`{key}: null` in {origin} would remove every field under it: a patch removes one field at a time (`{key}.<field>: null`)"
+    ))
+}
+
 /// One `<group>: { … }` section into `layer`.
-fn read_group(group: &str, value: &Value, origin: &str, layer: &mut Layer) -> Result<(), ConfigError> {
+fn read_group(group: &str, value: &Value, origin: &str, layer: &mut Layer, nulls: Nulls) -> Result<(), ConfigError> {
     let Some((group, fields)) = schema::GROUPS.iter().find(|(name, _)| *name == group) else {
         let groups: Vec<&str> = schema::GROUPS.iter().map(|(name, _)| *name).collect();
         return Err(ConfigError(format!(
@@ -262,22 +295,25 @@ fn read_group(group: &str, value: &Value, origin: &str, layer: &mut Layer) -> Re
         )));
     };
     let entries = match value {
+        Value::Null if nulls == Nulls::Remove => return Err(whole_removal(group, origin)),
         Value::Null => return Ok(()),
         Value::Object(entries) => entries,
         _ => return Err(ConfigError(format!("`{group}` in {origin} must map field names to values"))),
     };
     for (key, value) in entries {
         if let Some(family) = family_of_scope(key) {
-            let Value::Object(scoped) = value else {
-                return Err(ConfigError(format!("`{group}.{key}` in {origin} must map field names to values")));
+            let scoped = match value {
+                Value::Object(scoped) => scoped,
+                Value::Null if nulls == Nulls::Remove => return Err(whole_removal(&format!("{group}.{key}"), origin)),
+                _ => return Err(ConfigError(format!("`{group}.{key}` in {origin} must map field names to values"))),
             };
             for (name, value) in scoped {
                 let meta = field_of(fields, group, name, origin)?;
-                set(layer, meta, Some(family), value, &format!("{group}.{key}.{name}"), origin)?;
+                set(layer, meta, Some(family), value, &format!("{group}.{key}.{name}"), origin, nulls)?;
             }
         } else {
             let meta = field_of(fields, group, key, origin)?;
-            set(layer, meta, None, value, &format!("{group}.{key}"), origin)?;
+            set(layer, meta, None, value, &format!("{group}.{key}"), origin, nulls)?;
         }
     }
     Ok(())
@@ -289,12 +325,13 @@ fn field_of(fields: &'static [FieldMeta], group: &str, name: &str, origin: &str)
     })
 }
 
-fn set(layer: &mut Layer, meta: &'static FieldMeta, family: Option<ModelFamily>, value: &Value, key: &str, origin: &str) -> Result<(), ConfigError> {
+fn set(layer: &mut Layer, meta: &'static FieldMeta, family: Option<ModelFamily>, value: &Value, key: &str, origin: &str, nulls: Nulls) -> Result<(), ConfigError> {
     let spelling = format!("{key} ({origin})");
-    let Some(raw) = (meta.file_text)(value).map_err(|reason| ConfigError(format!("`{spelling}` {reason}")))? else {
-        return Ok(());
-    };
-    layer.set(meta, family, Candidate { raw, spelling })
+    match (meta.file_text)(value).map_err(|reason| ConfigError(format!("`{spelling}` {reason}")))? {
+        Some(raw) => layer.set(meta, family, Candidate { raw, spelling }),
+        None if nulls == Nulls::Remove => layer.remove(meta, family, spelling),
+        None => Ok(()),
+    }
 }
 
 /// `config`'s settings as a document: every field's value for no family in
@@ -366,14 +403,51 @@ pub fn merge(document: &mut Value, changes: impl IntoIterator<Item = Change>) {
     }
 }
 
-/// The text of the config file at `path` with `changes` merged in (and, when
-/// given, `profile:` set) — what both `config patch` and `PATCH /v1/config`
-/// write, so the two can never change a file differently. Every key the
-/// changes do not name is kept; the keys are written in declaration order;
-/// a YAML file's comments do not survive the rewrite.
-pub fn rewrite(files: &dyn Files, path: &Path, changes: Vec<Change>, profile: Option<&str>) -> Result<String, ConfigError> {
+/// One field's removal, as [`remove`] writes it: the field and its scope.
+pub type Removal = (&'static FieldMeta, Option<ModelFamily>);
+
+/// Take each of `removals` out of `document` — the key, then the family
+/// section and the group the removal leaves empty — what a `null` in `PATCH
+/// /v1/config` writes (spec playground/05 §Decisions). A key the document
+/// does not hold is no change, and a section or group that was empty
+/// already is left as it was.
+pub fn remove(document: &mut Value, removals: impl IntoIterator<Item = Removal>) {
+    let Some(top) = document.as_object_mut() else {
+        return;
+    };
+    for (meta, family) in removals {
+        let Some(group) = top.get_mut(meta.group).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let emptied = match family {
+            Some(family) => {
+                let Some(section) = group.get_mut(scope(family)).and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                let emptied = section.remove(meta.name).is_some() && section.is_empty();
+                if emptied {
+                    group.remove(scope(family));
+                }
+                emptied
+            }
+            None => group.remove(meta.name).is_some(),
+        };
+        if emptied && group.is_empty() {
+            top.remove(meta.group);
+        }
+    }
+}
+
+/// The text of the config file at `path` with `changes` merged in and
+/// `removals` taken out (and, when given, `profile:` set) — what both
+/// `config patch` and `PATCH /v1/config` write, so the two can never change a
+/// file differently. Every key the changes do not name is kept; the keys are
+/// written in declaration order; a YAML file's comments do not survive the
+/// rewrite.
+pub fn rewrite(files: &dyn Files, path: &Path, changes: Vec<Change>, removals: Vec<Removal>, profile: Option<&str>) -> Result<String, ConfigError> {
     let (mut document, _) = load(files, path)?;
     merge(&mut document, changes);
+    remove(&mut document, removals);
     if let Some(name) = profile {
         document.as_object_mut().expect("a merged document is a map").insert("profile".to_owned(), Value::String(name.to_owned()));
     }
@@ -554,6 +628,46 @@ mod tests {
         let mut empty = Value::Null;
         merge(&mut empty, [(pool, None, json!("1G"))]);
         assert_eq!(empty, json!({ "reuse": { "kv_host_pool_bytes": "1G" } }));
+    }
+
+    /// Spec playground/05 §Decisions: in a patch `null` removes the key —
+    /// JSON merge patch — where in a config file it leaves it unset; a whole
+    /// group or family section is not removed at once.
+    #[test]
+    fn a_patchs_null_is_a_removal_and_a_files_is_unset() {
+        let value = json!({ "reuse": { "kv_host_pool_bytes": null, "qwen38": { "prompt": null } }, "server": { "request_timeout": 60 } });
+        let patch = read_merge_patch(&value, "the request body").unwrap();
+        let removed: Vec<_> = patch.removals().map(|(meta, family, _)| (meta.file_key(), family)).collect();
+        assert_eq!(removed, [("reuse.kv_host_pool_bytes".to_owned(), None), ("reuse.prompt".to_owned(), Some(ModelFamily::Qwen38_27b))]);
+        assert_eq!(patch.entries().count(), 1);
+        assert_eq!(read_document(&value, "f.yaml").unwrap().values.removals().count(), 0, "a file's null sets nothing and removes nothing");
+        for (body, says) in [(json!({ "reuse": null }), "`reuse: null`"), (json!({ "reuse": { "qwen38": null } }), "`reuse.qwen38: null`")] {
+            let err = read_merge_patch(&body, "the request body").unwrap_err().0;
+            assert!(err.contains(says) && err.contains("one field at a time"), "{err}");
+        }
+    }
+
+    /// A removal takes its key out of the document, and the family section
+    /// and the group it leaves empty; a key that is not there changes
+    /// nothing.
+    #[test]
+    fn a_removal_takes_the_key_and_whatever_it_empties_out_of_the_document() {
+        let pool = field("reuse", "kv_host_pool_bytes").unwrap();
+        let prompt = field("reuse", "prompt").unwrap();
+        let timeout = field("server", "request_timeout").unwrap();
+        let q = Some(ModelFamily::Qwen38_27b);
+        let mut document = json!({
+            "reuse": { "kv_host_pool_bytes": "8G", "qwen38": { "prompt": false } },
+            "server": { "request_timeout": 30, "ui": true },
+            "vram": {}
+        });
+        remove(&mut document, [(prompt, q)]);
+        assert_eq!(document["reuse"], json!({ "kv_host_pool_bytes": "8G" }), "the emptied section goes");
+        remove(&mut document, [(pool, None), (timeout, None)]);
+        assert_eq!(document, json!({ "server": { "ui": true }, "vram": {} }), "the emptied group goes, the rest stays");
+        let before = document.clone();
+        remove(&mut document, [(pool, q), (pool, None), (field("vram", "headroom_bytes").unwrap(), None)]);
+        assert_eq!(document, before, "a key that is not there is no change");
     }
 
     #[test]
