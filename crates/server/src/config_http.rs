@@ -22,11 +22,11 @@
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode};
+use axum::extract::{Query, State};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
 
@@ -194,21 +194,38 @@ pub const STATUS_HEADER: &str = "ignis-model-status";
     tag = "config",
     operation_id = "get_config",
     summary = "The running configuration",
-    description = "The configuration in force, in the config file's own shape: `<group>: { <field>: value }`, with a `qwen38` / `qwen38flashnext` section beside a group's fields wherever a model family's value differs. The values are the ones the loaded model runs with — its family's own where one is set — with every live change on top.\n\nOnly fields declared visible appear: a hidden field (the API key) is absent, not masked. `ignis-server help --fields` lists every field and whether it is shown.\n\nAnswers during a model switch too: until the switch lands it shows the configuration still running, and the `ignis-model-status` header says `switching` (as `GET /v1/models` reports it).",
+    description = "The configuration in force, in the config file's own shape: `<group>: { <field>: value }`, with a `qwen38` / `qwen38flashnext` section beside a group's fields wherever a model family's value differs. The values are the ones the loaded model runs with — its family's own where one is set — with every live change on top.\n\nOnly fields declared visible appear: a hidden field (the API key) is absent, not masked. `ignis-server help --fields` lists every field and whether it is shown.\n\nAnswers during a model switch too: until the switch lands it shows the configuration still running, and the `ignis-model-status` header says `switching` (as `GET /v1/models` reports it).\n\n`?format=yaml` answers the same configuration as the config file it amounts to: `application/yaml`, the text `ignis-server config print` writes for it, without the hidden fields. It is the configuration in force — live changes included — not the file on disk, whose comments it does not carry.",
+    params(("format" = Option<String>, Query, description = "`json` (the default) or `yaml`; any other is `400 config_invalid`.")),
     responses(
-        (status = 200, description = "The running configuration.", body = ConfigDocument,
+        (status = 200, description = "The running configuration.",
+            content((ConfigDocument = "application/json"), (String = "application/yaml")),
             headers(("ignis-model-status" = String, description = "`serving`, `switching` or `failed`."))),
+        (status = 400, description = "`format` is neither `json` nor `yaml` (`config_invalid`).", body = ApiError),
         (status = 401, description = "The server was started with an API key and the request carried no matching bearer token.", body = ApiError),
         (status = 501, description = "This server was built without a running configuration (`config_unavailable`).", body = ApiError),
     ),
 )]
-pub(crate) async fn get_config(State(server): State<Arc<Server>>) -> Response {
+pub(crate) async fn get_config(State(server): State<Arc<Server>>, Query(query): Query<ConfigQuery>) -> Response {
     let Some(state) = &server.config else {
         return no_config();
     };
-    let mut response = Json(visible_document(&state.current())).into_response();
+    let document = visible_document(&state.current());
+    let mut response = match query.format.as_deref() {
+        None | Some("json") => Json(document).into_response(),
+        // Spec playground/05 §Decisions: the rendered file — `config
+        // print`'s writer over the document the JSON answer is.
+        Some("yaml") => ([(header::CONTENT_TYPE, "application/yaml")], file::Format::Yaml.write(&document)).into_response(),
+        Some(other) => return refused("config_invalid", format!("`format={other}`: the formats are json and yaml")),
+    };
     response.headers_mut().insert(STATUS_HEADER, HeaderValue::from_static(server.status().as_str()));
     response
+}
+
+/// `GET /v1/config`'s query.
+#[derive(Deserialize)]
+pub(crate) struct ConfigQuery {
+    /// `json` (the default) or `yaml`.
+    format: Option<String>,
 }
 
 /// One field's declaration as `GET /v1/config/fields` serves it. Documentation

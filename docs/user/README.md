@@ -307,12 +307,20 @@ a file's `profiles: { <name>: { <group>: { … } } }` defines one for any other
 card.
 
 **At runtime.** `GET /v1/config` shows the running configuration (fields
-declared visible only: never the API key). `PATCH /v1/config` takes a partial
-document in the file's shape: a change to the request timeout, the message
-policies, the thinking defaults or the switch knobs applies at once; a change
-touching anything the load is built from reloads the model with the whole
-patch, as a model switch does. Either way it is written to the config file in
-use once it has taken. `GET /v1/config/fields` says what each of those fields
+declared visible only: never the API key); `GET /v1/config?format=yaml` shows
+it as the config file it amounts to, the text `config print` writes.
+`PATCH /v1/config` takes a partial document in the file's shape: a change to
+the request timeout, the message policies, the thinking defaults or the switch
+knobs applies at once, and so does a value the loaded model does not run with
+— one in the other model's family section, or a group value the loaded model
+overrides in its own — which that model uses when it next loads; a change to
+anything the loaded model's load is built from reloads it with the whole
+patch, as a model switch does. A `null` removes a key: in a family's section,
+so the group's value applies to that model again; at a group key, so the
+profile's or the built-in default applies — a flag or an env var that sets the
+field still outranks the file, and the answer names it. Either way it is
+written to the config file in use once it has taken, a removed key and the
+section it empties taken out. `GET /v1/config/fields` says what each of those fields
 is: its key, kind, default, rule, the model families that take it, and whether
 a change is live, needs a reload, or can only be made at start — the same
 declarations as `ignis-server help --fields --format json`, minus the fields

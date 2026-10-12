@@ -133,6 +133,21 @@ fn the_server_view_routes_are_documented_with_their_responses() {
     assert!(document["components"]["schemas"]["LastSwitchInfo"]["properties"]["outcome"].is_object());
 }
 
+/// Spec playground/05 AC 22: `GET /v1/config` documents its `format` query,
+/// the two media types it answers in, and the `400` of any other format.
+#[test]
+fn the_config_route_documents_its_format_and_both_media_types() {
+    let document = document();
+    let get = &document["paths"]["/v1/config"]["get"];
+    let parameters = get["parameters"].as_array().expect("parameters");
+    let format = parameters.iter().find(|parameter| parameter["name"] == "format").expect("the format query");
+    assert_eq!((format["in"].clone(), format["required"].clone()), (serde_json::json!("query"), serde_json::json!(false)));
+    let content = &get["responses"]["200"]["content"];
+    assert_eq!(content["application/json"]["schema"]["$ref"], "#/components/schemas/ConfigDocument");
+    assert_eq!(content["application/yaml"]["schema"]["type"], "string");
+    assert!(get["responses"]["400"].is_object());
+}
+
 #[test]
 fn the_counting_routes_carry_their_schemas() {
     // GitHub #285: the request and response shapes are in the document, not

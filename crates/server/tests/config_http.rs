@@ -780,3 +780,48 @@ async fn a_removed_field_a_flag_sets_runs_the_flags_value_and_is_named_as_shadow
     assert_eq!(server.live().request_timeout, Duration::from_secs(40), "the flag's value, as at a start");
     assert!(read_yaml(&path).get("server").is_none(), "the file loses the key");
 }
+
+/// Spec playground/05 AC 22: `?format=yaml` answers, as `application/yaml`
+/// with the model's state, the YAML `config print` writes for the same
+/// configuration minus the hidden fields — the JSON document's own content;
+/// `json` or no `format` is the JSON document, and any other is `400
+/// config_invalid`.
+#[tokio::test]
+async fn get_config_as_yaml_is_what_config_print_writes_minus_the_hidden_fields() {
+    let path = config_file("yaml", "server:\n  request_timeout: 45\nreuse:\n  qwen38flashnext:\n    kv_host_pool_bytes: 1G\n");
+    let path = path.to_str().unwrap();
+    let loader = MockLoader::new();
+    let app = server_on(&loader, started(&["--config", path, "--server-api-key", "sk-secret"])).app();
+    let request = Request::builder().uri("/v1/config?format=yaml").header(header::AUTHORIZATION, "Bearer sk-secret").body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/yaml");
+    assert_eq!(response.headers()["ignis-model-status"], "serving");
+    let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(!text.contains("sk-secret") && !text.contains("api_key"), "{text}");
+
+    let argv: Vec<String> = ["config", "print", "--file", path, "--server-api-key", "sk-secret"].iter().map(|s| s.to_string()).collect();
+    let ConfigOutcome::Print(printed) = resolve_with(&argv, |_| None, &RealFiles).unwrap() else { panic!("config print prints") };
+    let mut printed = Format::Yaml.read(&printed).unwrap();
+    ignis_server::config_http::remove_invisible(&mut printed, all_fields());
+    assert_eq!(text, Format::Yaml.write(&printed), "config print's text, minus the hidden fields");
+
+    let get = |uri: &'static str| {
+        let request = Request::builder().uri(uri).header(header::AUTHORIZATION, "Bearer sk-secret").body(Body::empty()).unwrap();
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        }
+    };
+    let (status, json) = get("/v1/config?format=json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(Format::Yaml.read(&text).unwrap(), json, "the same document, as YAML");
+    assert_eq!(get("/v1/config").await.1, json);
+    let (status, refused) = get("/v1/config?format=toml").await;
+    assert_eq!((status, refused["error"]["code"].clone()), (StatusCode::BAD_REQUEST, json!("config_invalid")), "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("toml") && message.contains("json") && message.contains("yaml"), "{message}");
+}
