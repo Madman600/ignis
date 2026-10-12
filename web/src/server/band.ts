@@ -48,8 +48,13 @@ export type RowAction =
 export function rowAction(row: CatalogRow, model: ModelState): RowAction {
   if (model.state === "switching" && row.id === model.to) return { kind: "loading" };
   if (row.loaded) return { kind: "loaded" };
-  if (row.on_disk !== "complete") return row.source === "known" ? { kind: "missing" } : { kind: "download" };
-  return { kind: "load", enabled: row.switchable && model.state !== "switching" && model.state !== "loading" };
+  // `switchable` decides first: the server knows a switch by id alone can begin
+  // (a catalog entry fetched since the last read, the model torn down by a
+  // failed restore), whatever `on_disk` last said.
+  if (row.switchable || row.on_disk === "complete") {
+    return { kind: "load", enabled: row.switchable && model.state !== "switching" && model.state !== "loading" };
+  }
+  return row.source === "known" ? { kind: "missing" } : { kind: "download" };
 }
 
 /** The family the loaded model runs as (its scope name), from the catalog's loaded row. */

@@ -23,6 +23,18 @@ describe("rowAction", () => {
     expect(rowAction({ ...row("qwen3.8-27b-fail"), on_disk: "absent", switchable: false }, ready)).toEqual({ kind: "missing" });
   });
 
+  it("follows the server's `switchable` before what is on disk: a catalog entry the server can switch to is Load", () => {
+    expect(rowAction({ ...row("qwen3.8-27b-custom"), on_disk: "absent", switchable: true }, ready)).toEqual({ kind: "load", enabled: true });
+    expect(rowAction({ ...row("qwen3.8-27b-custom"), source: "built-in", on_disk: "absent", switchable: true }, ready)).toEqual({ kind: "load", enabled: true });
+  });
+
+  it("offers Load on every row, the torn-down model's included, while nothing serves", () => {
+    const dead: ModelState = { state: "error", message: "Switch failed: x", failed: true };
+    const torn = CATALOG.map((r) => ({ ...r, loaded: false, switchable: r.on_disk === "complete" }));
+    expect(rowAction(torn[0], dead)).toEqual({ kind: "load", enabled: true });
+    expect(torn.map((r) => rowAction(r, dead).kind)).not.toContain("loaded");
+  });
+
   it("marks the model a switch is loading, and offers no Load while one runs", () => {
     expect(rowAction(row("qwen3.8-flash-next"), switching)).toEqual({ kind: "loading" });
     expect(rowAction(row("qwen3.8-27b-fail"), switching)).toEqual({ kind: "load", enabled: false });

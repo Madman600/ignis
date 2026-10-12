@@ -64,6 +64,17 @@ describe("ServerView: the model band", () => {
     expect(html).toContain("Partly downloaded, 18.07 GiB in all");
   });
 
+  it("has no Loaded row while nothing serves, and offers Load for the retry, the torn-down model's included", () => {
+    const dead: ModelState = { state: "error", message: "Switch failed: x", failed: true };
+    const torn = CATALOG.map((r) => ({ ...r, loaded: false, switchable: r.on_disk === "complete" }));
+    const html = render({ catalog: { state: "ok", value: torn } }, dead);
+    expect(html).not.toContain(">Loaded<");
+    expect(html).toContain("No model is serving");
+    expect(html).toContain('aria-label="Load qwen3.8-27b"');
+    expect(html).not.toMatch(/aria-label="Load qwen3\.8-27b" disabled=""/);
+    expect(html).not.toMatch(/aria-label="Load qwen3\.8-flash-next" disabled=""/);
+  });
+
   it("follows a switch: both ids, the seconds it has run, the model it loads, and no Load in reach", () => {
     const switching: ModelState = { state: "switching", from: "qwen3.8-27b", to: "qwen3.8-flash-next", since: 1_000 };
     const html = render({}, switching, false, 13_500);
