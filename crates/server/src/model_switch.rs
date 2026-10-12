@@ -130,27 +130,39 @@ impl ModelLoader for ArtifactLoader {
         let family = crate::loader::artifact_family(&target.artifact)
             .map_err(|e| e.to_string())?
             .unwrap_or(ignis_core::compute::ModelFamily::Qwen38_27b);
-        let options = match options {
-            // A reload with a changed config: patched, validated and fitted
-            // by the caller, for the model it reloads.
-            Some(options) if options.basis.family() == Some(family) => options.clone(),
-            given => {
-                // The target's artifact and id over the running options, as
-                // a patch: the options are resolved again from their
-                // sources, so a value set on the struct would not survive
-                // the fit.
-                let base = given.cloned().unwrap_or_else(|| crate::config::Config::clone(&self.state.current()));
-                let named = crate::config::target_patch(&target.artifact, &target.model)
-                    .and_then(|patch| base.general_with(&patch))
-                    .map_err(|e| e.to_string())?;
-                let (options, dropped) = crate::config::fit_to_family(&named, family).map_err(|e| e.to_string())?;
-                log_flags_dropped(&target.model, family, &dropped);
-                options
-            }
-        };
+        let options = load_options(&self.state.current(), target, family, options)?;
         let prepared = crate::load::prepare_model(&options, &target.artifact).map_err(|e| e.to_string())?;
         Ok(Box::new(prepared))
     }
+}
+
+/// The configuration a load of `target`, an artifact of `family`, runs
+/// with: `given` as it is when it was fitted to that family (a reload with a
+/// changed config, patched, validated and fitted by the caller), else
+/// `given` or `running` with the target's artifact and id over it, fitted to
+/// `family` as a switch fits it. What [`ArtifactLoader`] loads with, apart
+/// from the load itself so a test's loader fits a switch the same way: a
+/// value a live `PATCH /v1/config` set for a family not loaded reaches that
+/// family's load through here (spec playground/05 AC 19).
+pub fn load_options(
+    running: &crate::config::Config,
+    target: &ModelSource,
+    family: ignis_core::compute::ModelFamily,
+    given: Option<&crate::config::Config>,
+) -> Result<crate::config::Config, String> {
+    if let Some(options) = given.filter(|options| options.basis.family() == Some(family)) {
+        return Ok(options.clone());
+    }
+    // The target's artifact and id over the running options, as a patch:
+    // the options are resolved again from their sources, so a value set on
+    // the struct would not survive the fit.
+    let base = given.unwrap_or(running);
+    let named = crate::config::target_patch(&target.artifact, &target.model)
+        .and_then(|patch| base.general_with(&patch))
+        .map_err(|e| e.to_string())?;
+    let (options, dropped) = crate::config::fit_to_family(&named, family).map_err(|e| e.to_string())?;
+    log_flags_dropped(&target.model, family, &dropped);
+    Ok(options)
 }
 
 /// Say which of the running options a switch to `to`, a model of `family`,

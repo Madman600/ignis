@@ -603,3 +603,82 @@ async fn a_one_of_rule_lists_each_value_once_in_canonical_form() {
         assert_eq!(listed, canonical, "{}", meta.file_key());
     }
 }
+
+// ── per-model overrides, removals, the rendered file (spec playground/05) ────
+
+/// A 27B serving `argv`'s configuration fitted to its family, on a server
+/// whose loader fits every load from the running configuration as the
+/// production loader does, `mock-b` being a Flash-Next artifact.
+fn qwen_server(loader: &Arc<MockLoader>, argv: &[&str]) -> Server {
+    let config = started(argv).for_family(ModelFamily::Qwen38_27b).expect("the 27B takes the start options");
+    let state = Arc::new(ConfigState::new(config.clone(), Arc::new(RealFiles)));
+    loader.fit_from(Arc::clone(&state), &[("mock-b", ModelFamily::FlashNext)]);
+    let server = Server::from_active(loader.model("mock-a"))
+        .with_switcher(Switcher::new(Arc::clone(loader) as _, PATIENT))
+        .with_config(state);
+    server.apply_config(&config);
+    server
+}
+
+/// Spec playground/05 AC 19: values that change nothing the running model
+/// runs with — one scoped to the family not loaded, a group value the
+/// running family overrides in its own section — are a live change though
+/// they need a reload: applied at once with no model touched, written to the
+/// file, and the load of the other family, fitted from the running
+/// configuration as the production loader fits it, runs with them.
+#[tokio::test]
+async fn a_patch_that_changes_nothing_running_is_live_and_the_other_familys_load_runs_with_it() {
+    let path = config_file("other-family", "reuse:\n  qwen38:\n    kv_host_pool_bytes: 4G\n");
+    let loader = MockLoader::new();
+    let server = qwen_server(&loader, &["--config", path.to_str().unwrap(), "--profile", "none"]);
+    let app = server.app();
+    let body = json!({ "reuse": { "kv_host_pool_bytes": "3G" }, "model": { "qwen38flashnext": { "max_context": 65536 } } });
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!((applied["applied"].clone(), applied["persisted"].clone()), (json!("live"), json!(true)), "{applied}");
+    assert!(loader.prepared_options().is_empty(), "no model was touched");
+    let shown = &applied["config"];
+    assert_eq!(shown["reuse"]["kv_host_pool_bytes"], "4G", "the 27B keeps its own: {shown}");
+    assert_eq!(shown["reuse"]["qwen38flashnext"]["kv_host_pool_bytes"], "3G", "{shown}");
+    assert_eq!(shown["model"]["qwen38flashnext"]["max_context"], 65536, "{shown}");
+    let written = read_yaml(&path);
+    assert_eq!(written["reuse"]["kv_host_pool_bytes"], "3G", "{written:?}");
+    assert_eq!(written["reuse"]["qwen38"]["kv_host_pool_bytes"], "4G", "{written:?}");
+    assert_eq!(written["model"]["qwen38flashnext"]["max_context"], 65536, "{written:?}");
+
+    let switch = json!({ "model": "mock-b", "artifact": "mock-b.ninfer" });
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(switch)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    until_serving(&app).await;
+    let fitted = loader.fitted_options();
+    let flash = fitted.last().expect("the Flash-Next load was fitted from the running configuration");
+    assert_eq!(flash.basis.family(), Some(ModelFamily::FlashNext));
+    assert_eq!((flash.host_pool_bytes, flash.max_context), (3 << 30, 65536));
+    let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
+    assert_eq!((document["reuse"]["kv_host_pool_bytes"].clone(), document["model"]["max_context"].clone()), (json!("3G"), json!(65536)), "{document}");
+}
+
+/// Spec playground/05 AC 20: a value waiting for the other family beside a
+/// change the running model takes reloads, and both land — in the load, in
+/// what `GET /v1/config` shows and in the file.
+#[tokio::test]
+async fn a_patch_mixing_the_other_familys_value_with_a_running_change_reloads_and_both_land() {
+    let path = config_file("mixed", "server:\n  request_timeout: 30\n");
+    let loader = MockLoader::new();
+    let server = qwen_server(&loader, &["--config", path.to_str().unwrap(), "--profile", "none"]);
+    let app = server.app();
+    let body = json!({ "reuse": { "qwen38": { "kv_host_pool_bytes": "3G" }, "qwen38flashnext": { "kv_host_pool_bytes": "1G" } } });
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{applied}");
+    assert_eq!(applied["applied"], "reload");
+    until_serving(&app).await;
+    let fitted = loader.fitted_options();
+    let reloaded = fitted.last().expect("the reload's load");
+    assert_eq!((reloaded.basis.family(), reloaded.host_pool_bytes), (Some(ModelFamily::Qwen38_27b), 3 << 30));
+    let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
+    assert_eq!(document["reuse"]["kv_host_pool_bytes"], "3G", "{document}");
+    assert_eq!(document["reuse"]["qwen38flashnext"]["kv_host_pool_bytes"], "1G", "{document}");
+    let written = read_yaml(&path);
+    assert_eq!(written["reuse"]["qwen38"]["kv_host_pool_bytes"], "3G", "{written:?}");
+    assert_eq!(written["reuse"]["qwen38flashnext"]["kv_host_pool_bytes"], "1G", "{written:?}");
+}

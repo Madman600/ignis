@@ -14,7 +14,10 @@
 //!
 //! The family scope is a tiebreaker *within* a source, never a source of
 //! its own: the command line wins whatever its scope, and inside any one
-//! source the more specific value wins. The first value found is the only
+//! source the more specific value wins. A patch is a change to the config
+//! file, so it keeps the file's own tiebreak: its general value yields to
+//! the file's `<family>-config` for that family, as in the rewritten file
+//! ([`Resolver::field`]). The first value found is the only
 //! one parsed — a lower-precedence value that would not parse is never
 //! reached, so an operator overriding a bad env var with a good flag is not
 //! refused for the env var.
@@ -314,7 +317,11 @@ impl Resolver<'_> {
             (&sources.file, Source::File),
         ];
         for (layer, source) in explicit {
-            let Some(candidate) = self.candidate(layer, meta) else {
+            let found = match source {
+                Source::Patch => self.patch_candidate(meta),
+                _ => self.candidate(layer, meta),
+            };
+            let Some(candidate) = found else {
                 continue;
             };
             let value = parse_candidate::<K>(meta, candidate)?;
@@ -354,6 +361,28 @@ impl Resolver<'_> {
     fn candidate<'l>(&self, layer: &'l Layer, meta: &FieldMeta) -> Option<&'l Candidate> {
         let scoped = self.family.filter(|family| meta.takes_scope(*family)).and_then(|family| layer.get(meta, Some(family)));
         scoped.or_else(|| layer.get(meta, None))
+    }
+
+    /// The live patch's value for `meta`: as [`Resolver::candidate`] picks
+    /// it, except that its general value yields to a value the config file
+    /// holds in the family's own section. A patch is a change to the config
+    /// file (written into it once it takes), applied ahead of every other
+    /// source while the process runs; in the file a family's own section
+    /// outranks the group's value, so a patched group value reaching a
+    /// family the file gives its own would run a value no start from the
+    /// rewritten file runs (spec playground/05 §Decisions). Whatever
+    /// outranks the file's own section then decides, as at a start.
+    fn patch_candidate(&self, meta: &FieldMeta) -> Option<&Candidate> {
+        let (patch, file) = (&self.sources.patch, &self.sources.file);
+        if let Some(family) = self.family.filter(|family| meta.takes_scope(*family)) {
+            if let Some(scoped) = patch.get(meta, Some(family)) {
+                return Some(scoped);
+            }
+            if file.get(meta, Some(family)).is_some() {
+                return None;
+            }
+        }
+        patch.get(meta, None)
     }
 
     fn record(&self, meta: &'static FieldMeta, source: Source, candidate: &Candidate, at_default: bool) {
@@ -589,6 +618,26 @@ mod tests {
             assert_eq!(resolved.settings.reuse.kv_host_pool_bytes, want, "{name}");
             assert_eq!(resolved.origin("reuse", "kv_host_pool_bytes").map_or(Source::Default, |o| o.source), from, "{name}");
         }
+    }
+
+    /// Spec playground/05 §Decisions: a live patch is a change to the config
+    /// file, applied ahead of every other source — and in the file a
+    /// family's own section outranks the group's value, so a patched group
+    /// value does not reach a family the file gives its own. The families
+    /// without one take it, and a patched family value still wins.
+    #[test]
+    fn a_patched_group_value_yields_to_the_files_own_section_for_that_family() {
+        let meta = field("reuse", "kv_host_pool_bytes").unwrap();
+        let (q, f) = (Some(ModelFamily::Qwen38_27b), Some(ModelFamily::FlashNext));
+        let resolved = |sources: &Sources, family| resolve_settings(sources, family, Fit::Start).unwrap().settings.reuse.kv_host_pool_bytes;
+        let sources = Sources { patch: layer(meta, &[(None, "3G")]), file: layer(meta, &[(q, "4G")]), ..Sources::default() };
+        assert_eq!((resolved(&sources, q), resolved(&sources, f), resolved(&sources, None)), (4 * GIB, 3 * GIB, 3 * GIB));
+        let own = Sources { patch: layer(meta, &[(None, "3G"), (q, "1G")]), ..sources.clone() };
+        assert_eq!(resolved(&own, q), GIB, "the patch's own value for the family");
+        let flagged = Sources { flags: layer(meta, &[(None, "6G")]), ..sources.clone() };
+        assert_eq!(resolved(&flagged, q), 6 * GIB, "what outranks the file's own section still does");
+        let scoped_flag = Sources { patch: layer(meta, &[(None, "3G")]), flags: layer(meta, &[(q, "5G")]), ..Sources::default() };
+        assert_eq!(resolved(&scoped_flag, q), 3 * GIB, "with nothing in the file a patch still outranks the command line");
     }
 
     /// Before an artifact names a family, only the general values count.

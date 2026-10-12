@@ -5,9 +5,10 @@
 //! (`config::schema`): `visible` decides `GET` — a whitelist, so a field
 //! nobody marked is absent, never masked, and the API key is simply not
 //! there — and `patchable` / `reload_required` decide `PATCH`. A patch is
-//! applied one way, never two: when no field in it needs a reload it takes
-//! effect at once with no model touched ([`crate::Server::apply_config`]);
-//! when even one does, the **whole** patch goes through the model switch
+//! applied one way, never two: when nothing it changes for the model running
+//! needs a reload ([`needs_reload`]) it takes effect at once with no model
+//! touched ([`crate::Server::apply_config`]); when even one such field
+//! does, the **whole** patch goes through the model switch
 //! #305 built (`crate::model_switch::reconfigure`) — same gate, drain,
 //! teardown and load, same return to the old model when the load fails — so
 //! the server is never left half old config and half new.
@@ -386,9 +387,18 @@ pub fn shadowed_at_restart(patch: &Layer, running: &Config) -> Vec<String> {
         .collect()
 }
 
-/// Whether applying `patch` needs a model reload: any field in it does.
-pub fn needs_reload(patch: &Layer) -> bool {
-    patch.entries().any(|(meta, _, _)| meta.reload_required)
+/// Whether going from `running` to `next` — the running config with a
+/// patch applied, both fitted to the family running ([`Config::with_patch`])
+/// — needs a model reload: a field that takes effect only through one
+/// resolves differently (spec playground/05 §Decisions). Judged on what the
+/// running model would run with, not on what the patch names: a value scoped
+/// to the family not loaded, or a group value the running family overrides
+/// in its own section, changes nothing running, so it is a live change —
+/// applied, written down, and used when that family next loads.
+pub fn needs_reload(running: &Config, next: &Config) -> bool {
+    let (before, after) = (running.settings().render(), next.settings().render());
+    let value = |groups: &serde_json::Map<String, Value>, meta: &FieldMeta| groups.get(meta.group).and_then(|group| group.get(meta.name)).cloned();
+    all_fields().filter(|meta| meta.reload_required).any(|meta| value(&before, meta) != value(&after, meta))
 }
 
 /// The checks a start makes on the thinking defaults, made again on the
@@ -424,7 +434,7 @@ fn check_thinking(server: &Server, next: &Config, patch: &Layer) -> Result<(), S
     tag = "config",
     operation_id = "patch_config",
     summary = "Change the running configuration",
-    description = "The body is a partial config document in the config file's own shape — only the fields being changed, a `qwen38` / `qwen38flashnext` section for a family's own value. Each value is checked as the config file's would be; a field the loaded model's family cannot take, or one not patchable (the API key, the bind addresses, the Playground), refuses the **whole** patch, nothing in it applied. `switch.known_models` adds to the models already known.\n\nApplied one way, never two. When no field in the patch needs a model reload (the request timeout, the message policies, the thinking defaults, the model switch's own knobs) it takes effect at once, no model touched: `200`, with the configuration now running. When even one field does, the whole patch — its other fields included — goes through a reload of the loaded model with the patched configuration: the same switch `POST /v1/models/switch` runs, `202` at once, every other `/v1` route answering `503 model_switching` until it lands, and `GET /v1/models` reporting it. A reload that fails leaves the previous model serving with the previous configuration.\n\nA change is written to the config file in use once it has taken — at once, or when the reloaded model serves — keeping every other key in the file. With no config file in use it still applies, and `persisted: false` says why. `shadowed_at_restart` names the fields a flag or an env var also sets: they outrank the file at the next start.",
+    description = "The body is a partial config document in the config file's own shape — only the fields being changed, a `qwen38` / `qwen38flashnext` section for a family's own value. Each value is checked as the config file's would be; a field the loaded model's family cannot take, or one not patchable (the API key, the bind addresses, the Playground), refuses the **whole** patch, nothing in it applied. `switch.known_models` adds to the models already known.\n\nApplied one way, never two. When nothing the patch changes for the loaded model needs a reload — its fields take effect live (the request timeout, the message policies, the thinking defaults, the model switch's own knobs), or the reload fields it names resolve as before for the loaded model's family (a value in the other family's section, a group value the loaded family overrides in its own) — it takes effect at once, no model touched: `200`, with the configuration now running; a value for the other family is used when that family next loads. When a reload field resolves differently for the loaded model, the whole patch — its other fields included — goes through a reload of the loaded model with the patched configuration: the same switch `POST /v1/models/switch` runs, `202` at once, every other `/v1` route answering `503 model_switching` until it lands, and `GET /v1/models` reporting it. A reload that fails leaves the previous model serving with the previous configuration.\n\nA change is written to the config file in use once it has taken — at once, or when the reloaded model serves — keeping every other key in the file. With no config file in use it still applies, and `persisted: false` says why. `shadowed_at_restart` names the fields a flag or an env var also sets: they outrank the file at the next start.",
     request_body(content = ConfigDocument, description = "The fields to change, nested as the config file nests them."),
     responses(
         (status = 200, description = "Applied live.", body = PatchApplied),
@@ -454,7 +464,7 @@ pub(crate) async fn patch_config(State(server): State<Arc<Server>>, Json(body): 
         Err(error) => return refused("config_invalid", error.0),
     };
     let shadowed = shadowed_at_restart(&patch, &running);
-    if !needs_reload(&patch) {
+    if !needs_reload(&running, &next) {
         if let Err(error) = check_thinking(&server, &next, &patch) {
             return refused("config_invalid", error);
         }
@@ -508,6 +518,7 @@ mod tests {
     use crate::config::file::testing::MemFiles;
     use crate::config::kind::*;
     use crate::config::source::Resolver;
+    use ignis_core::compute::ModelFamily;
     use serde_json::{json, Map};
 
     fn config(flags: &[&str]) -> Config {
@@ -592,10 +603,24 @@ mod tests {
             read_patch(&json!({ "server": { "request_timeout": 60, "api_key": "k", "bind": "x" } })).unwrap_err();
         assert_eq!(code, "config_field_not_patchable");
         assert!(message.contains("`server.api_key`") && message.contains("`server.bind`") && !message.contains("request_timeout"), "{message}");
-        let live = read_patch(&json!({ "server": { "request_timeout": 60 }, "switch": { "drain_timeout": 0 } })).unwrap();
-        assert!(!needs_reload(&live));
-        let reload = read_patch(&json!({ "server": { "request_timeout": 60 }, "reuse": { "qwen38": { "kv_host_pool_bytes": "1G" } } })).unwrap();
-        assert!(needs_reload(&reload));
+    }
+
+    /// Spec playground/05 AC 19-20: a patch reloads only when a field that
+    /// needs a reload resolves differently for the family running — not for
+    /// a value scoped to the other family, nor for a group value the running
+    /// family overrides in its own section.
+    #[test]
+    fn a_patch_reloads_only_for_what_the_running_family_runs_with() {
+        let running = config(&["--profile", "none"]).for_family(ModelFamily::Qwen38_27b).unwrap();
+        let reloads = |running: &Config, body: Value| needs_reload(running, &running.with_patch(&read_patch(&body).unwrap()).unwrap());
+        assert!(!reloads(&running, json!({ "server": { "request_timeout": 60 }, "switch": { "drain_timeout": 0 } })), "live fields");
+        assert!(!reloads(&running, json!({ "reuse": { "qwen38flashnext": { "kv_host_pool_bytes": "1G" } } })), "the other family's value");
+        assert!(!reloads(&running, json!({ "reuse": { "kv_host_pool_bytes": "2G" } })), "the value already running");
+        assert!(reloads(&running, json!({ "reuse": { "qwen38": { "kv_host_pool_bytes": "1G" } } })), "the running family's own");
+        assert!(reloads(&running, json!({ "reuse": { "kv_host_pool_bytes": "1G" } })), "a group value the running family reads");
+        assert!(reloads(&running, json!({ "server": { "request_timeout": 60 }, "reuse": { "qwen38flashnext": { "prompt": false }, "prompt": false } })));
+        let own = running.with_patch(&read_patch(&json!({ "reuse": { "qwen38": { "kv_host_pool_bytes": "4G" } } })).unwrap()).unwrap();
+        assert!(!reloads(&own, json!({ "reuse": { "kv_host_pool_bytes": "1G" } })), "a group value the running family overrides");
     }
 
     #[test]

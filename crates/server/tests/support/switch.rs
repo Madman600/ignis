@@ -16,10 +16,12 @@ use std::collections::HashSet;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
 
+use ignis_core::compute::ModelFamily;
 use ignis_core::mock::{GateController, GatedCompute, MockCompute};
 use ignis_core::{Compute, ConcreteScheduler, SchedulerConfig};
+use ignis_server::config_http::ConfigState;
 use ignis_server::engine::Engine;
-use ignis_server::model_switch::{ModelLoader, PreparedLoad};
+use ignis_server::model_switch::{load_options, ModelLoader, PreparedLoad};
 use ignis_server::load::LoadedModel;
 use ignis_server::telemetry::SystemClock;
 use ignis_server::template::SimpleTemplateProvider;
@@ -52,6 +54,13 @@ struct State {
     options: Mutex<Vec<Option<ignis_server::config::Config>>>,
     /// The artifact each prepare was asked to load, in order.
     artifacts: Mutex<Vec<std::path::PathBuf>>,
+    /// The server's configuration, and the family each id's artifact is
+    /// ([`MockLoader::fit_from`]): when set, every prepare fits the options
+    /// its load runs with from the configuration running at that moment, by
+    /// the production loader's own function.
+    fitting: Mutex<Option<(Arc<ConfigState>, Vec<(String, ModelFamily)>)>>,
+    /// The options each fitted load runs with, in order.
+    fitted: Mutex<Vec<ignis_server::config::Config>>,
 }
 
 /// The mock loader. Clone the `Arc` into a `Switcher`, keep one to steer it.
@@ -110,6 +119,22 @@ impl MockLoader {
         *self.state.serving.lock().unwrap() = Some(config);
     }
 
+    /// Fit every load's options from `config`, the server's running
+    /// configuration, as the production loader does
+    /// ([`ignis_server::model_switch::load_options`]); an id `families` does
+    /// not name is a 27B. What proves a value set for a family not loaded
+    /// reaches that family's load, not only a fixed configuration
+    /// ([`MockLoader::serve_with`]) handed back.
+    pub fn fit_from(&self, config: Arc<ConfigState>, families: &[(&str, ModelFamily)]) {
+        let families = families.iter().map(|(id, family)| (id.to_string(), *family)).collect();
+        *self.state.fitting.lock().unwrap() = Some((config, families));
+    }
+
+    /// The options each fitted load ran with, in order.
+    pub fn fitted_options(&self) -> Vec<ignis_server::config::Config> {
+        self.state.fitted.lock().unwrap().clone()
+    }
+
     /// How many built models were alive as each load began.
     pub fn resident_at_load(&self) -> Vec<usize> {
         self.state.resident_at_load.lock().unwrap().clone()
@@ -155,7 +180,16 @@ impl ModelLoader for MockLoader {
         if self.state.refused.lock().unwrap().contains(&target.model) {
             return Err(format!("{} refused at prepare (simulated)", target.model));
         }
-        let options = self.state.serving.lock().unwrap().clone();
+        let fitted = match &*self.state.fitting.lock().unwrap() {
+            Some((config, families)) => {
+                let family = families.iter().find(|(id, _)| *id == target.model).map_or(ModelFamily::Qwen38_27b, |(_, family)| *family);
+                let fitted = load_options(&config.current(), target, family, options)?;
+                self.state.fitted.lock().unwrap().push(fitted.clone());
+                Some(fitted)
+            }
+            None => None,
+        };
+        let options = fitted.or_else(|| self.state.serving.lock().unwrap().clone());
         Ok(Box::new(MockPrepared { state: Arc::clone(&self.state), id: target.model.clone(), options }))
     }
 }
