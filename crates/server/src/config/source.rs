@@ -14,13 +14,14 @@
 //!
 //! The family scope is a tiebreaker *within* a source, never a source of
 //! its own: the command line wins whatever its scope, and inside any one
-//! source the more specific value wins. A patch is a change to the config
-//! file, so it keeps the file's own tiebreak: its general value yields to
-//! the file's `<family>-config` for that family, as in the rewritten file
-//! ([`Resolver::field`]). The first value found is the only
+//! source the more specific value wins. The first value found is the only
 //! one parsed — a lower-precedence value that would not parse is never
 //! reached, so an operator overriding a bad env var with a good flag is not
 //! refused for the env var.
+//!
+//! A patch is a change to the config file, so it keeps the file's own
+//! tiebreak: its general value yields to the file's `<family>-config` for
+//! that family, as in the rewritten file ([`Resolver::field`]).
 //!
 //! Gathering the layers once and keeping them ([`Sources`], carried by every
 //! resolved [`super::Config`]) is what lets one start's options be resolved

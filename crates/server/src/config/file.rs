@@ -45,6 +45,13 @@ impl Format {
         }
     }
 
+    /// The format the file at `path` is read and written in: the one its
+    /// extension names ([`Format::of_path`]), else YAML, which reads JSON
+    /// too.
+    pub fn of_file(path: &Path) -> Format {
+        Format::of_path(path).unwrap_or(Format::Yaml)
+    }
+
     /// `json` or `yaml`, as `--format` spells it.
     pub fn parse(name: &str) -> Option<Format> {
         match name.to_ascii_lowercase().as_str() {
@@ -207,8 +214,7 @@ pub fn load(files: &dyn Files, path: &Path) -> Result<(Value, Document), ConfigE
     let text = files
         .read(path)
         .map_err(|e| ConfigError(format!("the config file {} cannot be read: {e}", path.display())))?;
-    let value = Format::of_path(path)
-        .unwrap_or(Format::Yaml)
+    let value = Format::of_file(path)
         .read(&text)
         .map_err(|e| ConfigError(format!("the config file {} is not valid: {e}", path.display())))?;
     let document = read_document(&value, &path.display().to_string())?;
@@ -458,20 +464,31 @@ pub fn remove(document: &mut Value, removals: impl IntoIterator<Item = Removal>)
     }
 }
 
+/// A config file as [`rewrite`] rewrites it.
+pub struct Rewritten {
+    /// The file's new text.
+    pub text: String,
+    /// Whether its document differs from the one read: a rewrite that
+    /// changes nothing need not be written, and the file then keeps its
+    /// comments and its layout.
+    pub changed: bool,
+}
+
 /// The text of the config file at `path` with `changes` merged in and
 /// `removals` taken out (and, when given, `profile:` set) — what both
 /// `config patch` and `PATCH /v1/config` write, so the two can never change a
-/// file differently. Every key the changes do not name is kept; the keys are
-/// written in declaration order; a YAML file's comments do not survive the
-/// rewrite.
-pub fn rewrite(files: &dyn Files, path: &Path, changes: Vec<Change>, removals: Vec<Removal>, profile: Option<&str>) -> Result<String, ConfigError> {
-    let (mut document, _) = load(files, path)?;
+/// file differently — and whether that changes its document. Every key the
+/// changes do not name is kept; the keys are written in declaration order; a
+/// YAML file's comments do not survive the rewrite.
+pub fn rewrite(files: &dyn Files, path: &Path, changes: Vec<Change>, removals: Vec<Removal>, profile: Option<&str>) -> Result<Rewritten, ConfigError> {
+    let (before, _) = load(files, path)?;
+    let mut document = before.clone();
     merge(&mut document, changes);
     remove(&mut document, removals);
     if let Some(name) = profile {
         document.as_object_mut().expect("a merged document is a map").insert("profile".to_owned(), Value::String(name.to_owned()));
     }
-    Ok(Format::of_path(path).unwrap_or(Format::Yaml).write(&document))
+    Ok(Rewritten { text: Format::of_file(path).write(&document), changed: document != before })
 }
 
 /// The changes a layer stands for: each value it sets, parsed by its field's
@@ -688,6 +705,23 @@ mod tests {
         let before = document.clone();
         remove(&mut document, [(pool, q), (pool, None), (field("vram", "headroom_bytes").unwrap(), None)]);
         assert_eq!(document, before, "a key that is not there is no change");
+    }
+
+    /// A rewrite says whether it changed the document: a removal of a key the
+    /// file does not hold, or a value it holds already, does not; a new value
+    /// does. The format is the path's, YAML for a path that names none.
+    #[test]
+    fn a_rewrite_says_whether_the_document_changed() {
+        let files = testing::MemFiles::with(&[("c.conf", "reuse:\n  kv_host_pool_bytes: 2G\n")]);
+        let path = Path::new("c.conf");
+        let pool = field("reuse", "kv_host_pool_bytes").unwrap();
+        let rewrite = |changes, removals| rewrite(&files, path, changes, removals, None).unwrap();
+        assert!(!rewrite(vec![], vec![(pool, Some(ModelFamily::FlashNext))]).changed, "a removal of a key not there");
+        assert!(!rewrite(vec![(pool, None, json!("2G"))], vec![]).changed, "the value it holds");
+        let rewritten = rewrite(vec![(pool, None, json!("3G"))], vec![]);
+        assert!(rewritten.changed);
+        assert_eq!(Format::Yaml.read(&rewritten.text).unwrap(), json!({ "reuse": { "kv_host_pool_bytes": "3G" } }));
+        assert_eq!((Format::of_file(path), Format::of_file(Path::new("c.json"))), (Format::Yaml, Format::Json));
     }
 
     #[test]

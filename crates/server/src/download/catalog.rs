@@ -177,7 +177,7 @@ pub fn load(files: &dyn Files, path: Option<&Path>) -> Result<Catalog, CatalogEr
     let text = files
         .read(path)
         .map_err(|err| CatalogError(format!("the catalog {} (`download.catalog`) cannot be read: {err}", path.display())))?;
-    parse_operator(&text, Format::of_path(path).unwrap_or(Format::Yaml), &path.display().to_string())
+    parse_operator(&text, Format::of_file(path), &path.display().to_string())
 }
 
 /// An operator catalog's text, read in `format` and put after the built-in

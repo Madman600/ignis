@@ -101,13 +101,12 @@ impl ConfigState {
         let removals = patch.removals().map(|(meta, family, _)| (meta, family)).collect();
         let written = file::changes_of(&patch)
             .and_then(|changes| file::rewrite(&*self.files, path, changes, removals, None))
-            .and_then(|text| {
-                let (before, _) = file::load(&*self.files, path)?;
-                if file::Format::of_path(path).unwrap_or(file::Format::Yaml).read(&text).ok() == Some(before) {
+            .and_then(|rewritten| {
+                if !rewritten.changed {
                     return Ok(());
                 }
                 self.files
-                    .write(path, &text)
+                    .write(path, &rewritten.text)
                     .map_err(|e| ConfigError(format!("{} cannot be written: {e}", path.display())))
             });
         match written {
@@ -192,7 +191,7 @@ pub const STATUS_HEADER: &str = "ignis-model-status";
     operation_id = "get_config",
     summary = "The running configuration",
     description = "The configuration in force, in the config file's own shape: `<group>: { <field>: value }`, with a `qwen38` / `qwen38flashnext` section beside a group's fields wherever a model family's value differs. A group key is the shared value, resolved for no family; a family's section (the loaded model's too) holds its own values, so what the loaded model runs with is its section's, else the group's. Every live change is on top.\n\nOnly fields declared visible appear: a hidden field (the API key) is absent, not masked. `ignis-server help --fields` lists every field and whether it is shown.\n\nAnswers during a model switch too: until the switch lands it shows the configuration still running, and the `ignis-model-status` header says `switching` (as `GET /v1/models` reports it).\n\n`?format=yaml` answers the same configuration as the config file it amounts to: `application/yaml`, the text `ignis-server config print` writes for it, without the hidden fields. It is the configuration in force — live changes included — not the file on disk, whose comments it does not carry.",
-    params(("format" = Option<String>, Query, description = "`json` (the default) or `yaml`; any other is `400 config_invalid`.")),
+    params(("format" = inline(Option<ConfigFormat>), Query, description = "The answer's format, JSON when absent; any other value is `400 config_invalid`.")),
     responses(
         (status = 200, description = "The running configuration.",
             content((ConfigDocument = "application/json"), (String = "application/yaml")),
@@ -206,23 +205,55 @@ pub(crate) async fn get_config(State(server): State<Arc<Server>>, Query(query): 
     let Some(state) = &server.config else {
         return no_config();
     };
+    let format = match query.format.as_deref().map(ConfigFormat::named) {
+        None => ConfigFormat::Json,
+        Some(Some(format)) => format,
+        Some(None) => {
+            let other = query.format.unwrap_or_default();
+            return refused("config_invalid", format!("`format={other}`: the formats are json and yaml"));
+        }
+    };
     let document = visible_document(&state.current());
-    let mut response = match query.format.as_deref() {
-        None | Some("json") => Json(document).into_response(),
+    let mut response = match format {
+        ConfigFormat::Json => Json(document).into_response(),
         // Spec playground/05 §Decisions: the rendered file — `config
         // print`'s writer over the document the JSON answer is.
-        Some("yaml") => ([(header::CONTENT_TYPE, "application/yaml")], file::Format::Yaml.write(&document)).into_response(),
-        Some(other) => return refused("config_invalid", format!("`format={other}`: the formats are json and yaml")),
+        ConfigFormat::Yaml => ([(header::CONTENT_TYPE, "application/yaml")], file::Format::Yaml.write(&document)).into_response(),
     };
     response.headers_mut().insert(STATUS_HEADER, HeaderValue::from_static(server.status().as_str()));
     response
 }
 
-/// `GET /v1/config`'s query.
+/// `GET /v1/config`'s query, as given: a format it does not name is refused
+/// by the handler, as a `config_invalid` naming it, rather than by the
+/// extractor.
 #[derive(Deserialize)]
 pub(crate) struct ConfigQuery {
-    /// `json` (the default) or `yaml`.
+    /// A [`ConfigFormat`]'s name.
     format: Option<String>,
+}
+
+/// What `GET /v1/config` answers in.
+#[derive(Serialize, ToSchema, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ConfigFormat {
+    /// The configuration as a JSON document (the default).
+    Json,
+    /// The config file it amounts to, as `ignis-server config print` writes
+    /// it (`application/yaml`).
+    Yaml,
+}
+
+impl ConfigFormat {
+    /// The format `?format=` names, spelled exactly as the document lists
+    /// it: unlike `config print --format`, no `yml`, no other case.
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "json" => Some(Self::Json),
+            "yaml" => Some(Self::Yaml),
+            _ => None,
+        }
+    }
 }
 
 /// One field's declaration as `GET /v1/config/fields` serves it. Documentation

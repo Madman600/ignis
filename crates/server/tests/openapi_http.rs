@@ -151,6 +151,10 @@ fn the_config_route_documents_its_format_and_both_media_types() {
     let parameters = get["parameters"].as_array().expect("parameters");
     let format = parameters.iter().find(|parameter| parameter["name"] == "format").expect("the format query");
     assert_eq!((format["in"].clone(), format["required"].clone()), (serde_json::json!("query"), serde_json::json!(false)));
+    // The two formats are the enum the handler matches on, not a sentence.
+    let schema = &format["schema"];
+    let listed = schema.get("enum").or_else(|| schema["oneOf"].as_array()?.iter().find_map(|any| any.get("enum")));
+    assert_eq!(listed, Some(&serde_json::json!(["json", "yaml"])), "{format}");
     let content = &get["responses"]["200"]["content"];
     assert_eq!(content["application/json"]["schema"]["$ref"], "#/components/schemas/ConfigDocument");
     assert_eq!(content["application/yaml"]["schema"]["type"], "string");
