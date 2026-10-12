@@ -339,6 +339,15 @@ describe("ServerView: the configuration file", () => {
     expect(html).not.toContain('disabled=""');
   });
 
+  it("fits the screen, and a file longer than it scrolls inside the dialog", () => {
+    const html = dialog({ state: "ok", value: "a: 1\n".repeat(400) });
+    // The panel's height is bound to the viewport: a percentage would resolve
+    // against the overlay's auto-sized grid row, which grows with the file.
+    expect(html).toMatch(/role="dialog"[^>]*class="[^"]*max-h-\[calc\(100dvh-2rem\)\][^"]*"/);
+    expect(html).not.toMatch(/role="dialog"[^>]*class="[^"]*max-h-full/);
+    expect(html).toMatch(/<pre[^>]*class="[^"]*min-h-0[^"]*flex-1[^"]*overflow-auto/);
+  });
+
   it("opens with focus on its close button, which is never disabled, whatever state the file is in", () => {
     for (const file of [{ state: "loading" }, { state: "error", refusal: { status: 400, message: "m" } }, { state: "ok", value: "a: 1\n" }] as const) {
       const html = dialog(file);

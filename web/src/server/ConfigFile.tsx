@@ -49,7 +49,10 @@ export function ConfigFileDialog({
         aria-modal="true"
         aria-labelledby="config-file-title"
         tabIndex={-1}
-        className="cut flex max-h-full w-full max-w-3xl outline-none flex-col gap-3 bg-surface p-4 [--cut-size:14px] md:p-5"
+        // The height is bound to the viewport (the overlay's 2rem of padding
+        // off), not `max-h-full`: the overlay's grid row grows with the file,
+        // so a percentage never limits it, and the `<pre>` below never scrolls.
+        className="cut flex max-h-[calc(100dvh-2rem)] w-full max-w-3xl outline-none flex-col gap-3 bg-surface p-4 [--cut-size:14px] md:p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-2">
