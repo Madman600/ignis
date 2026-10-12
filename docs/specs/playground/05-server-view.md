@@ -316,3 +316,37 @@ three seconds after a switch or reload, then `last_switch`.
   Kinds that spell `auto`/`off` take those words.
 - Arbitration between clients switching the same server (spec
   model-switch/01: no router).
+
+## As built (2026-10-12)
+
+Branch `server-view`, `0a899a2..` (server `d5dee2f`, `5969862`, `1da20a2`,
+`466e128`; Playground `1230c01`, `6d8cea6`, `4ce7e04`, `e9749a8`, `d7f5ae1`,
+`987112d`, `6aec2c2`, `8cc2771`, `c86e29d`, `c4352ad`).
+
+- Wire shapes settled after the spec was written:
+  - both new routes answer `{ "object": "list", "data": [...] }`;
+  - a catalog row omits `bytes` / `family` when there is none;
+  - `last_switch` is absent before the first switch;
+  - `switchable` is false on every row while a switch runs, and true for the
+    torn-down model while nothing serves.
+- `help --fields --format json` keeps `rule` as a sentence and `families` as
+  comma-joined names, and gains `nullable`, `rule_text` and `scoped`. One builder
+  (`FieldMeta::declaration`) serves both, and a test holds the OpenAPI schema to
+  its keys.
+- The start model is remembered by the `Switcher` for the server's life
+  (`note_start`). `main` and `apply_config` build the explicit and implicit
+  tables in one place (`Switcher::tables`).
+- Ratified deviations:
+  - The reload button uses the bright core of `--heat` (`.heat-fill`) with dark
+    text, because no text colour has enough contrast on the whole gradient.
+  - Only editable rows carry the reload mark.
+  - An absent known model (not a catalog entry) shows no download command,
+    since there is nothing to fetch it from.
+- The Playground keeps reading `GET /v1/models` every second while the state is
+  `failed` too, until a model serves.
+- A draft is dropped when another model id serves.
+- Below `sm` the header's views are a native `<select>`, and the wordmark is
+  hidden.
+- Not done: the CORS `Access-Control-Allow-Methods` header lists no `PATCH`.
+  The same-origin Playground is unaffected; a cross-origin `PATCH /v1/config`
+  fails its preflight.

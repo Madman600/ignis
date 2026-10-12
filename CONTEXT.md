@@ -278,6 +278,14 @@ When output names a domain concept, use the term as defined here.
   Face by default, or a mirror answering the same repo/revision/file paths.
   Chosen per machine, not per entry.
   _Avoid_: registry, hub
+- **Switch by id** — an explicit `POST /v1/models/switch` naming only the
+  served id: resolved as a known model (`switch.known_models`, the start
+  model), then a catalog entry on disk. `switch.allow_implicit` does not gate
+  it; it gates only the **implicit switch** a request triggers by naming a
+  model. Never starts a download.
+- **Last switch** — how the most recent switch or reload ended (`switched`,
+  `refused`, `restored`, `failed`, with the reason), kept on `GET /v1/models`
+  after the status itself has moved on.
 
 ## Prompt rendering
 

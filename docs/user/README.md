@@ -132,7 +132,7 @@ an explicit `--switch-known-models` entry wins for its id). A request naming a
 catalog id that is not on disk is refused as an unknown model — a switch never
 starts a download.
 
-A client configured with two known models reloads the server back and forth: opencode sends its `small_model` requests (titles, summaries) to the id named by `small_model`, so a `model` and a `small_model` naming different ignis ids switch the server on alternate requests, 13-33 s each. Point both at the same id, or start with `--switch-allow-implicit false`. The Playground never causes a switch: its requests name no model, so the server serves the one loaded, and the header and the context limit follow it, read again from `GET /v1/models` when a turn starts.
+A client configured with two known models reloads the server back and forth: opencode sends its `small_model` requests (titles, summaries) to the id named by `small_model`, so a `model` and a `small_model` naming different ignis ids switch the server on alternate requests, 13-33 s each. Point both at the same id, or start with `--switch-allow-implicit false`. The Playground's chat never causes a switch: its requests name no model, so the server serves the one loaded, and the header and the context limit follow it, read again from `GET /v1/models` when a turn starts. The one switch the Playground makes is the explicit **Load** on its Server view.
 
 ### Letting the server fetch it
 
@@ -1047,6 +1047,15 @@ cargo build --release -p ignis-server
 
 A server built without `web/dist` still serves `/ui/`, as a page with these
 instructions.
+
+The **Server** view changes the running server from the page (GitHub #316). It
+lists the models a switch can go to (`GET /v1/models/catalog`); **Load**
+switches to one by id, whatever `--switch-allow-implicit` says, and a model not
+on disk shows the `ignis-server model download <id>` command instead. Below,
+every field `GET /v1/config` shows is a form (`GET /v1/config/fields` says
+which can change and which reload the model); **Apply** sends the changed
+fields as one `PATCH /v1/config`, which writes them to the config file in use,
+and reads **Apply and reload** when one of them reloads the model.
 
 For frontend work, `npm --prefix web run dev` proxies `/v1` and `/ui/metrics` to
 a running engine (`IGNIS_URL`, default `http://127.0.0.1:8000`);
