@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { getAuth, saveKey } from "../api/auth.ts";
-import { patchConfig, readCatalog, readFields, refusalOf, switchTo } from "./routes.ts";
+import { patchConfig, readCatalog, readConfigFile, readFields, refusalOf, switchTo } from "./routes.ts";
 
 // The Server view's requests (spec playground/05): what each sends, and how
 // each answer is read.
@@ -14,6 +14,23 @@ function answering(status: number, body: unknown, sent: Sent[] = []): typeof fet
     return new Response(typeof body === "string" ? body : JSON.stringify(body), { status });
   }) as typeof fetch;
 }
+
+describe("readConfigFile", () => {
+  it("asks for the YAML and keeps it as text, not parsed", async () => {
+    saveKey("sk-test");
+    const sent: Sent[] = [];
+    const yaml = "server:\n  bind: 127.0.0.1:8000\n";
+    const answer = await readConfigFile(answering(200, yaml, sent));
+    expect(answer).toEqual({ ok: true, status: 200, value: yaml });
+    expect(sent[0].url).toBe("/v1/config?format=yaml");
+    expect(sent[0].init.headers).toMatchObject({ Authorization: "Bearer sk-test" });
+  });
+
+  it("reads a refusal as the server's message", async () => {
+    const answer = await readConfigFile(answering(400, { error: { message: "unknown format", code: "config_invalid" } }));
+    expect(answer).toEqual({ ok: false, status: 400, message: "unknown format", code: "config_invalid" });
+  });
+});
 
 describe("switchTo", () => {
   it("sends POST /v1/models/switch with the id alone, never a path, and the key", async () => {

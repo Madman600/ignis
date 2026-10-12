@@ -1,7 +1,7 @@
 import type { ModelState } from "../api/model.ts";
 import { IconClose } from "../ui/icons.tsx";
 import { ConfigForm } from "./ConfigForm.tsx";
-import { changes, drainTimeout, needsReload, primaryLabel } from "./form.ts";
+import { changes, drainTimeout, needsReload, primaryLabel, waiting as waitingFor, waitingLine } from "./form.ts";
 import { ModelBand } from "./ModelBand.tsx";
 import { drainNote, type Line } from "./outcome.ts";
 import { runningFamily } from "./band.ts";
@@ -27,6 +27,7 @@ export function ServerView({
   now: number;
 }) {
   const config = state.config.state === "ok" ? state.config.value : null;
+  const family = runningFamily(state.catalog.state === "ok" ? state.catalog.value : null);
   const drain = drainTimeout(config);
   const count = Object.keys(changes(state.draft)).length;
   const docked = Object.keys(state.draft).length > 0 || state.result !== null || state.pending !== null;
@@ -46,13 +47,15 @@ export function ServerView({
         <ConfigForm
           fields={state.fields}
           config={state.config}
-          family={runningFamily(state.catalog.state === "ok" ? state.catalog.value : null)}
+          family={family}
           draft={state.draft}
           marked={state.marked}
           onEdit={actions.edit}
+          onRemove={actions.remove}
+          onUndo={actions.undo}
         />
       </div>
-      {docked && <Dock model={model} state={state} actions={actions} count={count} streaming={streaming} drain={drain} />}
+      {docked && <Dock model={model} state={state} actions={actions} count={count} streaming={streaming} drain={drain} family={family} />}
     </main>
   );
 }
@@ -62,8 +65,10 @@ const TONE: Record<Line["tone"], string> = { done: "text-good", warn: "text-warn
 /**
  * The dock: how many changes, "Discard", and the action whose label says what
  * it will do — "Apply", or "Apply and reload <id>" in the heat of the
- * header's bar when a changed field needs a reload. No confirmation: the
- * label is the confirmation. Then the answer, in the spec's words.
+ * header's bar when a changed or removed value reaches the running model. A
+ * value that waits for the other model is listed, not counted as a reload.
+ * No confirmation: the label is the confirmation. Then the answer, in the
+ * spec's words.
  */
 function Dock({
   model,
@@ -72,6 +77,7 @@ function Dock({
   count,
   streaming,
   drain,
+  family,
 }: {
   model: ModelState;
   state: ServerState;
@@ -79,8 +85,12 @@ function Dock({
   count: number;
   streaming: boolean;
   drain: number | null;
+  family: string | null;
 }) {
-  const reload = needsReload(state.draft);
+  const fields = state.fields.state === "ok" ? state.fields.value : [];
+  const config = state.config.state === "ok" ? state.config.value : null;
+  const reload = needsReload(state.draft, fields, config, family);
+  const later = waitingFor(state.draft, fields, config, family);
   const id = model.state === "ready" ? model.id : model.state === "switching" ? model.from : (state.pending?.id ?? "the model");
   // Every route but GET answers 503 while a switch runs, so the action waits for it to land.
   const waiting =
@@ -98,6 +108,11 @@ function Dock({
         <div className="flex min-w-0 flex-1 basis-64 flex-col gap-0.5 text-sm">
           {count > 0 && <p className="font-display font-semibold">{count === 1 ? "1 change" : `${count} changes`}</p>}
           {waiting && <p className="text-ash">{waiting}</p>}
+          {later.map((entry) => (
+            <p key={entry.family} className="text-ash [overflow-wrap:anywhere]">
+              {waitingLine(entry)}
+            </p>
+          ))}
           {reload && streaming && state.pending === null && <p className="text-warn">{drainNote(drain, "The reload")}</p>}
           {state.result && (
             <ul aria-live="polite" className="flex flex-col gap-0.5">
@@ -129,7 +144,7 @@ function Dock({
                 reload ? "heat-fill hover:brightness-110" : "bg-ink text-ground hover:bg-ember"
               }`}
             >
-              {state.applying ? "Applying…" : primaryLabel(state.draft, id)}
+              {state.applying ? "Applying…" : primaryLabel(reload, id)}
             </button>
           )}
           {count === 0 && state.result && state.pending === null && (

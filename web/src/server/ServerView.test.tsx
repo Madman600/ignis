@@ -2,7 +2,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { ModelState } from "../api/model.ts";
 import { CATALOG, CONFIG, FIELDS } from "./fixture.ts";
-import { type Draft, editDraft, valueInForce } from "./form.ts";
+import { ConfigFileDialog, FILE_NOTE } from "./ConfigFile.tsx";
+import { ConfigForm } from "./ConfigForm.tsx";
+import { type Draft, editDraft, removeDraft, rowView } from "./form.ts";
 import type { FieldDecl } from "./routes.ts";
 import { ServerView } from "./ServerView.tsx";
 import type { ServerActions, ServerState } from "./useServer.ts";
@@ -14,7 +16,7 @@ import type { ServerActions, ServerState } from "./useServer.ts";
 
 const ready: ModelState = { state: "ready", id: "qwen3.8-27b", contextLimit: 786432 };
 
-const actions: ServerActions = { load: () => {}, edit: () => {}, discard: () => {}, apply: () => {}, dismiss: () => {} };
+const actions: ServerActions = { load: () => {}, edit: () => {}, remove: () => {}, undo: () => {}, discard: () => {}, apply: () => {}, dismiss: () => {} };
 
 const base: ServerState = {
   fields: { state: "ok", value: FIELDS },
@@ -33,7 +35,24 @@ const render = (state: Partial<ServerState> = {}, model: ModelState = ready, str
   renderToStaticMarkup(<ServerView model={model} state={{ ...base, ...state }} actions={actions} streaming={streaming} now={now} />);
 
 const decl = (key: string): FieldDecl => FIELDS.find((f) => f.file_key === key)!;
-const edit = (draft: Draft, key: string, value: string | boolean) => editDraft(draft, decl(key), valueInForce(decl(key), CONFIG, "qwen38"), value);
+const edit = (draft: Draft, key: string, value: string | boolean, scope: string | null = "qwen38") =>
+  editDraft(draft, decl(key), rowView(decl(key), CONFIG, scope).inForce, value);
+
+/** The configuration form alone, opened on `scope` (`null` is "All models"). */
+const renderForm = (scope: string | null, draft: Draft = {}) =>
+  renderToStaticMarkup(
+    <ConfigForm
+      fields={base.fields}
+      config={base.config}
+      family="qwen38"
+      initialScope={scope}
+      draft={draft}
+      marked={[]}
+      onEdit={actions.edit}
+      onRemove={actions.remove}
+      onUndo={actions.undo}
+    />,
+  );
 
 /** The markup of the configuration row of `key`, from its name to the next row. */
 const rowOf = (html: string, key: string) => {
@@ -144,8 +163,8 @@ describe("ServerView: the configuration", () => {
     const html = render();
     const context = rowOf(html, "model.max_context");
     expect(context).toContain('value="786432"');
-    expect(context).toContain("Qwen3.8-27B&#x27;s own value");
-    expect(rowOf(html, "model.kv_format")).not.toContain("own value");
+    expect(context).toContain("Own value");
+    expect(rowOf(html, "model.kv_format")).toContain("Shared");
   });
 
   it("says the server has no running configuration on a 501, and the band still works", () => {
@@ -159,6 +178,133 @@ describe("ServerView: the configuration", () => {
     const fields = render().match(/<(input|textarea|select)\b[^>]*>/g) ?? [];
     expect(fields.length).toBeGreaterThan(0);
     for (const field of fields) expect(field).toMatch(/\s(id|name)="[^"]+"/);
+  });
+});
+
+/** The scope selector's options in order, and the one that is checked. */
+const scopes = (html: string) => {
+  const radios = [...html.matchAll(/<input type="radio"([^>]*name="server-scope"[^>]*)\/><span[^>]*>([^<]*)</g)];
+  return { labels: radios.map((m) => m[2]), checked: radios.filter((m) => m[1].includes('checked=""')).map((m) => m[2]) };
+};
+
+describe("ServerView: the scope selector", () => {
+  it("offers All models and each family, and opens on the running one, marked", () => {
+    expect(scopes(render())).toEqual({ labels: ["All models", "Qwen3.8-27B (running)", "Qwen3.8-Flash-Next"], checked: ["Qwen3.8-27B (running)"] });
+    expect(scopes(renderForm(null)).checked).toEqual(["All models"]);
+    expect(scopes(renderForm("qwen38flashnext")).checked).toEqual(["Qwen3.8-Flash-Next"]);
+  });
+
+  it("is a select below sm, so it fits a phone", () => {
+    const html = render();
+    expect(html).toMatch(/<select aria-label="Scope"[^>]*class="[^"]*sm:hidden"/);
+    expect(html).toContain('<option value="qwen38" selected="">Qwen3.8-27B (running)</option>');
+    expect(html).toMatch(/class="hidden sm:block"><fieldset/);
+  });
+});
+
+describe("ServerView: the configuration in each scope", () => {
+  it("in All models shows the group values and names the families that have their own", () => {
+    const html = renderForm(null);
+    const context = rowOf(html, "model.max_context");
+    expect(context).toMatch(/<input[^>]*value="40960"/);
+    expect(context).toContain("Qwen3.8-27B has its own value: 786432");
+    expect(context).toContain("Qwen3.8-Flash-Next has its own value: 589824");
+    expect(rowOf(html, "model.kv_format")).not.toContain("has its own value");
+    expect(rowOf(html, "spec.backend")).toContain("Qwen3.8-27B has its own value: dflash2");
+    expect(rowOf(html, "server.request_timeout")).not.toContain("Same for every model");
+  });
+
+  it("in All models lists a family-only field under its family's name, editable", () => {
+    const html = renderForm(null);
+    const vision = rowOf(html, "vision.enabled");
+    expect(vision).toContain("Qwen3.8-27B only");
+    expect(vision).toContain('role="switch"');
+    const lanes = rowOf(html, "spec.decode_lanes");
+    expect(lanes).toContain("Qwen3.8-Flash-Next only");
+    expect(lanes).toMatch(/<input[^>]*name="spec\.decode_lanes"/);
+    expect(lanes).not.toContain("Not used by");
+  });
+
+  it("in the running family's scope shows its own values and the shared ones, with the way back", () => {
+    const html = renderForm("qwen38");
+    const context = rowOf(html, "model.max_context");
+    expect(context).toMatch(/<input[^>]*value="786432"/);
+    expect(context).toContain("Own value");
+    expect(context).toContain("Use shared value (40960)");
+    const kv = rowOf(html, "model.kv_format");
+    expect(kv).toContain("Shared");
+    expect(kv).not.toContain("Own value");
+    expect(kv).not.toContain("Use shared value");
+    // An own value over an unset shared one goes back to auto.
+    expect(rowOf(html, "spec.backend")).toContain("Use shared value (auto)");
+    expect(rowOf(html, "server.request_timeout")).toContain("Same for every model");
+    expect(rowOf(html, "spec.decode_lanes")).toContain("Not used by Qwen3.8-27B");
+  });
+
+  it("in the other family's scope shows that family's values, and edits its fields while the first runs", () => {
+    const html = renderForm("qwen38flashnext");
+    expect(rowOf(html, "model.max_context")).toMatch(/<input[^>]*value="589824"/);
+    expect(rowOf(html, "model.max_context")).toContain("Own value");
+    expect(rowOf(html, "vision.enabled")).toContain("Not used by Qwen3.8-Flash-Next");
+    const lanes = rowOf(html, "spec.decode_lanes");
+    expect(lanes).toMatch(/<input[^>]*name="spec\.decode_lanes"/);
+    expect(lanes).not.toContain("Not used by");
+    expect(rowOf(html, "spec.backend")).toContain("Shared");
+  });
+
+  it("shows a pending edit as an own value, and a pending removal as the shared value it returns to", () => {
+    const kv = rowOf(renderForm("qwen38", edit({}, "model.kv_format", "bf16")), "model.kv_format");
+    expect(kv).toContain("Own value");
+    expect(kv).toMatch(/type="radio"[^>]*name="model\.kv_format"/);
+    const removed = rowOf(renderForm("qwen38", removeDraft({}, decl("model.max_context"), "qwen38")), "model.max_context");
+    expect(removed).toContain("Back to the shared value once applied");
+    expect(removed).toContain("Keep own value");
+    expect(removed).toMatch(/<input[^>]*value="40960"/);
+    expect(removed).not.toContain("Use shared value");
+  });
+
+  it("counts a group's edits from every scope in the group list", () => {
+    const draft = edit(edit({}, "model.max_context", "50000", null), "model.kv_format", "bf16", "qwen38flashnext");
+    expect(renderForm("qwen38", draft)).toMatch(/Model<span[^>]*>2<\/span>/);
+  });
+});
+
+describe("ServerView: the configuration file", () => {
+  const dialog = (file: Parameters<typeof ConfigFileDialog>[0]["file"], copied: boolean | "failed" = false) =>
+    renderToStaticMarkup(<ConfigFileDialog file={file} copied={copied} onCopy={() => {}} onDownload={() => {}} onClose={() => {}} />);
+
+  it("has a button beside the heading, only where there is a configuration", () => {
+    expect(render()).toContain(">View as config file</button>");
+    expect(render({ config: { state: "error", refusal: { status: 501, message: "no config", code: "config_unavailable" } } })).not.toContain("View as config file");
+  });
+
+  it("shows the file in the code face with Copy, Download, the note and a way out, as a dialog", () => {
+    const yaml = "server:\n  bind: 127.0.0.1:8000\n";
+    const html = dialog({ state: "ok", value: yaml });
+    expect(html).toContain('role="dialog"');
+    expect(html).toContain('aria-modal="true"');
+    expect(html).toMatch(/<pre tabindex="0" aria-label="ignis.yaml" class="[^"]*overflow-auto[^"]*font-mono[^"]*">server:\n  bind: 127.0.0.1:8000\n<\/pre>/);
+    expect(html).toMatch(/>Copy<\/button>/);
+    expect(html).toMatch(/>Download<\/button>/);
+    expect(html).toContain('aria-label="Close"');
+    expect(html).toContain(FILE_NOTE);
+    for (const word of ["API key", "download token", "comments", "pending draft"]) expect(FILE_NOTE).toContain(word);
+    expect(html).not.toContain('disabled=""');
+  });
+
+  it("holds Copy and Download until the file is read, and says why when it could not be", () => {
+    const loading = dialog({ state: "loading" });
+    expect(loading).toContain("Reading the file…");
+    expect(loading.match(/disabled=""/g)).toHaveLength(2);
+    const failed = dialog({ state: "error", refusal: { status: 400, message: "unknown format" } });
+    expect(failed).toContain("The file could not be read: unknown format");
+    expect(failed.match(/disabled=""/g)).toHaveLength(2);
+  });
+
+  it("says Copy worked, or did not", () => {
+    const file = { state: "ok", value: "a: 1\n" } as const;
+    expect(dialog(file, true)).toContain(">Copied</button>");
+    expect(dialog(file, "failed")).toContain(">Could not copy</button>");
   });
 });
 
@@ -176,6 +322,23 @@ describe("ServerView: the dock", () => {
 
     const reload = render({ draft: edit(edit({}, "server.request_timeout", "60"), "model.max_context", "524288") });
     expect(reload).toMatch(/class="[^"]*heat-fill[^"]*">Apply and reload qwen3\.8-27b<\/button>/);
+  });
+
+  it("reloads only for what reaches the running model, and lists what waits for the other one", () => {
+    const other = render({ draft: edit({}, "model.max_context", "524288", "qwen38flashnext") });
+    expect(other).toMatch(/>Apply<\/button>/);
+    expect(other).not.toContain("heat-fill");
+    expect(other).toContain("Takes effect when Qwen3.8-Flash-Next loads: model.qwen38flashnext.max_context");
+
+    const both = render({ draft: edit(edit({}, "model.max_context", "524288", "qwen38flashnext"), "model.kv_format", "bf16", null) });
+    expect(both).toMatch(/heat-fill[^"]*">Apply and reload qwen3\.8-27b<\/button>/);
+    expect(both).toContain("Takes effect when Qwen3.8-Flash-Next loads");
+
+    // A group value the running family overrides is no reload either.
+    expect(render({ draft: edit({}, "spec.backend", "mtp", null) })).toMatch(/>Apply<\/button>/);
+
+    const removal = render({ draft: removeDraft({}, decl("model.max_context"), "qwen38") });
+    expect(removal).toMatch(/heat-fill[^"]*">Apply and reload qwen3\.8-27b<\/button>/);
   });
 
   it("warns a streaming reply about the reload only while one streams, and only for a reload", () => {

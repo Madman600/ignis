@@ -2,17 +2,23 @@ import { Fragment, type ReactNode, useState } from "react";
 import { field, fieldLook } from "../ui/classes.ts";
 import { Segmented } from "../ui/Segmented.tsx";
 import { Switch } from "../ui/Switch.tsx";
+import { ConfigFileButton } from "./ConfigFile.tsx";
 import {
+  canUseShared,
   changes,
   controlFor,
   type Draft,
+  draftKey,
+  familiesOf,
   familyName,
   firstSentence,
   groupTitle,
-  rowMode,
+  type InForce,
+  labelOf,
+  noteLines,
+  rowView,
   shownOf,
   textOf,
-  valueInForce,
 } from "./form.ts";
 import type { ConfigDocument, FieldDecl } from "./routes.ts";
 import type { Loaded } from "./useServer.ts";
@@ -23,6 +29,17 @@ import type { Loaded } from "./useServer.ts";
 // is the heat mark on a field whose change reloads the model — the heat of
 // the header's bar, which runs while that reload does. No popup lives in the
 // clipped (`.cut`) surface: a choice of more than four is a native select.
+//
+// A scope selector at the top picks whose values the rows show and edit (spec
+// playground/05 §Follow-up): "All models" the shared ones, a family its own
+// where it has any. It opens on the running family.
+
+/** What a row's controls ask of the draft: an edit, the family's own value removed, or that removal taken back. */
+export type RowEdits = {
+  onEdit: (decl: FieldDecl, inForce: InForce, value: string | boolean) => void;
+  onRemove: (decl: FieldDecl, scope: string) => void;
+  onUndo: (decl: FieldDecl, scope: string) => void;
+};
 
 export function ConfigForm({
   fields,
@@ -30,7 +47,8 @@ export function ConfigForm({
   family,
   draft,
   marked,
-  onEdit,
+  initialScope,
+  ...edits
 }: {
   fields: Loaded<FieldDecl[]>;
   config: Loaded<ConfigDocument>;
@@ -38,24 +56,64 @@ export function ConfigForm({
   family: string | null;
   draft: Draft;
   marked: string[];
-  onEdit: (decl: FieldDecl, value: string | boolean) => void;
-}) {
+  /** The scope the form opens on: a family, or `null` for "All models". Unset, the running family. */
+  initialScope?: string | null;
+} & RowEdits) {
+  // Undefined until picked: the scope then follows the running family, which the catalog may name only after the first read.
+  const [picked, setPicked] = useState<string | null | undefined>(initialScope);
+  const scope = picked === undefined ? family : picked;
   return (
     <section aria-labelledby="server-config" className="flex flex-col gap-3">
-      <div>
-        <h2 id="server-config" className="font-display text-xl font-semibold">
-          Configuration
-        </h2>
-        <p className="text-sm text-ash">
-          What the loaded model runs with. A change is sent as one patch, and the server judges every value in it.
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-1">
+        <div className="min-w-0">
+          <h2 id="server-config" className="font-display text-xl font-semibold">
+            Configuration
+          </h2>
+          <p className="text-sm text-ash">
+            What the server runs with, for all models or for one. A change is sent as one patch, and the server judges every value in it.
+          </p>
+        </div>
+        {config.state === "ok" && <ConfigFileButton />}
       </div>
-      <Body fields={fields} config={config} family={family} draft={draft} marked={marked} onEdit={onEdit} />
+      <Body fields={fields} config={config} family={family} scope={scope} onScope={setPicked} draft={draft} marked={marked} {...edits} />
     </section>
   );
 }
 
-function Body({ fields, config, family, draft, marked, onEdit }: Parameters<typeof ConfigForm>[0]) {
+/** "All models", then a family each, the running one marked: a segmented row from `sm`, a select below it. */
+function ScopeSelector({ families, running, scope, onScope }: { families: string[]; running: string | null; scope: string | null; onScope: (scope: string | null) => void }) {
+  const options = [
+    { value: "all", label: "All models" },
+    ...families.map((f) => ({ value: f, label: f === running ? `${familyName(f)} (running)` : familyName(f) })),
+  ];
+  const value = scope ?? "all";
+  const pick = (next: string) => onScope(next === "all" ? null : next);
+  return (
+    <div>
+      <div className="hidden sm:block">
+        <Segmented legend="Scope" legendHidden name="server-scope" value={value} options={options} onChange={pick} />
+      </div>
+      <select aria-label="Scope" name="server-scope-select" value={value} onChange={(e) => pick(e.target.value)} className={`w-full ${fieldLook} sm:hidden`}>
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+function Body({
+  fields,
+  config,
+  family,
+  scope,
+  onScope,
+  draft,
+  marked,
+  ...edits
+}: Parameters<typeof ConfigForm>[0] & { scope: string | null; onScope: (scope: string | null) => void }) {
   if (config.state === "error" && config.refusal.status === 501) {
     return <Notice>This server has no running configuration to show. The model above can still be switched.</Notice>;
   }
@@ -67,53 +125,56 @@ function Body({ fields, config, family, draft, marked, onEdit }: Parameters<type
   const changed = changes(draft);
   const jump = (group: string) => document.getElementById(`server-group-${group}`)?.scrollIntoView({ block: "start" });
   return (
-    <div className="lg:grid lg:grid-cols-[11rem_minmax(0,1fr)] lg:items-start lg:gap-6">
-      <nav aria-label="Configuration groups" className="sticky top-4 hidden lg:block">
-        <ul className="flex flex-col">
-          {groups.map((group) => {
-            const count = fields.value.filter((decl) => decl.group === group && decl.file_key in changed).length;
-            return (
-              <li key={group}>
-                <button
-                  type="button"
-                  onClick={() => jump(group)}
-                  className="flex w-full items-baseline justify-between gap-2 px-3 py-1.5 text-left text-sm text-ash hover:bg-surface hover:text-ink"
-                >
-                  {groupTitle(group)}
-                  {count > 0 && <span className="text-xs text-ember tabular-nums">{count}</span>}
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      </nav>
-      <div className="cut min-w-0 bg-surface [--cut-size:14px]">
-        {groups.map((group) => (
-          <section
-            key={group}
-            id={`server-group-${group}`}
-            aria-labelledby={`server-group-${group}-title`}
-            className="scroll-mt-4 border-t border-line first:border-t-0"
-          >
-            <h3 id={`server-group-${group}-title`} className="flex items-baseline gap-2 px-4 pt-5 pb-2 md:px-5">
-              <span className="font-display text-[17px] font-semibold">{groupTitle(group)}</span>
-              <code className="font-mono text-xs text-ash">{group}</code>
-            </h3>
-            {fields.value
-              .filter((decl) => decl.group === group)
-              .map((decl) => (
-                <FieldRow
-                  key={decl.file_key}
-                  decl={decl}
-                  config={config.value}
-                  family={family}
-                  draft={draft}
-                  marked={marked.includes(decl.file_key)}
-                  onEdit={onEdit}
-                />
-              ))}
-          </section>
-        ))}
+    <div className="flex flex-col gap-3">
+      <ScopeSelector families={familiesOf(fields.value, family)} running={family} scope={scope} onScope={onScope} />
+      <div className="lg:grid lg:grid-cols-[11rem_minmax(0,1fr)] lg:items-start lg:gap-6">
+        <nav aria-label="Configuration groups" className="sticky top-4 hidden lg:block">
+          <ul className="flex flex-col">
+            {groups.map((group) => {
+              const count = Object.values(changed).filter((entry) => entry.group === group).length;
+              return (
+                <li key={group}>
+                  <button
+                    type="button"
+                    onClick={() => jump(group)}
+                    className="flex w-full items-baseline justify-between gap-2 px-3 py-1.5 text-left text-sm text-ash hover:bg-surface hover:text-ink"
+                  >
+                    {groupTitle(group)}
+                    {count > 0 && <span className="text-xs text-ember tabular-nums">{count}</span>}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </nav>
+        <div className="cut min-w-0 bg-surface [--cut-size:14px]">
+          {groups.map((group) => (
+            <section
+              key={group}
+              id={`server-group-${group}`}
+              aria-labelledby={`server-group-${group}-title`}
+              className="scroll-mt-4 border-t border-line first:border-t-0"
+            >
+              <h3 id={`server-group-${group}-title`} className="flex items-baseline gap-2 px-4 pt-5 pb-2 md:px-5">
+                <span className="font-display text-[17px] font-semibold">{groupTitle(group)}</span>
+                <code className="font-mono text-xs text-ash">{group}</code>
+              </h3>
+              {fields.value
+                .filter((decl) => decl.group === group)
+                .map((decl) => (
+                  <FieldRow
+                    key={decl.file_key}
+                    decl={decl}
+                    config={config.value}
+                    scope={scope}
+                    draft={draft}
+                    marked={marked.includes(decl.file_key)}
+                    {...edits}
+                  />
+                ))}
+            </section>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -126,23 +187,28 @@ function Notice({ children }: { children: ReactNode }) {
 function FieldRow({
   decl,
   config,
-  family,
+  scope,
   draft,
   marked,
   onEdit,
+  onRemove,
+  onUndo,
 }: {
   decl: FieldDecl;
   config: ConfigDocument;
-  family: string | null;
+  /** The scope the form shows: a family's scope name, or `null` for "All models". */
+  scope: string | null;
   draft: Draft;
   marked: boolean;
-  onEdit: (decl: FieldDecl, value: string | boolean) => void;
-}) {
-  const mode = rowMode(decl, family);
-  const inForce = valueInForce(decl, config, family);
-  const entry = draft[decl.file_key];
+} & RowEdits) {
+  const view = rowView(decl, config, scope);
+  const { mode, inForce } = view;
+  const entry = draft[draftKey(decl.group, decl.name, inForce.scope)];
+  // A removal on its way out shows the shared value the family returns to.
+  const shown = entry ? (entry.removal ? view.shared : entry.value) : inForce.value;
   const id = `server-field-${decl.file_key}`;
   const nameId = `${id}-name`;
+  const notes = mode.kind === "edit" ? noteLines(view, entry) : [];
   return (
     <div
       className={`relative grid gap-x-6 gap-y-2 border-t border-line px-4 py-3.5 md:grid-cols-[minmax(0,1fr)_minmax(0,17rem)] md:px-5 ${marked ? "bg-fault/5" : ""}`}
@@ -156,14 +222,28 @@ function FieldRow({
           {decl.reload_required && mode.kind === "edit" && <ReloadMark />}
         </div>
         <Description text={decl.description} />
-        {mode.kind === "edit" && inForce.scope !== null && decl.scoped && (
-          <p className="mt-1 text-xs text-ash">{familyName(inForce.scope)}'s own value</p>
+        {notes.length > 0 && (
+          <ul className="mt-1 flex flex-col gap-0.5 text-xs text-ash">
+            {notes.map((note) => (
+              <li key={note}>{note}</li>
+            ))}
+          </ul>
+        )}
+        {mode.kind === "edit" && inForce.scope !== null && canUseShared(view, entry) && (
+          <button type="button" onClick={() => onRemove(decl, inForce.scope!)} className="mt-1 text-xs text-ember hover:underline">
+            Use shared value ({labelOf(view.shared)})
+          </button>
+        )}
+        {mode.kind === "edit" && inForce.scope !== null && entry?.removal && (
+          <button type="button" onClick={() => onUndo(decl, inForce.scope!)} className="mt-1 text-xs text-ember hover:underline">
+            Keep own value
+          </button>
         )}
         {marked && <p className="mt-1 text-xs text-fault">Refused by the server</p>}
       </div>
       <div className="min-w-0">
         {mode.kind === "edit" && (
-          <Control decl={decl} id={id} nameId={nameId} value={entry ? entry.value : inForce.value} inForce={inForce.value} marked={marked} onEdit={onEdit} />
+          <Control decl={decl} id={id} nameId={nameId} value={shown} inForce={entry?.removal ? view.shared : inForce.value} marked={marked} onEdit={(value) => onEdit(decl, inForce, value)} />
         )}
         {mode.kind === "fixed" && <ReadOnly value={shownOf(inForce.value)} note="Set at start" />}
         {mode.kind === "unused" && <p className="text-sm text-ash md:text-right">Not used by {familyName(mode.family)}</p>}
@@ -268,7 +348,7 @@ function Control({
   value: unknown;
   inForce: unknown;
   marked: boolean;
-  onEdit: (decl: FieldDecl, value: string | boolean) => void;
+  onEdit: (value: string | boolean) => void;
 }) {
   const control = controlFor(decl, inForce);
   const chosen = (options: string[]) => options.find((option) => option.toLowerCase() === textOf(value).toLowerCase()) ?? null;
@@ -276,7 +356,7 @@ function Control({
     case "switch":
       return (
         <div className="md:flex md:justify-end">
-          <Switch on={value === true} onChange={(on) => onEdit(decl, on)} labelledBy={nameId} />
+          <Switch on={value === true} onChange={(on) => onEdit(on)} labelledBy={nameId} />
         </div>
       );
     case "segmented":
@@ -287,7 +367,7 @@ function Control({
           name={decl.file_key}
           value={chosen(control.options)}
           options={control.options.map((option) => ({ value: option, label: option }))}
-          onChange={(option) => onEdit(decl, option)}
+          onChange={(option) => onEdit(option)}
         />
       );
     case "select": {
@@ -299,7 +379,7 @@ function Control({
           aria-labelledby={nameId}
           aria-invalid={marked || undefined}
           value={current ?? ""}
-          onChange={(e) => onEdit(decl, e.target.value)}
+          onChange={(e) => onEdit(e.target.value)}
           // A variant, not a second border colour: of two base utilities Tailwind's order wins, not the class string's.
           className={`w-full ${fieldLook} aria-invalid:border-fault`}
         >
@@ -329,7 +409,7 @@ function Control({
             spellCheck={false}
             value={textOf(value)}
             placeholder={control.placeholder}
-            onChange={(e) => onEdit(decl, e.target.value)}
+            onChange={(e) => onEdit(e.target.value)}
             className={`${field} font-mono aria-invalid:border-fault`}
           />
           <p id={`${id}-hint`} className="mt-1 text-xs text-ash">

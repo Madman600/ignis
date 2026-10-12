@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LastSwitch, ModelState } from "../api/model.ts";
-import { runningFamily } from "./band.ts";
-import { type Draft, editDraft, patchBody, valueInForce } from "./form.ts";
+import { dropDraft, type Draft, editDraft, type InForce, patchBody, removeDraft } from "./form.ts";
 import { afterPatch, afterSwitch, type Line, type PendingReload, settleReload } from "./outcome.ts";
 import {
   type Answer,
@@ -48,7 +47,12 @@ export type ServerState = {
 
 export type ServerActions = {
   load: (id: string) => void;
-  edit: (decl: FieldDecl, value: string | boolean) => void;
+  /** Set `decl` where `inForce` says: a family's section, or the group. */
+  edit: (decl: FieldDecl, inForce: InForce, value: string | boolean) => void;
+  /** Take the family's own value of `decl` away, so the shared one applies to it again. */
+  remove: (decl: FieldDecl, scope: string) => void;
+  /** Take a pending removal back. */
+  undo: (decl: FieldDecl, scope: string) => void;
   discard: () => void;
   apply: () => void;
   dismiss: () => void;
@@ -142,8 +146,6 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
   }, [pending, model]);
 
   const fieldList = fields.state === "ok" ? fields.value : null;
-  const configDoc = config.state === "ok" ? config.value : null;
-  const family = runningFamily(catalog.state === "ok" ? catalog.value : null);
 
   const actions = useMemo<ServerActions>(
     () => ({
@@ -158,9 +160,16 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
           if (after.refreshModel) refreshModel();
         });
       },
-      edit(decl, value) {
-        setDraft((current) => editDraft(current, decl, valueInForce(decl, configDoc, family), value));
+      edit(decl, inForce, value) {
+        setDraft((current) => editDraft(current, decl, inForce, value));
         setMarked((current) => current.filter((key) => key !== decl.file_key));
+      },
+      remove(decl, scope) {
+        setDraft((current) => removeDraft(current, decl, scope));
+        setMarked((current) => current.filter((key) => key !== decl.file_key));
+      },
+      undo(decl, scope) {
+        setDraft((current) => dropDraft(current, decl, scope));
       },
       discard() {
         setDraft({});
@@ -194,7 +203,7 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
         setResult(null);
       },
     }),
-    [draft, configDoc, family, fieldList, refreshModel, reread],
+    [draft, fieldList, refreshModel, reread],
   );
 
   return [{ fields, config, catalog, draft, marked, result, pending, applying, loadingId, loadRefusal }, actions];

@@ -82,17 +82,20 @@ export function refusalOf(status: number, body: string): Refusal {
   return { status, message: text || `${status}` };
 }
 
-async function call<T>(path: string, init: RequestInit, read: (body: unknown) => T, fetcher: typeof fetch): Promise<Answer<T>> {
+async function callText<T>(path: string, init: RequestInit, read: (text: string) => T, fetcher: typeof fetch): Promise<Answer<T>> {
   try {
     const res = await fetcher(path, { ...init, headers: { ...authHeaders(), ...(init.headers as Record<string, string> | undefined) } });
     if (res.status === 401) keyRequired();
     const text = await res.text();
     if (!res.ok) return { ok: false, ...refusalOf(res.status, text) };
-    return { ok: true, status: res.status, value: read(JSON.parse(text)) };
+    return { ok: true, status: res.status, value: read(text) };
   } catch (err) {
     return { ok: false, status: 0, message: `Could not reach ignis: ${String(err)}` };
   }
 }
+
+const call = <T,>(path: string, init: RequestInit, read: (body: unknown) => T, fetcher: typeof fetch) =>
+  callText(path, init, (text) => read(JSON.parse(text)), fetcher);
 
 /** The list envelope both new routes answer with, as `GET /v1/models` does. */
 const listData = <T,>(body: unknown) => ((body as { data?: T[] }).data ?? []) as T[];
@@ -100,6 +103,9 @@ const listData = <T,>(body: unknown) => ((body as { data?: T[] }).data ?? []) as
 export const readFields = (fetcher: typeof fetch = fetch) => call("/v1/config/fields", {}, listData<FieldDecl>, fetcher);
 
 export const readConfig = (fetcher: typeof fetch = fetch) => call("/v1/config", {}, (body) => body as ConfigDocument, fetcher);
+
+/** The configuration in force as the file it amounts to (`?format=yaml`), as text. */
+export const readConfigFile = (fetcher: typeof fetch = fetch) => callText("/v1/config?format=yaml", {}, (text) => text, fetcher);
 
 export const readCatalog = (fetcher: typeof fetch = fetch) => call("/v1/models/catalog", {}, listData<CatalogRow>, fetcher);
 
