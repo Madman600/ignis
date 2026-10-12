@@ -94,6 +94,12 @@ impl MockLoader {
         (model, gated, controller)
     }
 
+    /// [`MockLoader::model`] over `compute`, a test's own (counted as
+    /// resident like every compute this loader builds).
+    pub fn model_over(&self, id: &str, compute: Arc<dyn Compute>) -> ActiveModel {
+        build(&self.state, id, compute)
+    }
+
     /// Refuse `id` at prepare, as a path with no file would be.
     pub fn refuse(&self, id: &str) {
         self.state.refused.lock().unwrap().insert(id.to_owned());

@@ -593,6 +593,79 @@ async fn an_unload_due_while_a_switch_runs_waits_for_it() {
     assert_eq!(loader.loads(), ["mock-b"]);
 }
 
+/// A compute whose drop waits for the test: the model thread drops it with
+/// its scheduler when the model is torn down, so a teardown is held open, as
+/// a GPU one lasting seconds is, with nothing in flight.
+struct HeldTeardown {
+    inner: ignis_core::MockCompute,
+    entered: Mutex<Option<Sender<()>>>,
+    release: Mutex<Option<Receiver<()>>>,
+}
+
+impl HeldTeardown {
+    /// The compute, the signal its teardown began, and its release. Hand the
+    /// compute over whole: a copy kept here would keep it from being dropped.
+    fn new() -> (Arc<Self>, Receiver<()>, Sender<()>) {
+        let (entered_tx, entered) = channel();
+        let (release, release_rx) = channel();
+        let compute = Self {
+            inner: ignis_core::MockCompute::new(),
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+        };
+        (Arc::new(compute), entered, release)
+    }
+}
+
+impl ignis_core::Compute for HeldTeardown {
+    fn prefill_step(&self, jobs: &[ignis_core::PrefillJob]) -> Result<Vec<ignis_core::PrefillOutcome>, ignis_core::ComputeError> {
+        self.inner.prefill_step(jobs)
+    }
+
+    fn decode_step(&self, jobs: &[ignis_core::DecodeJob]) -> Result<Vec<ignis_core::DecodeOutcome>, ignis_core::ComputeError> {
+        self.inner.decode_step(jobs)
+    }
+}
+
+impl Drop for HeldTeardown {
+    fn drop(&mut self) {
+        if let Some(entered) = self.entered.get_mut().unwrap().take() {
+            let _ = entered.send(());
+        }
+        if let Some(release) = self.release.get_mut().unwrap().take() {
+            let _ = release.recv_timeout(PATIENT);
+        }
+    }
+}
+
+/// AC 12 with the clock stopped mid-teardown, as the serve loop ending under
+/// it stops it: the unload's teardown and the slot it holds end together, so
+/// a request arriving meanwhile loads the model only once the old one is
+/// gone — never a load beside a teardown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_unload_keeps_its_slot_until_its_teardown_ends_even_when_the_clock_stops() {
+    let loader = MockLoader::new();
+    let (compute, entered, release) = HeldTeardown::new();
+    let server = idle_server(&loader, loader.model_over("mock-a", compute), IDLE, &[]);
+    let app = server.app();
+    let clock = server.spawn_idle_clock(TICK).expect("a clock");
+    tokio::task::spawn_blocking(move || entered.recv_timeout(PATIENT).expect("the teardown began")).await.unwrap();
+    drop(clock);
+    server.update_live(|live| live.idle_unload = Duration::ZERO);
+
+    let pending = chat_task(&app, None);
+    tokio::time::sleep(TICK * 4).await;
+    assert!(loader.loads().is_empty(), "a load began beside the teardown: {:?}", loader.loads());
+    assert_eq!(*server.status(), ModelStatus::Unloaded);
+    assert_eq!(server.usage.in_flight(), 1, "the request is admitted");
+    assert!(!pending.is_finished(), "the request waits for the teardown, then for its load");
+
+    release.send(()).expect("the teardown is waiting");
+    let (status, completion) = pending.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{completion}");
+    assert_eq!(loader.loads(), ["mock-a"]);
+}
+
 /// AC 13: a live `PATCH` of `model.idle_unload` takes effect with no reload:
 /// 0 → 1 unloads about a second later, the clock starting at the change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

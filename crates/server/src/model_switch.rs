@@ -951,19 +951,30 @@ pub(crate) fn claim_unload(server: &Server) -> Option<Unloading> {
 /// what `GET /v1/models` names and what the next load reads — and its
 /// engine is never called again. Not a switch: `ignis.model.unloaded`, and
 /// `last_switch` is left as it was (AC 14). The slot is freed, and the
-/// requests that arrived meanwhile woken, when this returns.
+/// requests that arrived meanwhile woken, once the teardown is done.
+///
+/// The teardown, its line and the slot's release are one unit on the
+/// blocking thread that runs them, never split across this future: the
+/// clock awaiting it is stopped when its serve loop ends, and a stop
+/// mid-teardown must not free the slot — and wake a request to load a model
+/// — while the old model still holds the card.
 pub(crate) async fn unload(server: &Server, unloading: Unloading, idle: Duration) {
     let model = server.active();
-    let teardown_began = Instant::now();
-    shut_down(&model).await;
-    tracing::info!(
-        name: "ignis.model.unloaded",
-        model = %model.engine.model_id(),
-        idle_secs = idle.as_secs(),
-        teardown_ms = teardown_began.elapsed().as_millis() as u64,
-        "nobody used the model for model.idle_unload seconds: it is unloaded, and the next request that needs it loads it again"
-    );
-    drop(unloading);
+    let teardown = tokio::task::spawn_blocking(move || {
+        let teardown_began = Instant::now();
+        model.shut_down();
+        tracing::info!(
+            name: "ignis.model.unloaded",
+            model = %model.engine.model_id(),
+            idle_secs = idle.as_secs(),
+            teardown_ms = teardown_began.elapsed().as_millis() as u64,
+            "nobody used the model for model.idle_unload seconds: it is unloaded, and the next request that needs it loads it again"
+        );
+        drop(unloading);
+    });
+    if let Err(panicked) = teardown.await {
+        tracing::error!(name: "ignis.model.teardown_panicked", error = %panicked, "tearing the unloaded model down panicked");
+    }
 }
 
 /// The switch itself, steps 2 to 5 of the module doc, from where `begun`

@@ -1,8 +1,9 @@
 //! The log lines of idle unload (spec model-switch/02 AC 2 and 6): the
 //! unload is `ignis.model.unloaded`, once, and the load a request begins
 //! after it `ignis.model.reloaded` — neither of them a switch. A binary of
-//! its own: a scoped subscriber sees nothing of a callsite a test running in
-//! parallel reached first, so the line-asserting test does not share one.
+//! its own with one test, which installs the process's subscriber: the
+//! unload's line is written on the blocking thread that tears the model
+//! down, which a subscriber scoped to the test's thread never sees.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,12 +35,11 @@ fn field(event: &Value, name: &str) -> Value {
     event.get(name).or_else(|| event["attributes"].get(name)).cloned().unwrap_or(Value::Null)
 }
 
-/// On the test's own thread (a current-thread runtime), so the scoped
-/// subscriber sees the clock's task and the load's async half.
 #[tokio::test]
 async fn the_unload_and_the_load_after_it_are_logged_and_neither_is_a_switch() {
     let log = Arc::new(MemorySink::new());
-    let _logging = tracing::subscriber::set_default(tracing_subscriber::registry().with(JsonLayer::new(log.clone())));
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(JsonLayer::new(log.clone())))
+        .expect("the binary's only subscriber");
     let loader = MockLoader::new();
     let server = Server::from_active(loader.model("mock-a"))
         .with_switcher(Switcher::new(Arc::clone(&loader) as _, Duration::from_secs(30)))

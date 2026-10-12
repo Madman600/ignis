@@ -139,7 +139,9 @@ impl http_body::Body for Counted {
     }
 }
 
-/// The running idle clock; dropping it stops the clock.
+/// The running idle clock; dropping it stops the clock. An unload it began
+/// still ends whole — its teardown, then its slot freed
+/// (`crate::model_switch::unload`).
 #[derive(Debug)]
 pub struct Clock(tokio::task::JoinHandle<()>);
 
