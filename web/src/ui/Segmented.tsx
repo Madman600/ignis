@@ -2,7 +2,9 @@ import { caption } from "./classes.ts";
 
 /**
  * A row of mutually exclusive options. `value` null checks none of them;
- * `disabled` greys the row and takes every option out of reach.
+ * `disabled` greys the row and takes every option out of reach;
+ * `legendHidden` keeps the legend for screen readers only, for a row that
+ * names the field beside it.
  */
 export function Segmented<T extends string>(props: {
   legend: string;
@@ -11,11 +13,12 @@ export function Segmented<T extends string>(props: {
   options: { value: T; label: string }[];
   onChange: (value: T) => void;
   disabled?: boolean;
+  legendHidden?: boolean;
 }) {
   const disabled = props.disabled ?? false;
   return (
     <fieldset className="flex flex-col gap-2" disabled={disabled}>
-      <legend className={`${caption} mb-2`}>{props.legend}</legend>
+      <legend className={props.legendHidden ? "sr-only" : `${caption} mb-2`}>{props.legend}</legend>
       <div className={`flex border border-line bg-surface p-0.5 ${disabled ? "opacity-50" : ""}`}>
         {props.options.map((o) => (
           <label key={o.value} className="relative flex-1">

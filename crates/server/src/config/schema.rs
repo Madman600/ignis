@@ -80,6 +80,7 @@ macro_rules! config_group {
                         group: $gname,
                         name: stringify!($field),
                         kind: <$kind as FieldKind>::TAG,
+                        nullable: <$kind as FieldKind>::NULLABLE,
                         default: || <$kind as FieldKind>::render(&$default),
                         file_text: <$kind as FieldKind>::file_text,
                         canonical: |raw| <$kind as FieldKind>::parse(raw).map(|value| <$kind as FieldKind>::render(&value)),

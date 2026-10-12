@@ -132,7 +132,7 @@ an explicit `--switch-known-models` entry wins for its id). A request naming a
 catalog id that is not on disk is refused as an unknown model — a switch never
 starts a download.
 
-A client configured with two known models reloads the server back and forth: opencode sends its `small_model` requests (titles, summaries) to the id named by `small_model`, so a `model` and a `small_model` naming different ignis ids switch the server on alternate requests, 13-33 s each. Point both at the same id, or start with `--switch-allow-implicit false`. The Playground never causes a switch: its requests name no model, so the server serves the one loaded, and the header and the context limit follow it, read again from `GET /v1/models` when a turn starts.
+A client configured with two known models reloads the server back and forth: opencode sends its `small_model` requests (titles, summaries) to the id named by `small_model`, so a `model` and a `small_model` naming different ignis ids switch the server on alternate requests, 13-33 s each. Point both at the same id, or start with `--switch-allow-implicit false`. The Playground's chat never causes a switch: its requests name no model, so the server serves the one loaded, and the header and the context limit follow it, read again from `GET /v1/models` when a turn starts. The one switch the Playground makes is the explicit **Load** on its Server view.
 
 ### Letting the server fetch it
 
@@ -307,12 +307,35 @@ a file's `profiles: { <name>: { <group>: { … } } }` defines one for any other
 card.
 
 **At runtime.** `GET /v1/config` shows the running configuration (fields
-declared visible only: never the API key). `PATCH /v1/config` takes a partial
-document in the file's shape: a change to the request timeout, the message
-policies, the thinking defaults or the switch knobs applies at once; a change
-touching anything the load is built from reloads the model with the whole
-patch, as a model switch does. Either way it is written to the config file in
-use once it has taken.
+declared visible only: never the API key); `GET /v1/config?format=yaml` shows
+it as the config file it amounts to, the text `config print` writes.
+Both are in the file's shape: a group key holds the shared value, and a model
+family's section (the loaded model's too) sits beside it wherever that family's
+value differs, so what the loaded model runs with is its section's, else the
+group's.
+`PATCH /v1/config` takes a partial document in the file's shape: a change to
+the request timeout, the message policies, the thinking defaults or the switch
+knobs applies at once, and so does a value the loaded model does not run with
+— one in the other model's family section, or a group value the loaded model
+overrides in its own — which that model uses when it next loads; a change to
+anything the loaded model's load is built from reloads it with the whole
+patch, as a model switch does. A `null` removes a key: in a family's section,
+so the group's value applies to that model again; at a group key, so the
+profile's or the built-in default applies — a flag or an env var that sets the
+field still outranks the file, and the answer names it. A field only one
+model takes (`spec.decode_lanes`) is set and removed in that model's section,
+whichever key names it. Either way it is
+written to the config file in use once it has taken, a removed key and the
+section it empties taken out. `GET /v1/config/fields` says what each of those fields
+is: its key, kind, default, rule, the model families that take it, and whether
+a change is live, needs a reload, or can only be made at start — the same
+declarations as `ignis-server help --fields --format json`, minus the fields
+`GET /v1/config` hides. `GET /v1/config/origins` says where each value in force
+comes from, for the shared value and for each model family: the default, the
+profile, the file, an env var, a flag or a live change, whether it was set for
+that family itself, and the flag, env var, file key or profile that set it.
+A family's own value in the file or from a live change is the one a group
+change does not reach and a `null` removes.
 
 ### Model and server
 
@@ -605,6 +628,10 @@ not.
 |---|---|---|
 | `/v1/models` | GET | The loaded model, and `status`: `serving`, `switching` or `failed` ([below](#switching-models)). |
 | `/v1/models/switch` | POST | Replace the loaded model on the running process ([below](#switching-models)). |
+| `/v1/models/catalog` | GET | Every model the server can switch to or fetch, with its state on disk ([below](#switching-models)). |
+| `/v1/config` | GET, PATCH | The running configuration, and a change to it ([configuration](#configuration)). |
+| `/v1/config/fields` | GET | What each visible configuration field is: kind, default, rule, families, whether a change reloads. |
+| `/v1/config/origins` | GET | Where each visible value in force comes from, shared and per model family: default, profile, file, env, flag or live. |
 | `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
 | `/v1/responses` | POST | The OpenAI responses API (non-streaming; `stream: true` is a 400). |
 | `/v1/tokenize` | POST | A body's prompt-token count without serving it ([below](#counting-a-prompt)). |
@@ -641,7 +668,8 @@ CPU mock, which has nothing to capture, is ready at once.
 
 ### Switching models
 
-`POST /v1/models/switch` with `{"artifact": "<path>", "model": "<id>"}` moves
+`POST /v1/models/switch` with `{"artifact": "<path>", "model": "<id>"}` — or
+with `{"model": "<id>"}` alone, see below — moves
 the running server to another model — the 27B to Qwen3.8-Flash-Next and back —
 without a restart. It answers `202 {"status": "switching", "from", "to"}` at
 once; a second switch while one runs is a `409 switch_in_progress`.
@@ -661,6 +689,26 @@ a checksum that is not clean, a model id of the other model — leaves the old
 model serving. One that fails to load after the old model was unloaded has the
 old model loaded again; `GET /v1/models` says `failed`, with a `reason`, until
 one of them serves.
+
+**By id.** With `model` alone the server finds the artifact itself: the
+`--switch-known-models` entry for the id (the model the server started on
+among them), else a [catalog](#the-catalog) entry whose artifact is under
+`--download-path`. `--switch-allow-implicit` does not apply: it gates the
+switch a request triggers by naming a model, not one an operator asked for. An
+id that is neither, or whose artifact is not on disk, is a `404
+model_not_found` naming the id — and, for a catalog entry, the `ignis-server
+model download <id>` that fetches it; a switch never starts a download.
+`GET /v1/models/catalog` lists the models a switch can go to, one row each:
+`id`, `source` (`built-in`, `operator` or `known`), `on_disk` (`complete`,
+`partial` or `absent`), `bytes`, `family`, `loaded` and `switchable`. It
+answers during a switch and while one has failed, and carries no path.
+
+**How the last one ended.** After the first switch or reload since start,
+`GET /v1/models` carries `last_switch: {from, to, outcome, reason?}`:
+`outcome` is `switched`, `refused` (nothing was torn down), `restored` (the
+old model was loaded again) or `failed` (nothing serves), with a `reason` for
+every outcome but the first. A reload from `PATCH /v1/config` is reported the
+same way, with `from` equal to `to`.
 
 **By naming the model.** A client can also just ask for the other model: a
 chat completion, a response (over HTTP or the WebSocket) or a decision whose
@@ -1019,6 +1067,15 @@ cargo build --release -p ignis-server
 
 A server built without `web/dist` still serves `/ui/`, as a page with these
 instructions.
+
+The **Server** view changes the running server from the page (GitHub #316). It
+lists the models a switch can go to (`GET /v1/models/catalog`); **Load**
+switches to one by id, whatever `--switch-allow-implicit` says, and a model not
+on disk shows the `ignis-server model download <id>` command instead. Below,
+every field `GET /v1/config` shows is a form (`GET /v1/config/fields` says
+which can change and which reload the model); **Apply** sends the changed
+fields as one `PATCH /v1/config`, which writes them to the config file in use,
+and reads **Apply and reload** when one of them reloads the model.
 
 For frontend work, `npm --prefix web run dev` proxies `/v1` and `/ui/metrics` to
 a running engine (`IGNIS_URL`, default `http://127.0.0.1:8000`);

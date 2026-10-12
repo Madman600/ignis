@@ -319,30 +319,32 @@ async fn main() {
     // through the same path, on the same start options — and so does a
     // request naming a known model (§Implicit switch), the start model among
     // them once its load has said which id and file it is.
-    let known = if allow_model_switch {
-        ignis_server::model_switch::known_models(&known_models, server.active().source.as_ref())
-    } else {
-        Default::default()
-    };
+    // The explicit switch by id (spec playground/05) names them whatever
+    // `--switch-allow-implicit` says; only the implicit one is gated by it.
+    let switcher = ignis_server::model_switch::Switcher::new(
+        Arc::new(ignis_server::model_switch::ArtifactLoader::sharing(Arc::clone(&config_state))),
+        std::time::Duration::from_secs(u64::from(switch_drain_timeout_secs)),
+    );
+    switcher.note_start(server.active().source.as_ref());
+    let tables = switcher.tables(&known_models, allow_model_switch);
     tracing::info!(
         name: "ignis.config.model_switch",
         allow_model_switch,
-        known_models = %known.keys().cloned().collect::<Vec<_>>().join(","),
+        known_models = %tables.known.keys().cloned().collect::<Vec<_>>().join(","),
         "a request naming one of these models, other than the loaded one, switches the server to it"
     );
     // Spec model-download/02 §Known models: a catalog entry whose artifact is
     // under `--download-path` when a request names it is switchable too, so
     // a `model download` into this directory needs no restart.
     let catalog_models = ignis_server::model_switch::CatalogModels { catalog, dir: model_download_path.clone() };
-    let server = server.with_switcher(
-        ignis_server::model_switch::Switcher::new(
-            Arc::new(ignis_server::model_switch::ArtifactLoader::sharing(Arc::clone(&config_state))),
-            std::time::Duration::from_secs(u64::from(switch_drain_timeout_secs)),
+    let server = server
+        .with_switcher(
+            switcher
+                .with_known_models(tables.known)
+                .with_listed_models(tables.listed)
+                .with_catalog(catalog_models, allow_model_switch),
         )
-        .with_known_models(known)
-        .with_catalog(catalog_models, allow_model_switch),
-    )
-    .with_config(config_state);
+        .with_config(config_state);
 
     // GitHub #209: joining or gathering developer messages trades prefix
     // reuse for fewer system blocks; the operator is told once, at start.

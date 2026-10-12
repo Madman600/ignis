@@ -118,6 +118,37 @@ impl Validator {
             Validator::OneOf(allowed) => format!("one of {}", allowed.join(", ")),
         }
     }
+
+    /// The rule as a tool reads it (`GET /v1/config/fields`, spec
+    /// playground/05): `null` for [`Validator::None`], else the one variant's
+    /// own shape — `{ "min", "max" }` (an open end is `null`),
+    /// `{ "multiple_of" }` or `{ "one_of": [..] }`. [`Validator::describe`] is
+    /// the same rule as the sentence a person reads.
+    ///
+    /// A [`Validator::OneOf`] lists the spellings the field *accepts*, which
+    /// may name one value twice (`hq` and `hq-e8-2b`); `canonical` is the
+    /// field's own ([`FieldMeta::canonical`]), and each value is listed once,
+    /// as the config writes it, in the order first seen.
+    pub fn to_json(&self, canonical: fn(&str) -> Result<Value, String>) -> Value {
+        match *self {
+            Validator::None => Value::Null,
+            Validator::Range { min, max } => serde_json::json!({ "min": min, "max": max }),
+            Validator::MultipleOf(step) => serde_json::json!({ "multiple_of": step }),
+            Validator::OneOf(allowed) => {
+                let mut values: Vec<String> = Vec::new();
+                for spelling in allowed {
+                    let written = match canonical(spelling) {
+                        Ok(Value::String(written)) => written,
+                        _ => (*spelling).to_owned(),
+                    };
+                    if !values.contains(&written) {
+                        values.push(written);
+                    }
+                }
+                serde_json::json!({ "one_of": values })
+            }
+        }
+    }
 }
 
 /// Which model families a field means anything for (spec config-v2/01
@@ -153,6 +184,16 @@ impl Applicability {
         match self {
             Applicability::AllFamilies => "all".to_owned(),
             Applicability::Only(families) => families.iter().map(|f| f.name()).collect::<Vec<_>>().join(", "),
+        }
+    }
+
+    /// As `GET /v1/config/fields` states it: `null` for a field every family
+    /// takes, else the scope names ([`scope`]) of the families that do — the
+    /// spelling a config file's family section uses.
+    pub fn to_json(self) -> Value {
+        match self {
+            Applicability::AllFamilies => Value::Null,
+            Applicability::Only(families) => families.iter().map(|family| scope(*family)).collect::<Vec<_>>().into(),
         }
     }
 }
@@ -207,6 +248,9 @@ pub struct FieldMeta {
     pub name: &'static str,
     /// The kind's tag (`bytes`, `bool`, …), for `help --fields`.
     pub kind: &'static str,
+    /// The field may be unset (its kind is [`super::kind::Opt`]): `null` in a
+    /// file, and "auto" or "off" where a page shows it.
+    pub nullable: bool,
     /// The hardcoded default as the file format would write it.
     pub default: fn() -> Value,
     /// A value read from a config file as the text the kind parses
@@ -289,6 +333,44 @@ impl FieldMeta {
     /// of the other model from the same file never sees it.
     pub fn takes_scope(&self, family: ModelFamily) -> bool {
         self.scoped || self.home_family() == Some(family)
+    }
+
+    /// The description on one line: rustdoc's leading spaces trimmed, the
+    /// lines joined.
+    pub fn description_line(&self) -> String {
+        self.description.lines().map(str::trim).collect::<Vec<_>>().join(" ").trim().to_owned()
+    }
+
+    /// The field's declaration as a tool reads it — the keys `help --fields
+    /// --format json` and `GET /v1/config/fields` have in common, built here
+    /// once so the two cannot drift (spec playground/05 §`GET
+    /// /v1/config/fields`). The command line adds what only it needs (the
+    /// per-family flags, `visible`: the route lists only visible fields).
+    ///
+    /// `rule` is machine-readable ([`Validator::to_json`]) with `rule_text`
+    /// the sentence `help --fields` prints (empty when there is no rule);
+    /// `families` is `null` for a field every family takes ([`Applicability::to_json`]).
+    pub fn declaration(&self) -> serde_json::Map<String, Value> {
+        let Value::Object(declaration) = serde_json::json!({
+            "group": self.group,
+            "name": self.name,
+            "file_key": self.file_key(),
+            "flag": self.flag(),
+            "env": self.env(),
+            "kind": self.kind,
+            "nullable": self.nullable,
+            "default": (self.default)(),
+            "rule": self.validator.to_json(self.canonical),
+            "rule_text": self.validator.describe(),
+            "families": self.applies.to_json(),
+            "scoped": self.scoped,
+            "patchable": self.patchable,
+            "reload_required": self.reload_required,
+            "description": self.description_line(),
+        }) else {
+            unreachable!("a JSON object literal")
+        };
+        declaration
     }
 
     /// The description's first sentence-or-paragraph, trimmed of rustdoc's
@@ -382,6 +464,7 @@ mod tests {
             group: "kv_disk",
             name: "kv_host_pool_bytes",
             kind: "bytes",
+            nullable: false,
             default: || Value::Null,
             file_text: |_| Ok(None),
             canonical: |_| Ok(Value::Null),

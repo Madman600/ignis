@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { forgetKey, useAuth } from "../api/auth.ts";
-import { useModel } from "../api/model.ts";
+import { type ModelState, useModel } from "../api/model.ts";
 import { Composer } from "../conversation/Composer.tsx";
 import { imageFromFile, type PromptImage } from "../conversation/images.ts";
 import { DecideView, type Drawer as DecideDrawer } from "../decide/DecideView.tsx";
@@ -11,6 +11,8 @@ import { MonitorView } from "../monitor/MonitorView.tsx";
 import { useMonitor, useMonitorVisible } from "../monitor/useMonitor.ts";
 import { SessionLog } from "../sessions/SessionLog.tsx";
 import { SessionsPanel } from "../sessions/SessionsPanel.tsx";
+import { ServerView } from "../server/ServerView.tsx";
+import { useServer, useTick } from "../server/useServer.ts";
 import { DEFAULT_SETTINGS, type PlaygroundSettings } from "../settings/defaults.ts";
 import { SettingsPanel } from "../settings/SettingsPanel.tsx";
 import { AgentReader } from "../tools/agents/AgentReader.tsx";
@@ -29,9 +31,10 @@ import { useConversation } from "./useConversation.ts";
 // Sessions, settings and figures live in memory; a reload starts over, apart
 // from the switches this browser stores (`storedFlag.ts`).
 // This is the page's layout; the conversation loop is useConversation.
-// The header switches between the chat, the Decide tab (GitHub #247) and —
-// when ignis serves metrics — the Monitor (GitHub #165). Whichever is showing,
-// the chat stays mounted underneath, so a streaming reply carries on.
+// The header switches between the chat, the Decide tab (GitHub #247), —
+// when ignis serves metrics — the Monitor (GitHub #165), and the Server view
+// (GitHub #316). Whichever is showing, the chat stays mounted underneath, so
+// a streaming reply carries on.
 
 type Drawer = "sessions" | "settings" | null;
 
@@ -64,6 +67,12 @@ export function App() {
   const { active } = chat;
   const monitoring = view === "monitor" && monitorVisible;
   const deciding = view === "decide";
+  const serving = view === "server";
+  // Mounted from its first visit on, like the Decide tab: a draft of changes
+  // and a reload being followed survive a look at the chat.
+  const [serverOpened, setServerOpened] = useState(false);
+  // A switch runs the header's flame and heat bar as a reply does (spec playground/05).
+  const busy = chat.busy || model.state === "switching";
 
   const readerRun: AgentRun | undefined = reader
     ? active.messages.find((m) => m.id === reader.messageId)?.agents?.find((r) => r.callId === reader.callId)
@@ -121,7 +130,19 @@ export function App() {
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden">
-      <Header model={model} busy={chat.busy} onOpen={(which) => (deciding ? setDecideDrawer(which) : setDrawer(which))} onForgetKey={auth.key ? forgetKey : undefined} onOpenMemory={() => setMemoryOpen(true)} view={monitoring ? "monitor" : deciding ? "decide" : "chat"} onView={setView} monitorAvailable={monitorVisible} />
+      <Header
+        model={model}
+        busy={busy}
+        onOpen={(which) => (deciding ? setDecideDrawer(which) : setDrawer(which))}
+        onForgetKey={auth.key ? forgetKey : undefined}
+        onOpenMemory={() => setMemoryOpen(true)}
+        view={monitoring ? "monitor" : deciding ? "decide" : serving ? "server" : "chat"}
+        onView={(next) => {
+          if (next === "server") setServerOpened(true);
+          setView(next);
+        }}
+        monitorAvailable={monitorVisible}
+      />
 
       <TransportNotice />
 
@@ -134,7 +155,13 @@ export function App() {
         <DecideView ready={model.state === "ready"} drawer={decideDrawer} onDrawer={setDecideDrawer} />
       </div>
 
-      <div className={monitoring || deciding ? "hidden" : "contents"}>
+      {serverOpened && (
+        <div className={serving ? "contents" : "hidden"}>
+          <Server model={model} refreshModel={refreshModel} streaming={chat.busy} visible={serving} />
+        </div>
+      )}
+
+      <div className={monitoring || deciding || serving ? "hidden" : "contents"}>
         <div className="relative flex min-h-0 flex-1">
           {drawer && (
             <div className="fixed inset-0 z-30 bg-[#1c2026]/60 lg:hidden" onClick={() => setDrawer(null)} aria-hidden />
@@ -225,4 +252,11 @@ export function App() {
 /** The Monitor subscribes on its own, so a scrape re-renders it and not the chat. */
 function Monitor() {
   return <MonitorView state={useMonitor()} />;
+}
+
+/** The Server view's state lives here, and its clock ticks only while a switch runs. */
+function Server({ model, refreshModel, streaming, visible }: { model: ModelState; refreshModel: () => void; streaming: boolean; visible: boolean }) {
+  const [state, actions] = useServer(model, refreshModel, visible);
+  const now = useTick(model.state === "switching");
+  return <ServerView model={model} state={state} actions={actions} streaming={streaming} now={now} />;
 }

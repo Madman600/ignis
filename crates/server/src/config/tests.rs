@@ -1548,12 +1548,18 @@ fn a_patch_on_a_switched_config_keeps_its_drops_and_judges_only_its_own_entries(
 /// A value an earlier patch set for the family then running is the switch's
 /// to drop on the other family, never a reason to refuse a later patch: the
 /// patch judged is the one in the request, not every one before it.
+///
+/// A field only Flash-Next takes is not even dropped: patched at its group
+/// key, it is applied in Flash-Next's own section, as the config file is
+/// written (spec playground/05 follow-up 2), so the 27B never reads it — as
+/// a 27B start from the rewritten file never would.
 #[test]
 fn a_patch_from_before_a_switch_never_refuses_a_later_one() {
     let flash = config(&[]).for_family(ModelFamily::FlashNext).unwrap();
     let patched = flash.with_patch(&patch_of(&[("spec", "decode_lanes", "1"), ("spec", "backend", "mtp")])).unwrap();
     let (on_27b, dropped) = fit_to_family(&patched, ModelFamily::Qwen38_27b).unwrap();
-    assert!(dropped.contains(&"--spec-decode-lanes".to_owned()) && dropped.contains(&"--spec-backend".to_owned()), "{dropped:?}");
+    assert_eq!(dropped, ["--spec-backend"], "a value both families read is dropped; the family-only one waits in its section");
+    assert_eq!(on_27b.decode_lanes, None);
     let later = on_27b.with_patch(&patch_of(&[("server", "request_timeout", "60")])).unwrap();
     assert_eq!(later.request_timeout_secs, 60);
     let (back, _) = fit_to_family(&later, ModelFamily::FlashNext).unwrap();

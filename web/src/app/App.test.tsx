@@ -37,6 +37,13 @@ describe("App", () => {
     expect(html).not.toContain('aria-label="Monitor"');
   });
 
+  it("offers the Server view from the start, and mounts it only once it is opened (spec playground/05)", () => {
+    const html = renderToStaticMarkup(<App />);
+    expect(html).toContain(">Server<");
+    // Nothing of it is on the page, and nothing fetched, until the first visit.
+    expect(html).not.toContain('aria-label="Model"');
+  });
+
   it("gives every form field an id or a name, as the browser asks", () => {
     const fields = renderToStaticMarkup(<App />).match(/<(input|textarea|select)\b[^>]*>/g) ?? [];
     expect(fields.length).toBeGreaterThan(0);

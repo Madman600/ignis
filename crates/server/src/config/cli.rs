@@ -89,26 +89,24 @@ pub fn fields_text() -> String {
 }
 
 /// `help --fields --format json`: the same table, one object per field, for
-/// a tool to read.
+/// a tool to read. The object is [`FieldMeta::declaration`], the one
+/// `GET /v1/config/fields` serves (spec playground/05), plus what only the
+/// command line has: every field, hidden ones included, so `visible`, and
+/// the per-family flags. `rule` and `families` keep the sentence and the
+/// comma-separated names they have always been here — the route's structured
+/// forms are the same fields' `rule` / `families` there, and `rule_text` is
+/// this `rule`.
 pub fn fields_json() -> String {
     let fields: Vec<Value> = all_fields()
         .map(|meta| {
-            serde_json::json!({
-                "group": meta.group,
-                "name": meta.name,
-                "flag": meta.flag(),
-                "env": meta.env(),
-                "file_key": meta.file_key(),
-                "kind": meta.kind,
-                "default": (meta.default)(),
-                "rule": meta.validator.describe(),
-                "families": meta.applies.describe(),
-                "scoped_flags": if meta.scoped { FAMILIES.iter().map(|f| meta.scoped_flag(*f)).collect() } else { Vec::new() },
-                "visible": meta.visible,
-                "patchable": meta.patchable,
-                "reload_required": meta.reload_required,
-                "description": meta.description.lines().map(str::trim).collect::<Vec<_>>().join(" ").trim().to_owned(),
-            })
+            let mut field = meta.declaration();
+            field.insert("rule".to_owned(), meta.validator.describe().into());
+            field.insert("families".to_owned(), meta.applies.describe().into());
+            let scoped_flags: Vec<String> =
+                if meta.scoped { FAMILIES.iter().map(|f| meta.scoped_flag(*f)).collect() } else { Vec::new() };
+            field.insert("scoped_flags".to_owned(), scoped_flags.into());
+            field.insert("visible".to_owned(), meta.visible.into());
+            Value::Object(field)
         })
         .collect();
     let mut text = serde_json::to_string_pretty(&fields).expect("plain JSON");
@@ -212,10 +210,10 @@ fn patch(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files: &d
     let mut changes = file::changes_of(&sources.file)?;
     changes.extend(file::changes_of(&sources.env)?);
     changes.extend(file::changes_of(&sources.flags)?);
-    let contents = file::rewrite(files, &path, changes, profile.as_deref())?;
+    let contents = file::rewrite(files, &path, changes, Vec::new(), profile.as_deref())?.text;
     let target = out.unwrap_or_else(|| path.clone());
     // An `--out` of the other format gets the same document in its own.
-    let contents = match (Format::of_path(&path).unwrap_or(Format::Yaml), Format::of_path(&target)) {
+    let contents = match (Format::of_file(&path), Format::of_path(&target)) {
         (from, Some(to)) if from != to => to.write(&from.read(&contents).expect("a rewritten file reads back")),
         _ => contents,
     };

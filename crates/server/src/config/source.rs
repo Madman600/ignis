@@ -19,6 +19,10 @@
 //! reached, so an operator overriding a bad env var with a good flag is not
 //! refused for the env var.
 //!
+//! A patch is a change to the config file, so it keeps the file's own
+//! tiebreak: its general value yields to the file's `<family>-config` for
+//! that family, as in the rewritten file ([`Resolver::field`]).
+//!
 //! Gathering the layers once and keeping them ([`Sources`], carried by every
 //! resolved [`super::Config`]) is what lets one start's options be resolved
 //! again later for a family the artifact names, or with a patch on top,
@@ -83,6 +87,13 @@ pub struct Origin {
     /// default (`vision.enabled: false`, `server.metrics_bind:
     /// 127.0.0.1:9464`) starts either model, as no file at all would.
     pub at_default: bool,
+    /// The value was given for the family resolved for, not the group: a
+    /// family section of a file or a profile, a `--<family>-…` flag, an
+    /// `IGNIS_<FAMILY>_…` env var, a live family value. What `GET
+    /// /v1/config/origins` tells apart (spec playground/05 follow-up 2): a
+    /// family's own value in a file or a patch is the operator's, which a
+    /// group value does not reach and a `null` removes.
+    pub scoped: bool,
 }
 
 /// One raw value and the spelling it arrived under.
@@ -99,18 +110,30 @@ pub struct Candidate {
 /// the group's general value.
 type Key = (&'static str, &'static str, Option<&'static str>);
 
-/// One source's raw values, general and per family.
+/// One source's raw values, general and per family — and, for a live
+/// patch only, the keys it removes.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Layer {
     values: BTreeMap<Key, Candidate>,
+    /// The keys a patch's `null` removes, each with the spelling it was
+    /// given under (spec playground/05 §Decisions). Never kept by a source:
+    /// [`Layer::overlay`] and [`super::Config::general_with`] apply them.
+    removed: BTreeMap<Key, String>,
 }
 
 impl std::fmt::Debug for Layer {
-    /// The spellings set, never their values: a layer holds the API key's
-    /// raw text, and a `Config` dumped into a log line must not leak it.
+    /// The spellings set or removed, never their values: a layer holds the
+    /// API key's raw text, and a `Config` dumped into a log line must not
+    /// leak it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.values.values().map(|candidate| &candidate.spelling)).finish()
+        f.debug_list().entries(self.values.values().map(|candidate| &candidate.spelling).chain(self.removed.values())).finish()
     }
+}
+
+/// The field a layer's key names, and its scope.
+fn of_key((group, name, scope_name): &Key) -> (&'static FieldMeta, Option<ModelFamily>) {
+    let meta = super::schema::field(group, name).expect("a layer only holds declared fields");
+    (meta, scope_name.and_then(super::field::family_of_scope))
 }
 
 impl Layer {
@@ -131,32 +154,34 @@ impl Layer {
     /// it is written. A field only one family takes may sit in that family's
     /// section, which is where `PATCH /v1/config` writes it.
     pub fn set(&mut self, meta: &'static FieldMeta, family: Option<ModelFamily>, candidate: Candidate) -> Result<(), ConfigError> {
-        if let Some(family) = family {
-            if !meta.applies.to(family) {
-                return Err(ConfigError(format!(
-                    "`{}`: {} does not take {} (a {} option)",
-                    candidate.spelling,
-                    family.name(),
-                    meta.file_key(),
-                    meta.applies.describe()
-                )));
-            }
-            if !meta.takes_scope(family) {
-                return Err(ConfigError(format!(
-                    "`{}`: {} has no per-family value; set `{}` instead",
-                    candidate.spelling,
-                    meta.file_key(),
-                    meta.file_key()
-                )));
-            }
-        }
+        check_scope(meta, family, &candidate.spelling)?;
         let key = (meta.group, meta.name, family.map(scope));
+        self.removed.remove(&key);
         if candidate.raw.trim().is_empty() {
             self.values.remove(&key);
         } else {
             self.values.insert(key, candidate);
         }
         Ok(())
+    }
+
+    /// Remove `meta`'s value in `family`'s scope — a live patch's `null`
+    /// (spec playground/05 §Decisions, JSON merge patch): overlaid on the
+    /// patches before it, the key's value is gone from them, and the config
+    /// file loses the key too. Its key is checked as a value's would be: a
+    /// `null` where no value can be is as wrong as a value there.
+    pub fn remove(&mut self, meta: &'static FieldMeta, family: Option<ModelFamily>, spelling: String) -> Result<(), ConfigError> {
+        check_scope(meta, family, &spelling)?;
+        let key = (meta.group, meta.name, family.map(scope));
+        self.values.remove(&key);
+        self.removed.insert(key, spelling);
+        Ok(())
+    }
+
+    /// Take `meta`'s value in `family`'s scope out of this layer, if it has
+    /// one.
+    pub fn unset(&mut self, meta: &FieldMeta, family: Option<ModelFamily>) {
+        self.values.remove(&(meta.group, meta.name, family.map(scope)));
     }
 
     /// Append to a repeatable field's value (`;`-joined).
@@ -168,25 +193,97 @@ impl Layer {
         self.set(meta, family, joined)
     }
 
-    /// Whether the layer sets nothing (a patch that names no field).
+    /// Whether the layer names nothing, set or removed (a patch that names no
+    /// field).
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.values.is_empty() && self.removed.is_empty()
     }
 
     /// Every value set, with its field and scope.
     pub fn entries(&self) -> impl Iterator<Item = (&'static FieldMeta, Option<ModelFamily>, &Candidate)> + '_ {
-        self.values.iter().map(|((group, name, scope_name), candidate)| {
-            let meta = super::schema::field(group, name).expect("a layer only holds declared fields");
-            (meta, scope_name.and_then(super::field::family_of_scope), candidate)
+        self.values.iter().map(|(key, candidate)| {
+            let (meta, family) = of_key(key);
+            (meta, family, candidate)
         })
     }
 
-    /// `other`'s values over this layer's.
+    /// Every key removed, with its field, scope and spelling.
+    pub fn removals(&self) -> impl Iterator<Item = (&'static FieldMeta, Option<ModelFamily>, &str)> + '_ {
+        self.removed.iter().map(|(key, spelling)| {
+            let (meta, family) = of_key(key);
+            (meta, family, spelling.as_str())
+        })
+    }
+
+    /// Every key the layer names, set or removed, in key order.
+    pub fn named(&self) -> impl Iterator<Item = (&'static FieldMeta, Option<ModelFamily>)> + '_ {
+        let keys: std::collections::BTreeSet<&Key> = self.values.keys().chain(self.removed.keys()).collect();
+        keys.into_iter().map(of_key)
+    }
+
+    /// This layer with every value and removal of a field only one family
+    /// takes moved from the group's key to that family's own section
+    /// ([`FieldMeta::home_family`]) — where a live patch puts it, in the
+    /// running configuration as in the config file (spec playground/05
+    /// follow-up 2, "a removal goes where a value goes"). Such a field means
+    /// something to that family alone, so its group key and its family key
+    /// are one value; homing it is what keeps a patched value from yielding
+    /// to the file's section it is written over, and a removal at either key
+    /// from leaving the other behind. A key the layer already names in that
+    /// family's section is the more specific and stays.
+    pub fn homed(&self) -> Layer {
+        let mut homed = self.clone();
+        let general = self.values.keys().chain(self.removed.keys()).filter(|(_, _, scope_name)| scope_name.is_none());
+        for key in general {
+            let Some(family) = of_key(key).0.home_family() else {
+                continue;
+            };
+            let home = (key.0, key.1, Some(scope(family)));
+            let named_there = self.values.contains_key(&home) || self.removed.contains_key(&home);
+            if let Some(candidate) = homed.values.remove(key).filter(|_| !named_there) {
+                homed.values.insert(home, candidate);
+            }
+            if let Some(spelling) = homed.removed.remove(key).filter(|_| !named_there) {
+                homed.removed.insert(home, spelling);
+            }
+        }
+        homed
+    }
+
+    /// `other`'s values over this layer's, and its removals taken out of it.
     pub fn overlay(&mut self, other: &Layer) {
         for (key, candidate) in &other.values {
             self.values.insert(*key, candidate.clone());
         }
+        for key in other.removed.keys() {
+            self.values.remove(key);
+        }
     }
+}
+
+/// Refuse a value — or a removal — of `meta` in `family`'s section when the
+/// family cannot take the field, or the field has no per-family value
+/// ([`Layer::set`]).
+fn check_scope(meta: &FieldMeta, family: Option<ModelFamily>, spelling: &str) -> Result<(), ConfigError> {
+    let Some(family) = family else {
+        return Ok(());
+    };
+    if !meta.applies.to(family) {
+        return Err(ConfigError(format!(
+            "`{spelling}`: {} does not take {} (a {} option)",
+            family.name(),
+            meta.file_key(),
+            meta.applies.describe()
+        )));
+    }
+    if !meta.takes_scope(family) {
+        return Err(ConfigError(format!(
+            "`{spelling}`: {} has no per-family value; set `{}` instead",
+            meta.file_key(),
+            meta.file_key()
+        )));
+    }
+    Ok(())
 }
 
 /// Where the config file in use came from (spec config-v2/02 §Config-file
@@ -314,7 +411,11 @@ impl Resolver<'_> {
             (&sources.file, Source::File),
         ];
         for (layer, source) in explicit {
-            let Some(candidate) = self.candidate(layer, meta) else {
+            let found = match source {
+                Source::Patch => self.patch_candidate(meta),
+                _ => self.candidate(layer, meta),
+            };
+            let Some((candidate, scoped)) = found else {
                 continue;
             };
             let value = parse_candidate::<K>(meta, candidate)?;
@@ -332,17 +433,17 @@ impl Resolver<'_> {
                 self.dropped.borrow_mut().push(meta.flag());
                 return Ok(default);
             }
-            self.record(meta, source, candidate, at_default);
+            self.record(meta, source, candidate, scoped, at_default);
             return Ok(value);
         }
         // A profile is a default, never an override: a value of it the
         // family cannot take is passed over in silence, as a hardcoded
         // default for a field the family ignores would be.
         if self.family.is_none_or(|family| meta.applies.to(family)) {
-            if let Some(candidate) = self.candidate(&sources.profile, meta) {
+            if let Some((candidate, scoped)) = self.candidate(&sources.profile, meta) {
                 let value = parse_candidate::<K>(meta, candidate)?;
                 let at_default = value == default;
-                self.record(meta, Source::Profile, candidate, at_default);
+                self.record(meta, Source::Profile, candidate, scoped, at_default);
                 return Ok(value);
             }
         }
@@ -350,16 +451,41 @@ impl Resolver<'_> {
     }
 
     /// `layer`'s value for `meta`: the family-scoped one first, then the
-    /// general one.
-    fn candidate<'l>(&self, layer: &'l Layer, meta: &FieldMeta) -> Option<&'l Candidate> {
+    /// general one — and whether it was the family-scoped one.
+    fn candidate<'l>(&self, layer: &'l Layer, meta: &FieldMeta) -> Option<(&'l Candidate, bool)> {
         let scoped = self.family.filter(|family| meta.takes_scope(*family)).and_then(|family| layer.get(meta, Some(family)));
-        scoped.or_else(|| layer.get(meta, None))
+        match scoped {
+            Some(candidate) => Some((candidate, true)),
+            None => layer.get(meta, None).map(|candidate| (candidate, false)),
+        }
     }
 
-    fn record(&self, meta: &'static FieldMeta, source: Source, candidate: &Candidate, at_default: bool) {
+    /// The live patch's value for `meta`: as [`Resolver::candidate`] picks
+    /// it, except that its general value yields to a value the config file
+    /// holds in the family's own section. A patch is a change to the config
+    /// file (written into it once it takes), applied ahead of every other
+    /// source while the process runs; in the file a family's own section
+    /// outranks the group's value, so a patched group value reaching a
+    /// family the file gives its own would run a value no start from the
+    /// rewritten file runs (spec playground/05 §Decisions). Whatever
+    /// outranks the file's own section then decides, as at a start.
+    fn patch_candidate(&self, meta: &FieldMeta) -> Option<(&Candidate, bool)> {
+        let (patch, file) = (&self.sources.patch, &self.sources.file);
+        if let Some(family) = self.family.filter(|family| meta.takes_scope(*family)) {
+            if let Some(scoped) = patch.get(meta, Some(family)) {
+                return Some((scoped, true));
+            }
+            if file.get(meta, Some(family)).is_some() {
+                return None;
+            }
+        }
+        patch.get(meta, None).map(|candidate| (candidate, false))
+    }
+
+    fn record(&self, meta: &'static FieldMeta, source: Source, candidate: &Candidate, scoped: bool, at_default: bool) {
         self.origins
             .borrow_mut()
-            .insert((meta.group, meta.name), Origin { source, spelling: candidate.spelling.clone(), at_default });
+            .insert((meta.group, meta.name), Origin { source, spelling: candidate.spelling.clone(), at_default, scoped });
     }
 }
 
@@ -589,6 +715,98 @@ mod tests {
             assert_eq!(resolved.settings.reuse.kv_host_pool_bytes, want, "{name}");
             assert_eq!(resolved.origin("reuse", "kv_host_pool_bytes").map_or(Source::Default, |o| o.source), from, "{name}");
         }
+    }
+
+    /// Spec playground/05 follow-up 2: an origin says whether the value that
+    /// won was the family's own or the group's, whatever the source — and a
+    /// patched group value that yields to the file's own section leaves the
+    /// file's, scoped, as the origin.
+    #[test]
+    fn an_origin_says_whether_the_familys_own_value_won() {
+        let meta = field("reuse", "kv_host_pool_bytes").unwrap();
+        let (q, f) = (Some(ModelFamily::Qwen38_27b), Some(ModelFamily::FlashNext));
+        let origin = |sources: &Sources, family| {
+            let resolved = resolve_settings(sources, family, Fit::Start).unwrap();
+            resolved.origin("reuse", "kv_host_pool_bytes").map(|origin| (origin.source, origin.scoped))
+        };
+        let profile = Sources { profile: layer(meta, &[(None, "3G"), (q, "1G")]), ..Sources::default() };
+        assert_eq!((origin(&profile, q), origin(&profile, f), origin(&profile, None)), (Some((Source::Profile, true)), Some((Source::Profile, false)), Some((Source::Profile, false))));
+        let flags = Sources { flags: layer(meta, &[(f, "7G")]), ..profile.clone() };
+        assert_eq!((origin(&flags, q), origin(&flags, f)), (Some((Source::Profile, true)), Some((Source::Flag, true))));
+        let patched = Sources { patch: layer(meta, &[(None, "5G")]), file: layer(meta, &[(q, "4G")]), ..Sources::default() };
+        assert_eq!((origin(&patched, q), origin(&patched, f)), (Some((Source::File, true)), Some((Source::Patch, false))));
+        let own = Sources { patch: layer(meta, &[(q, "6G")]), ..patched.clone() };
+        assert_eq!(origin(&own, q), Some((Source::Patch, true)));
+        assert_eq!(origin(&Sources::default(), q), None, "the hardcoded default has no origin");
+    }
+
+    /// Spec playground/05 §Decisions: a live patch is a change to the config
+    /// file, applied ahead of every other source — and in the file a
+    /// family's own section outranks the group's value, so a patched group
+    /// value does not reach a family the file gives its own. The families
+    /// without one take it, and a patched family value still wins.
+    #[test]
+    fn a_patched_group_value_yields_to_the_files_own_section_for_that_family() {
+        let meta = field("reuse", "kv_host_pool_bytes").unwrap();
+        let (q, f) = (Some(ModelFamily::Qwen38_27b), Some(ModelFamily::FlashNext));
+        let resolved = |sources: &Sources, family| resolve_settings(sources, family, Fit::Start).unwrap().settings.reuse.kv_host_pool_bytes;
+        let sources = Sources { patch: layer(meta, &[(None, "3G")]), file: layer(meta, &[(q, "4G")]), ..Sources::default() };
+        assert_eq!((resolved(&sources, q), resolved(&sources, f), resolved(&sources, None)), (4 * GIB, 3 * GIB, 3 * GIB));
+        let own = Sources { patch: layer(meta, &[(None, "3G"), (q, "1G")]), ..sources.clone() };
+        assert_eq!(resolved(&own, q), GIB, "the patch's own value for the family");
+        let flagged = Sources { flags: layer(meta, &[(None, "6G")]), ..sources.clone() };
+        assert_eq!(resolved(&flagged, q), 6 * GIB, "what outranks the file's own section still does");
+        let scoped_flag = Sources { patch: layer(meta, &[(None, "3G")]), flags: layer(meta, &[(q, "5G")]), ..Sources::default() };
+        assert_eq!(resolved(&scoped_flag, q), 3 * GIB, "with nothing in the file a patch still outranks the command line");
+    }
+
+    /// Spec playground/05 §Decisions: a patch's `null` is a removal — it
+    /// names its key, checked as a value there would be, sets nothing, and
+    /// overlaid on the patches before it takes their value for that key away.
+    #[test]
+    fn a_removal_names_its_key_sets_nothing_and_takes_an_earlier_patchs_value_away() {
+        let meta = field("reuse", "kv_host_pool_bytes").unwrap();
+        let q = Some(ModelFamily::Qwen38_27b);
+        let mut removal = Layer::default();
+        removal.remove(meta, q, "reuse.qwen38.kv_host_pool_bytes".into()).unwrap();
+        assert!(!removal.is_empty() && removal.entries().next().is_none(), "a body of only removals is a patch");
+        let named: Vec<_> = removal.named().map(|(meta, family)| (meta.file_key(), family)).collect();
+        assert_eq!(named, [("reuse.kv_host_pool_bytes".to_owned(), q)]);
+        let mut earlier = layer(meta, &[(None, "3G"), (q, "1G")]);
+        earlier.overlay(&removal);
+        assert!(earlier.get(meta, q).is_none() && earlier.get(meta, None).is_some(), "only the key removed: {earlier:?}");
+        assert_eq!(earlier.removals().count(), 0, "a removal is applied, never kept");
+        let err = Layer::default().remove(field("server", "bind").unwrap(), q, "server.qwen38.bind".into()).unwrap_err();
+        assert!(err.0.contains("server.qwen38.bind") && err.0.contains("per-family"), "{err}");
+    }
+
+    /// Spec playground/05 follow-up 2: a field only one family takes is one
+    /// value at its group key and in its family's section, so homing moves
+    /// its value and its removal there, leaves every other field where it
+    /// was named, and lets a key named in the section win over the group's.
+    #[test]
+    fn homing_moves_a_family_only_fields_value_and_removal_to_its_section() {
+        let lanes = field("spec", "decode_lanes").unwrap();
+        let pool = field("reuse", "kv_host_pool_bytes").unwrap();
+        let flash = Some(ModelFamily::FlashNext);
+        let mut patch = Layer::default();
+        patch.set(lanes, None, Candidate { raw: "2".into(), spelling: "spec.decode_lanes".into() }).unwrap();
+        patch.set(pool, None, Candidate { raw: "3G".into(), spelling: "reuse.kv_host_pool_bytes".into() }).unwrap();
+        let homed = patch.homed();
+        let raw = |layer: &Layer, meta, family| layer.get(meta, family).map(|candidate| candidate.raw.clone());
+        assert_eq!((raw(&homed, lanes, None), raw(&homed, lanes, flash)), (None, Some("2".to_owned())));
+        assert_eq!(homed.get(pool, None).map(|c| c.raw.as_str()), Some("3G"), "a field both families take stays at its group key");
+
+        let mut removal = Layer::default();
+        removal.remove(lanes, None, "spec.decode_lanes".into()).unwrap();
+        let named: Vec<_> = removal.homed().named().map(|(meta, family)| (meta.file_key(), family)).collect();
+        assert_eq!(named, [("spec.decode_lanes".to_owned(), flash)]);
+
+        let mut both = Layer::default();
+        both.set(lanes, None, Candidate { raw: "2".into(), spelling: "spec.decode_lanes".into() }).unwrap();
+        both.remove(lanes, flash, "spec.qwen38flashnext.decode_lanes".into()).unwrap();
+        let homed = both.homed();
+        assert_eq!((homed.entries().count(), homed.removals().count()), (0, 1), "the section's own key wins: {homed:?}");
     }
 
     /// Before an artifact names a family, only the general values count.

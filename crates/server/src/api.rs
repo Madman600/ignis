@@ -150,8 +150,14 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         .routes(routes!(list_models))
         // Spec model-switch/01: replace the loaded model.
         .routes(routes!(switch_model))
+        // Spec playground/05: the models a switch can go to or fetch.
+        .routes(routes!(crate::catalog_http::get_models_catalog))
         // Spec config-v2/02: the running configuration, read and changed.
         .routes(routes!(crate::config_http::get_config, crate::config_http::patch_config))
+        // Spec playground/05: what each of those fields is, and where each
+        // running value comes from.
+        .routes(routes!(crate::config_http::get_config_fields))
+        .routes(routes!(crate::config_http::get_config_origins))
         .routes(routes!(chat_completions))
         // GitHub #285: the prompt counted without being served. Neither
         // reaches the scheduler.
@@ -173,7 +179,10 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         )
         .route("/v1/models", options(cors_preflight))
         .route("/v1/models/switch", options(cors_preflight))
+        .route("/v1/models/catalog", options(cors_preflight))
         .route("/v1/config", options(cors_preflight))
+        .route("/v1/config/fields", options(cors_preflight))
+        .route("/v1/config/origins", options(cors_preflight))
         .route("/v1/chat/completions", options(cors_preflight))
         .route("/v1/tokenize", options(cors_preflight))
         .route("/v1/detokenize", options(cors_preflight))
@@ -252,7 +261,8 @@ impl<B> MakeSpan<B> for RootSpanMaker {
 /// it stay open — `GET /v1/models` (whose `status` says what is happening)
 /// and `POST /v1/models/switch` (which answers a second switch `409`, and
 /// is how a failed one is recovered from). During the warm-up they are held
-/// like every other route, as they always were.
+/// like every other route, as they always were. `GET /v1/config/fields` is
+/// static and is never held.
 async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
     let status = server.status();
     let Some(code) = status.refusal() else {
@@ -260,7 +270,10 @@ async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: 
     };
     let switch_route = matches!(*status, ModelStatus::Switching { .. } | ModelStatus::Failed { .. })
         && reports_or_drives_the_switch(req.method(), req.uri().path());
-    if switch_route || req.method() == axum::http::Method::OPTIONS {
+    // The field declarations are static (spec playground/05): nothing about
+    // the model's state changes them, so no state holds them back.
+    let static_route = req.method() == axum::http::Method::GET && req.uri().path() == "/v1/config/fields";
+    if switch_route || static_route || req.method() == axum::http::Method::OPTIONS {
         return next.run(req).await;
     }
     let message = match &*status {
@@ -326,12 +339,16 @@ pub(crate) fn implicit_switch_refused(refusal: crate::model_switch::ImplicitRefu
     }
 }
 
-/// `GET /v1/models`, `POST /v1/models/switch` or `GET /v1/config`: the
-/// routes a model switch keeps open ([`require_serving`]) — the two that
-/// report and drive it, and the running configuration, which a reload with
-/// a changed config is changing (spec config-v2/02).
+/// `GET /v1/models`, `POST /v1/models/switch`, `GET /v1/config` and the
+/// reads beside them: the routes a model switch keeps open
+/// ([`require_serving`]) — the two that report and drive it, the running
+/// configuration, which a reload with a changed config is changing (spec
+/// config-v2/02), and what a page needs to show the switch and the
+/// configuration while it runs: the fields' declarations, where each value
+/// comes from and the models a switch can go to (spec playground/05).
 fn reports_or_drives_the_switch(method: &axum::http::Method, path: &str) -> bool {
-    (method == axum::http::Method::GET && (path == "/v1/models" || path == "/v1/config"))
+    (method == axum::http::Method::GET
+        && matches!(path, "/v1/models" | "/v1/models/catalog" | "/v1/config" | "/v1/config/fields" | "/v1/config/origins"))
         || (method == axum::http::Method::POST && path == "/v1/models/switch")
 }
 
@@ -374,14 +391,16 @@ async fn cors_preflight() -> StatusCode {
 }
 
 /// Adds permissive CORS headers to every response so the API is reachable
-/// from browser-based clients on other origins.
+/// from browser-based clients on other origins. `PATCH` is there for
+/// `PATCH /v1/config` (spec config-v2/02): a browser on another origin sends
+/// nothing its preflight did not allow.
 async fn cors_headers(req: Request, next: Next) -> Response {
     let mut res = next.run(req).await;
     let headers = res.headers_mut();
     headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
     headers.insert(
         "Access-Control-Allow-Methods",
-        HeaderValue::from_static("GET, POST, OPTIONS"),
+        HeaderValue::from_static("GET, POST, PATCH, OPTIONS"),
     );
     headers.insert(
         "Access-Control-Allow-Headers",
@@ -1452,6 +1471,7 @@ async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
             ModelStatus::Failed { reason } => Some(reason.clone()),
             _ => None,
         },
+        last_switch: server.switcher.as_ref().and_then(|switcher| switcher.last_switch()).map(LastSwitchInfo::of),
     })
 }
 
@@ -1468,6 +1488,52 @@ struct ModelList {
     /// Why the last switch failed, while `status` is `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// How the last switch or reload since start ended (spec playground/05);
+    /// absent before the first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_switch: Option<LastSwitchInfo>,
+}
+
+/// How a switch or a reload ended.
+#[derive(Serialize, ToSchema)]
+struct LastSwitchInfo {
+    /// The id served when it began.
+    from: String,
+    /// The id it loaded; equal to `from` for a reload from `PATCH /v1/config`.
+    to: String,
+    /// `switched`; `refused` (refused before anything was torn down: the old
+    /// model never stopped); `restored` (the target failed to load and the old
+    /// model was loaded again); or `failed` (nothing serves).
+    outcome: LastOutcome,
+    /// Why, for every outcome but `switched`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// How a switch or a reload ended: `switched`; `refused` (refused before
+/// anything was torn down: the old model never stopped); `restored` (the
+/// target failed to load and the old model was loaded again); or `failed`
+/// (nothing serves).
+#[derive(Serialize, ToSchema, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum LastOutcome {
+    Switched,
+    Refused,
+    Restored,
+    Failed,
+}
+
+impl LastSwitchInfo {
+    fn of(last: crate::model_switch::LastSwitch) -> Self {
+        use crate::model_switch::SwitchOutcome;
+        let (outcome, reason) = match last.outcome {
+            SwitchOutcome::Switched => (LastOutcome::Switched, None),
+            SwitchOutcome::Refused { reason } => (LastOutcome::Refused, Some(reason)),
+            SwitchOutcome::Restored { reason } => (LastOutcome::Restored, Some(reason)),
+            SwitchOutcome::Failed { reason } => (LastOutcome::Failed, Some(reason)),
+        };
+        Self { from: last.from, to: last.to, outcome, reason }
+    }
 }
 
 /// The two ends of a model switch.
@@ -1486,10 +1552,13 @@ struct SwitchIds {
 #[derive(Deserialize, ToSchema)]
 struct SwitchRequest {
     /// The `.ninfer` container to serve, a path on the server's machine
-    /// (its sidecar beside it, as at start).
-    artifact: String,
+    /// (its sidecar beside it, as at start). Omitted, `model` is looked up:
+    /// the known models first, then the catalog's entries on disk (see
+    /// `GET /v1/models/catalog`).
+    artifact: Option<String>,
     /// The id to serve it under (`--model-id`); a known model's id must be the
-    /// artifact's own.
+    /// artifact's own. With no `artifact`, the id of a known model or a
+    /// catalog entry on disk.
     model: String,
 }
 
@@ -1512,25 +1581,33 @@ struct SwitchAccepted {
     tag = "models",
     operation_id = "switch_model",
     summary = "Replace the loaded model",
-    description = "Unloads the model being served and loads `artifact` in its place under the id `model`, on the same process: a full reload, the two models never resident together, every flag the server started with applied to the new load except one the new model does not take (`--vision-enabled` on Qwen3.8-Flash-Next, the other model's `--spec-backend` backend, the Flash-Next-only knobs), which is left off for it.\n\nAnswers `202` at once; the switch runs behind it. Meanwhile every other `/v1` route answers `503 model_switching` with `Retry-After`, and `GET /v1/models` reports `status: switching`. Requests already running on the old model get `--switch-drain-timeout` (30 s by default) to finish; any still running then ends with an `engine_error`. A target that can be refused without unloading anything — a path with no file, a checksum that is not clean, a model id of the other model, a flag it cannot take — leaves the old model serving. A target that fails to load after the old model was unloaded has the old model reloaded from its artifact; `GET /v1/models` reports `status: failed` until one of them serves.",
+    description = "Unloads the model being served and loads `artifact` in its place under the id `model` — or, with `model` alone, the artifact the server knows it by: the `switch.known_models` entry for the id (which wins), else a catalog entry whose artifact is under `download.path` (`GET /v1/models/catalog` lists them, with whether each is switchable). `switch.allow_implicit` does not apply to that: it gates the switch a request triggers by naming a model. An id that is neither, or whose artifact is not on disk, is `404 model_not_found`; a switch never starts a download. The switch is on the same process: a full reload, the two models never resident together, every flag the server started with applied to the new load except one the new model does not take (`--vision-enabled` on Qwen3.8-Flash-Next, the other model's `--spec-backend` backend, the Flash-Next-only knobs), which is left off for it.\n\nAnswers `202` at once; the switch runs behind it. Meanwhile every other `/v1` route answers `503 model_switching` with `Retry-After`, and `GET /v1/models` reports `status: switching`. Requests already running on the old model get `--switch-drain-timeout` (30 s by default) to finish; any still running then ends with an `engine_error`. A target that can be refused without unloading anything — a path with no file, a checksum that is not clean, a model id of the other model, a flag it cannot take — leaves the old model serving. A target that fails to load after the old model was unloaded has the old model reloaded from its artifact; `GET /v1/models` reports `status: failed` until one of them serves.",
     request_body = SwitchRequest,
     responses(
         (status = 202, description = "The switch began.", body = SwitchAccepted),
-        (status = 400, description = "`artifact` or `model` is empty.", body = ApiError),
+        (status = 400, description = "`artifact` (when given) or `model` is empty.", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 404, description = "`model` was sent alone and is not a known model or a catalog entry on disk (`model_not_found`); for a catalog entry not yet fetched the message names the `model download` command.", body = ApiError),
         (status = 409, description = "A switch is already under way (`switch_in_progress`): switches are not queued.", body = ApiError),
         (status = 501, description = "This server was built without a model loader (`switch_unavailable`).", body = ApiError),
         (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`).", body = ApiError),
     ),
 )]
 async fn switch_model(State(server): State<Arc<Server>>, Json(req): Json<SwitchRequest>) -> Response {
-    if req.artifact.trim().is_empty() {
+    if req.artifact.as_deref().is_some_and(|artifact| artifact.trim().is_empty()) {
         return bad_request_param("`artifact` must name the container to load", "artifact");
     }
     if req.model.trim().is_empty() {
         return bad_request_param("`model` must name the id to serve it under", "model");
     }
-    let target = ModelSource { artifact: req.artifact.into(), model: req.model };
+    let artifact = match req.artifact {
+        Some(artifact) => artifact.into(),
+        None => match resolve_by_id(&server, &req.model) {
+            Ok(artifact) => artifact,
+            Err(refused) => return refused,
+        },
+    };
+    let target = ModelSource { artifact, model: req.model };
     match crate::model_switch::begin(&server, target) {
         Ok((started, _task)) => (
             StatusCode::ACCEPTED,
@@ -1539,6 +1616,32 @@ async fn switch_model(State(server): State<Arc<Server>>, Json(req): Json<SwitchR
             .into_response(),
         Err(refusal) => switch_refused(refusal),
     }
+}
+
+/// The artifact an id sent alone names (spec playground/05 §Switch by id), or
+/// the `404 model_not_found` saying why it names none — the id, and for a
+/// catalog entry not fetched yet the command that fetches it. Nothing is
+/// unloaded and nothing downloaded.
+fn resolve_by_id(server: &Server, model: &str) -> Result<std::path::PathBuf, Response> {
+    use crate::model_switch::{SwitchRefusal, Unswitchable};
+    let Some(switcher) = &server.switcher else {
+        return Err(switch_refused(SwitchRefusal::Unavailable));
+    };
+    switcher.resolve(model).map_err(|why| {
+        let message = match why {
+            Unswitchable::Unknown => format!(
+                "unknown model: {model} is neither in switch.known_models nor a catalog entry; GET /v1/models/catalog lists the models this server can switch to"
+            ),
+            Unswitchable::KnownMissing { artifact } => format!(
+                "model {model} is in switch.known_models but its artifact {} is not a file; fix the path or put the file there",
+                artifact.display()
+            ),
+            Unswitchable::NotDownloaded => format!(
+                "model {model} is in the catalog but not on disk (download.path); fetch it with `ignis-server model download {model}`, a switch never starts a download"
+            ),
+        };
+        error_response_naming(StatusCode::NOT_FOUND, "model_not_found", "model_not_found", message, Some("model"))
+    })
 }
 
 /// The answer to a switch that did not begin — an explicit one, or a reload

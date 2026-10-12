@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 
 use super::field::{family_of_scope, scope, FieldMeta, FAMILIES};
 use super::schema::{self, all_fields};
-use super::source::{resolve_settings, Candidate, Fit, Layer};
+use super::source::{resolve_settings, Candidate, Fit, Layer, Resolution};
 use super::{Config, ConfigError};
 
 /// A config file's format.
@@ -43,6 +43,13 @@ impl Format {
             "yaml" | "yml" => Some(Format::Yaml),
             _ => None,
         }
+    }
+
+    /// The format the file at `path` is read and written in: the one its
+    /// extension names ([`Format::of_path`]), else YAML, which reads JSON
+    /// too.
+    pub fn of_file(path: &Path) -> Format {
+        Format::of_path(path).unwrap_or(Format::Yaml)
     }
 
     /// `json` or `yaml`, as `--format` spells it.
@@ -207,8 +214,7 @@ pub fn load(files: &dyn Files, path: &Path) -> Result<(Value, Document), ConfigE
     let text = files
         .read(path)
         .map_err(|e| ConfigError(format!("the config file {} cannot be read: {e}", path.display())))?;
-    let value = Format::of_path(path)
-        .unwrap_or(Format::Yaml)
+    let value = Format::of_file(path)
         .read(&text)
         .map_err(|e| ConfigError(format!("the config file {} is not valid: {e}", path.display())))?;
     let document = read_document(&value, &path.display().to_string())?;
@@ -241,19 +247,52 @@ pub fn read_document(value: &Value, origin: &str) -> Result<Document, ConfigErro
                     };
                     let mut layer = Layer::default();
                     for (group, fields) in body {
-                        read_group(group, fields, &format!("profile {name} in {origin}"), &mut layer)?;
+                        read_group(group, fields, &format!("profile {name} in {origin}"), &mut layer, Nulls::Unset)?;
                     }
                     document.profiles.insert(name.clone(), layer);
                 }
             }
-            group => read_group(group, value, origin, &mut document.values)?,
+            group => read_group(group, value, origin, &mut document.values, Nulls::Unset)?,
         }
     }
     Ok(document)
 }
 
+/// What a `null` value means in the document being read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nulls {
+    /// A config file's: the key is not set, as if it were absent.
+    Unset,
+    /// A live patch's: the key is removed ([`Layer::remove`]).
+    Remove,
+}
+
+/// A live patch's body as a layer (`PATCH /v1/config`): its groups read as
+/// a config file's are, except that `null` removes the key — JSON merge
+/// patch — where a file's `null` leaves it unset (spec playground/05
+/// §Decisions). Only a field's value may be `null`: a whole group or family
+/// section is not removed at once, since it would take the fields no patch
+/// may change with the rest.
+pub fn read_merge_patch(value: &Value, origin: &str) -> Result<Layer, ConfigError> {
+    let Value::Object(top) = value else {
+        return Err(ConfigError(format!("{origin} must be a map of groups")));
+    };
+    let mut layer = Layer::default();
+    for (group, fields) in top {
+        read_group(group, fields, origin, &mut layer, Nulls::Remove)?;
+    }
+    Ok(layer)
+}
+
+/// A whole group or family section set to `null` in a patch.
+fn whole_removal(key: &str, origin: &str) -> ConfigError {
+    ConfigError(format!(
+        "`{key}: null` in {origin} would remove every field under it: a patch removes one field at a time (`{key}.<field>: null`)"
+    ))
+}
+
 /// One `<group>: { … }` section into `layer`.
-fn read_group(group: &str, value: &Value, origin: &str, layer: &mut Layer) -> Result<(), ConfigError> {
+fn read_group(group: &str, value: &Value, origin: &str, layer: &mut Layer, nulls: Nulls) -> Result<(), ConfigError> {
     let Some((group, fields)) = schema::GROUPS.iter().find(|(name, _)| *name == group) else {
         let groups: Vec<&str> = schema::GROUPS.iter().map(|(name, _)| *name).collect();
         return Err(ConfigError(format!(
@@ -262,22 +301,25 @@ fn read_group(group: &str, value: &Value, origin: &str, layer: &mut Layer) -> Re
         )));
     };
     let entries = match value {
+        Value::Null if nulls == Nulls::Remove => return Err(whole_removal(group, origin)),
         Value::Null => return Ok(()),
         Value::Object(entries) => entries,
         _ => return Err(ConfigError(format!("`{group}` in {origin} must map field names to values"))),
     };
     for (key, value) in entries {
         if let Some(family) = family_of_scope(key) {
-            let Value::Object(scoped) = value else {
-                return Err(ConfigError(format!("`{group}.{key}` in {origin} must map field names to values")));
+            let scoped = match value {
+                Value::Object(scoped) => scoped,
+                Value::Null if nulls == Nulls::Remove => return Err(whole_removal(&format!("{group}.{key}"), origin)),
+                _ => return Err(ConfigError(format!("`{group}.{key}` in {origin} must map field names to values"))),
             };
             for (name, value) in scoped {
                 let meta = field_of(fields, group, name, origin)?;
-                set(layer, meta, Some(family), value, &format!("{group}.{key}.{name}"), origin)?;
+                set(layer, meta, Some(family), value, &format!("{group}.{key}.{name}"), origin, nulls)?;
             }
         } else {
             let meta = field_of(fields, group, key, origin)?;
-            set(layer, meta, None, value, &format!("{group}.{key}"), origin)?;
+            set(layer, meta, None, value, &format!("{group}.{key}"), origin, nulls)?;
         }
     }
     Ok(())
@@ -289,21 +331,45 @@ fn field_of(fields: &'static [FieldMeta], group: &str, name: &str, origin: &str)
     })
 }
 
-fn set(layer: &mut Layer, meta: &'static FieldMeta, family: Option<ModelFamily>, value: &Value, key: &str, origin: &str) -> Result<(), ConfigError> {
+fn set(layer: &mut Layer, meta: &'static FieldMeta, family: Option<ModelFamily>, value: &Value, key: &str, origin: &str, nulls: Nulls) -> Result<(), ConfigError> {
     let spelling = format!("{key} ({origin})");
-    let Some(raw) = (meta.file_text)(value).map_err(|reason| ConfigError(format!("`{spelling}` {reason}")))? else {
-        return Ok(());
-    };
-    layer.set(meta, family, Candidate { raw, spelling })
+    match (meta.file_text)(value).map_err(|reason| ConfigError(format!("`{spelling}` {reason}")))? {
+        Some(raw) => layer.set(meta, family, Candidate { raw, spelling }),
+        None if nulls == Nulls::Remove => layer.remove(meta, family, spelling),
+        None => Ok(()),
+    }
+}
+
+/// The resolutions `config`'s document is written from: the shared one,
+/// resolved for no family, then each family's own in [`FAMILIES`] order —
+/// what [`effective_document`] writes the values of and `GET
+/// /v1/config/origins` the sources of (spec playground/05 follow-up 2), so a
+/// value and the origin given for it cannot come from two resolutions.
+///
+/// The shared one is resolved for no family even when `config` is fitted to
+/// one (a running server's): a fitted config's settings hold that family's
+/// values, which would read as the group's (GitHub #316). A family whose
+/// values do not resolve is left out; a start refuses those before any of
+/// them serves.
+pub fn resolutions(config: &Config) -> (Resolution, Vec<(ModelFamily, Resolution)>) {
+    let sources = config.basis.sources();
+    let shared = resolve_settings(sources, None, Fit::Switch).unwrap_or_else(|_| config.basis.resolution().clone());
+    let families = FAMILIES
+        .into_iter()
+        .filter_map(|family| resolve_settings(sources, Some(family), Fit::Switch).ok().map(|resolution| (family, resolution)))
+        .collect();
+    (shared, families)
 }
 
 /// `config`'s settings as a document: every field's value for no family in
 /// particular, and beside it, in each family's section, every scoped field
 /// whose value differs for that family — what the sources say, written so a
 /// start reading it back resolves the same values. What `config generate`
-/// and `config print` write and `GET /v1/config` shows.
+/// and `config print` write and `GET /v1/config` shows. The values are
+/// [`resolutions`]'.
 pub fn effective_document(config: &Config) -> Value {
-    let mut general = config.settings().render();
+    let (shared, families) = resolutions(config);
+    let mut general = shared.settings.render();
     // A field only one family takes is never written at the general scope,
     // even when that family's own value is the one it already has there:
     // the general section is read by every family, and this one refuses it
@@ -318,10 +384,7 @@ pub fn effective_document(config: &Config) -> Value {
         }
     }
     let mut changes = Vec::new();
-    for family in FAMILIES {
-        let Ok(resolution) = resolve_settings(config.basis.sources(), Some(family), Fit::Switch) else {
-            continue;
-        };
+    for (family, resolution) in families {
         let scoped = resolution.settings.render();
         for meta in all_fields().filter(|meta| meta.takes_scope(family)) {
             let at = |groups: &Map<String, Value>| groups.get(meta.group).and_then(|group| group.get(meta.name)).cloned();
@@ -366,18 +429,66 @@ pub fn merge(document: &mut Value, changes: impl IntoIterator<Item = Change>) {
     }
 }
 
-/// The text of the config file at `path` with `changes` merged in (and, when
-/// given, `profile:` set) — what both `config patch` and `PATCH /v1/config`
-/// write, so the two can never change a file differently. Every key the
-/// changes do not name is kept; the keys are written in declaration order;
-/// a YAML file's comments do not survive the rewrite.
-pub fn rewrite(files: &dyn Files, path: &Path, changes: Vec<Change>, profile: Option<&str>) -> Result<String, ConfigError> {
-    let (mut document, _) = load(files, path)?;
+/// One field's removal, as [`remove`] writes it: the field and its scope.
+pub type Removal = (&'static FieldMeta, Option<ModelFamily>);
+
+/// Take each of `removals` out of `document` — the key, then the family
+/// section and the group the removal leaves empty — what a `null` in `PATCH
+/// /v1/config` writes (spec playground/05 §Decisions). A key the document
+/// does not hold is no change, and a section or group that was empty
+/// already is left as it was.
+pub fn remove(document: &mut Value, removals: impl IntoIterator<Item = Removal>) {
+    let Some(top) = document.as_object_mut() else {
+        return;
+    };
+    for (meta, family) in removals {
+        let Some(group) = top.get_mut(meta.group).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let emptied = match family {
+            Some(family) => {
+                let Some(section) = group.get_mut(scope(family)).and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                let emptied = section.remove(meta.name).is_some() && section.is_empty();
+                if emptied {
+                    group.remove(scope(family));
+                }
+                emptied
+            }
+            None => group.remove(meta.name).is_some(),
+        };
+        if emptied && group.is_empty() {
+            top.remove(meta.group);
+        }
+    }
+}
+
+/// A config file as [`rewrite`] rewrites it.
+pub struct Rewritten {
+    /// The file's new text.
+    pub text: String,
+    /// Whether its document differs from the one read: a rewrite that
+    /// changes nothing need not be written, and the file then keeps its
+    /// comments and its layout.
+    pub changed: bool,
+}
+
+/// The text of the config file at `path` with `changes` merged in and
+/// `removals` taken out (and, when given, `profile:` set) — what both
+/// `config patch` and `PATCH /v1/config` write, so the two can never change a
+/// file differently — and whether that changes its document. Every key the
+/// changes do not name is kept; the keys are written in declaration order; a
+/// YAML file's comments do not survive the rewrite.
+pub fn rewrite(files: &dyn Files, path: &Path, changes: Vec<Change>, removals: Vec<Removal>, profile: Option<&str>) -> Result<Rewritten, ConfigError> {
+    let (before, _) = load(files, path)?;
+    let mut document = before.clone();
     merge(&mut document, changes);
+    remove(&mut document, removals);
     if let Some(name) = profile {
         document.as_object_mut().expect("a merged document is a map").insert("profile".to_owned(), Value::String(name.to_owned()));
     }
-    Ok(Format::of_path(path).unwrap_or(Format::Yaml).write(&document))
+    Ok(Rewritten { text: Format::of_file(path).write(&document), changed: document != before })
 }
 
 /// The changes a layer stands for: each value it sets, parsed by its field's
@@ -554,6 +665,63 @@ mod tests {
         let mut empty = Value::Null;
         merge(&mut empty, [(pool, None, json!("1G"))]);
         assert_eq!(empty, json!({ "reuse": { "kv_host_pool_bytes": "1G" } }));
+    }
+
+    /// Spec playground/05 §Decisions: in a patch `null` removes the key —
+    /// JSON merge patch — where in a config file it leaves it unset; a whole
+    /// group or family section is not removed at once.
+    #[test]
+    fn a_patchs_null_is_a_removal_and_a_files_is_unset() {
+        let value = json!({ "reuse": { "kv_host_pool_bytes": null, "qwen38": { "prompt": null } }, "server": { "request_timeout": 60 } });
+        let patch = read_merge_patch(&value, "the request body").unwrap();
+        let removed: Vec<_> = patch.removals().map(|(meta, family, _)| (meta.file_key(), family)).collect();
+        assert_eq!(removed, [("reuse.kv_host_pool_bytes".to_owned(), None), ("reuse.prompt".to_owned(), Some(ModelFamily::Qwen38_27b))]);
+        assert_eq!(patch.entries().count(), 1);
+        assert_eq!(read_document(&value, "f.yaml").unwrap().values.removals().count(), 0, "a file's null sets nothing and removes nothing");
+        for (body, says) in [(json!({ "reuse": null }), "`reuse: null`"), (json!({ "reuse": { "qwen38": null } }), "`reuse.qwen38: null`")] {
+            let err = read_merge_patch(&body, "the request body").unwrap_err().0;
+            assert!(err.contains(says) && err.contains("one field at a time"), "{err}");
+        }
+    }
+
+    /// A removal takes its key out of the document, and the family section
+    /// and the group it leaves empty; a key that is not there changes
+    /// nothing.
+    #[test]
+    fn a_removal_takes_the_key_and_whatever_it_empties_out_of_the_document() {
+        let pool = field("reuse", "kv_host_pool_bytes").unwrap();
+        let prompt = field("reuse", "prompt").unwrap();
+        let timeout = field("server", "request_timeout").unwrap();
+        let q = Some(ModelFamily::Qwen38_27b);
+        let mut document = json!({
+            "reuse": { "kv_host_pool_bytes": "8G", "qwen38": { "prompt": false } },
+            "server": { "request_timeout": 30, "ui": true },
+            "vram": {}
+        });
+        remove(&mut document, [(prompt, q)]);
+        assert_eq!(document["reuse"], json!({ "kv_host_pool_bytes": "8G" }), "the emptied section goes");
+        remove(&mut document, [(pool, None), (timeout, None)]);
+        assert_eq!(document, json!({ "server": { "ui": true }, "vram": {} }), "the emptied group goes, the rest stays");
+        let before = document.clone();
+        remove(&mut document, [(pool, q), (pool, None), (field("vram", "headroom_bytes").unwrap(), None)]);
+        assert_eq!(document, before, "a key that is not there is no change");
+    }
+
+    /// A rewrite says whether it changed the document: a removal of a key the
+    /// file does not hold, or a value it holds already, does not; a new value
+    /// does. The format is the path's, YAML for a path that names none.
+    #[test]
+    fn a_rewrite_says_whether_the_document_changed() {
+        let files = testing::MemFiles::with(&[("c.conf", "reuse:\n  kv_host_pool_bytes: 2G\n")]);
+        let path = Path::new("c.conf");
+        let pool = field("reuse", "kv_host_pool_bytes").unwrap();
+        let rewrite = |changes, removals| rewrite(&files, path, changes, removals, None).unwrap();
+        assert!(!rewrite(vec![], vec![(pool, Some(ModelFamily::FlashNext))]).changed, "a removal of a key not there");
+        assert!(!rewrite(vec![(pool, None, json!("2G"))], vec![]).changed, "the value it holds");
+        let rewritten = rewrite(vec![(pool, None, json!("3G"))], vec![]);
+        assert!(rewritten.changed);
+        assert_eq!(Format::Yaml.read(&rewritten.text).unwrap(), json!({ "reuse": { "kv_host_pool_bytes": "3G" } }));
+        assert_eq!((Format::of_file(path), Format::of_file(Path::new("c.json"))), (Format::Yaml, Format::Json));
     }
 
     #[test]

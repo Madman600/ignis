@@ -84,6 +84,13 @@ fn the_document_lists_exactly_the_v1_surface() {
         "get /v1/models",
         // Spec model-switch/01: replace the loaded model.
         "post /v1/models/switch",
+        // Spec playground/05: the models a switch can go to or fetch, and
+        // what each configuration field is.
+        "get /v1/models/catalog",
+        "get /v1/config/fields",
+        // Spec playground/05 follow-up 2: where each of those values comes
+        // from.
+        "get /v1/config/origins",
         // Spec config-v2/02: the running configuration, read and changed.
         "get /v1/config",
         "patch /v1/config",
@@ -100,6 +107,58 @@ fn the_document_lists_exactly_the_v1_surface() {
     .map(str::to_owned)
     .collect();
     assert_eq!(documented(), expected);
+}
+
+/// Spec playground/05 AC 9: the Server view's routes are in the document
+/// with their responses, and the rows they return are described.
+#[test]
+fn the_server_view_routes_are_documented_with_their_responses() {
+    let document = document();
+    for (path, list, ok) in [("/v1/models/catalog", "CatalogList", "CatalogRow"), ("/v1/config/fields", "FieldList", "FieldDeclaration"), ("/v1/config/origins", "OriginList", "OriginRow")] {
+        let get = &document["paths"][path]["get"];
+        for status in ["200", "401"] {
+            assert!(get["responses"][status].is_object(), "{path} documents {status}");
+        }
+        assert_eq!(
+            get["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            format!("#/components/schemas/{list}"),
+            "{path}"
+        );
+        assert!(document["components"]["schemas"][ok]["properties"].is_object(), "{ok}");
+    }
+    // An origin's source is one of six, each named; no configuration is a 501.
+    assert_eq!(
+        document["components"]["schemas"]["OriginSource"]["enum"],
+        serde_json::json!(["default", "profile", "file", "env", "flag", "live"])
+    );
+    assert!(document["paths"]["/v1/config/origins"]["get"]["responses"]["501"].is_object());
+    // The switch takes a model alone, and says what a 404 is.
+    let switch = &document["paths"]["/v1/models/switch"]["post"];
+    assert!(switch["responses"]["404"].is_object());
+    let request = &document["components"]["schemas"]["SwitchRequest"];
+    assert_eq!(request["required"], serde_json::json!(["model"]), "artifact is optional");
+    // `GET /v1/models` carries how the last switch ended.
+    assert!(document["components"]["schemas"]["ModelList"]["properties"]["last_switch"].is_object());
+    assert!(document["components"]["schemas"]["LastSwitchInfo"]["properties"]["outcome"].is_object());
+}
+
+/// Spec playground/05 AC 22: `GET /v1/config` documents its `format` query,
+/// the two media types it answers in, and the `400` of any other format.
+#[test]
+fn the_config_route_documents_its_format_and_both_media_types() {
+    let document = document();
+    let get = &document["paths"]["/v1/config"]["get"];
+    let parameters = get["parameters"].as_array().expect("parameters");
+    let format = parameters.iter().find(|parameter| parameter["name"] == "format").expect("the format query");
+    assert_eq!((format["in"].clone(), format["required"].clone()), (serde_json::json!("query"), serde_json::json!(false)));
+    // The two formats are the enum the handler matches on, not a sentence.
+    let schema = &format["schema"];
+    let listed = schema.get("enum").or_else(|| schema["oneOf"].as_array()?.iter().find_map(|any| any.get("enum")));
+    assert_eq!(listed, Some(&serde_json::json!(["json", "yaml"])), "{format}");
+    let content = &get["responses"]["200"]["content"];
+    assert_eq!(content["application/json"]["schema"]["$ref"], "#/components/schemas/ConfigDocument");
+    assert_eq!(content["application/yaml"]["schema"]["type"], "string");
+    assert!(get["responses"]["400"].is_object());
 }
 
 #[test]
@@ -466,4 +525,15 @@ async fn the_preflight_still_answers_on_every_v1_route() {
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
     }
+}
+
+#[test]
+fn the_field_declaration_schema_names_exactly_the_keys_a_declaration_has() {
+    // ADR 0046: the route builds each object with `FieldMeta::declaration`;
+    // the schema restating it by hand must not drift from it silently.
+    let document = document();
+    let schema: BTreeSet<String> =
+        document["components"]["schemas"]["FieldDeclaration"]["properties"].as_object().expect("properties").keys().cloned().collect();
+    let declared: BTreeSet<String> = ignis_server::config::schema::all_fields().next().expect("a field").declaration().keys().cloned().collect();
+    assert_eq!(schema, declared);
 }
