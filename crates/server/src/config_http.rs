@@ -440,7 +440,8 @@ pub(crate) struct PatchApplied {
     reason: Option<String>,
     /// The fields of the patch a flag or an env var also sets: those outrank
     /// the config file at the next start, so the written value applies only
-    /// until then — each named with the spelling that sets it.
+    /// until then — each named with the spelling that sets it, a family's
+    /// own flag or env var included for a group key ([`shadowed_at_restart`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     shadowed_at_restart: Vec<String>,
     /// The reload under way: the id served when it began, and the id it
@@ -514,27 +515,43 @@ pub fn add_known_models(patch: &mut Layer, running: &Config) -> Result<(), Confi
 }
 
 /// The fields of `patch`, set or removed, that a flag or an env var of
-/// `running`'s start also sets — in the patched key's own scope, or the
-/// general one, which outranks the file's family section too — each with
-/// the spelling that sets it: written to the file, they are outranked again
-/// at the next start (spec config-v2/01 AC 6), so the answer says so rather
-/// than promise a change that will not survive it. After a removal the flag
-/// or env var is in force at once (spec playground/05 §Decisions).
+/// `running`'s start also sets, each with the spelling that sets it: written
+/// to the file, they are outranked again at the next start (spec
+/// config-v2/01 AC 6), so the answer says so rather than promise a change
+/// that will not survive it. After a removal the flag or env var is in force
+/// at once (spec playground/05 §Decisions).
+///
+/// What outranks a key is what a start resolving it would read first, above
+/// the file: for a family's key, that family's flag, the general flag, its
+/// env var, the general env var. A group key is read by the shared value and
+/// by every family that has a section for the field, so each of those is
+/// asked, and a family's own flag or env var is named too (spec playground/05
+/// AC 30) — while the server runs, the patched group value outranks it, and
+/// at the next start it takes that family back. A spelling is named once per
+/// key.
 pub fn shadowed_at_restart(patch: &Layer, running: &Config) -> Vec<String> {
     let sources = running.basis.sources();
-    let set_at_start = |meta: &FieldMeta, family| {
-        let scopes = [family, None];
-        let mut found = [&sources.flags, &sources.env].into_iter().flat_map(|layer| scopes.into_iter().filter_map(move |scope| layer.get(meta, scope)));
-        found.next()
+    let set_at_start = |meta: &FieldMeta, family: Option<ModelFamily>| {
+        [&sources.flags, &sources.env]
+            .into_iter()
+            .find_map(|layer| family.and_then(|family| layer.get(meta, Some(family))).or_else(|| layer.get(meta, None)))
     };
-    patch
-        .named()
-        .filter_map(|(meta, family)| {
-            let key = family.map_or_else(|| meta.file_key(), |family| meta.scoped_file_key(family));
-            let by = set_at_start(meta, family)?;
-            Some(format!("{key} (set by {})", by.spelling))
-        })
-        .collect()
+    let mut shadowed = Vec::new();
+    for (meta, family) in patch.named() {
+        let key = family.map_or_else(|| meta.file_key(), |family| meta.scoped_file_key(family));
+        let readers: Vec<Option<ModelFamily>> = match family {
+            Some(_) => vec![family],
+            None => std::iter::once(None).chain(FAMILIES.into_iter().filter(|family| meta.takes_scope(*family)).map(Some)).collect(),
+        };
+        let mut named: Vec<&str> = Vec::new();
+        for by in readers.into_iter().filter_map(|reader| set_at_start(meta, reader)) {
+            if !named.contains(&by.spelling.as_str()) {
+                named.push(&by.spelling);
+                shadowed.push(format!("{key} (set by {})", by.spelling));
+            }
+        }
+    }
+    shadowed
 }
 
 /// Whether going from `running` to `next` — the running config with a
@@ -584,7 +601,7 @@ fn check_thinking(server: &Server, next: &Config, patch: &Layer) -> Result<(), S
     tag = "config",
     operation_id = "patch_config",
     summary = "Change the running configuration",
-    description = "The body is a partial config document in the config file's own shape — only the fields being changed, a `qwen38` / `qwen38flashnext` section for a family's own value. Each value is checked as the config file's would be; a field the loaded model's family cannot take, or one not patchable (the API key, the bind addresses, the Playground), refuses the **whole** patch, nothing in it applied. `switch.known_models` adds to the models already known.\n\nA `null` removes the key (JSON merge patch): in a family's section, that family's own value, so the group's applies to it again; at a group key, the group's value, so the profile's or the hardcoded default applies — or a flag or an env var that sets the field, which outranks the file (named in `shadowed_at_restart`). The value in force after a removal is the one a start from the rewritten file resolves; the file loses the key, and a family section or group left empty with it. A removal of a key nothing sets changes nothing. Only a field may be `null`, not a whole group or section.\n\nApplied one way, never two. When nothing the patch changes for the loaded model needs a reload — its fields take effect live (the request timeout, the message policies, the thinking defaults, the model switch's own knobs), or the reload fields it names resolve as before for the loaded model's family (a value in the other family's section, a group value the loaded family overrides in its own) — it takes effect at once, no model touched: `200`, with the configuration now running; a value for the other family is used when that family next loads. When a reload field resolves differently for the loaded model, the whole patch — its other fields included — goes through a reload of the loaded model with the patched configuration: the same switch `POST /v1/models/switch` runs, `202` at once, every other `/v1` route answering `503 model_switching` until it lands, and `GET /v1/models` reporting it. A reload that fails leaves the previous model serving with the previous configuration.\n\nA change is written to the config file in use once it has taken — at once, or when the reloaded model serves — keeping every other key in the file. With no config file in use it still applies, and `persisted: false` says why. `shadowed_at_restart` names the fields a flag or an env var also sets: they outrank the file at the next start.",
+    description = "The body is a partial config document in the config file's own shape — only the fields being changed, a `qwen38` / `qwen38flashnext` section for a family's own value. Each value is checked as the config file's would be; a field the loaded model's family cannot take, or one not patchable (the API key, the bind addresses, the Playground), refuses the **whole** patch, nothing in it applied. `switch.known_models` adds to the models already known.\n\nA `null` removes the key (JSON merge patch): in a family's section, that family's own value, so the group's applies to it again; at a group key, the group's value, so the profile's or the hardcoded default applies — or a flag or an env var that sets the field, which outranks the file (named in `shadowed_at_restart`). The value in force after a removal is the one a start from the rewritten file resolves; the file loses the key, and a family section or group left empty with it. A removal of a key nothing sets changes nothing. Only a field may be `null`, not a whole group or section.\n\nApplied one way, never two. When nothing the patch changes for the loaded model needs a reload — its fields take effect live (the request timeout, the message policies, the thinking defaults, the model switch's own knobs), or the reload fields it names resolve as before for the loaded model's family (a value in the other family's section, a group value the loaded family overrides in its own) — it takes effect at once, no model touched: `200`, with the configuration now running; a value for the other family is used when that family next loads. When a reload field resolves differently for the loaded model, the whole patch — its other fields included — goes through a reload of the loaded model with the patched configuration: the same switch `POST /v1/models/switch` runs, `202` at once, every other `/v1` route answering `503 model_switching` until it lands, and `GET /v1/models` reporting it. A reload that fails leaves the previous model serving with the previous configuration.\n\nA change is written to the config file in use once it has taken — at once, or when the reloaded model serves — keeping every other key in the file. With no config file in use it still applies, and `persisted: false` says why. `shadowed_at_restart` names the fields a flag or an env var also sets — for a group key, a model family's own `--<family>-…` flag or `IGNIS_<FAMILY>_…` variable too: they outrank the file at the next start.",
     request_body(content = ConfigDocument, description = "The fields to change, nested as the config file nests them."),
     responses(
         (status = 200, description = "Applied live.", body = PatchApplied),
@@ -830,5 +847,36 @@ mod tests {
             shadowed_at_restart(&patch, &running),
             ["model.thinking_budget (set by IGNIS_MODEL_THINKING_BUDGET)", "server.request_timeout (set by --server-request-timeout)"]
         );
+    }
+
+    /// Spec playground/05 AC 30: a group key written to the file is
+    /// outranked at the next start, for a family, by that family's own flag
+    /// or env var — so each is named, once, beside a general one; a family's
+    /// key only by its own family's and the general ones.
+    #[test]
+    fn a_family_flag_or_env_var_that_outranks_a_patched_group_value_is_named() {
+        let files = MemFiles::with(&[("c.yaml", "server: {}\n")]);
+        let env = &[("IGNIS_QWEN38FLASHNEXT_REUSE_KV_HOST_POOL_BYTES", "1G")];
+        let running = on_file(&files, &["--config", "c.yaml", "--qwen38-reuse-kv-host-pool-bytes", "5G"], env);
+        let shadowed = |body: Value| shadowed_at_restart(&read_patch(&body).unwrap(), &running);
+        assert_eq!(
+            shadowed(json!({ "reuse": { "kv_host_pool_bytes": "3G" } })),
+            [
+                "reuse.kv_host_pool_bytes (set by --qwen38-reuse-kv-host-pool-bytes)",
+                "reuse.kv_host_pool_bytes (set by IGNIS_QWEN38FLASHNEXT_REUSE_KV_HOST_POOL_BYTES)"
+            ]
+        );
+        assert_eq!(
+            shadowed(json!({ "reuse": { "qwen38flashnext": { "kv_host_pool_bytes": null } } })),
+            ["reuse.qwen38flashnext.kv_host_pool_bytes (set by IGNIS_QWEN38FLASHNEXT_REUSE_KV_HOST_POOL_BYTES)"],
+            "the other family's flag is not this key's"
+        );
+        let general = on_file(&files, &["--config", "c.yaml", "--reuse-kv-host-pool-bytes", "6G", "--qwen38-reuse-kv-host-pool-bytes", "5G"], &[]);
+        assert_eq!(
+            shadowed_at_restart(&read_patch(&json!({ "reuse": { "kv_host_pool_bytes": "3G" } })).unwrap(), &general),
+            ["reuse.kv_host_pool_bytes (set by --reuse-kv-host-pool-bytes)", "reuse.kv_host_pool_bytes (set by --qwen38-reuse-kv-host-pool-bytes)"],
+            "the general flag once, for the shared value and every family without its own"
+        );
+        assert!(shadowed(json!({ "reuse": { "prompt": false } })).is_empty(), "nothing sets it");
     }
 }

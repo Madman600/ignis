@@ -1052,6 +1052,24 @@ async fn a_family_only_value_in_the_file_is_replaced_and_removed_at_its_group_ke
     assert_eq!(running.settings(), started(&argv).for_family(ModelFamily::FlashNext).unwrap().settings());
 }
 
+/// Spec playground/05 AC 30: a patched group value reaches the 27B while the
+/// server runs, over the 27B's own flag; the answer names that flag, since a
+/// start from the rewritten file runs the flag's value again.
+#[tokio::test]
+async fn a_family_flag_that_outranks_a_patched_group_value_at_restart_is_named() {
+    let path = config_file("shadowed-family-flag", "server:\n  request_timeout: 30\n");
+    let argv = ["--config", path.to_str().unwrap(), "--profile", "none", "--qwen38-vram-headroom-bytes", "1G"];
+    let loader = MockLoader::new();
+    let server = qwen_server(&loader, &argv);
+    let app = server.app();
+    let applied = patched(&app, json!({ "vram": { "headroom_bytes": "2G" } })).await;
+    assert_eq!(applied["applied"], "reload", "{applied}");
+    assert_eq!(applied["shadowed_at_restart"], json!(["vram.headroom_bytes (set by --qwen38-vram-headroom-bytes)"]), "{applied}");
+    assert_eq!(server.config.as_ref().unwrap().current().settings().vram.headroom_bytes, 2 << 30, "the patch runs");
+    let restarted = started(&argv).for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert_eq!(restarted.settings().vram.headroom_bytes, 1 << 30, "the flag's value at the next start");
+}
+
 /// Spec playground/05 AC 28: the origins answer as `GET /v1/config` does —
 /// during a switch, behind the API key, the preflight passed — and `501` on
 /// a server with no running configuration.
