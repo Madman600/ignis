@@ -5,7 +5,7 @@
 <h1 align="center">Ignis</h1>
 
 <p align="center">
-  <b>A single-GPU inference engine for Qwen3.8-27B, built for the load an agent makes.</b>
+  <b>A single-GPU inference engine for Qwen3.8 (the 27B and the 125B Flash-Next MoE), built for the load an agent makes.</b>
 </p>
 
 <p align="center">
@@ -15,17 +15,19 @@
 <p align="center">
   <img alt="license Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-d94b1f?style=flat-square">
   <img alt="target SM120a" src="https://img.shields.io/badge/target-SM120a%20%2F%20RTX%205090%20%7C%20RTX%20PRO%206000-d94b1f?style=flat-square">
-  <img alt="model Qwen3.8-27B NVFP4" src="https://img.shields.io/badge/model-Qwen3.8--27B%20NVFP4-d94b1f?style=flat-square">
+  <img alt="models Qwen3.8-27B NVFP4 and Qwen3.8-Flash-Next" src="https://img.shields.io/badge/models-Qwen3.8--27B%20NVFP4%20%7C%20Flash--Next%20125B%20MoE-d94b1f?style=flat-square">
   <img alt="API OpenAI-compatible" src="https://img.shields.io/badge/API-OpenAI--compatible-d94b1f?style=flat-square">
   <br>
   <a href="https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer"><img alt="weights on Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20weights-Qwen3.8--27B%20NVFP4%20%2B%20DFlash2-ffb000?style=flat-square"></a>
   <a href="https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer"><img alt="uncensored weights on Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20weights-uncensored%20(abliterated)-ffb000?style=flat-square"></a>
+  <a href="https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis"><img alt="Flash-Next weights on Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20weights-Qwen3.8--Flash--Next%20trellis%202.5%20bpw-ffb000?style=flat-square"></a>
 </p>
 
 <table align="center">
   <tr>
     <td align="center"><b>367 tok/s</b><br><sub>one lane, coding prompts</sub></td>
     <td align="center"><b>1,065 tok/s</b><br><sub>eight lanes, aggregate</sub></td>
+    <td align="center"><b>~100 tok/s</b><br><sub>Flash-Next 125B MoE, one lane</sub></td>
     <td align="center"><b>7.11x</b><br><sub>KV capacity of BF16</sub></td>
     <td align="center"><b>~36 ms</b><br><sub>a decision, zero tokens decoded</sub></td>
     <td align="center"><b>512K</b><br><sub>context, YaRN x2</sub></td>
@@ -49,6 +51,16 @@ evidence, not an afterthought; and a decision can be answered without
 generating a single token. A Playground, a live Monitor and Prometheus
 metrics ship in the binary.
 
+It also serves **Qwen3.8-Flash-Next**, the 125B MoE with 6B active, on the
+same 32 GB card. Its 48 × 512 experts are re-quantized to a trellis code at 2.5
+bits per weight on average (2 to 4 bits per expert, from calibration error); a
+VRAM cache holds the hot ones and the rest stream from pinned host RAM, about
+**100 tok/s at one lane on a PCIe 3.0 board**
+([weights and numbers](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis)).
+The server switches between the two models without a restart, and unloads an
+idle one after five minutes so the card is free for other work; the next
+request loads it again.
+
 Rust owns everything above the *step* — scheduling, admission, KV accounting,
 serving. The forward pass and all GPU compute live in a C++/CUDA static
 library behind a flat, device-resident step-level C ABI. The engine is its own
@@ -68,15 +80,19 @@ ignis-server --model-max-context 524288 --model-rope-scaling yarn:2 \
   --spec-backend dflash2 --spec-draft-tokens 7 --vision-enabled --server-metrics
 ```
 
-No model yet? It offers to fetch one. Those flags turn on what the bare
-`ignis-server` leaves off: the 512K context (it starts at 40,960), DFlash2
-speculative decoding, image input, and the Prometheus metrics the Playground's
-Monitor reads.
+No model yet? It offers to fetch one. Those flags are what `make` serves: the
+512K context, DFlash2 speculative decoding, image input, and the Prometheus
+metrics the Playground's Monitor reads. A bare `ignis-server` already gets
+DFlash2 and image input from the built-in `rtx5090` profile, with a 768K
+context (YaRN x4), but not the metrics. Flash-Next is `--model-id
+qwen3.8-flash-next`; the flags `make` serves it with are on its
+[weights card](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis).
 
 Then the OpenAI API is on <http://127.0.0.1:8000/v1>, the Playground and its
 Monitor on <http://127.0.0.1:8000/ui/>, and Prometheus on
-<http://127.0.0.1:9464/metrics>. The weights are on Hugging Face in two flavours,
-the standard one and an uncensored one: [The weights](#the-weights). Everything
+<http://127.0.0.1:9464/metrics>. The weights are on Hugging Face: the 27B in two
+flavours, the standard one and an uncensored one, and Flash-Next:
+[The weights](#the-weights). Everything
 else — the container, building from a checkout, every flag — is
 [Quick start](#quick-start) and [docs/user](docs/user/README.md).
 
@@ -263,13 +279,14 @@ latency quantiles:
 
 ### The weights
 
-Two images of the same model, both on Hugging Face, both 18.07 GiB, both
-carrying the DFlash2 drafter:
+Three images on Hugging Face: two of the 27B, both 18.07 GiB, both carrying
+the DFlash2 drafter, and Flash-Next:
 
 | | Hugging Face | file |
 |---|---|---|
 | **Standard** | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer) | `qwen3_8_27b_nvfp4full-v2.ninfer` |
 | **Uncensored** | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer) | `qwen3_8_27b_nvfp4full-v2-huihui-abliterated.ninfer` |
+| **Flash-Next** (125B MoE, 67.8 GiB with its MTP companion) | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | `qwen3_8_flash_next_trellis_a25-v2.ninfer` |
 
 The server fetches the standard one by itself the first time it starts without
 a model, and checks every file's size and SHA-256 before using it. To download
@@ -279,6 +296,7 @@ network:
 ```
 ignis-server model download qwen3.8-27b
 ignis-server model download qwen3.8-27b-abliterated
+ignis-server model download qwen3.8-flash-next
 ```
 
 The uncensored image is the standard one with the
