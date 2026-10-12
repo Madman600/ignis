@@ -1,7 +1,8 @@
 import type { ModelState } from "../api/model.ts";
 import { IconClose } from "../ui/icons.tsx";
 import { ConfigForm } from "./ConfigForm.tsx";
-import { changes, drainTimeout, needsReload, primaryLabel, waiting as waitingFor, waitingLine } from "./form.ts";
+import { actionInk, actionShape } from "../ui/classes.ts";
+import { changes, drainTimeout, familiesOf, needsReload, primaryLabel, waitingForOthers, waitingLine } from "./form.ts";
 import { ModelBand } from "./ModelBand.tsx";
 import { drainNote, type Line } from "./outcome.ts";
 import { runningFamily } from "./band.ts";
@@ -47,6 +48,8 @@ export function ServerView({
         <ConfigForm
           fields={state.fields}
           config={state.config}
+          origins={state.origins}
+          catalog={state.catalog}
           family={family}
           draft={state.draft}
           marked={state.marked}
@@ -89,8 +92,11 @@ function Dock({
 }) {
   const fields = state.fields.state === "ok" ? state.fields.value : [];
   const config = state.config.state === "ok" ? state.config.value : null;
-  const reload = needsReload(state.draft, fields, config, family);
-  const later = waitingFor(state.draft, fields, config, family);
+  const origins = state.origins.state === "ok" ? state.origins.value : null;
+  const catalog = state.catalog.state === "ok" ? state.catalog.value : null;
+  const basis = { fields, doc: config, origins, family, families: familiesOf(fields, catalog, family) };
+  const reload = needsReload(state.draft, basis);
+  const later = waitingForOthers(state.draft, basis);
   const id = model.state === "ready" ? model.id : model.state === "switching" ? model.from : (state.pending?.id ?? "the model");
   // Every route but GET answers 503 while a switch runs, so the action waits for it to land.
   const waiting =
@@ -140,9 +146,7 @@ function Dock({
               type="button"
               onClick={actions.apply}
               disabled={blocked}
-              className={`cut px-4 py-2 font-display text-[13px] font-semibold [--cut-size:8px] disabled:cursor-not-allowed disabled:opacity-50 ${
-                reload ? "heat-fill hover:brightness-110" : "bg-ink text-ground hover:bg-ember"
-              }`}
+              className={`${actionShape} px-4 py-2 [--cut-size:8px] ${reload ? "heat-fill hover:brightness-110" : actionInk}`}
             >
               {state.applying ? "Applying…" : primaryLabel(reload, id)}
             </button>

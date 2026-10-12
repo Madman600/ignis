@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { CONFIG, FIELDS } from "./fixture.ts";
+import { CATALOG, CONFIG, FIELDS, ORIGINS } from "./fixture.ts";
 import {
   changes,
   controlFor,
   type Draft,
   drainTimeout,
   editDraft,
+  type Basis,
+  familiesOf,
   familyName,
   firstSentence,
   namedKeys,
@@ -19,10 +21,10 @@ import {
   rowMode,
   rowView,
   shownOf,
-  waiting,
+  waitingForOthers,
   waitingLine,
 } from "./form.ts";
-import type { FieldDecl } from "./routes.ts";
+import type { FieldDecl, OriginRow } from "./routes.ts";
 
 // The Server view's form (spec playground/05 §Configuration, §Applying): the
 // control a declaration calls for, the value in force, and the draft that
@@ -36,9 +38,15 @@ const field = (key: string): FieldDecl => {
 
 /** Edit `key` to `value` in `scope` (the 27B's by default; `null` is "All models"), as a row does. */
 const edit = (draft: Draft, key: string, value: string | boolean, scope: string | null = "qwen38") =>
-  editDraft(draft, field(key), rowView(field(key), CONFIG, scope).inForce, value);
+  editDraft(draft, field(key), rowView(field(key), CONFIG, ORIGINS, scope).inForce, value);
 
-const view = (key: string, scope: string | null) => rowView(field(key), CONFIG, scope);
+const view = (key: string, scope: string | null, origins: OriginRow[] | null = ORIGINS) => rowView(field(key), CONFIG, origins, scope);
+
+/** The origins with the row of `key` in `scope` replaced. */
+const withRow = (key: string, scope: string, row: Partial<OriginRow>): OriginRow[] =>
+  ORIGINS.map((r) => (r.key === key && r.scope === scope ? { ...r, ...row } : r));
+
+const basis = (family: string | null, origins: OriginRow[] | null = ORIGINS): Basis => ({ fields: FIELDS, doc: CONFIG, origins, family, families: familiesOf(FIELDS, CATALOG, family) });
 
 describe("controlFor", () => {
   it("is the switch for a bool, segments up to four values, a select past that, else a text field", () => {
@@ -89,11 +97,58 @@ describe("rowMode", () => {
 
 describe("rowView", () => {
   it("in a family's scope reads a scoped field from its section when it has one, else the group's, and says which", () => {
-    expect(view("model.max_context", "qwen38")).toMatchObject({ inForce: { value: 786432, scope: "qwen38" }, shared: 40960, note: { kind: "scoped", own: true } });
+    expect(view("model.max_context", "qwen38")).toMatchObject({ inForce: { value: 786432, scope: "qwen38" }, shared: 40960, note: { kind: "scoped", origin: { kind: "own" } } });
     expect(view("model.max_context", "qwen38flashnext").inForce).toEqual({ value: 589824, scope: "qwen38flashnext" });
     // No own value: the group's, and an edit still goes to the family's section.
-    expect(view("model.kv_format", "qwen38")).toMatchObject({ inForce: { value: "hq-e8-2b", scope: "qwen38" }, note: { kind: "scoped", own: false } });
-    expect(view("spec.backend", "qwen38flashnext")).toMatchObject({ inForce: { value: null, scope: "qwen38flashnext" }, note: { kind: "scoped", own: false } });
+    expect(view("model.kv_format", "qwen38")).toMatchObject({ inForce: { value: "hq-e8-2b", scope: "qwen38" }, note: { kind: "scoped", origin: { kind: "shared" } } });
+    expect(view("spec.backend", "qwen38flashnext")).toMatchObject({ inForce: { value: null, scope: "qwen38flashnext" }, note: { kind: "scoped", origin: { kind: "shared" } } });
+  });
+
+  it("reads a family's value by its origin: the profile's and a flag's are neither own nor removable", () => {
+    const profile = view("vram.headroom_bytes", "qwen38");
+    expect(profile).toMatchObject({ inForce: { value: "1200M", scope: "qwen38" }, shared: "1536M", note: { kind: "scoped", origin: { kind: "profile", name: "rtx5090" } } });
+    expect(noteLines(profile, undefined)).toEqual(["From profile rtx5090"]);
+    expect(canUseShared(profile, undefined)).toBe(false);
+    // An edit of it is the family's own value from then on.
+    expect(noteLines(profile, edit({}, "vram.headroom_bytes", "1G")["vram.qwen38.headroom_bytes"])).toEqual(["Own value"]);
+
+    const flagged = view("vram.headroom_bytes", "qwen38", withRow("vram.headroom_bytes", "qwen38", { source: "flag", spelling: "--qwen38-vram-headroom-bytes" }));
+    expect(noteLines(flagged, undefined)).toEqual(["Set by --qwen38-vram-headroom-bytes"]);
+    expect(canUseShared(flagged, undefined)).toBe(false);
+    const env = view("vram.headroom_bytes", "qwen38", withRow("vram.headroom_bytes", "qwen38", { source: "env", spelling: "IGNIS_QWEN38_VRAM_HEADROOM_BYTES" }));
+    expect(noteLines(env, undefined)).toEqual(["Set by IGNIS_QWEN38_VRAM_HEADROOM_BYTES"]);
+
+    // Only a file or live value is the operator's own.
+    for (const source of ["file", "live"] as const) {
+      const own = view("vram.headroom_bytes", "qwen38", withRow("vram.headroom_bytes", "qwen38", { source }));
+      expect(noteLines(own, undefined)).toEqual(["Own value"]);
+      expect(canUseShared(own, undefined)).toBe(true);
+    }
+  });
+
+  it("shows an own value equal to the shared one as own, which the file's shape alone cannot", () => {
+    // GET /v1/config leaves the 27B's kv_format out of its section when it equals the shared one; the origins still say it is the file's.
+    const own = withRow("model.kv_format", "qwen38", { source: "file", scoped: true });
+    const kv = view("model.kv_format", "qwen38", own);
+    expect(kv.inForce).toEqual({ value: "hq-e8-2b", scope: "qwen38" });
+    expect(noteLines(kv, undefined)).toEqual(["Own value"]);
+    expect(canUseShared(kv, undefined)).toBe(true);
+    expect(noteLines(view("model.kv_format", null, own), undefined)).toEqual(["Qwen3.8-27B has its own value: hq-e8-2b"]);
+  });
+
+  it("without the origins reads the file's shape alone: a family section is the family's own", () => {
+    expect(noteLines(view("model.max_context", "qwen38", null), undefined)).toEqual(["Own value"]);
+    expect(noteLines(view("model.kv_format", "qwen38", null), undefined)).toEqual(["Shared"]);
+    expect(noteLines(view("model.max_context", null, null), undefined)).toEqual(["Qwen3.8-27B has its own value: 786432", "Qwen3.8-Flash-Next has its own value: 589824"]);
+  });
+
+  it("in All models says what a shared edit does to each family with a value of its own", () => {
+    // The profile's value is replaced by a shared edit; a flag's or an env var's value is named.
+    expect(noteLines(view("vram.headroom_bytes", null), undefined)).toEqual(["Replaces the profile's 1200M for Qwen3.8-27B"]);
+    const flagged = withRow("vram.headroom_bytes", "qwen38", { source: "flag", spelling: "--qwen38-vram-headroom-bytes" });
+    expect(noteLines(view("vram.headroom_bytes", null, flagged), undefined)).toEqual(["Qwen3.8-27B is set by --qwen38-vram-headroom-bytes"]);
+    // A family on the shared value is not named.
+    expect(noteLines(view("vram.allow_oversubscription", null), undefined)).toEqual([]);
   });
 
   it("in All models shows and edits the group value, and names each family that has its own", () => {
@@ -124,8 +179,8 @@ describe("rowView", () => {
   });
 
   it("has no value without a configuration", () => {
-    expect(rowView(field("server.request_timeout"), null, "qwen38").inForce).toEqual({ value: undefined, scope: null });
-    expect(rowView(field("model.max_context"), null, null).note).toBeNull();
+    expect(rowView(field("server.request_timeout"), null, null, "qwen38").inForce).toEqual({ value: undefined, scope: null });
+    expect(rowView(field("model.max_context"), null, null, null).note).toBeNull();
   });
 
   it("marks a pending edit as an own value, and a pending removal as a return to the shared one", () => {
@@ -204,8 +259,8 @@ describe("patchBody", () => {
 });
 
 describe("the reload a draft causes", () => {
-  const reload = (draft: Draft, family: string | null = "qwen38") => needsReload(draft, FIELDS, CONFIG, family);
-  const waits = (draft: Draft, family: string | null = "qwen38") => waiting(draft, FIELDS, CONFIG, family);
+  const reload = (draft: Draft, family: string | null = "qwen38", origins: OriginRow[] | null = ORIGINS) => needsReload(draft, basis(family, origins));
+  const waits = (draft: Draft, family: string | null = "qwen38") => waitingForOthers(draft, basis(family));
 
   it("reloads for a reload_required value that resolves differently for the running family", () => {
     expect(reload(edit({}, "model.max_context", "524288"))).toBe(true);
@@ -243,6 +298,29 @@ describe("the reload a draft causes", () => {
     expect(reload(backend, "qwen38flashnext")).toBe(true);
   });
 
+  it("reloads for a shared edit of a value the profile gave the running family, which the edit replaces", () => {
+    // rtx5090 gives the 27B headroom 1200M; the patched shared value outranks it.
+    const headroom = edit({}, "vram.headroom_bytes", "1G", null);
+    expect(reload(headroom)).toBe(true);
+    expect(waits(headroom)).toEqual([]);
+    // A flag's value or an env var's is replaced the same way, until restart.
+    for (const source of ["flag", "env"] as const) {
+      expect(reload(headroom, "qwen38", withRow("vram.headroom_bytes", "qwen38", { source, spelling: "x" }))).toBe(true);
+    }
+    // Replaced by the value it already has, nothing changes for the model.
+    expect(reload(edit({}, "vram.headroom_bytes", "1200M", null))).toBe(false);
+  });
+
+  it("does not reload for a shared edit the running family's own value outranks, hidden from the file's shape or not", () => {
+    // The 27B's own kv_format equals the shared one, so GET /v1/config shows no section: only the origins say it is the file's.
+    const own = withRow("model.kv_format", "qwen38", { source: "file", scoped: true });
+    const draft = edit({}, "model.kv_format", "bf16", null);
+    expect(reload(draft, "qwen38", own)).toBe(false);
+    expect(reload(draft, "qwen38", ORIGINS)).toBe(true);
+    expect(reload(draft, "qwen38flashnext", own)).toBe(true);
+    expect(waitingForOthers(draft, basis("qwen38", own))).toEqual([{ family: "qwen38flashnext", keys: ["model.kv_format"] }]);
+  });
+
   it("reloads for a removal of the running family's own value when the shared one differs", () => {
     expect(reload(removeDraft({}, field("model.max_context"), "qwen38"))).toBe(true);
     expect(reload(removeDraft({}, field("spec.backend"), "qwen38"))).toBe(true);
@@ -266,7 +344,7 @@ describe("the reload a draft causes", () => {
     const draft = edit({}, "model.max_context", "524288", "qwen38flashnext");
     expect(reload(draft, null)).toBe(true);
     expect(waits(draft, null)).toEqual([]);
-    expect(needsReload(draft, FIELDS, null, "qwen38")).toBe(true);
+    expect(needsReload(draft, { ...basis("qwen38"), doc: null })).toBe(true);
   });
 });
 
@@ -275,7 +353,7 @@ describe("primaryLabel", () => {
     expect(primaryLabel(false, "qwen3.8-27b")).toBe("Apply");
     expect(primaryLabel(true, "qwen3.8-27b")).toBe("Apply and reload qwen3.8-27b");
     // A cleared reload field is no change, so no reload either.
-    expect(needsReload(edit({}, "model.max_context", ""), FIELDS, CONFIG, "qwen38")).toBe(false);
+    expect(needsReload(edit({}, "model.max_context", ""), basis("qwen38"))).toBe(false);
   });
 });
 
@@ -296,9 +374,21 @@ describe("text", () => {
     expect(firstSentence(field("model.enable_thinking").description)).toEqual(["Whether a request that says nothing thinks.", ""]);
   });
 
+  it("derives the families from the declarations and the catalog, never a list kept here", () => {
+    expect(familiesOf(FIELDS, CATALOG, "qwen38")).toEqual(["qwen38", "qwen38flashnext"]);
+    expect(familiesOf([], [], null)).toEqual([]);
+    expect(familiesOf(FIELDS, null, null)).toEqual(["qwen38", "qwen38flashnext"]);
+    // The catalog names a family no declaration does, and the running one is always there.
+    const third = [...CATALOG, { id: "m", source: "known" as const, on_disk: "complete" as const, family: "qwen4", loaded: false, switchable: true }];
+    expect(familiesOf(FIELDS, third, "qwen38")).toEqual(["qwen38", "qwen38flashnext", "qwen4"]);
+    expect(familiesOf([], [], "qwen9")).toEqual(["qwen9"]);
+  });
+
   it("names the families as people do, and shows a value with no control as words", () => {
     expect(familyName("qwen38")).toBe("Qwen3.8-27B");
     expect(familyName("qwen38flashnext")).toBe("Qwen3.8-Flash-Next");
+    // A scope with no display name is shown as the server spells it.
+    expect(familyName("qwen4")).toBe("qwen4");
     expect(shownOf(null)).toBe("Not set");
     expect(shownOf(true)).toBe("On");
     expect(shownOf("127.0.0.1:8000")).toBe("127.0.0.1:8000");

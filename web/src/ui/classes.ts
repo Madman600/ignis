@@ -17,3 +17,9 @@ export const fieldLook =
   "rounded-[2px] border border-line bg-surface px-2.5 py-2 text-sm text-ink placeholder:text-ash/70 focus:border-ember focus:outline-none";
 
 export const field = `w-full ${fieldLook}`;
+
+/** The cut, face and disabled look of an action button; its size and fill are the caller's. */
+export const actionShape = "cut font-display text-[13px] font-semibold disabled:cursor-not-allowed disabled:opacity-50";
+
+/** The ink fill of a plain action, which turns to the ember on hover. */
+export const actionInk = "bg-ink text-ground hover:bg-ember";

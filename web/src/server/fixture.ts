@@ -1,4 +1,4 @@
-import type { CatalogRow, ConfigDocument, FieldDecl, Rule } from "./routes.ts";
+import type { CatalogRow, ConfigDocument, FieldDecl, OriginRow, Rule } from "./routes.ts";
 
 // What the Server view reads, as ignis serves it (spec playground/05): every
 // visible field's declaration in declaration order — taken from `ignis-server
@@ -162,6 +162,9 @@ export const FIELDS: FieldDecl[] = [
  * `GET /v1/config` on the 27B under the `rtx5090` profile: the general value
  * of every field, and a family's section wherever its value differs — a field
  * only one family takes is only ever in that family's section.
+ *
+ * The 27B's `headroom_bytes` is the profile's (1200M against the general
+ * 1536M); every other family value is the operator's own, in the file.
  */
 export const CONFIG: ConfigDocument = {
   server: {
@@ -194,6 +197,7 @@ export const CONFIG: ConfigDocument = {
     headroom_bytes: "1536M",
     budget_bytes: null,
     allow_oversubscription: false,
+    qwen38: { headroom_bytes: "1200M" },
     qwen38flashnext: { allow_expert_cache_below_floor: false },
   },
   reuse: { prompt: true, retained_device: null, retained_host: null, retained_interactive_ttl: 300, kv_host_pool_bytes: "2G" },
@@ -229,3 +233,49 @@ export const CATALOG: CatalogRow[] = [
   { id: "qwen3.8-27b-dead", source: "known", on_disk: "complete", bytes: 19406942468, family: "qwen38", loaded: false, switchable: true },
   { id: "qwen3.8-27b-fail", source: "known", on_disk: "complete", bytes: 19406942468, family: "qwen38", loaded: false, switchable: true },
 ];
+
+/** The families the fixture's server declares. */
+export const SCOPES = ["qwen38", "qwen38flashnext"];
+
+/** Where a value was set, by `<group>.<name>` or `<group>.<family>.<name>`; a value not named here is the file's, or the default's. */
+export type Provenance = Record<string, { source: OriginRow["source"]; spelling?: string }>;
+
+export const PROVENANCE: Provenance = {
+  "vram.qwen38.headroom_bytes": { source: "profile", spelling: "rtx5090" },
+  "model.thinking_budget": { source: "env", spelling: "IGNIS_MODEL_THINKING_BUDGET" },
+};
+
+const CONFIG_PATH = "ignis.yaml";
+
+/**
+ * `GET /v1/config/origins` for a configuration: a row per visible field and
+ * scope, the shared one first, then each family that takes the field. `doc`
+ * holds every family value, also one equal to the shared one, which is why
+ * the server's own answer could not tell it from a shared one.
+ */
+export function originRows(fields: FieldDecl[], doc: ConfigDocument, from: Provenance): OriginRow[] {
+  const rows: OriginRow[] = [];
+  for (const decl of fields) {
+    const only = decl.families?.length === 1;
+    for (const scope of only ? decl.families! : [null, ...(decl.families ?? SCOPES)]) {
+      const section = scope === null ? undefined : doc[decl.group]?.[scope];
+      const own = section !== null && typeof section === "object" && decl.name in (section as object);
+      const key = scope === null ? `${decl.group}.${decl.name}` : `${decl.group}.${scope}.${decl.name}`;
+      const sharedKey = `${decl.group}.${decl.name}`;
+      const set = from[key] ?? (own ? undefined : scope === null ? undefined : from[sharedKey]);
+      const value = own ? (section as Record<string, unknown>)[decl.name] : doc[decl.group]?.[decl.name];
+      const source = set?.source ?? (JSON.stringify(value ?? null) === JSON.stringify(decl.default ?? null) ? "default" : "file");
+      rows.push({
+        key: decl.file_key,
+        scope,
+        source,
+        scoped: own,
+        ...(set?.spelling ? { spelling: set.spelling } : source === "file" ? { spelling: `${own ? key : sharedKey} in ${CONFIG_PATH}` } : {}),
+      });
+    }
+  }
+  return rows;
+}
+
+/** `GET /v1/config/origins` for the fixture's configuration. */
+export const ORIGINS: OriginRow[] = originRows(FIELDS, CONFIG, PROVENANCE);

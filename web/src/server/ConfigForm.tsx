@@ -20,7 +20,7 @@ import {
   shownOf,
   textOf,
 } from "./form.ts";
-import type { ConfigDocument, FieldDecl } from "./routes.ts";
+import type { CatalogRow, ConfigDocument, FieldDecl, OriginRow } from "./routes.ts";
 import type { Loaded } from "./useServer.ts";
 
 // The running configuration as a form (spec playground/05 §Configuration):
@@ -44,6 +44,8 @@ export type RowEdits = {
 export function ConfigForm({
   fields,
   config,
+  origins,
+  catalog,
   family,
   draft,
   marked,
@@ -52,6 +54,10 @@ export function ConfigForm({
 }: {
   fields: Loaded<FieldDecl[]>;
   config: Loaded<ConfigDocument>;
+  /** Where each value comes from; the rows read the file's shape alone until it is read, or when the server has no such route. */
+  origins: Loaded<OriginRow[]>;
+  /** Names the families whose artifacts the server can load. */
+  catalog: Loaded<CatalogRow[]>;
   /** The running family's scope name, from the catalog's loaded row; unknown without it. */
   family: string | null;
   draft: Draft;
@@ -75,7 +81,7 @@ export function ConfigForm({
         </div>
         {config.state === "ok" && <ConfigFileButton />}
       </div>
-      <Body fields={fields} config={config} family={family} scope={scope} onScope={setPicked} draft={draft} marked={marked} {...edits} />
+      <Body fields={fields} config={config} origins={origins} catalog={catalog} family={family} scope={scope} onScope={setPicked} draft={draft} marked={marked} {...edits} />
     </section>
   );
 }
@@ -107,6 +113,8 @@ function ScopeSelector({ families, running, scope, onScope }: { families: string
 function Body({
   fields,
   config,
+  origins,
+  catalog,
   family,
   scope,
   onScope,
@@ -126,7 +134,7 @@ function Body({
   const jump = (group: string) => document.getElementById(`server-group-${group}`)?.scrollIntoView({ block: "start" });
   return (
     <div className="flex flex-col gap-3">
-      <ScopeSelector families={familiesOf(fields.value, family)} running={family} scope={scope} onScope={onScope} />
+      <ScopeSelector families={familiesOf(fields.value, catalog.state === "ok" ? catalog.value : null, family)} running={family} scope={scope} onScope={onScope} />
       <div className="lg:grid lg:grid-cols-[11rem_minmax(0,1fr)] lg:items-start lg:gap-6">
         <nav aria-label="Configuration groups" className="sticky top-4 hidden lg:block">
           <ul className="flex flex-col">
@@ -166,6 +174,7 @@ function Body({
                     key={decl.file_key}
                     decl={decl}
                     config={config.value}
+                    origins={origins.state === "ok" ? origins.value : null}
                     scope={scope}
                     draft={draft}
                     marked={marked.includes(decl.file_key)}
@@ -187,6 +196,7 @@ function Notice({ children }: { children: ReactNode }) {
 function FieldRow({
   decl,
   config,
+  origins,
   scope,
   draft,
   marked,
@@ -196,12 +206,13 @@ function FieldRow({
 }: {
   decl: FieldDecl;
   config: ConfigDocument;
+  origins: OriginRow[] | null;
   /** The scope the form shows: a family's scope name, or `null` for "All models". */
   scope: string | null;
   draft: Draft;
   marked: boolean;
 } & RowEdits) {
-  const view = rowView(decl, config, scope);
+  const view = rowView(decl, config, origins, scope);
   const { mode, inForce } = view;
   const entry = draft[draftKey(decl.group, decl.name, inForce.scope)];
   // A removal on its way out shows the shared value the family returns to.
@@ -356,7 +367,7 @@ function Control({
     case "switch":
       return (
         <div className="md:flex md:justify-end">
-          <Switch on={value === true} onChange={(on) => onEdit(on)} labelledBy={nameId} />
+          <Switch on={value === true} onChange={onEdit} labelledBy={nameId} />
         </div>
       );
     case "segmented":
@@ -367,7 +378,7 @@ function Control({
           name={decl.file_key}
           value={chosen(control.options)}
           options={control.options.map((option) => ({ value: option, label: option }))}
-          onChange={(option) => onEdit(option)}
+          onChange={onEdit}
         />
       );
     case "select": {

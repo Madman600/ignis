@@ -1,8 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { ModelState } from "../api/model.ts";
-import { CATALOG, CONFIG, FIELDS } from "./fixture.ts";
-import { ConfigFileDialog, FILE_NOTE } from "./ConfigFile.tsx";
+import { CATALOG, CONFIG, FIELDS, ORIGINS } from "./fixture.ts";
+import { ConfigFileDialog, FILE_NOTE, INITIAL_FOCUS } from "./ConfigFile.tsx";
 import { ConfigForm } from "./ConfigForm.tsx";
 import { type Draft, editDraft, removeDraft, rowView } from "./form.ts";
 import type { FieldDecl } from "./routes.ts";
@@ -21,6 +21,7 @@ const actions: ServerActions = { load: () => {}, edit: () => {}, remove: () => {
 const base: ServerState = {
   fields: { state: "ok", value: FIELDS },
   config: { state: "ok", value: CONFIG },
+  origins: { state: "ok", value: ORIGINS },
   catalog: { state: "ok", value: CATALOG },
   draft: {},
   marked: [],
@@ -36,7 +37,7 @@ const render = (state: Partial<ServerState> = {}, model: ModelState = ready, str
 
 const decl = (key: string): FieldDecl => FIELDS.find((f) => f.file_key === key)!;
 const edit = (draft: Draft, key: string, value: string | boolean, scope: string | null = "qwen38") =>
-  editDraft(draft, decl(key), rowView(decl(key), CONFIG, scope).inForce, value);
+  editDraft(draft, decl(key), rowView(decl(key), CONFIG, ORIGINS, scope).inForce, value);
 
 /** The configuration form alone, opened on `scope` (`null` is "All models"). */
 const renderForm = (scope: string | null, draft: Draft = {}) =>
@@ -44,6 +45,8 @@ const renderForm = (scope: string | null, draft: Draft = {}) =>
     <ConfigForm
       fields={base.fields}
       config={base.config}
+      origins={base.origins}
+      catalog={base.catalog}
       family="qwen38"
       initialScope={scope}
       draft={draft}
@@ -252,6 +255,47 @@ describe("ServerView: the configuration in each scope", () => {
     expect(rowOf(html, "spec.backend")).toContain("Shared");
   });
 
+  it("labels a family's value by its origin, and offers the way back only for the operator's own", () => {
+    const html = renderForm("qwen38");
+    const headroom = rowOf(html, "vram.headroom_bytes");
+    expect(headroom).toContain("From profile rtx5090");
+    expect(headroom).not.toContain("Use shared value");
+    expect(headroom).toMatch(/<input[^>]*value="1200M"/);
+    // An own value equal to the shared one is shown as own, offering the way back.
+    const equal = renderToStaticMarkup(
+      <ConfigForm
+        fields={base.fields}
+        config={base.config}
+        origins={{ state: "ok", value: ORIGINS.map((r) => (r.key === "model.kv_format" && r.scope === "qwen38" ? { ...r, scoped: true, source: "file" as const } : r)) }}
+        catalog={base.catalog}
+        family="qwen38"
+        initialScope="qwen38"
+        draft={{}}
+        marked={[]}
+        onEdit={actions.edit}
+        onRemove={actions.remove}
+        onUndo={actions.undo}
+      />,
+    );
+    expect(rowOf(equal, "model.kv_format")).toContain("Own value");
+    expect(rowOf(equal, "model.kv_format")).toContain("Use shared value (hq-e8-2b)");
+    // In All models the shared edit says what it does to the family.
+    expect(rowOf(renderForm(null), "vram.headroom_bytes")).toContain("Replaces the profile&#x27;s 1200M for Qwen3.8-27B");
+  });
+
+  it("offers the families the server declares, and each by its name", () => {
+    const html = renderForm(null);
+    expect(html).toContain("All models");
+    expect(html).toContain("Qwen3.8-27B (running)");
+    expect(html).toContain("Qwen3.8-Flash-Next");
+    // A family only the catalog names is offered too, under the scope's own name.
+    const third: ServerState["catalog"] = { state: "ok", value: [...CATALOG, { id: "m", source: "known", on_disk: "complete", family: "qwen4", loaded: false, switchable: true }] };
+    const withThird = renderToStaticMarkup(
+      <ConfigForm fields={base.fields} config={base.config} origins={base.origins} catalog={third} family="qwen38" draft={{}} marked={[]} onEdit={actions.edit} onRemove={actions.remove} onUndo={actions.undo} />,
+    );
+    expect(withThird).toContain(">qwen4<");
+  });
+
   it("shows a pending edit as an own value, and a pending removal as the shared value it returns to", () => {
     const kv = rowOf(renderForm("qwen38", edit({}, "model.kv_format", "bf16")), "model.kv_format");
     expect(kv).toContain("Own value");
@@ -288,8 +332,23 @@ describe("ServerView: the configuration file", () => {
     expect(html).toMatch(/>Download<\/button>/);
     expect(html).toContain('aria-label="Close"');
     expect(html).toContain(FILE_NOTE);
-    for (const word of ["API key", "download token", "comments", "pending draft"]) expect(FILE_NOTE).toContain(word);
+    // The note says hidden fields are left out without naming any: which ones is the server's to declare.
+    expect(FILE_NOTE).toContain("Hidden fields are not in it");
+    for (const word of ["comments", "pending draft"]) expect(FILE_NOTE).toContain(word);
+    for (const name of ["API key", "download token"]) expect(FILE_NOTE).not.toContain(name);
     expect(html).not.toContain('disabled=""');
+  });
+
+  it("opens with focus on its close button, which is never disabled, whatever state the file is in", () => {
+    for (const file of [{ state: "loading" }, { state: "error", refusal: { status: 400, message: "m" } }, { state: "ok", value: "a: 1\n" }] as const) {
+      const html = dialog(file);
+      expect(INITIAL_FOCUS).toBe('[aria-label="Close"]');
+      expect(html).toMatch(/<button type="button" aria-label="Close"[^>]*>/);
+      expect(html.match(/<button type="button" aria-label="Close"[^>]*>/)![0]).not.toContain("disabled");
+      // The dialog itself can take focus when nothing inside does.
+      expect(html).toContain('role="dialog"');
+      expect(html).toMatch(/role="dialog"[^>]*tabindex="-1"|tabindex="-1"[^>]*role="dialog"/);
+    }
   });
 
   it("holds Copy and Download until the file is read, and says why when it could not be", () => {
@@ -336,6 +395,11 @@ describe("ServerView: the dock", () => {
 
     // A group value the running family overrides is no reload either.
     expect(render({ draft: edit({}, "spec.backend", "mtp", null) })).toMatch(/>Apply<\/button>/);
+
+    // A group value over what the profile gave the running family is one: the 27B under rtx5090 and its headroom.
+    const profile = render({ draft: edit({}, "vram.headroom_bytes", "1G", null) });
+    expect(profile).toMatch(/heat-fill[^"]*">Apply and reload qwen3\.8-27b<\/button>/);
+    expect(profile).not.toContain("Takes effect when");
 
     const removal = render({ draft: removeDraft({}, decl("model.max_context"), "qwen38") });
     expect(removal).toMatch(/heat-fill[^"]*">Apply and reload qwen3\.8-27b<\/button>/);

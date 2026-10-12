@@ -7,16 +7,18 @@ import {
   type CatalogRow,
   type ConfigDocument,
   type FieldDecl,
+  type OriginRow,
   patchConfig,
   readCatalog,
   readConfig,
   readFields,
+  readOrigins,
   type Refusal,
   switchTo,
 } from "./routes.ts";
 
 // The Server view's state (spec playground/05): the declarations, the
-// running configuration and the catalog as read, the draft of changes, and
+// running configuration, where its values come from and the catalog as read, the draft of changes, and
 // the answers to "Apply" and "Load". The view renders it and nothing else,
 // so each of its states is a plain value a test can render.
 //
@@ -30,6 +32,8 @@ export type Loaded<T> = { state: "loading" } | { state: "ok"; value: T } | { sta
 export type ServerState = {
   fields: Loaded<FieldDecl[]>;
   config: Loaded<ConfigDocument>;
+  /** Where each value of `config` comes from; unread, the rows fall back to the file's shape. */
+  origins: Loaded<OriginRow[]>;
   catalog: Loaded<CatalogRow[]>;
   draft: Draft;
   /** The file keys of the rows the last refusal named. */
@@ -65,6 +69,7 @@ const sameSwitch = (a: LastSwitch | undefined, b: LastSwitch | undefined) => JSO
 export function useServer(model: ModelState, refreshModel: () => void, visible: boolean): [ServerState, ServerActions] {
   const [fields, setFields] = useState<Loaded<FieldDecl[]>>({ state: "loading" });
   const [config, setConfig] = useState<Loaded<ConfigDocument>>({ state: "loading" });
+  const [origins, setOrigins] = useState<Loaded<OriginRow[]>>({ state: "loading" });
   const [catalog, setCatalog] = useState<Loaded<CatalogRow[]>>({ state: "loading" });
   const [draft, setDraft] = useState<Draft>({});
   const [marked, setMarked] = useState<string[]>([]);
@@ -89,6 +94,7 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
       });
     }
     void readConfig().then((answer) => setConfig(loaded(answer)));
+    void readOrigins().then((answer) => setOrigins(loaded(answer)));
     void readCatalog().then((answer) => setCatalog(loaded(answer)));
   }, []);
 
@@ -189,8 +195,10 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
           setResult(after.result);
           setMarked(after.marked);
           if (after.clearDraft) setDraft({});
-          if (after.config) setConfig({ state: "ok", value: after.config });
-          else if (after.clearDraft) reread();
+          if (after.config) {
+            setConfig({ state: "ok", value: after.config });
+            void readOrigins().then((read) => setOrigins(loaded(read)));
+          } else if (after.clearDraft) reread();
           if (after.pending) {
             // The whole patch goes through a reload; the band shows it as a switch.
             setPending(after.pending);
@@ -206,7 +214,7 @@ export function useServer(model: ModelState, refreshModel: () => void, visible: 
     [draft, fieldList, refreshModel, reread],
   );
 
-  return [{ fields, config, catalog, draft, marked, result, pending, applying, loadingId, loadRefusal }, actions];
+  return [{ fields, config, origins, catalog, draft, marked, result, pending, applying, loadingId, loadRefusal }, actions];
 }
 
 const lastSwitchOf = (model: ModelState) => (model.state === "loading" ? undefined : model.lastSwitch);

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { getAuth, saveKey } from "../api/auth.ts";
-import { patchConfig, readCatalog, readConfigFile, readFields, refusalOf, switchTo } from "./routes.ts";
+import { patchConfig, readCatalog, readConfigFile, readFields, readOrigins, refusalOf, switchTo } from "./routes.ts";
 
 // The Server view's requests (spec playground/05): what each sends, and how
 // each answer is read.
@@ -29,6 +29,23 @@ describe("readConfigFile", () => {
   it("reads a refusal as the server's message", async () => {
     const answer = await readConfigFile(answering(400, { error: { message: "unknown format", code: "config_invalid" } }));
     expect(answer).toEqual({ ok: false, status: 400, message: "unknown format", code: "config_invalid" });
+  });
+});
+
+describe("readOrigins", () => {
+  it("asks GET /v1/config/origins with the key and reads the rows of the list envelope", async () => {
+    saveKey("sk-test");
+    const sent: Sent[] = [];
+    const rows = [{ key: "vram.headroom_bytes", scope: "qwen38", source: "profile", scoped: true, spelling: "rtx5090" }];
+    const answer = await readOrigins(answering(200, { object: "list", data: rows }, sent));
+    expect(answer).toEqual({ ok: true, status: 200, value: rows });
+    expect(sent[0].url).toBe("/v1/config/origins");
+    expect(sent[0].init.headers).toMatchObject({ Authorization: "Bearer sk-test" });
+  });
+
+  it("is a refusal where the server has no running configuration or no such route", async () => {
+    expect(await readOrigins(answering(501, { error: { message: "no configuration", code: "config_unavailable" } }))).toEqual({ ok: false, status: 501, message: "no configuration", code: "config_unavailable" });
+    expect(await readOrigins(answering(404, ""))).toMatchObject({ ok: false, status: 404 });
   });
 });
 

@@ -37,6 +37,23 @@ export type FieldDecl = {
 /** A config document in the file's own shape: `<group>: { <field>: value, <family>: { <field>: value } }`. */
 export type ConfigDocument = Record<string, Record<string, unknown>>;
 
+/**
+ * Where one value of one field comes from (`GET /v1/config/origins`, spec
+ * playground/05 §Follow-up 2): a row per visible field and scope, `null` for
+ * the shared value, else a family. `source` is the source of the value that
+ * resolves there, `scoped` that it was set for this family specifically, and
+ * `spelling` where, as the startup source log spells it: a flag, an env var,
+ * a file key and path, or a profile's name.
+ */
+export type OriginRow = {
+  /** `<group>.<name>`, a declaration's `file_key`. */
+  key: string;
+  scope: string | null;
+  source: "default" | "profile" | "file" | "env" | "flag" | "live";
+  scoped: boolean;
+  spelling?: string;
+};
+
 /** One model the server can switch to or fetch (`GET /v1/models/catalog`). No path: the page switches by id. */
 export type CatalogRow = {
   id: string;
@@ -103,6 +120,9 @@ const listData = <T,>(body: unknown) => ((body as { data?: T[] }).data ?? []) as
 export const readFields = (fetcher: typeof fetch = fetch) => call("/v1/config/fields", {}, listData<FieldDecl>, fetcher);
 
 export const readConfig = (fetcher: typeof fetch = fetch) => call("/v1/config", {}, (body) => body as ConfigDocument, fetcher);
+
+/** Where each value of the configuration in force comes from. */
+export const readOrigins = (fetcher: typeof fetch = fetch) => call("/v1/config/origins", {}, listData<OriginRow>, fetcher);
 
 /** The configuration in force as the file it amounts to (`?format=yaml`), as text. */
 export const readConfigFile = (fetcher: typeof fetch = fetch) => callText("/v1/config?format=yaml", {}, (text) => text, fetcher);

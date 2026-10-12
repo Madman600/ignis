@@ -1,5 +1,6 @@
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { actionInk, actionShape } from "../ui/classes.ts";
 import { FOCUSABLE, trapIndex } from "../ui/focus.ts";
 import { IconClose } from "../ui/icons.tsx";
 import { readConfigFile } from "./routes.ts";
@@ -15,9 +16,12 @@ export const FILE_NAME = "ignis.yaml";
 
 /** What the file leaves out, in one line. */
 export const FILE_NOTE =
-  "This is the configuration in force, live changes included, without the comments of the file on disk. Hidden fields (the API key, the download token) and any pending draft are not in it.";
+  "This is the configuration in force, live changes included, without the comments of the file on disk. Hidden fields are not in it, and neither is a pending draft.";
 
-const action = "cut px-3 py-1.5 font-display text-[13px] font-semibold [--cut-size:6px] bg-ink text-ground hover:bg-ember disabled:cursor-not-allowed disabled:opacity-50";
+const action = `${actionShape} ${actionInk} px-3 py-1.5 [--cut-size:6px]`;
+
+/** What takes focus when the dialog opens: its close button, which is never disabled. */
+export const INITIAL_FOCUS = '[aria-label="Close"]';
 
 /** The dialog's markup alone; `ConfigFile` gives it its behaviour. */
 export function ConfigFileDialog({
@@ -44,7 +48,8 @@ export function ConfigFileDialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby="config-file-title"
-        className="cut flex max-h-full w-full max-w-3xl flex-col gap-3 bg-surface p-4 [--cut-size:14px] md:p-5"
+        tabIndex={-1}
+        className="cut flex max-h-full w-full max-w-3xl outline-none flex-col gap-3 bg-surface p-4 [--cut-size:14px] md:p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-2">
@@ -95,7 +100,7 @@ function ConfigFileModal({ onClose, opener }: { onClose: () => void; opener: Ref
   // Focus goes into the dialog, Tab stays in it, Esc closes it, and the button that opened it gets focus back.
   useEffect(() => {
     const button = opener.current;
-    panel.current?.querySelector<HTMLElement>("button")?.focus();
+    (panel.current?.querySelector<HTMLElement>(INITIAL_FOCUS) ?? panel.current)?.focus();
     const keys = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
