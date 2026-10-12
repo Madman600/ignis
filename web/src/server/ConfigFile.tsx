@@ -1,4 +1,4 @@
-import { type RefObject, useEffect, useRef, useState } from "react";
+import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { FOCUSABLE, trapIndex } from "../ui/focus.ts";
 import { IconClose } from "../ui/icons.tsx";
@@ -133,6 +133,8 @@ function ConfigFileModal({ onClose, opener }: { onClose: () => void; opener: Ref
 export function ConfigFileButton() {
   const [open, setOpen] = useState(false);
   const button = useRef<HTMLButtonElement>(null);
+  // Stable: the modal's focus effect depends on it, and runs again (taking focus back to the button) if it changes.
+  const close = useCallback(() => setOpen(false), []);
   return (
     <>
       <button
@@ -144,7 +146,7 @@ export function ConfigFileButton() {
       >
         View as config file
       </button>
-      {open && <ConfigFileModal onClose={() => setOpen(false)} opener={button} />}
+      {open && <ConfigFileModal onClose={close} opener={button} />}
     </>
   );
 }
