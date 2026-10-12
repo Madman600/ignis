@@ -165,13 +165,30 @@ async fn an_unused_model_is_unloaded_after_its_seconds_and_keeps_its_id() {
 
     let at = until(&server, "unloaded", IDLE * 5).await - began;
     assert!(at >= IDLE, "unloaded after {at:?}, before its {IDLE:?} were up");
-    assert!(at < IDLE * 3, "unloaded after {at:?}: the clock ticks every {TICK:?}");
+    // Within a tick of its due time; a second tick and a fifth of a second
+    // are the margin a loaded test machine needs to schedule the clock.
+    let latest = IDLE + TICK * 2 + Duration::from_millis(200);
+    assert!(at < latest, "unloaded after {at:?}: the clock ticks every {TICK:?}");
     let (status, models) = send(&app, Method::GET, "/v1/models", None).await;
     assert_eq!(status, StatusCode::OK, "the API stays up: {models}");
     assert_eq!(models["status"], "unloaded", "{models}");
     assert_eq!(models["data"][0]["id"], "mock-a", "the model is named as it was");
     until_true("the unloaded model's scheduler was dropped", || loader.resident() == 0).await;
     assert!(loader.loads().is_empty());
+}
+
+/// AC 1 over the wire: `GET /v1/config/fields` lists `model.idle_unload`,
+/// patchable, with no reload, under its flag and environment variable.
+#[tokio::test]
+async fn the_fields_route_lists_idle_unload_patchable_with_no_reload() {
+    let loader = MockLoader::new();
+    let app = idle_server(&loader, loader.model("mock-a"), IDLE, &[]).app();
+    let (status, fields) = send(&app, Method::GET, "/v1/config/fields", None).await;
+    assert_eq!(status, StatusCode::OK, "{fields}");
+    let field = fields["data"].as_array().unwrap().iter().find(|field| field["file_key"] == "model.idle_unload").expect("listed");
+    assert_eq!((field["patchable"].clone(), field["reload_required"].clone()), (json!(true), json!(false)), "{field}");
+    assert_eq!((field["flag"].clone(), field["env"].clone()), (json!("--model-idle-unload"), json!("IGNIS_MODEL_IDLE_UNLOAD")));
+    assert_eq!(field["default"], 300, "{field}");
 }
 
 /// AC 3: zero never unloads, however long the clock runs.
@@ -222,6 +239,40 @@ async fn a_request_in_flight_keeps_the_model_and_the_clock_starts_when_it_ends()
     assert!(streamed.as_str().unwrap().contains("[DONE]"), "{streamed}");
     let at = until(&server, "unloaded", IDLE * 5).await - released;
     assert!(at >= IDLE, "unloaded {at:?} after the stream was let go: the clock starts when it ends");
+}
+
+/// AC 4's other end: a client hanging up mid-stream ends its use as the
+/// stream's end does — the count is released, and the model is unloaded once
+/// it has gone unused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_hanging_up_mid_stream_releases_its_use() {
+    let loader = MockLoader::new();
+    let (model, gated, gate) = loader.gated_model("mock-a");
+    gated.arm();
+    drop(gated);
+    let server = idle_server(&loader, model, IDLE, &[]);
+    let app = server.app();
+    let mut body = chat(None);
+    body["stream"] = json!(true);
+    let streaming = tokio::spawn({
+        let app = app.clone();
+        async move { send(&app, Method::POST, "/v1/chat/completions", Some(body)).await }
+    });
+    let gate = tokio::task::spawn_blocking(move || {
+        gate.wait_entered();
+        gate
+    })
+    .await
+    .unwrap();
+    assert_eq!(server.usage.in_flight(), 1, "the stream is in use");
+
+    // The client goes away mid-stream: its response body is dropped unread.
+    streaming.abort();
+    assert!(streaming.await.unwrap_err().is_cancelled());
+    until_true("the hang-up released the count", || server.usage.in_flight() == 0).await;
+    tokio::task::spawn_blocking(move || gate.release()).await.unwrap();
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+    until(&server, "unloaded", IDLE * 5).await;
 }
 
 /// AC 5: polling every route that reports state — the model, the catalog,
@@ -348,29 +399,38 @@ async fn a_chat_request_while_unloaded_loads_the_model_and_two_together_share_on
     assert_eq!(loader.resident_at_load(), [0], "nothing was resident when it loaded");
 }
 
-/// AC 6 on a Responses socket opened before the unload: the open socket does
-/// not keep the model, and a job on it loads the model again and is served.
+/// AC 6 on Responses sockets opened before the unload: an open socket does
+/// not keep the model, and a job on it loads the model again — `loading`
+/// meanwhile — and is served; jobs on two sockets share the one load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_job_on_a_socket_opened_before_the_unload_loads_the_model() {
     let loader = MockLoader::new();
     let server = idle_server(&loader, loader.model("mock-a"), IDLE, &[]);
+    let app = server.app();
     // The serve loop runs the server's own clock.
     let live = responses::live(server.clone()).await;
-    let mut socket = responses::socket(&live).await;
+    let (mut first, mut second) = (responses::socket(&live).await, responses::socket(&live).await);
     until(&server, "unloaded", IDLE * 6).await;
     server.update_live(|live| live.idle_unload = Duration::ZERO);
 
-    responses::send(
-        &mut socket,
-        json!({ "type": "response.create", "input": "hello there", "max_output_tokens": 3, "enable_thinking": false }),
-    )
-    .await;
-    let events = responses::events_until(&mut socket, responses::terminal).await;
-    let last = events.last().expect("a terminal event");
-    assert!(matches!(last["type"].as_str(), Some("response.completed" | "response.incomplete")), "{events:?}");
-    assert_eq!(last["response"]["model"], "mock-a");
+    let release = loader.hold_next_load();
+    let job = json!({ "type": "response.create", "input": "hello there", "max_output_tokens": 3, "enable_thinking": false });
+    responses::send(&mut first, job.clone()).await;
+    responses::send(&mut second, job).await;
+    until(&server, "loading", PATIENT).await;
+    until_true("both jobs are admitted", || server.usage.in_flight() == 2).await;
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!(models["status"], "loading", "{models}");
+    release.send(()).expect("the held load is waiting");
+
+    for socket in [&mut first, &mut second] {
+        let events = responses::events_until(socket, responses::terminal).await;
+        let last = events.last().expect("a terminal event");
+        assert!(matches!(last["type"].as_str(), Some("response.completed" | "response.incomplete")), "{events:?}");
+        assert_eq!(last["response"]["model"], "mock-a");
+    }
     assert_eq!(*server.status(), ModelStatus::Serving);
-    assert_eq!(loader.loads(), ["mock-a"]);
+    assert_eq!(loader.loads(), ["mock-a"], "one load for both jobs");
 }
 
 /// AC 7: a load out of `unloaded` that fails leaves `failed`, answers the
@@ -408,6 +468,91 @@ async fn a_failed_load_answers_its_waiters_503_and_a_later_request_tries_again()
     assert_eq!(status, StatusCode::OK, "a later request loads again: {completion}");
     assert_eq!(*server.status(), ModelStatus::Serving);
     assert_eq!(loader.loads(), ["mock-a", "mock-a"]);
+}
+
+/// AC 7 at prepare: a load out of `unloaded` refused before it reaches the
+/// GPU leaves `failed` with the reason, the request waiting on it gets `503
+/// model_load_failed`, nothing was loaded, and no switch is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_load_refused_at_prepare_answers_503_and_leaves_failed() {
+    let loader = MockLoader::new();
+    let server = idle_server(&loader, loader.model("mock-a"), IDLE, &[]);
+    let app = server.app();
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+    unloaded(&server, &loader).await;
+    server.update_live(|live| live.idle_unload = Duration::ZERO);
+    loader.refuse("mock-a");
+
+    let (status, refused) = chat_task(&app, None).await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refused}");
+    assert_eq!(refused["error"]["code"], "model_load_failed", "{refused}");
+    assert!(refused["error"]["message"].as_str().unwrap().contains("refused at prepare"), "{refused}");
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!(models["status"], "failed", "{models}");
+    assert!(models["reason"].as_str().unwrap().contains("refused at prepare"), "{models}");
+    assert!(models["last_switch"].is_null(), "a request's load is not a switch: {models}");
+    assert_eq!(loader.prepared_artifacts(), [PathBuf::from("mock-a.ninfer")]);
+    assert!(loader.loads().is_empty(), "{:?}", loader.loads());
+}
+
+/// AC 11 refused at prepare: a switch out of `unloaded` whose target is
+/// refused before anything loads leaves the server `unloaded` as it was —
+/// the unloaded model still the one a request loads — and `last_switch` says
+/// why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_switch_out_of_unloaded_refused_at_prepare_leaves_it_unloaded() {
+    let loader = MockLoader::new();
+    let server = idle_server(&loader, loader.model("mock-a"), IDLE, &[]);
+    let app = server.app();
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+    unloaded(&server, &loader).await;
+    server.update_live(|live| live.idle_unload = Duration::ZERO);
+    loader.refuse("mock-b");
+
+    let switch = json!({ "artifact": "mock-b.ninfer", "model": "mock-b" });
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(switch)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    until(&server, "unloaded", PATIENT).await;
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!((models["status"].as_str(), models["data"][0]["id"].as_str()), (Some("unloaded"), Some("mock-a")), "{models}");
+    let last = &models["last_switch"];
+    assert_eq!((last["from"].as_str(), last["to"].as_str(), last["outcome"].as_str()), (Some("mock-a"), Some("mock-b"), Some("refused")), "{models}");
+    assert!(last["reason"].as_str().unwrap().contains("refused at prepare"), "{models}");
+    assert!(loader.loads().is_empty(), "{:?}", loader.loads());
+
+    let (status, completion) = chat_task(&app, None).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{completion}");
+    assert_eq!(completion["model"], "mock-a");
+    assert_eq!(loader.loads(), ["mock-a"]);
+}
+
+/// AC 11 failing at load: a switch out of `unloaded` whose target fails on
+/// the GPU leaves `failed` — there is nothing to reload — and is recorded as
+/// one; the next request loads the unloaded model again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_switch_out_of_unloaded_that_fails_to_load_leaves_failed_and_a_request_loads_again() {
+    let loader = MockLoader::new();
+    let server = idle_server(&loader, loader.model("mock-a"), IDLE, &[]);
+    let app = server.app();
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+    unloaded(&server, &loader).await;
+    server.update_live(|live| live.idle_unload = Duration::ZERO);
+    loader.break_load("mock-b");
+
+    let switch = json!({ "artifact": "mock-b.ninfer", "model": "mock-b" });
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(switch)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    until(&server, "failed", PATIENT).await;
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert!(models["reason"].as_str().unwrap().contains("simulated kernel load error"), "{models}");
+    let last = &models["last_switch"];
+    assert_eq!((last["from"].as_str(), last["to"].as_str(), last["outcome"].as_str()), (Some("mock-a"), Some("mock-b"), Some("failed")), "{models}");
+    assert_eq!(loader.loads(), ["mock-b"], "no reload of a model that was not resident");
+
+    let (status, completion) = chat_task(&app, None).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{completion}");
+    assert_eq!(completion["model"], "mock-a");
+    assert_eq!(loader.loads(), ["mock-b", "mock-a"]);
 }
 
 /// AC 7: after a failed load out of `unloaded`, a switch is a way back too.
@@ -649,6 +794,55 @@ async fn an_unload_due_while_a_switch_runs_waits_for_it() {
     assert!(at >= IDLE, "unloaded {at:?} after the switch's load was let go");
     assert_eq!(server.active().engine.model_id(), "mock-b", "the switch's model was the one unloaded");
     assert_eq!(loader.loads(), ["mock-b"]);
+}
+
+/// AC 12: an unload due while a reload (`PATCH /v1/config`) runs waits for
+/// it, and the clock starts again once the reloaded model serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unload_due_while_a_reload_runs_waits_for_it() {
+    let loader = MockLoader::new();
+    let server = configured_server(&loader, started("reload-runs", &["--model-idle-unload", "1"]));
+    let app = server.app();
+    let release = loader.hold_next_load();
+    let body = json!({ "reuse": { "kv_host_pool_bytes": "3G" } });
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{applied}");
+    // The clock starts with the reload already holding the slot.
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+
+    tokio::time::sleep(IDLE * 2).await;
+    assert!(matches!(*server.status(), ModelStatus::Switching { .. }), "no unload under a reload: {:?}", server.status());
+    let released = Instant::now();
+    release.send(()).expect("the held load is waiting");
+    until(&server, "serving", PATIENT).await;
+    let at = until(&server, "unloaded", IDLE * 5).await - released;
+    assert!(at >= IDLE, "unloaded {at:?} after the reload's load was let go");
+    assert_eq!(loader.loads(), ["mock-a"]);
+}
+
+/// AC 12: nothing unloads under the load a request began out of `unloaded`,
+/// however long it takes, and the clock starts again once the request it
+/// served has ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_unload_overlaps_the_load_a_request_began() {
+    let loader = MockLoader::new();
+    let server = idle_server(&loader, loader.model("mock-a"), IDLE, &[]);
+    let app = server.app();
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+    unloaded(&server, &loader).await;
+
+    let release = loader.hold_next_load();
+    let pending = chat_task(&app, None);
+    until(&server, "loading", PATIENT).await;
+    tokio::time::sleep(IDLE * 2).await;
+    assert_eq!(*server.status(), ModelStatus::Loading, "no unload under a load");
+    release.send(()).expect("the held load is waiting");
+    let (status, completion) = pending.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{completion}");
+    let served = Instant::now();
+    let at = until(&server, "unloaded", IDLE * 5).await - served;
+    assert!(at >= IDLE - TICK, "unloaded {at:?} after the request it loaded for was served");
+    assert_eq!(loader.loads(), ["mock-a"]);
 }
 
 /// A compute whose drop waits for the test: the model thread drops it with

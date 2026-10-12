@@ -67,8 +67,10 @@ async fn the_unload_and_the_load_after_it_are_logged_and_neither_is_a_switch() {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
-    let response = app.oneshot(request).await.unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // Its body read or not, a response held is a request in use.
+    drop(response);
 
     let reloaded = named(&log, "ignis.model.reloaded");
     assert_eq!(reloaded.len(), 1, "{reloaded:?}");
@@ -77,4 +79,27 @@ async fn the_unload_and_the_load_after_it_are_logged_and_neither_is_a_switch() {
         assert!(field(&reloaded[0], timing).is_u64(), "{timing}: {}", reloaded[0]);
     }
     assert!(named(&log, "ignis.model.switched").is_empty(), "neither is a switch");
+
+    // Unloaded again, and the next load refused before it reaches the GPU:
+    // `reload_failed` at the prepare stage, still not a switch.
+    server.update_live(|live| live.idle_unload = Duration::from_secs(1));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while named(&log, "ignis.model.unloaded").len() < 2 {
+        assert!(Instant::now() < deadline, "never unloaded again");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    server.update_live(|live| live.idle_unload = Duration::ZERO);
+    loader.refuse("mock-a");
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let failed = named(&log, "ignis.model.reload_failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!((field(&failed[0], "model"), field(&failed[0], "stage")), (json!("mock-a"), json!("prepare")), "{}", failed[0]);
+    assert!(named(&log, "ignis.model.switch_failed").is_empty(), "not a switch either");
 }
