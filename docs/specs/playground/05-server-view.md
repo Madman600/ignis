@@ -571,3 +571,19 @@ value's origin. The precedence is unchanged.
 33. No hand-kept family list or hidden-field names in `web/`. The modal
     focuses a focusable control on open. `dev:mock` serves the origins.
     `npm test`, `npm run build` and `cargo test --workspace` pass.
+
+### As built, follow-ups (2026-10-12)
+
+- **Follow-up 1:**
+  - Server: `6f84605`, `e410e09`, `4f265aa`, `a2241cc`, `c1c929e`.
+  - Playground: `b9ea66d`, `fbf7966`, `875affe`.
+  - The precedence change (a patched group value yields to the file's own
+    family section) was ratified by the owner.
+- **Follow-up 2:**
+  - Server: `e960261`, `63975ac`, `2310ad6`, `f2de5ed`, `c7a932b`, `54640ba`.
+  - Playground: `d6659f5`, `187840c`, `3bd41f7`.
+  - Fix: `0a5a683` (the file dialog fits the viewport).
+- **Owner checks** on the preview server with the `rtx5090` profile:
+  - the switch by id;
+  - the scope selector and the origins labels;
+  - the rendered file.
