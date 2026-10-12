@@ -163,6 +163,20 @@ only the fields being changed.
    rather than refusing a live change just because there is nowhere to
    write it down.
 
+*Note, 2026-10-12 (#316, spec playground/05).* The layering above and what
+`GET` answers were tightened, so the view and the file agree:
+
+- What runs is what a start from the rewritten file resolves. A patched
+  group value therefore yields to the config file's own `<family>` section
+  for that family; a patch's own family value still wins.
+- A `null` removes the key (JSON merge patch): the file loses it, and the
+  next source down applies.
+- `GET` answers in the file's shape. A group key is the shared value,
+  resolved for no family with every live change on top; a section for each
+  family, the running one included, sits beside it wherever that family's
+  value differs. A family-only field stays in its family's section. The
+  value the loaded model runs with is its section's, else the group's.
+
 `model_switch::ArtifactLoader` (`crates/server/src/model_switch.rs`) is
 extended to carry an optional config diff alongside its fixed
 `artifact`/`model`, applied to `self.options` before `fit_to_family` runs —

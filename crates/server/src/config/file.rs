@@ -339,8 +339,14 @@ fn set(layer: &mut Layer, meta: &'static FieldMeta, family: Option<ModelFamily>,
 /// whose value differs for that family — what the sources say, written so a
 /// start reading it back resolves the same values. What `config generate`
 /// and `config print` write and `GET /v1/config` shows.
+///
+/// The general values are always the shared ones, resolved for no family:
+/// a config fitted to a family (a running server's) holds that family's
+/// values in its settings, which would read as the group's and leave the
+/// family without a section of its own (GitHub #316).
 pub fn effective_document(config: &Config) -> Value {
-    let mut general = config.settings().render();
+    let shared = config.basis.family().and_then(|_| resolve_settings(config.basis.sources(), None, Fit::Switch).ok());
+    let mut general = shared.as_ref().map_or_else(|| config.settings(), |resolution| &resolution.settings).render();
     // A field only one family takes is never written at the general scope,
     // even when that family's own value is the one it already has there:
     // the general section is read by every family, and this one refuses it

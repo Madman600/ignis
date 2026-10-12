@@ -309,6 +309,10 @@ card.
 **At runtime.** `GET /v1/config` shows the running configuration (fields
 declared visible only: never the API key); `GET /v1/config?format=yaml` shows
 it as the config file it amounts to, the text `config print` writes.
+Both are in the file's shape: a group key holds the shared value, and a model
+family's section (the loaded model's too) sits beside it wherever that family's
+value differs, so what the loaded model runs with is its section's, else the
+group's.
 `PATCH /v1/config` takes a partial document in the file's shape: a change to
 the request timeout, the message policies, the thinking defaults or the switch
 knobs applies at once, and so does a value the loaded model does not run with

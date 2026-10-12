@@ -638,8 +638,11 @@ async fn a_patch_that_changes_nothing_running_is_live_and_the_other_familys_load
     assert_eq!((applied["applied"].clone(), applied["persisted"].clone()), (json!("live"), json!(true)), "{applied}");
     assert!(loader.prepared_options().is_empty(), "no model was touched");
     let shown = &applied["config"];
-    assert_eq!(shown["reuse"]["kv_host_pool_bytes"], "4G", "the 27B keeps its own: {shown}");
-    assert_eq!(shown["reuse"]["qwen38flashnext"]["kv_host_pool_bytes"], "3G", "{shown}");
+    // The file's shape (#316): the group key is the shared value, and the
+    // 27B's own value stays in its section; Flash-Next takes the shared one.
+    assert_eq!(shown["reuse"]["kv_host_pool_bytes"], "3G", "the shared value: {shown}");
+    assert_eq!(shown["reuse"]["qwen38"]["kv_host_pool_bytes"], "4G", "the 27B keeps its own: {shown}");
+    assert!(shown["reuse"].get("qwen38flashnext").is_none(), "Flash-Next takes the shared value: {shown}");
     assert_eq!(shown["model"]["qwen38flashnext"]["max_context"], 65536, "{shown}");
     let written = read_yaml(&path);
     assert_eq!(written["reuse"]["kv_host_pool_bytes"], "3G", "{written:?}");
@@ -655,7 +658,31 @@ async fn a_patch_that_changes_nothing_running_is_live_and_the_other_familys_load
     assert_eq!(flash.basis.family(), Some(ModelFamily::FlashNext));
     assert_eq!((flash.host_pool_bytes, flash.max_context), (3 << 30, 65536));
     let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
-    assert_eq!((document["reuse"]["kv_host_pool_bytes"].clone(), document["model"]["max_context"].clone()), (json!("3G"), json!(65536)), "{document}");
+    assert_eq!((document["reuse"]["kv_host_pool_bytes"].clone(), document["model"]["qwen38flashnext"]["max_context"].clone()), (json!("3G"), json!(65536)), "{document}");
+}
+
+/// GitHub #316: `GET /v1/config` answers in the file's shape even while the
+/// config is fitted to a family: the group key is the shared value, and the
+/// running family's own value is in its section — the Playground's "All
+/// models" and "Own value" read them off. A patch of the group key leaves
+/// the section in force.
+#[tokio::test]
+async fn get_config_shows_the_shared_value_and_the_running_familys_own_section() {
+    let path = config_file("file-shape", "reuse:\n  kv_host_pool_bytes: 2G\n  qwen38:\n    kv_host_pool_bytes: 4G\n");
+    let loader = MockLoader::new();
+    let server = qwen_server(&loader, &["--config", path.to_str().unwrap(), "--profile", "none"]);
+    let app = server.app();
+    let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
+    assert_eq!(document["reuse"]["kv_host_pool_bytes"], "2G", "the group key is the shared value: {document}");
+    assert_eq!(document["reuse"]["qwen38"]["kv_host_pool_bytes"], "4G", "the running family's own section: {document}");
+
+    let body = json!({ "reuse": { "kv_host_pool_bytes": "3G" } });
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(applied["applied"], "live", "{applied}");
+    let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
+    assert_eq!(document["reuse"]["kv_host_pool_bytes"], "3G", "{document}");
+    assert_eq!(document["reuse"]["qwen38"]["kv_host_pool_bytes"], "4G", "the section stays in force: {document}");
 }
 
 /// Spec playground/05 AC 20: a value waiting for the other family beside a
@@ -676,7 +703,8 @@ async fn a_patch_mixing_the_other_familys_value_with_a_running_change_reloads_an
     let reloaded = fitted.last().expect("the reload's load");
     assert_eq!((reloaded.basis.family(), reloaded.host_pool_bytes), (Some(ModelFamily::Qwen38_27b), 3 << 30));
     let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
-    assert_eq!(document["reuse"]["kv_host_pool_bytes"], "3G", "{document}");
+    assert_eq!(document["reuse"]["kv_host_pool_bytes"], "2G", "the shared value, the default: {document}");
+    assert_eq!(document["reuse"]["qwen38"]["kv_host_pool_bytes"], "3G", "{document}");
     assert_eq!(document["reuse"]["qwen38flashnext"]["kv_host_pool_bytes"], "1G", "{document}");
     let written = read_yaml(&path);
     assert_eq!(written["reuse"]["qwen38"]["kv_host_pool_bytes"], "3G", "{written:?}");
@@ -702,7 +730,9 @@ async fn null_removes_a_familys_own_value_then_the_groups_and_the_file_loses_eac
     let body = json!({ "reuse": { "qwen38flashnext": { "kv_host_pool_bytes": null } } });
     let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
     assert_eq!((status, applied["applied"].clone()), (StatusCode::OK, json!("live")), "the family not loaded: {applied}");
-    assert_eq!(applied["config"]["reuse"]["qwen38flashnext"]["kv_host_pool_bytes"], "3G", "the group's applies to it: {applied}");
+    let shown = &applied["config"]["reuse"];
+    assert!(shown.get("qwen38flashnext").is_none(), "the group's applies to it, so it has no section: {applied}");
+    assert_eq!((shown["kv_host_pool_bytes"].clone(), shown["qwen38"]["kv_host_pool_bytes"].clone()), (json!("3G"), json!("4G")), "{applied}");
     let written = read_yaml(&path);
     assert!(written["reuse"].get("qwen38flashnext").is_none(), "the emptied section goes: {written:?}");
     assert_eq!(written["reuse"]["qwen38"]["kv_host_pool_bytes"], "4G", "{written:?}");
