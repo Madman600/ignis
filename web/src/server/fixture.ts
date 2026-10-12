@@ -1,3 +1,4 @@
+import { familiesOf } from "./form.ts";
 import type { CatalogRow, ConfigDocument, FieldDecl, OriginRow, Rule } from "./routes.ts";
 
 // What the Server view reads, as ignis serves it (spec playground/05): every
@@ -234,8 +235,8 @@ export const CATALOG: CatalogRow[] = [
   { id: "qwen3.8-27b-fail", source: "known", on_disk: "complete", bytes: 19406942468, family: "qwen38", loaded: false, switchable: true },
 ];
 
-/** The families the fixture's server declares. */
-export const SCOPES = ["qwen38", "qwen38flashnext"];
+/** The families the fixture's server declares, read from its declarations and catalog as the page reads them. */
+export const SCOPES = familiesOf(FIELDS, CATALOG, null);
 
 /** Where a value was set, by `<group>.<name>` or `<group>.<family>.<name>`; a value not named here is the file's, or the default's. */
 export type Provenance = Record<string, { source: OriginRow["source"]; spelling?: string }>;
@@ -249,15 +250,15 @@ const CONFIG_PATH = "ignis.yaml";
 
 /**
  * `GET /v1/config/origins` for a configuration: a row per visible field and
- * scope, the shared one first, then each family that takes the field. `doc`
+ * scope, the shared one first, then each family that takes the field (the
+ * shared row of a field one family takes holds the default, as no group value is set). `doc`
  * holds every family value, also one equal to the shared one, which is why
  * the server's own answer could not tell it from a shared one.
  */
 export function originRows(fields: FieldDecl[], doc: ConfigDocument, from: Provenance): OriginRow[] {
   const rows: OriginRow[] = [];
   for (const decl of fields) {
-    const only = decl.families?.length === 1;
-    for (const scope of only ? decl.families! : [null, ...(decl.families ?? SCOPES)]) {
+    for (const scope of [null, ...(decl.families ?? SCOPES)]) {
       const section = scope === null ? undefined : doc[decl.group]?.[scope];
       const own = section !== null && typeof section === "object" && decl.name in (section as object);
       const key = scope === null ? `${decl.group}.${decl.name}` : `${decl.group}.${scope}.${decl.name}`;

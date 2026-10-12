@@ -223,8 +223,8 @@ describe("createServerSim: where each value comes from", () => {
     expect(sim.origins(T)).toMatchObject({ object: "list" });
     const rows = origins(sim);
     expect(rows.filter((r) => r.key === "model.max_context").map((r) => r.scope)).toEqual([null, "qwen38", "qwen38flashnext"]);
-    // A field one family takes has its family's row alone.
-    expect(rows.filter((r) => r.key === "spec.decode_lanes").map((r) => r.scope)).toEqual(["qwen38flashnext"]);
+    // A field one family takes has the shared row too, then its family's alone.
+    expect(rows.filter((r) => r.key === "spec.decode_lanes").map((r) => r.scope)).toEqual([null, "qwen38flashnext"]);
     expect(new Set(rows.map((r) => r.key))).toEqual(new Set(FIELDS.map((f) => f.file_key)));
   });
 
