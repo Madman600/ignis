@@ -220,6 +220,35 @@ impl Layer {
         keys.into_iter().map(of_key)
     }
 
+    /// This layer with every value and removal of a field only one family
+    /// takes moved from the group's key to that family's own section
+    /// ([`FieldMeta::home_family`]) — where a live patch puts it, in the
+    /// running configuration as in the config file (spec playground/05
+    /// follow-up 2, "a removal goes where a value goes"). Such a field means
+    /// something to that family alone, so its group key and its family key
+    /// are one value; homing it is what keeps a patched value from yielding
+    /// to the file's section it is written over, and a removal at either key
+    /// from leaving the other behind. A key the layer already names in that
+    /// family's section is the more specific and stays.
+    pub fn homed(&self) -> Layer {
+        let mut homed = self.clone();
+        let general = self.values.keys().chain(self.removed.keys()).filter(|(_, _, scope_name)| scope_name.is_none());
+        for key in general {
+            let Some(family) = of_key(key).0.home_family() else {
+                continue;
+            };
+            let home = (key.0, key.1, Some(scope(family)));
+            let named_there = self.values.contains_key(&home) || self.removed.contains_key(&home);
+            if let Some(candidate) = homed.values.remove(key).filter(|_| !named_there) {
+                homed.values.insert(home, candidate);
+            }
+            if let Some(spelling) = homed.removed.remove(key).filter(|_| !named_there) {
+                homed.removed.insert(home, spelling);
+            }
+        }
+        homed
+    }
+
     /// `other`'s values over this layer's, and its removals taken out of it.
     pub fn overlay(&mut self, other: &Layer) {
         for (key, candidate) in &other.values {
@@ -748,6 +777,35 @@ mod tests {
         assert_eq!(earlier.removals().count(), 0, "a removal is applied, never kept");
         let err = Layer::default().remove(field("server", "bind").unwrap(), q, "server.qwen38.bind".into()).unwrap_err();
         assert!(err.0.contains("server.qwen38.bind") && err.0.contains("per-family"), "{err}");
+    }
+
+    /// Spec playground/05 follow-up 2: a field only one family takes is one
+    /// value at its group key and in its family's section, so homing moves
+    /// its value and its removal there, leaves every other field where it
+    /// was named, and lets a key named in the section win over the group's.
+    #[test]
+    fn homing_moves_a_family_only_fields_value_and_removal_to_its_section() {
+        let lanes = field("spec", "decode_lanes").unwrap();
+        let pool = field("reuse", "kv_host_pool_bytes").unwrap();
+        let flash = Some(ModelFamily::FlashNext);
+        let mut patch = Layer::default();
+        patch.set(lanes, None, Candidate { raw: "2".into(), spelling: "spec.decode_lanes".into() }).unwrap();
+        patch.set(pool, None, Candidate { raw: "3G".into(), spelling: "reuse.kv_host_pool_bytes".into() }).unwrap();
+        let homed = patch.homed();
+        let raw = |layer: &Layer, meta, family| layer.get(meta, family).map(|candidate| candidate.raw.clone());
+        assert_eq!((raw(&homed, lanes, None), raw(&homed, lanes, flash)), (None, Some("2".to_owned())));
+        assert_eq!(homed.get(pool, None).map(|c| c.raw.as_str()), Some("3G"), "a field both families take stays at its group key");
+
+        let mut removal = Layer::default();
+        removal.remove(lanes, None, "spec.decode_lanes".into()).unwrap();
+        let named: Vec<_> = removal.homed().named().map(|(meta, family)| (meta.file_key(), family)).collect();
+        assert_eq!(named, [("spec.decode_lanes".to_owned(), flash)]);
+
+        let mut both = Layer::default();
+        both.set(lanes, None, Candidate { raw: "2".into(), spelling: "spec.decode_lanes".into() }).unwrap();
+        both.remove(lanes, flash, "spec.qwen38flashnext.decode_lanes".into()).unwrap();
+        let homed = both.homed();
+        assert_eq!((homed.entries().count(), homed.removals().count()), (0, 1), "the section's own key wins: {homed:?}");
     }
 
     /// Before an artifact names a family, only the general values count.

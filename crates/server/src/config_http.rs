@@ -81,10 +81,12 @@ impl ConfigState {
     /// `config patch` writes with.
     ///
     /// A field only one family takes goes under that family's own section,
-    /// never the general one ([`FieldMeta::home_family`]): it can only ever
-    /// apply to that family, so there it is both right and enough, and a
-    /// start of the other model from the same file never sees it instead of
-    /// being refused for it. Every other field goes where the patch put it.
+    /// never the general one, its value and its removal alike
+    /// ([`Layer::homed`], as the running configuration applies it): it can
+    /// only ever apply to that family, so there it is both right and enough,
+    /// and a start of the other model from the same file never sees it
+    /// instead of being refused for it. Every other field goes where the
+    /// patch put it.
     ///
     /// A removal (`null`) takes its key out, and the family section or group
     /// it empties (spec playground/05 §Decisions). A patch that leaves the
@@ -95,15 +97,9 @@ impl ConfigState {
         let Some(path) = current.file_path() else {
             return Persisted::No(NO_FILE.to_owned());
         };
-        let homed = |changes: Vec<file::Change>| {
-            changes
-                .into_iter()
-                .map(|(meta, family, value)| (meta, family.or_else(|| meta.home_family()), value))
-                .collect::<Vec<_>>()
-        };
+        let patch = patch.homed();
         let removals = patch.removals().map(|(meta, family, _)| (meta, family)).collect();
-        let written = file::changes_of(patch)
-            .map(homed)
+        let written = file::changes_of(&patch)
             .and_then(|changes| file::rewrite(&*self.files, path, changes, removals, None))
             .and_then(|text| {
                 let (before, _) = file::load(&*self.files, path)?;

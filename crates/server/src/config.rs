@@ -735,9 +735,15 @@ impl Config {
     /// This config's sources with `patch`'s values over them, resolved for no
     /// family in particular: the starting point of a switch to another model,
     /// whose family the switch fits it to ([`fit_to_family`]).
+    ///
+    /// A field only one family takes is applied in that family's own section
+    /// whatever key the patch named it at ([`source::Layer::homed`]), as the
+    /// config file is written: so the configuration running and a start from
+    /// the rewritten file agree on it (spec playground/05 follow-up 2).
     pub fn general_with(&self, patch: &source::Layer) -> Result<Config, ConfigError> {
+        let patch = patch.homed();
         let mut sources = self.basis.sources().clone();
-        sources.patch.overlay(patch);
+        sources.patch.overlay(&patch);
         // A removal (`null`) takes the key out of the config file as well as
         // out of the patches before it, as the rewritten file will not hold
         // it: what runs after it is what a start from that file resolves —
@@ -763,7 +769,10 @@ impl Config {
     /// dropping what the family cannot take ([`fit_to_family`]): a value a
     /// switch dropped on the way here is neither brought back nor refused
     /// now. Every family's values are validated as at start; the patch is
-    /// refused whole if any of it is wrong.
+    /// refused whole if any of it is wrong. The patch is judged at the keys
+    /// it named, before a family-only field is moved to its family's section
+    /// ([`Config::general_with`]): a value at the group key of a field only
+    /// the other family takes is still refused, as a start would refuse it.
     pub fn with_patch(&self, patch: &source::Layer) -> Result<Config, ConfigError> {
         let config = self.general_with(patch)?;
         match self.basis.family() {

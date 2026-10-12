@@ -977,6 +977,81 @@ async fn the_origins_say_where_each_value_comes_from() {
     assert_eq!(pool[2], row(&flash, "live", true, None));
 }
 
+/// `PATCH /v1/config` with `body`, applied live or through a reload, and
+/// returned once the model serves again.
+async fn patched(app: &axum::Router, body: Value) -> Value {
+    let (status, applied) = send(app, Method::PATCH, "/v1/config", Some(body.clone())).await;
+    assert!(status == StatusCode::OK || status == StatusCode::ACCEPTED, "{body}: {status} {applied}");
+    until_serving(app).await;
+    applied
+}
+
+/// Spec playground/05 AC 29, a value then its removal: a field only
+/// Flash-Next takes, set at its group key, lives in Flash-Next's section in
+/// the running configuration as in the file, so a removal at either key
+/// takes it away from both — and what runs is what a start from the
+/// rewritten file resolves.
+#[tokio::test]
+async fn a_family_only_value_set_then_removed_leaves_what_a_start_from_the_file_runs() {
+    let path = config_file("family-only-set-remove", "server:\n  request_timeout: 30\n");
+    let argv = ["--config", path.to_str().unwrap(), "--profile", "none"];
+    let loader = MockLoader::new();
+    let server = family_server(&loader, ModelFamily::FlashNext, started(&argv));
+    let app = server.app();
+    let running = || server.config.as_ref().unwrap().current();
+    let restarted = || started(&argv).for_family(ModelFamily::FlashNext).unwrap();
+    for removal in [json!({ "spec": { "qwen38flashnext": { "decode_lanes": null } } }), json!({ "spec": { "decode_lanes": null } })] {
+        patched(&app, json!({ "spec": { "decode_lanes": 2 } })).await;
+        assert_eq!(running().decode_lanes, Some(2));
+        assert_eq!(read_yaml(&path)["spec"]["qwen38flashnext"]["decode_lanes"], 2);
+        assert_eq!(running().settings(), restarted().settings(), "set: what the file starts");
+        patched(&app, removal.clone()).await;
+        assert!(read_yaml(&path).get("spec").is_none(), "{removal}: the file loses the key and the section");
+        assert_eq!(running().decode_lanes, None, "{removal}: nothing sets it any more");
+        assert_eq!(running().settings(), restarted().settings(), "{removal}: what the rewritten file starts");
+    }
+}
+
+/// Spec playground/05 AC 29, the file's own value then a change at the
+/// group key: a value for a field only Flash-Next takes goes to its
+/// section, in the running configuration as in the file — so it replaces
+/// the file's value rather than yielding to it — and a `null` at the group
+/// key removes that section's value.
+#[tokio::test]
+async fn a_family_only_value_in_the_file_is_replaced_and_removed_at_its_group_key() {
+    let path = config_file("family-only-file-remove", "spec:\n  qwen38flashnext:\n    decode_lanes: 2\n");
+    let argv = ["--config", path.to_str().unwrap(), "--profile", "none"];
+    let loader = MockLoader::new();
+    let server = family_server(&loader, ModelFamily::FlashNext, started(&argv));
+    let app = server.app();
+    let running = || server.config.as_ref().unwrap().current();
+    let restarted = || started(&argv).for_family(ModelFamily::FlashNext).unwrap();
+    assert_eq!(running().decode_lanes, Some(2));
+
+    let applied = patched(&app, json!({ "spec": { "decode_lanes": 1 } })).await;
+    assert_eq!(applied["applied"], "reload", "the running family's own value changes: {applied}");
+    assert_eq!(read_yaml(&path)["spec"]["qwen38flashnext"]["decode_lanes"], 1);
+    assert_eq!(running().decode_lanes, Some(1), "the change runs, as the file now says");
+    assert_eq!(running().settings(), restarted().settings());
+
+    patched(&app, json!({ "spec": { "decode_lanes": null } })).await;
+    assert!(read_yaml(&path).get("spec").is_none(), "the file loses the section's key");
+    assert_eq!(running().decode_lanes, None);
+    assert_eq!(running().settings(), restarted().settings(), "what the rewritten file starts");
+
+    // The file's own value, removed at the group key with no change before.
+    let path = config_file("family-only-file-null", "spec:\n  qwen38flashnext:\n    decode_lanes: 2\n");
+    let argv = ["--config", path.to_str().unwrap(), "--profile", "none"];
+    let loader = MockLoader::new();
+    let server = family_server(&loader, ModelFamily::FlashNext, started(&argv));
+    let app = server.app();
+    patched(&app, json!({ "spec": { "decode_lanes": null } })).await;
+    assert!(read_yaml(&path).get("spec").is_none(), "the file loses the section's key");
+    let running = server.config.as_ref().unwrap().current();
+    assert_eq!(running.decode_lanes, None);
+    assert_eq!(running.settings(), started(&argv).for_family(ModelFamily::FlashNext).unwrap().settings());
+}
+
 /// Spec playground/05 AC 28: the origins answer as `GET /v1/config` does —
 /// during a switch, behind the API key, the preflight passed — and `501` on
 /// a server with no running configuration.
