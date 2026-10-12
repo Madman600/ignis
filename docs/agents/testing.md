@@ -555,7 +555,8 @@ nvidia-smi --format=csv,noheader -l 1 `
 # tokens; with no --vram-kv-pool-bytes the pool is the rest of the VRAM budget)
 .\target\x86_64-pc-windows-msvc\release\ignis-server.exe --model-artifact $Artifact `
   --server-bind 127.0.0.1:8000 --model-kv-format hq-e8-2b --model-max-context 40960 `
-  --vram-kv-pool-bytes 576M --model-prefill-chunk 1024 --server-request-timeout 900
+  --vram-kv-pool-bytes 576M --model-prefill-chunk 1024 --server-request-timeout 900 `
+  --model-idle-unload 0
 
 # the reference, same two formats
 F:\ai\q38\ninfer\build-ninja\apps\ninfer-serve.exe $Artifact `
