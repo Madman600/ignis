@@ -35,13 +35,20 @@ describe("controlFor", () => {
   it("is the switch for a bool, segments up to four values, a select past that, else a text field", () => {
     expect(controlFor(field("model.enable_thinking"), true)).toEqual({ kind: "switch" });
     expect(controlFor(field("server.system_message_policy"), "merge")).toEqual({ kind: "segmented", options: ["merge", "strict"] });
-    // Four exactly is still segments.
-    expect(controlFor(field("model.kv_format"), "hq-e8-2b")).toMatchObject({ kind: "segmented" });
+    expect(controlFor(field("model.kv_format"), "hq-e8-2b")).toEqual({ kind: "segmented", options: ["bf16", "hq-e8-2b"] });
     expect(controlFor(field("server.developer_message_policy"), "inplace")).toEqual({
       kind: "select",
       options: ["inplace", "into-system", "after-system", "one-after-system", "reject"],
     });
     expect(controlFor(field("model.reasoning_effort"), null)).toMatchObject({ kind: "select" });
+  });
+
+  it("lists a value in force the rule does not name (an alias set from the file), so it shows as the choice", () => {
+    expect(controlFor(field("model.kv_format"), "hq_e8_2b")).toEqual({ kind: "segmented", options: ["bf16", "hq-e8-2b", "hq_e8_2b"] });
+    // A spelling that differs in case only is the same choice.
+    expect(controlFor(field("model.kv_format"), "BF16")).toEqual({ kind: "segmented", options: ["bf16", "hq-e8-2b"] });
+    // Unset is no value to list.
+    expect(controlFor(field("model.reasoning_effort"), null)).toMatchObject({ options: expect.not.arrayContaining([null]) });
   });
 
   it("gives a text field the kind and the rule as its hint, and \"auto\" as the placeholder of an unset value", () => {

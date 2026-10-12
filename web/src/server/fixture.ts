@@ -78,7 +78,7 @@ export const FIELDS: FieldDecl[] = [
     "The largest prompt + generation a single request may reserve, in tokens. On the 27B, bounded by its attention's envelope for the KV format."),
   decl("model", "default_max_tokens", "tokens", 38912, { scoped: true, patchable: true, reload_required: true },
     "The max_tokens of a request that sends none, its reasoning included, never past what its prompt leaves of `max_context`; an explicit cap always wins. 0 = none, up to the context."),
-  decl("model", "kv_format", "kv format", "hq-e8-2b", { rule: { one_of: ["bf16", "hq-e8-2b", "hq_e8_2b", "hq"] }, scoped: true, patchable: true, reload_required: true },
+  decl("model", "kv_format", "kv format", "hq-e8-2b", { rule: { one_of: ["bf16", "hq-e8-2b"] }, scoped: true, patchable: true, reload_required: true },
     "The KV storage format: `hq-e8-2b` (the serving default) or `bf16` (the retained oracle format)."),
   decl("model", "prefill_chunk", "tokens", 1024, { rule: { multiple_of: 128 }, scoped: true, patchable: true, reload_required: true },
     "The prefill chunk width, in tokens."),

@@ -41,7 +41,10 @@ export type Control =
 export function controlFor(decl: FieldDecl, value: unknown): Control {
   if (decl.kind === "bool") return { kind: "switch" };
   if (decl.rule && "one_of" in decl.rule) {
-    const options = decl.rule.one_of;
+    // The server lists canonical forms; a value in force it spells otherwise (an alias set from the file) is listed too, to show as chosen.
+    const named = decl.rule.one_of;
+    const shown = typeof value === "string" ? value : null;
+    const options = shown !== null && !named.some((option) => option.toLowerCase() === shown.toLowerCase()) ? [...named, shown] : named;
     return options.length <= 4 ? { kind: "segmented", options } : { kind: "select", options };
   }
   const hint = decl.rule_text ? `${decl.kind}, ${decl.rule_text}` : decl.kind;
