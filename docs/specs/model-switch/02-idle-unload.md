@@ -152,14 +152,17 @@ Where the implementation chose what the sections above leave open.
   carries `switching: {from, to}` while `loading` too, naming what loads.
   The catalog lists no row as loaded while unloaded or loading, and the
   unloaded model as switchable (the Server view's "Load").
-- **What is recorded.** The load a request begins is `ignis.model.reloaded`
-  and leaves `last_switch` alone; an explicit `POST /v1/models/switch` or a
-  reloading `PATCH /v1/config` out of `unloaded` is still a switch or a
-  reload, logged and recorded as one (its status is `loading`, since nothing
-  is drained). A failed load out of `unloaded` sets `failed`; the serving
-  gate lets requests through then (the next one tries again) only while the
-  switcher says nothing is resident — a failed switch with nothing to reload
-  is still held as before.
+- **What is recorded.** AC 14's "the load after it" is the load a request
+  begins: `ignis.model.reloaded`, and `last_switch` is left alone. An
+  explicit `POST /v1/models/switch` or a reloading `PATCH /v1/config` out of
+  `unloaded` is still a switch or a reload, logged and recorded in
+  `last_switch` as one: ADR 0049 §5's reason (the field tells what the last
+  switch did) makes it one, and the Server view settles a switch or reload
+  it began on that record. Its status is `loading`, since nothing is
+  drained. A failed load out of `unloaded` sets `failed`; the serving gate
+  lets requests through then (the next one tries again) only while the
+  switcher says nothing is resident — a failed switch with nothing to
+  reload is still held as before.
 - **Off unless configured.** `Live::default()` has `idle_unload` zero: only
   `main` (the config) and a live `PATCH` turn it on, so tests and in-process
   harnesses never meet an unload they did not ask for. The clock runs in the

@@ -759,9 +759,11 @@ API key is refused `401` as always and loads nothing.
 Only use counts: a request is in use from its admission to the end of its
 response (a long stream keeps the model loaded); polling `GET /v1/models`, the
 config and catalog reads or `/metrics` does not, so a Playground left open
-neither keeps the model loaded nor loads it again. An unload and the load after
-it are logged (`ignis.model.unloaded`, `ignis.model.reloaded`) and are not a
-switch: `last_switch` is left as it was.
+neither keeps the model loaded nor loads it again. An unload and the load a
+request begins after it are logged (`ignis.model.unloaded`,
+`ignis.model.reloaded`) and are not a switch: `last_switch` is left as it was.
+A `POST /v1/models/switch` or a reloading `PATCH /v1/config` while unloaded is
+still a switch or a reload, and is recorded in `last_switch` like any other.
 
 `0` never unloads. The value is patchable live — `PATCH /v1/config` with
 `{"model": {"idle_unload": 600}}` takes effect at once, counting from the
