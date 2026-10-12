@@ -160,9 +160,10 @@ Where the implementation chose what the sections above leave open.
   switch did) makes it one, and the Server view settles a switch or reload
   it began on that record. Its status is `loading`, since nothing is
   drained. A failed load out of `unloaded` sets `failed`; the serving gate
-  lets requests through then (the next one tries again) only while the
-  switcher says nothing is resident — a failed switch with nothing to
-  reload is still held as before.
+  lets requests through then (the next one tries again) because the status
+  says the failed run left `unloaded` (`ModelStatus::Failed`'s
+  `from_unloaded`, which `refusal()` reads) — a failed switch with nothing
+  to reload is still held as before.
 - **Off unless configured.** `Live::default()` has `idle_unload` zero: only
   `main` (the config) and a live `PATCH` turn it on, so tests and in-process
   harnesses never meet an unload they did not ask for. The clock runs in the

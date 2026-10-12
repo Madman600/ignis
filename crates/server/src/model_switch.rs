@@ -247,12 +247,6 @@ pub struct Switcher {
     /// listed ([`Switcher::tables`]). Set once, by the start or by the first
     /// switch, whichever sees it first.
     start: Mutex<Option<ModelSource>>,
-    /// Whether nothing is resident because the idle clock unloaded the model
-    /// (spec model-switch/02): set by the unload, cleared when a load
-    /// publishes a model. What tells a failed load out of `unloaded` — which
-    /// a later request may try again — from a failed switch with nothing to
-    /// reload, which only a switch recovers from.
-    unloaded: AtomicBool,
 }
 
 /// The two tables a server's models are named by, computed together from the
@@ -336,14 +330,7 @@ impl Switcher {
             last: Mutex::new(None),
             settled: AtomicBool::new(true),
             start: Mutex::new(None),
-            unloaded: AtomicBool::new(false),
         }
-    }
-
-    /// Whether the idle clock unloaded the model and no load has published
-    /// one since (spec model-switch/02): nothing is resident.
-    pub fn is_unloaded(&self) -> bool {
-        self.unloaded.load(Ordering::SeqCst)
     }
 
     /// What holds the switch's slot now — a switch, a reload, a load, or an
@@ -600,7 +587,7 @@ impl Drop for RunningGuard {
             ModelStatus::Switching { .. } | ModelStatus::Loading => {
                 Some("the switch ended before it finished (see ignis.model.switch_panicked)".to_owned())
             }
-            ModelStatus::Failed { reason } if self.records && !self.switcher.settled.load(Ordering::SeqCst) => Some(reason.clone()),
+            ModelStatus::Failed { reason, .. } if self.records && !self.switcher.settled.load(Ordering::SeqCst) => Some(reason.clone()),
             _ => None,
         };
         if let Some(reason) = reason {
@@ -612,7 +599,10 @@ impl Drop for RunningGuard {
                 panicking = std::thread::panicking(),
                 "the switch task ended mid-switch; a switch to a model that loads is the way back"
             );
-            self.status.store(Arc::new(ModelStatus::Failed { reason }));
+            // A load out of `unloaded` (status `loading`, or already failed
+            // so) had nothing resident: a request may load the model again.
+            let from_unloaded = matches!(*status, ModelStatus::Loading) || status.is_unloaded();
+            self.status.store(Arc::new(ModelStatus::Failed { reason, from_unloaded }));
         }
         *self.switcher.running.lock().expect("switch lock") = None;
         self.status.wake();
@@ -701,8 +691,7 @@ fn begin_with(
         }
         // Unloaded, or a load out of `unloaded` that failed: nothing is
         // resident, so this run only loads.
-        let unloaded = matches!(*before, ModelStatus::Unloaded)
-            || (matches!(*before, ModelStatus::Failed { .. }) && switcher.is_unloaded());
+        let unloaded = before.is_unloaded();
         if on_demand && !unloaded {
             return Err(SwitchRefusal::NotUnloaded);
         }
@@ -871,7 +860,7 @@ pub async fn ensure_loaded(server: &Server, requested: Option<&str>) -> Result<(
                 waited = true;
                 false
             }
-            ModelStatus::Failed { reason } if switcher.is_unloaded() => {
+            ModelStatus::Failed { reason, from_unloaded: true } => {
                 if waited {
                     return Err(reason.clone());
                 }
@@ -938,7 +927,6 @@ pub(crate) fn claim_unload(server: &Server) -> Option<Unloading> {
     }
     let model = server.active().engine.model_id();
     *running = Some(SwitchStarted { from: model.clone(), to: model });
-    switcher.unloaded.store(true, Ordering::SeqCst);
     server.status.store(Arc::new(ModelStatus::Unloaded));
     drop(running);
     Some(Unloading { _slot: RunningGuard { switcher, status: Arc::clone(&server.status), records: false } })
@@ -1011,7 +999,7 @@ async fn run(
                 %reason,
                 "loading the unloaded model failed; the next request tries again"
             );
-            server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone() }));
+            server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone(), from_unloaded: true }));
             return SwitchOutcome::Failed { reason };
         }
         Err(reason) => {
@@ -1030,7 +1018,7 @@ async fn run(
             // (`last_switch`) before either is stored.
             let outcome = SwitchOutcome::Refused { reason: reason.clone() };
             switcher.record(&from, &to, &outcome);
-            server.status.store(Arc::new(ModelStatus::Failed { reason }));
+            server.status.store(Arc::new(ModelStatus::Failed { reason, from_unloaded: begun.unloaded }));
             if let Some(back) = begun.back {
                 server.status.store(Arc::new(back));
             }
@@ -1143,7 +1131,7 @@ async fn run(
                 );
                 switcher.record(&from, &to, &outcome);
             }
-            server.status.store(Arc::new(ModelStatus::Failed { reason }));
+            server.status.store(Arc::new(ModelStatus::Failed { reason, from_unloaded: true }));
             outcome
         }
         Err(reason) => {
@@ -1155,7 +1143,7 @@ async fn run(
                 %reason,
                 "the target failed to load after the old model was torn down; reloading the old model"
             );
-            server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone() }));
+            server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone(), from_unloaded: false }));
             restore(&server, &switcher, &old, (&from, &to), reason).await
         }
     }
@@ -1225,9 +1213,6 @@ async fn load_and_warm(server: &Server, prepared: Box<dyn PreparedLoad>) -> Resu
 fn publish(server: &Server, model: ActiveModel) {
     *server.fork_history.lock().expect("fork history lock") = crate::reuse::ForkHistory::default();
     server.active.store(Arc::new(model));
-    if let Some(switcher) = &server.switcher {
-        switcher.unloaded.store(false, Ordering::SeqCst);
-    }
     server.usage.touch();
     crate::decide::log_load_heads(&server.active());
 }
@@ -1247,7 +1232,7 @@ async fn restore(
         tracing::error!(name: "ignis.model.switch_restore_failed", %reason, "nothing is serving until a switch succeeds");
         let outcome = SwitchOutcome::Failed { reason: reason.clone() };
         switcher.record(from, to, &outcome);
-        server.status.store(Arc::new(ModelStatus::Failed { reason }));
+        server.status.store(Arc::new(ModelStatus::Failed { reason, from_unloaded: false }));
         return outcome;
     };
     // The running configuration, unchanged: a reload that failed never
@@ -1276,7 +1261,7 @@ async fn restore(
             tracing::error!(name: "ignis.model.switch_restore_failed", %reason, "nothing is serving until a switch succeeds");
             let outcome = SwitchOutcome::Failed { reason: reason.clone() };
             switcher.record(from, to, &outcome);
-            server.status.store(Arc::new(ModelStatus::Failed { reason }));
+            server.status.store(Arc::new(ModelStatus::Failed { reason, from_unloaded: false }));
             outcome
         }
     }

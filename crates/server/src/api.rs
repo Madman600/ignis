@@ -268,20 +268,15 @@ impl<B> MakeSpan<B> for RootSpanMaker {
 /// static and is never held.
 ///
 /// Unloaded, loading, or failed while leaving `unloaded` (spec
-/// model-switch/02), every route passes: the request that needs the model
-/// loads it, or waits for the load under way, **behind** the key
-/// ([`switch_to_named_model`]) — never here, where a request without a key
-/// would cost a load.
+/// model-switch/02, [`ModelStatus::refusal`]), every route passes: the
+/// request that needs the model loads it, or waits for the load under way,
+/// **behind** the key ([`switch_to_named_model`]) — never here, where a
+/// request without a key would cost a load.
 async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
     let status = server.status();
     let Some(code) = status.refusal() else {
         return next.run(req).await;
     };
-    let failed_unloaded = matches!(*status, ModelStatus::Failed { .. })
-        && server.switcher.as_ref().is_some_and(|switcher| switcher.is_unloaded());
-    if failed_unloaded {
-        return next.run(req).await;
-    }
     let switch_route = matches!(*status, ModelStatus::Switching { .. } | ModelStatus::Failed { .. })
         && reports_or_drives_the_switch(req.method(), req.uri().path());
     // The field declarations are static (spec playground/05): nothing about
@@ -292,7 +287,7 @@ async fn require_serving(State(server): State<Arc<Server>>, req: Request, next: 
     }
     let message = match &*status {
         ModelStatus::Switching { from, to } => switching_message(from, to),
-        ModelStatus::Failed { reason } => {
+        ModelStatus::Failed { reason, .. } => {
             format!("a model switch failed and no model is serving ({reason}); retry shortly")
         }
         ModelStatus::WarmingUp | ModelStatus::Serving | ModelStatus::Unloaded | ModelStatus::Loading => {
@@ -1538,7 +1533,7 @@ async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
             _ => None,
         },
         reason: match &*status {
-            ModelStatus::Failed { reason } => Some(reason.clone()),
+            ModelStatus::Failed { reason, .. } => Some(reason.clone()),
             _ => None,
         },
         last_switch: server.switcher.as_ref().and_then(|switcher| switcher.last_switch()).map(LastSwitchInfo::of),

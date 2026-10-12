@@ -101,7 +101,7 @@ fn rows(server: &Server) -> Vec<CatalogRow> {
     // After a failed switch, or an unload, nothing is resident: the engine
     // `active` still holds is the torn-down one, so no row is loaded and its
     // model is a way out — "Load" on the unloaded model loads it.
-    let serving = !matches!(*status, ModelStatus::Failed { .. } | ModelStatus::Unloaded | ModelStatus::Loading);
+    let serving = !status.no_model_loaded();
     let size_of = |path: &Path| std::fs::metadata(path).ok().filter(|meta| meta.is_file()).map(|meta| meta.len());
     let family_of = |path: &Path| crate::loader::artifact_family(path).ok().flatten();
     let row = |id: &str, source, on_disk: OnDisk, bytes, family| {
