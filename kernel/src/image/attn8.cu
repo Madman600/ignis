@@ -32,7 +32,8 @@
 //   - Two K/V runs per call (the stored condition prefix, then the target), with the fp32
 //     accumulator rescaled per channel by vscale_A / vscale_B when the key loop crosses them.
 //   - Causal aligned bottom-right (query i sees keys 0 .. i + keys - queries), masked on every
-//     block the diagonal crosses, at any offset.
+//     block the diagonal crosses, at any offset; masked and plain blocks take separate score
+//     conversions behind one warp-uniform branch.
 //   - K and V in two shared-memory stages (48 KiB a CTA, still two CTAs an SM): the next block
 //     loads during this one's QK, softmax and PV, behind one barrier per block where SA2's single
 //     K and V buffers need three.

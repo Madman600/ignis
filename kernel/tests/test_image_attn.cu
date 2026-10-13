@@ -845,6 +845,25 @@ void case_small(const Options &o) {
   c3.q_tokens = 1;
   c3.a_keys = 1;
   run_call(o, s, c3, q8, prefix.bytes, nullptr, dq, false);
+  Call c4 = t;
+  c4.what = "small: target over [prefix truncated to 100 ; target]";
+  c4.a_keys = 100;
+  run_call(o, s, c4, q8, prefix.bytes, &tgt.bytes, dq);
+  // Causal over two runs with more queries than run B has keys: the first 128-query tile sees no
+  // key of run B, so it never crosses the boundary and ends in run A's V scales.
+  Call c5 = t;
+  c5.what = "small: 200 rows causal over [prefix ; 70 target keys]";
+  c5.q_first = 0;
+  c5.q_tokens = 200;
+  c5.a_keys = s.prefix;
+  c5.causal = true;
+  DeviceRun tgt70(70);
+  ATT_RC(ignis_image_attn_store_kv(at(dk, s.prefix), at(dv, s.prefix), 70, kHD, prefix.bytes.p, s.prefix, tgt70.bytes.p,
+                                   nullptr));
+  MOE_CUDA(cudaDeviceSynchronize());
+  const Run rt70 = download_run(tgt70.bytes, 70);
+  c5.b = &rt70;
+  run_call(o, s, c5, q8, prefix.bytes, &tgt70.bytes, dq);
 }
 
 // The quantizers' edge rows: a Q block and a V channel of zeros (scale 1, zero codes).
