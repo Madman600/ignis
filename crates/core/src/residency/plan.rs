@@ -103,6 +103,24 @@ pub enum HostPlanError {
     },
 }
 
+impl HostPlanError {
+    /// What the plan needed available: its lines and the margin.
+    pub fn needed_bytes(&self) -> u64 {
+        let Self::BelowMargin { planned_bytes, margin_bytes, .. } = self;
+        planned_bytes.saturating_add(*margin_bytes)
+    }
+
+    /// How much more available memory the plan needed than there was.
+    pub fn short_bytes(&self) -> u64 {
+        let Self::BelowMargin { available_bytes, .. } = self;
+        self.needed_bytes().saturating_sub(*available_bytes)
+    }
+}
+
+/// For a person, in the binary units the plan is laid out in: what the load
+/// needed, what it had, how far short it fell, and what would make room.
+/// The exact bytes are the refusal's log event's
+/// (`ignis.runtime.flash_next_host_plan_refused`) and `GET /v1/models`'s.
 impl std::fmt::Display for HostPlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self::BelowMargin {
@@ -114,38 +132,71 @@ impl std::fmt::Display for HostPlanError {
         } = self;
         write!(
             f,
-            "the host plan needs {planned_bytes} bytes ("
+            "not enough RAM: the load pins {} and keeps {} free for the system, so it needs {} \
+             available, but only {} is ({} short). ",
+            human_bytes(*planned_bytes),
+            human_bytes(*margin_bytes),
+            human_bytes(self.needed_bytes()),
+            human_bytes(*available_bytes),
+            human_bytes(self.short_bytes()),
         )?;
+        match *crossing_line {
+            "expert_pool" => write!(f, "Even the experts alone ({}) do not fit: close other applications", human_bytes(lines[0].1)),
+            "ngram_hot_rows" => f.write_str(
+                "The experts fit, the n-gram hot rows do not: hold fewer (--ngram-hot-bytes) or close other applications",
+            ),
+            "staging" => f.write_str(
+                "The experts and the n-gram hot rows fit, KV-disk's staging buffers do not: --kv-disk-bytes 0 drops them, \
+                 or close other applications",
+            ),
+            "retained_host_slots" => f.write_str(
+                "The model fits, prompt reuse's retained host slots do not: fewer of them \
+                 (--qwen38flashnext-reuse-retained-host) or close other applications",
+            ),
+            "kv_ram_arena" => f.write_str(
+                "The model and its retained slots fit, the KV-RAM arena does not: a smaller one \
+                 (--qwen38flashnext-reuse-kv-host-pool-bytes, 0 turns it off) or close other applications",
+            ),
+            _ => f.write_str("Close other applications"),
+        }?;
+        f.write_str(". Plan: ")?;
         for (i, (name, bytes)) in lines.iter().enumerate() {
-            write!(f, "{}{name} {bytes}", if i == 0 { "" } else { ", " })?;
+            write!(f, "{}{} {}", if i == 0 { "" } else { ", " }, line_label(name), human_bytes(*bytes))?;
         }
-        let remedy = match *crossing_line {
-            "ngram_hot_rows" => "load fewer n-gram hot rows (--ngram-hot-bytes), or free memory",
-            "staging" => "give the load smaller staging buffers, or free memory",
-            "retained_host_slots" => {
-                "give prompt reuse fewer host retained slots (--reuse-retained-host), or free memory"
-            }
-            "kv_ram_arena" => "give KV-RAM a smaller arena (--reuse-kv-host-pool-bytes), or free memory",
-            _ => "free memory: close other applications",
-        };
-        write!(
-            f,
-            ") of the {available_bytes} bytes of physical memory available, and must leave \
-             {margin_bytes} ({}, --model-host-margin-bytes) of it so the system does not page; \
-             the {crossing_line} line crosses that margin: {remedy}",
-            gib_text(*margin_bytes)
-        )
+        write!(f, "; margin {} (--qwen38flashnext-model-host-margin-bytes).", human_bytes(*margin_bytes))
     }
 }
 
 impl std::error::Error for HostPlanError {}
 
-/// `4 GiB`, or `3.50 GiB` for a margin that is not whole GiB.
-fn gib_text(bytes: u64) -> String {
-    if bytes % GIB == 0 {
-        format!("{} GiB", bytes / GIB)
+/// A plan line as the refusal names it to a person.
+fn line_label(name: &str) -> &str {
+    match name {
+        "expert_pool" => "experts",
+        "ngram_hot_rows" => "n-gram hot rows",
+        "retained_host_slots" => "retained host slots",
+        "kv_ram_arena" => "KV-RAM arena",
+        other => other,
+    }
+}
+
+/// `4 GiB`, `35.2 GiB`, `992 MiB`, `512 KiB`, `100 bytes`: binary units,
+/// whole GiB without a decimal, one decimal otherwise, MiB and KiB rounded.
+pub fn human_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1 << 20;
+    const KIB: u64 = 1 << 10;
+    if bytes >= GIB {
+        if bytes % GIB == 0 {
+            format!("{} GiB", bytes / GIB)
+        } else {
+            format!("{:.1} GiB", bytes as f64 / GIB as f64)
+        }
+    } else if bytes >= MIB {
+        format!("{} MiB", (bytes as f64 / MIB as f64).round() as u64)
+    } else if bytes >= KIB {
+        format!("{} KiB", (bytes as f64 / KIB as f64).round() as u64)
     } else {
-        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+        format!("{bytes} bytes")
     }
 }
 

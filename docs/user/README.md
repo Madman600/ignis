@@ -584,7 +584,19 @@ experts, 1 GB of n-gram hot rows, ~0.5 GB of staging (KV-disk's 64 MiB
 included: `--kv-disk-bytes 0` drops it), ~1 GB of retained host
 slots, the 2 GiB KV-RAM arena and the 4 GiB margin the load refuses to dip into
 (`--model-host-margin-bytes`: it never lets reuse push Windows into paging). A load below that is refused
-naming the plan line to shrink. The knobs that lower it, with what each costs:
+in GiB, with how far short it fell and the plan line to shrink:
+
+```
+not enough RAM: the load pins 39.2 GiB and keeps 4 GiB free for the system, so it needs 43.2 GiB
+available, but only 38.8 GiB is (4.5 GiB short). Even the experts alone (35.2 GiB) do not fit: close
+other applications. Plan: experts 35.2 GiB, n-gram hot rows 1 GiB, staging 64 MiB, retained host slots
+992 MiB, KV-RAM arena 2 GiB; margin 4 GiB (--qwen38flashnext-model-host-margin-bytes).
+```
+
+The same refusal in exact bytes is the `ignis.runtime.flash_next_host_plan_refused`
+log event (every line, `available_bytes`, `margin_bytes`, `needed_bytes`,
+`short_bytes`, `crossing_line`) and, after a switch, `GET /v1/models`'s
+`last_switch.host_plan`. The knobs that lower it, with what each costs:
 
 | Knob (`make`) | Flag | Saves | Costs |
 |---|---|---|---|
@@ -710,11 +722,15 @@ model download <id>` that fetches it; a switch never starts a download.
 answers during a switch and while one has failed, and carries no path.
 
 **How the last one ended.** After the first switch or reload since start,
-`GET /v1/models` carries `last_switch: {from, to, outcome, reason?}`:
+`GET /v1/models` carries `last_switch: {from, to, outcome, reason?, host_plan?}`:
 `outcome` is `switched`, `refused` (nothing was torn down), `restored` (the
 old model was loaded again) or `failed` (nothing serves), with a `reason` for
 every outcome but the first. A reload from `PATCH /v1/config` is reported the
-same way, with `from` equal to `to`.
+same way, with `from` equal to `to`. When Flash-Next's
+[host plan](#host-ram-for-flash-next) refused the target, `host_plan` holds
+it in exact bytes for an agent (`available_bytes`, `margin_bytes`,
+`planned_bytes`, `needed_bytes`, `short_bytes`, `crossing_line`, and every
+line as `{name, bytes}`), while `reason` says it for a person.
 
 **By naming the model.** A client can also just ask for the other model: a
 chat completion, a response (over HTTP or the WebSocket) or a decision whose

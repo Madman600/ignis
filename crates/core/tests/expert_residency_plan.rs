@@ -6,7 +6,7 @@
 use ignis_core::residency::{
     ExpertCachePlanError, ExpertCacheRequest, ExpertCatalog, ExpertTraffic, DEFAULT_HOST_MARGIN_BYTES,
     HostPlanError, HostPlanRequest, KBits, MEASURED_ONE_ROW_PREFETCH_BUDGET_BYTES,
-    MEASURED_THREE_ROW_PREFETCH_BUDGET_BYTES, Projection, ProjectionId, default_prefetch_budget,
+    MEASURED_THREE_ROW_PREFETCH_BUDGET_BYTES, Projection, ProjectionId, default_prefetch_budget, human_bytes,
     min_slots_per_class, plan_expert_cache, plan_host, prefill_staging_ring_bytes,
     residency_table_bytes, warm_start_order,
 };
@@ -55,10 +55,28 @@ fn a_named_margin_is_the_one_the_plan_leaves() {
     // None at all: the lines may take every available byte.
     let none = |available| HostPlanRequest { margin_bytes: 0, ..host(available) };
     assert_eq!(plan_host(&none(41 * GIB)).expect("fits exactly").left_bytes, 0);
-    // A margin that is not whole GiB prints as one.
+    // A margin that is not whole GiB prints with its decimal: 44.5 GiB
+    // needed, 44 available.
     let half = HostPlanRequest { margin_bytes: 3 * GIB + GIB / 2, ..host(44 * GIB) };
-    let message = plan_host(&half).expect_err("below the margin").to_string();
-    assert!(message.contains(&format!("{} (3.50 GiB, --model-host-margin-bytes)", 3 * GIB + GIB / 2)), "{message}");
+    let err = plan_host(&half).expect_err("below the margin");
+    assert_eq!((err.needed_bytes(), err.short_bytes()), (44 * GIB + GIB / 2, GIB / 2));
+    let message = err.to_string();
+    assert!(message.contains("keeps 3.5 GiB free") && message.contains("(512 MiB short)"), "{message}");
+}
+
+#[test]
+fn bytes_read_as_binary_units() {
+    for (bytes, text) in [
+        (4 * GIB, "4 GiB"),
+        (37_795_446_784, "35.2 GiB"),
+        (1_040_115_712, "992 MiB"),
+        (64 << 20, "64 MiB"),
+        (512 << 10, "512 KiB"),
+        (100, "100 bytes"),
+        (0, "0 bytes"),
+    ] {
+        assert_eq!(human_bytes(bytes), text, "{bytes}");
+    }
 }
 
 #[test]
@@ -74,17 +92,20 @@ fn a_host_plan_below_the_margin_refuses_naming_the_line_that_crosses_it() {
     assert_eq!(*available_bytes, 43 * GIB);
     assert_eq!(*planned_bytes, 41 * GIB);
     assert_eq!(*crossing_line, "ngram_hot_rows");
+    assert_eq!((err.needed_bytes(), err.short_bytes()), (45 * GIB, 2 * GIB));
+    // A person reads it in GiB, with how far short the load fell and what
+    // would make room; the exact bytes are the error's fields.
     let message = err.to_string();
     for needle in [
-        "ngram_hot_rows",
-        "--ngram-hot-bytes",
-        &(43 * GIB).to_string(),
-        &(41 * GIB).to_string(),
-        &(2 * GIB).to_string(),
-        &format!("{DEFAULT_HOST_MARGIN_BYTES} (4 GiB, --model-host-margin-bytes)"),
+        "not enough RAM: the load pins 41 GiB and keeps 4 GiB free for the system",
+        "needs 45 GiB available, but only 43 GiB is (2 GiB short)",
+        "the n-gram hot rows do not: hold fewer (--ngram-hot-bytes)",
+        "Plan: experts 38 GiB, n-gram hot rows 2 GiB, staging 1 GiB",
+        "margin 4 GiB (--qwen38flashnext-model-host-margin-bytes)",
     ] {
         assert!(message.contains(needle), "{needle} missing: {message}");
     }
+    assert!(!message.contains(&(41 * GIB).to_string()), "no raw byte counts: {message}");
 }
 
 #[test]
@@ -102,8 +123,8 @@ fn a_machine_short_of_the_pool_itself_names_the_pool() {
     let message = err.to_string();
     let HostPlanError::BelowMargin { crossing_line, .. } = err;
     assert_eq!(crossing_line, "expert_pool");
-    assert!(message.contains("close other applications"), "{message}");
-    assert!(!message.contains("hot rows"), "{message}");
+    assert!(message.contains("Even the experts alone (38 GiB) do not fit: close other applications"), "{message}");
+    assert!(!message.contains("--ngram-hot-bytes"), "{message}");
 }
 
 #[test]
@@ -118,8 +139,8 @@ fn the_staging_line_crossing_names_staging_and_its_own_remedy() {
     let message = err.to_string();
     let HostPlanError::BelowMargin { crossing_line, .. } = err;
     assert_eq!(crossing_line, "staging");
-    assert!(message.contains("smaller staging buffers"), "{message}");
-    assert!(!message.contains("hot rows,"), "{message}");
+    assert!(message.contains("KV-disk's staging buffers do not: --kv-disk-bytes 0 drops them"), "{message}");
+    assert!(!message.contains("--ngram-hot-bytes"), "{message}");
 }
 
 // ---- the VRAM expert cache -------------------------------------------------

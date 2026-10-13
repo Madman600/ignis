@@ -233,7 +233,7 @@ async fn on_the_image_model(loader: &Arc<MockLoader>) -> Server {
 }
 
 fn the_switch_to_the_image_model() -> Option<LastSwitch> {
-    Some(LastSwitch { from: "mock-b".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched })
+    Some(LastSwitch { from: "mock-b".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched, host_plan: None })
 }
 
 /// Spec image-model/05 §Prompt enhancement: a visit is two switches in one
@@ -369,7 +369,7 @@ async fn with_the_enhancer_loaded_the_rewrite_comes_first_and_the_request_switch
     assert_eq!(loader.encoded_prompts(), [revised], "the image model ran on the rewrite");
     assert_eq!(loader.loads(), [IMAGE], "one switch: the rewrite needed none");
     let last = server.switcher.as_ref().unwrap().last_switch();
-    assert_eq!(last, Some(LastSwitch { from: "mock-a".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched }));
+    assert_eq!(last, Some(LastSwitch { from: "mock-a".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched, host_plan: None }));
 
     let thinking_off = ThinkingOptions { enable_thinking: false, ..ThinkingOptions::default() };
     let expected = SimpleTemplateProvider.apply_chat_template(&Task::GenerationZh.messages(prompt, &[]), &thinking_off, &[]).unwrap();
@@ -409,7 +409,7 @@ async fn a_streamed_request_on_the_loaded_enhancer_hears_the_rewrite_then_one_sw
     assert_eq!(prefilled(&compute).len(), 1, "one rewrite, on mock-a");
     assert_eq!(loader.loads(), [IMAGE], "one switch: the rewrite needed none");
     let last = server.switcher.as_ref().unwrap().last_switch();
-    assert_eq!(last, Some(LastSwitch { from: "mock-a".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched }));
+    assert_eq!(last, Some(LastSwitch { from: "mock-a".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched, host_plan: None }));
     assert_eq!((server.status().as_str(), server.active().model_id()), ("serving", IMAGE.to_owned()));
 }
 
@@ -508,7 +508,7 @@ async fn a_visit_from_another_text_model_is_written_to_last_switch() {
     );
     assert!(events.last().unwrap().1["revised_prompt"].is_string(), "{:?}", events.last());
     assert_eq!(loader.loads(), ["mock-a", IMAGE]);
-    assert_eq!(last(), Some(LastSwitch { from: "mock-a".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched }));
+    assert_eq!(last(), Some(LastSwitch { from: "mock-a".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched, host_plan: None }));
 
     let (_, task) = ignis_server::model_switch::begin(&server, source("mock-b")).unwrap();
     assert_eq!(task.await.unwrap(), SwitchOutcome::Switched);

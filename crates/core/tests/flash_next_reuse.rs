@@ -212,8 +212,8 @@ fn a_host_plan_short_at_the_retained_slots_names_them() {
     let message = err.to_string();
     let HostPlanError::BelowMargin { crossing_line, .. } = err;
     assert_eq!(crossing_line, "retained_host_slots");
-    assert!(message.contains("--reuse-retained-host"), "{message}");
-    assert!(!message.contains("--reuse-kv-host-pool-bytes"), "{message}");
+    assert!(message.contains("retained host slots do not: fewer of them (--qwen38flashnext-reuse-retained-host)"), "{message}");
+    assert!(!message.contains("-reuse-kv-host-pool-bytes"), "{message}");
 }
 
 #[test]
@@ -223,8 +223,8 @@ fn a_host_plan_short_at_the_kv_ram_arena_names_it() {
     let message = err.to_string();
     let HostPlanError::BelowMargin { crossing_line, .. } = err;
     assert_eq!(crossing_line, "kv_ram_arena");
-    assert!(message.contains("--reuse-kv-host-pool-bytes"), "{message}");
-    assert!(message.contains(&(2 * GIB).to_string()), "{message}");
+    assert!(message.contains("a smaller one (--qwen38flashnext-reuse-kv-host-pool-bytes, 0 turns it off)"), "{message}");
+    assert!(message.contains("KV-RAM arena 2 GiB"), "{message}");
 }
 
 /// The switch to Flash-Next refused on 2026-10-12, its lines as the log
@@ -246,6 +246,31 @@ fn the_logged_switch_fits_with_flash_nexts_own_arena() {
     assert_eq!(crossing_line, "kv_ram_arena");
     let plan = plan_host(&logged(2 * GIB)).expect("Flash-Next's own arena");
     assert!(plan.left_bytes >= DEFAULT_HOST_MARGIN_BYTES, "{}", plan.left_bytes);
+}
+
+/// The switch refused on 2026-10-13, as the owner read it: 41.6 GB
+/// available with the desktop at ~25 GiB, too little for the experts
+/// alone and the margin. The whole message, as a person reads it.
+#[test]
+fn the_refusal_reads_in_binary_units_with_the_shortfall() {
+    let request = HostPlanRequest {
+        available_physical_bytes: 41_632_530_432,
+        expert_pool_bytes: 37_795_446_784,
+        ngram_hot_rows_bytes: GIB,
+        staging_bytes: 64 << 20,
+        retained_host_slots_bytes: 1_040_115_712,
+        kv_ram_arena_bytes: 2 * GIB,
+        margin_bytes: DEFAULT_HOST_MARGIN_BYTES,
+    };
+    let err = plan_host(&request).expect_err("the experts alone cross the margin");
+    assert_eq!((err.needed_bytes(), err.short_bytes()), (46_418_864_128, 4_786_333_696));
+    assert_eq!(
+        err.to_string(),
+        "not enough RAM: the load pins 39.2 GiB and keeps 4 GiB free for the system, so it needs 43.2 GiB \
+         available, but only 38.8 GiB is (4.5 GiB short). Even the experts alone (35.2 GiB) do not fit: close \
+         other applications. Plan: experts 35.2 GiB, n-gram hot rows 1 GiB, staging 64 MiB, retained host slots \
+         992 MiB, KV-RAM arena 2 GiB; margin 4 GiB (--qwen38flashnext-model-host-margin-bytes)."
+    );
 }
 
 #[test]

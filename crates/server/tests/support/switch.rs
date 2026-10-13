@@ -31,7 +31,7 @@ use ignis_core::{Compute, ConcreteScheduler, SchedulerConfig};
 use ignis_server::config_http::ConfigState;
 use ignis_server::engine::Engine;
 use ignis_server::images::ImageModel;
-use ignis_server::model_switch::{load_options, ModelLoader, PreparedLoad};
+use ignis_server::model_switch::{load_options, LoadFailure, ModelLoader, PreparedLoad};
 use ignis_server::load::LoadedModel;
 use ignis_server::telemetry::SystemClock;
 use ignis_server::template::SimpleTemplateProvider;
@@ -57,6 +57,8 @@ struct State {
     refused: Mutex<HashSet<String>>,
     /// Ids whose load fails after prepare accepted them.
     broken: Mutex<HashSet<String>>,
+    /// Ids whose load Flash-Next's host plan refuses ([`starved_plan`]).
+    starved: Mutex<HashSet<String>>,
     /// Each load takes the first of these and waits for a message on it
     /// before it builds: how a test holds a switch inside its load step (a
     /// second one holds the reload that follows a failed load).
@@ -138,6 +140,12 @@ impl MockLoader {
         self.state.broken.lock().unwrap().insert(id.to_owned());
     }
 
+    /// Fail `id`'s load as Flash-Next's host plan refuses one short of RAM
+    /// ([`starved_plan`]), the refusal kept whole as the real loader keeps it.
+    pub fn starve(&self, id: &str) {
+        self.state.starved.lock().unwrap().insert(id.to_owned());
+    }
+
     /// Let `id` load again ([`MockLoader::break_load`] undone): the way a
     /// test proves a later attempt is made, and can succeed.
     pub fn mend(&self, id: &str) {
@@ -212,6 +220,21 @@ impl MockLoader {
     }
 }
 
+/// The host plan of the switch refused on 2026-10-13: 41.6 GB available,
+/// too little for Flash-Next's experts and the 4 GiB margin.
+pub fn starved_plan() -> ignis_core::residency::HostPlanError {
+    ignis_core::residency::plan_host(&ignis_core::residency::HostPlanRequest {
+        available_physical_bytes: 41_632_530_432,
+        expert_pool_bytes: 37_795_446_784,
+        ngram_hot_rows_bytes: 1 << 30,
+        staging_bytes: 64 << 20,
+        retained_host_slots_bytes: 1_040_115_712,
+        kv_ram_arena_bytes: 2 << 30,
+        margin_bytes: ignis_core::residency::DEFAULT_HOST_MARGIN_BYTES,
+    })
+    .expect_err("short of RAM")
+}
+
 fn resident(state: &State) -> usize {
     let images = state.built_images.lock().unwrap().iter().filter(|built| built.strong_count() > 0).count();
     images + state.built.lock().unwrap().iter().filter(|built| built.strong_count() > 0).count()
@@ -269,7 +292,15 @@ impl PreparedLoad for MockPrepared {
         if self.state.broken.lock().unwrap().contains(&self.id) {
             return Err(format!("{} failed to load (simulated kernel load error)", self.id));
         }
+        if self.state.starved.lock().unwrap().contains(&self.id) {
+            return Err(starved_plan().to_string());
+        }
         Ok(LoadedModel { model: build(&self.state, &self.id, Arc::new(MockCompute::new())), reservations: None })
+    }
+
+    fn load_detailed(self: Box<Self>) -> Result<LoadedModel, LoadFailure> {
+        let starved = self.state.starved.lock().unwrap().contains(&self.id);
+        self.load().map_err(|reason| if starved { starved_plan().into() } else { reason.into() })
     }
 
     fn options(&self) -> Option<&ignis_server::config::Config> {
