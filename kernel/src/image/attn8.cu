@@ -4,11 +4,10 @@
 // Upstream: thu-ml/SageAttention, commit d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5, Apache-2.0
 // (Copyright (c) 2024 by SageAttention team):
 //   csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh  qk_int_sv_f8_attn_kernel: the CTA shape (128 queries,
-//                                          4 warps of 32, 64-key blocks), the cp.async pipeline
-//                                          (K of the next block loads during this block's
-//                                          softmax and PV, V during the next QK), the per-warp Q
-//                                          and per-block K dequantization folded into the
-//                                          exponent's FMA, the per-channel V scale at the end;
+//                                          4 warps of 32, 64-key blocks), Q, K and V staged in
+//                                          shared memory by cp.async, the per-warp Q and
+//                                          per-block K dequantization folded into the exponent's
+//                                          FMA, the per-channel V scale at the end;
 //   csrc/qattn/attn_utils.cuh              compute_int_qk, update_mdo (the online max offset by
 //                                          8.807 so P fits E4M3), RS_32_to_8 (P's accumulator
 //                                          fragment packed as PV's A fragment, which is why V is
@@ -34,6 +33,11 @@
 //     accumulator rescaled per channel by vscale_A / vscale_B when the key loop crosses them.
 //   - Causal aligned bottom-right (query i sees keys 0 .. i + keys - queries), masked on every
 //     block the diagonal crosses, at any offset.
+//   - K and V in two shared-memory stages (48 KiB a CTA, still two CTAs an SM): the next block
+//     loads during this one's QK, softmax and PV, behind one barrier per block where SA2's single
+//     K and V buffers need three.
+//   - The int32 scores reach fp32 by the 1.5 * 2^23 bias (exact, |S| < 2^22) instead of the
+//     quarter-rate I2F, and a block that raises no row's max skips the rescale by 1.
 //   - Rows the online max has not yet seen stay -inf with an exact 0 / 1 rescale (no -5e6
 //     sentinel); the 1 / sum is __frcp_rn; output BF16 or fp32 stored from registers.
 
@@ -47,6 +51,7 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <type_traits>
 
 namespace ignis_image {
 namespace {
@@ -57,8 +62,10 @@ constexpr int kTilesK = 4;   // n16 key tiles per block (64 keys)
 constexpr int kTilesV = 8;   // n16 channel tiles (128 channels)
 constexpr int kInnerQK = 4;  // k32 steps over D = 128 INT8
 constexpr float kExpOffset = 8.807f;  // 2^8.807 ~ 448: P's largest value fills E4M3
-constexpr int kSmemQ = 0, kSmemK = kCtaQ * kAttnDim, kSmemV = kSmemK + kCtaK * kAttnDim;
-constexpr int kSmemBytes = kSmemV + kAttnDim * kCtaK;  // 16 + 8 + 8 KiB
+// Shared memory: Q, then two K/V stages (the next block's K and V load while this one computes).
+constexpr int kSmemQ = 0, kSmemStage0 = kCtaQ * kAttnDim, kStageBytes = 2 * kCtaK * kAttnDim;
+constexpr int kSmemK = 0, kSmemV = kCtaK * kAttnDim;  // within a stage
+constexpr int kSmemBytes = kSmemStage0 + 2 * kStageBytes;  // 16 + 2 x (8 + 8) KiB = 48 KiB
 constexpr uint32_t kOnesE4m3 = 0x38383838u;  // four E4M3 1.0
 
 // Byte offset of 16-byte chunk `chunk` of `row` in a tile of 128-byte rows (Q, K: chunk ^ row % 8)
@@ -133,28 +140,26 @@ __global__ void __launch_bounds__(kThreads, 2) attn8_kernel(AttnArgs p) {
   const int blocks = nb[0] + nb[1];
 
   auto block_span = [&](int it) { return it < nb[0] ? 0 : 1; };
-  auto load_k = [&](int it) {
+  // Block it's K (64 rows of 128 bytes) and V^T (128 rows of 64 bytes) into stage it % 2.
+  auto load_kv = [&](int it) {
     const int s = block_span(it), lb = s == 0 ? it : it - nb[0];
     const Span &sp = p.span[s];
-    const int8_t *src = sp.k + (static_cast<std::size_t>(h) * sp.n_pad + lb * kCtaK) * kAttnDim;
+    uint8_t *stage = smem + kSmemStage0 + (it & 1) * kStageBytes;
+    const int8_t *ksrc = sp.k + (static_cast<std::size_t>(h) * sp.n_pad + lb * kCtaK) * kAttnDim;
 #pragma unroll
     for (int i = 0; i < kCtaK * 8 / kThreads; ++i) {
       const int chunk = tid + i * kThreads, row = chunk >> 3, part = chunk & 7;
-      cp_async16(smem + kSmemK + swz128(row, part), src + row * kAttnDim + part * 16);
+      cp_async16(stage + kSmemK + swz128(row, part), ksrc + row * kAttnDim + part * 16);
     }
-  };
-  auto load_v = [&](int it) {
-    const int s = block_span(it), lb = s == 0 ? it : it - nb[0];
-    const Span &sp = p.span[s];
-    const uint8_t *src = sp.v + static_cast<std::size_t>(h) * kAttnDim * sp.n_pad + lb * kCtaK;
+    const uint8_t *vsrc = sp.v + static_cast<std::size_t>(h) * kAttnDim * sp.n_pad + lb * kCtaK;
 #pragma unroll
     for (int i = 0; i < kAttnDim * 4 / kThreads; ++i) {
       const int chunk = tid + i * kThreads, row = chunk >> 2, part = chunk & 3;
-      cp_async16(smem + kSmemV + swz64(row, part), src + static_cast<std::size_t>(row) * sp.n_pad + part * 16);
+      cp_async16(stage + kSmemV + swz64(row, part), vsrc + static_cast<std::size_t>(row) * sp.n_pad + part * 16);
     }
   };
 
-  // Prologue: Q, K0, V0 in three groups.
+  // Prologue: Q, then block 0's K and V.
   {
     const int8_t *src = p.q + (static_cast<std::size_t>(h) * p.nq_pad + q0) * kAttnDim;
 #pragma unroll
@@ -164,9 +169,7 @@ __global__ void __launch_bounds__(kThreads, 2) attn8_kernel(AttnArgs p) {
     }
     cp_async_commit();
   }
-  load_k(0);
-  cp_async_commit();
-  load_v(0);
+  load_kv(0);
   cp_async_commit();
 
   const float qscale = p.qscale[static_cast<std::size_t>(h) * (p.nq_pad / kAttnQScaleRows) + q0 / kAttnQScaleRows + warp];
@@ -195,8 +198,13 @@ __global__ void __launch_bounds__(kThreads, 2) attn8_kernel(AttnArgs p) {
   for (int it = 0; it < blocks; ++it) {
     const int s = block_span(it), lb = s == 0 ? it : it - nb[0];
     const Span &sp = p.span[s];
-    cp_async_wait<1>();  // Q and K(it) have landed (V(it) may still be in flight)
+    // One barrier per block: block it's K and V (and Q) have landed and are visible, and every warp
+    // is done with block it - 1, whose stage the next block's loads now overwrite.
+    cp_async_wait<0>();
     __syncthreads();
+    if (it + 1 < blocks) load_kv(it + 1);
+    cp_async_commit();
+    const uint8_t *stage = smem + kSmemStage0 + (it & 1) * kStageBytes;
 
     // S = Q K^T, exact in int32.
     int32_t rs[kTilesQ][kTilesK][2][4];
@@ -216,7 +224,7 @@ __global__ void __launch_bounds__(kThreads, 2) attn8_kernel(AttnArgs p) {
 #pragma unroll
       for (int fk = 0; fk < kTilesK; ++fk) {
         uint32_t kb[4];
-        ldmatrix_x4(kb, smem + kSmemK + swz128(fk * 16 + b_row, 2 * kk + b_half));
+        ldmatrix_x4(kb, stage + kSmemK + swz128(fk * 16 + b_row, 2 * kk + b_half));
         const uint32_t b0[2] = {kb[0], kb[1]}, b1[2] = {kb[2], kb[3]};
 #pragma unroll
         for (int fq = 0; fq < kTilesQ; ++fq) {
@@ -225,9 +233,6 @@ __global__ void __launch_bounds__(kThreads, 2) attn8_kernel(AttnArgs p) {
         }
       }
     }
-    __syncthreads();  // every warp is done with K(it)
-    if (it + 1 < blocks) load_k(it + 1);
-    cp_async_commit();
 
     // The online softmax over this block (update_mdo, with exact -inf handling).
     const float c = __fmul_rn(__fmul_rn(qscale, sp.kscale[static_cast<std::size_t>(h) * (sp.n_pad / kCtaK) + lb]), p.c_sm);
@@ -235,24 +240,36 @@ __global__ void __launch_bounds__(kThreads, 2) attn8_kernel(AttnArgs p) {
     const bool partial = key0 + kCtaK > sp.keys;
     const bool diag = causal && sp.first + key0 + kCtaK - 1 > q0 + warp * 32 + p.causal_offset;
     float sf[kTilesQ][kTilesK][2][4];
+    // int32 -> fp32 exactly, at full rate: |S| <= 128 * 128^2 < 2^22, so 1.5 * 2^23 + S has S as
+    // its low bits (I2F is quarter rate). One warp-uniform branch picks the masked or the plain
+    // conversion, so the plain path carries no per-element branch.
+    auto convert = [&](auto masked_path) {
 #pragma unroll
-    for (int fq = 0; fq < kTilesQ; ++fq)
+      for (int fq = 0; fq < kTilesQ; ++fq)
 #pragma unroll
-      for (int fk = 0; fk < kTilesK; ++fk)
+        for (int fk = 0; fk < kTilesK; ++fk)
 #pragma unroll
-        for (int nt = 0; nt < 2; ++nt)
+          for (int nt = 0; nt < 2; ++nt)
 #pragma unroll
-          for (int e = 0; e < 4; ++e) {
-            float v = static_cast<float>(rs[fq][fk][nt][e]);
-            if (partial || diag) {
-              const int key = key0 + fk * 16 + nt * 8 + 2 * t + (e & 1);
-              const int row = q0 + warp * 32 + fq * 16 + g + 8 * (e >> 1);
-              const bool masked = key >= sp.keys || (causal && sp.first + key > row + p.causal_offset);
-              if (masked) v = neg_inf();
+            for (int e = 0; e < 4; ++e) {
+              float v = __fsub_rn(__int_as_float(0x4B400000 + rs[fq][fk][nt][e]), 12582912.0f);
+              if constexpr (decltype(masked_path)::value) {
+                const int key = key0 + fk * 16 + nt * 8 + 2 * t + (e & 1);
+                const int row = q0 + warp * 32 + fq * 16 + g + 8 * (e >> 1);
+                const bool masked = key >= sp.keys || (causal && sp.first + key > row + p.causal_offset);
+                v = masked ? neg_inf() : v;
+              }
+              sf[fq][fk][nt][e] = v;
             }
-            sf[fq][fk][nt][e] = v;
-          }
+    };
+    if (partial || diag) {
+      convert(std::true_type{});
+    } else {
+      convert(std::false_type{});
+    }
     uint32_t pa[kTilesQ][2][4];  // P as PV's A fragments, per 32-key half
+    float o[kTilesQ][2];
+    bool rescale = false;
 #pragma unroll
     for (int fq = 0; fq < kTilesQ; ++fq) {
 #pragma unroll
@@ -265,23 +282,41 @@ __global__ void __launch_bounds__(kThreads, 2) attn8_kernel(AttnArgs p) {
         mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, 1));
         mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, 2));
         const float m_new = fmaxf(m[fq][rr], fmaf(mx, c, -kExpOffset));
-        const float o = m_new == m[fq][rr] ? 1.0f : ex2(m[fq][rr] - m_new);
+        o[fq][rr] = m_new == m[fq][rr] ? 1.0f : ex2(m[fq][rr] - m_new);
+        rescale = rescale || m_new != m[fq][rr];
         m[fq][rr] = m_new;
-        dsum[fq][2 * rr] *= o;
-        dsum[fq][2 * rr + 1] *= o;
+      }
+    }
+    // Once the running max has settled most blocks raise no row's max: skip the multiplications
+    // by 1 when no row of the warp moved.
+    if (__any_sync(0xFFFFFFFFu, rescale)) {
 #pragma unroll
-        for (int fv = 0; fv < kTilesV; ++fv)
+      for (int fq = 0; fq < kTilesQ; ++fq) {
 #pragma unroll
-          for (int nt = 0; nt < 2; ++nt) {
-            ro[fq][fv][nt][2 * rr] *= o;
-            ro[fq][fv][nt][2 * rr + 1] *= o;
-          }
+        for (int rr = 0; rr < 2; ++rr) {
+          dsum[fq][2 * rr] *= o[fq][rr];
+          dsum[fq][2 * rr + 1] *= o[fq][rr];
+#pragma unroll
+          for (int fv = 0; fv < kTilesV; ++fv)
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+              ro[fq][fv][nt][2 * rr] *= o[fq][rr];
+              ro[fq][fv][nt][2 * rr + 1] *= o[fq][rr];
+            }
+        }
+      }
+    }
+#pragma unroll
+    for (int fq = 0; fq < kTilesQ; ++fq) {
+#pragma unroll
+      for (int rr = 0; rr < 2; ++rr) {
 #pragma unroll
         for (int fk = 0; fk < kTilesK; ++fk)
 #pragma unroll
           for (int nt = 0; nt < 2; ++nt)
 #pragma unroll
-            for (int e = 0; e < 2; ++e) sf[fq][fk][nt][2 * rr + e] = ex2(fmaf(sf[fq][fk][nt][2 * rr + e], c, -m_new));
+            for (int e = 0; e < 2; ++e)
+              sf[fq][fk][nt][2 * rr + e] = ex2(fmaf(sf[fq][fk][nt][2 * rr + e], c, -m[fq][rr]));
       }
       // RS_32_to_8: half hh's a[0] = row g, keys {2t, 2t+1, 8+2t, 9+2t} of tile 2hh; a[1] row g+8;
       // a[2], a[3] the same of tile 2hh+1 -- the V layout stores those keys at k 4t..4t+3.
@@ -320,15 +355,13 @@ __global__ void __launch_bounds__(kThreads, 2) attn8_kernel(AttnArgs p) {
           }
     }
 
-    cp_async_wait<1>();  // V(it) has landed
-    __syncthreads();
     // O += P V on block-scaled FP8 tensor cores, fp32 accumulate.
 #pragma unroll
     for (int hh = 0; hh < 2; ++hh) {
 #pragma unroll
       for (int fv = 0; fv < kTilesV; ++fv) {
         uint32_t vb[4];
-        ldmatrix_x4(vb, smem + kSmemV + swz64(fv * 16 + b_row, 2 * hh + b_half));
+        ldmatrix_x4(vb, stage + kSmemV + swz64(fv * 16 + b_row, 2 * hh + b_half));
         const uint32_t b0[2] = {vb[0], vb[1]}, b1[2] = {vb[2], vb[3]};
 #pragma unroll
         for (int fq = 0; fq < kTilesQ; ++fq) {
@@ -337,9 +370,6 @@ __global__ void __launch_bounds__(kThreads, 2) attn8_kernel(AttnArgs p) {
         }
       }
     }
-    __syncthreads();  // every warp is done with V(it)
-    if (it + 1 < blocks) load_v(it + 1);
-    cp_async_commit();
   }
   cp_async_wait<0>();
 

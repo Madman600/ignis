@@ -560,6 +560,7 @@ struct Verdict {
   int over = 0;
   double worst = 0.0;
   double min_cos = 1.0, min_centred = 1.0, max_rel_rms = 0.0;
+  double median_bound = 0.0;  // the bound over |reference|, median over the checked outputs
 };
 
 Verdict run_call(const Options &o, const Sequence &s, const Call &call, DeviceBytes &d_q8, const DeviceBytes &d_a,
@@ -584,6 +585,7 @@ Verdict run_call(const Options &o, const Sequence &s, const Call &call, DeviceBy
   for (std::size_t i = 0; i < o32.size(); ++i) bf16_diff += f32_to_bf16(o32[i]) != o16[i] || std::isnan(o32[i]);
 
   std::vector<int> over(kHeads, 0);
+  std::vector<std::vector<double>> tight(kHeads);
   std::vector<double> worst(kHeads, 0.0), cosv(kHeads, 1.0), centred(kHeads, 1.0), rel(kHeads, 0.0);
   parallel_for(kHeads, [&](int h) {
     const std::vector<int> rows = rows_for(call.q_tokens, h, rows_per_head);
@@ -596,6 +598,7 @@ Verdict run_call(const Options &o, const Sequence &s, const Call &call, DeviceBy
         const double y = o32[static_cast<std::size_t>(i) * kHD + h * kDim + c];
         const double err = std::fabs(y - rc.out[c]);
         if (!(err <= rc.bound[c])) ++over[h];
+        if (rc.out[c] != 0.0) tight[h].push_back(rc.bound[c] / std::fabs(rc.out[c]));
         worst[h] = std::isnan(err) ? 1e300 : std::max(worst[h], err / rc.bound[c]);
       }
       if (quant_check) {
@@ -643,8 +646,14 @@ Verdict run_call(const Options &o, const Sequence &s, const Call &call, DeviceBy
     v.min_centred = std::min(v.min_centred, centred[h]);
     v.max_rel_rms = std::max(v.max_rel_rms, rel[h]);
   }
-  std::printf("  %-44s %5d q x %6d keys%s: mechanics worst %.3f of bound, %d over; BF16 = RN(fp32) %s", call.what.c_str(),
-              call.q_tokens, call.keys(), call.causal ? " causal" : "", v.worst, v.over,
+  std::vector<double> all;
+  for (const auto &t : tight) all.insert(all.end(), t.begin(), t.end());
+  if (!all.empty()) {
+    std::nth_element(all.begin(), all.begin() + all.size() / 2, all.end());
+    v.median_bound = all[all.size() / 2];
+  }
+  std::printf("  %-44s %5d q x %6d keys%s: mechanics worst %.3f of bound (bound/|O| median %.1e), %d over; BF16 = RN(fp32) %s",
+              call.what.c_str(), call.q_tokens, call.keys(), call.causal ? " causal" : "", v.worst, v.median_bound, v.over,
               bf16_diff == 0 ? "bit for bit" : "NO");
   if (quant_check) {
     std::printf("; per head cosine >= %.5f (centred %.5f), rel RMS <= %.4f", v.min_cos, v.min_centred, v.max_rel_rms);
