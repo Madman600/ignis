@@ -100,7 +100,7 @@ pub const QWEN_IMAGE_ARTIFACT_FILE_NAME: &str = "ignis_image_2_1_turbo-v2.ninfer
 pub const QWEN_IMAGE_HEADER_BYTES: u64 = 4 << 20;
 
 /// The image model's identity: FP8 row-scaled linears, BF16 elsewhere, the
-/// vision tower in the 27B's grouped formats, from revision `fc13ba19`.
+/// vision tower's matrices W8, from revision `fc13ba19`.
 pub fn qwen_image_identity() -> ArtifactIdentity {
     ArtifactIdentity {
         model_id: crate::qwen_image::MODEL_ID.into(),

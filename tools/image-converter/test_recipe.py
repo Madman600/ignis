@@ -46,15 +46,16 @@ def test_the_spec_table_holds_on_named_tensors(items):
         ("text_encoder/embed_tokens.weight", "bf16", [151936, 4096])
     assert enc("text_encoder", "lm_head.weight") is None
     assert enc("text_encoder", "model.language_model.norm.weight") is None
-    # the vision tower in the 27B's formats and names (crates/artifact/src/inventory.rs vision_scope_27b)
+    # the vision tower under the 27B's names (crates/artifact/src/inventory.rs vision_scope_27b),
+    # every matrix W8
     assert enc("text_encoder", "model.visual.patch_embed.proj.weight") == \
-        ("vision/patch_embedding", "q6", [1152, 1536])
+        ("vision/patch_embedding", "w8", [1152, 1536])
     assert enc("text_encoder", "model.visual.blocks.26.attn.qkv.weight") == \
-        ("vision/layers/26/attention/qkv", "q4", [3456, 1152])
+        ("vision/layers/26/attention/qkv", "w8", [3456, 1152])
     assert enc("text_encoder", "model.visual.blocks.0.attn.proj.weight") == \
-        ("vision/layers/0/attention/output", "q5", [1152, 1152])
-    assert enc("text_encoder", "model.visual.blocks.0.mlp.linear_fc1.weight")[1] == "q4"
-    assert enc("text_encoder", "model.visual.blocks.0.mlp.linear_fc2.weight")[1] == "q5"
+        ("vision/layers/0/attention/output", "w8", [1152, 1152])
+    assert enc("text_encoder", "model.visual.blocks.0.mlp.linear_fc1.weight")[1] == "w8"
+    assert enc("text_encoder", "model.visual.blocks.0.mlp.linear_fc2.weight")[1] == "w8"
     assert enc("text_encoder", "model.visual.blocks.3.norm2.bias") == ("vision/layers/3/norm2/bias", "bf16", [1152])
     assert enc("text_encoder", "model.visual.merger.linear_fc2.weight") == ("vision/merger/fc2", "w8", [4096, 4608])
     assert enc("text_encoder", "model.visual.deepstack_merger_list.2.linear_fc1.weight") == \
@@ -74,10 +75,8 @@ def test_every_pinned_tensor_is_mapped_and_counted(items):
     # tower (27 blocks of 12, patch/bias/positions, the merger and 3 DeepStack mergers of 6)
     assert counts[("text_encoder", "fp8")] == 36 * 7
     assert counts[("text_encoder", None)] == 2
-    assert counts[("text_encoder", "q6")] == 1
-    assert counts[("text_encoder", "q4")] == 27 * 2
-    assert counts[("text_encoder", "q5")] == 27 * 2
-    assert counts[("text_encoder", "w8")] == 2 + 3 * 2
+    assert counts[("text_encoder", "w8")] == 1 + 27 * 4 + 2 + 3 * 2
+    assert not {enc for _, enc in counts} & {"q4", "q5", "q6"}
     assert counts[("text_encoder", "bf16")] == 1 + 36 * 4 + 2 + 27 * 8 + 4 + 3 * 4
     # transformer: 32 x 7 block linears + img_in, txt_in x 2, proj_out
     assert counts[("transformer", "fp8")] == 32 * 7 + 4

@@ -11,9 +11,10 @@
 //!   scale, norms BF16, the token embedding BF16 and read on the host (only a
 //!   prompt's rows go to the device);
 //! - the vision tower, its merger and the DeepStack mergers under the 27B
-//!   artifact's own names and formats (`vision/...`,
-//!   [`crate::inventory::vision_scope_27b`]): Q6 patch embedding, Q4
-//!   qkv/fc1, Q5 output/fc2, W8 mergers, BF16 biases, norms and positions;
+//!   artifact's own names (`vision/...`,
+//!   [`crate::inventory::vision_scope_27b`]), every matrix W8 (the patch
+//!   embedding, the blocks' and the mergers' linears; the 27B's blocks are
+//!   Q4/Q5/Q6), BF16 biases, norms and positions;
 //! - the DiT under `transformer/` and the VAE under `vae/`, checkpoint names:
 //!   the DiT's linears FP8, its modulation, timestep embedder and norms BF16,
 //!   the VAE BF16 at the checkpoint's own shapes;
@@ -264,9 +265,6 @@ fn entry(name: String, (format, layout): (NumericFormat, StorageLayout), shape: 
 
 const FP8: (NumericFormat, StorageLayout) = (NumericFormat::Fp8E4M3FnRowBf16S, StorageLayout::RowScaleV1);
 const BF16: (NumericFormat, StorageLayout) = (NumericFormat::Bf16, StorageLayout::ContiguousLeV1);
-const Q4: (NumericFormat, StorageLayout) = (NumericFormat::Q4G64F16S, StorageLayout::RowSplitK128V1);
-const Q5: (NumericFormat, StorageLayout) = (NumericFormat::Q5G64F16S, StorageLayout::RowSplitK128V1);
-const Q6: (NumericFormat, StorageLayout) = (NumericFormat::Q6G64F16S, StorageLayout::RowSplitK128V1);
 const W8: (NumericFormat, StorageLayout) = (NumericFormat::W8G32F16S, StorageLayout::RowSplitK128V1);
 
 /// The text encoder's objects: the embedding (host), then each layer's.
@@ -307,24 +305,24 @@ fn merger_entries(g: &VisionGeometry, prefix: &str, norm: u64) -> Vec<Entry> {
     ]
 }
 
-/// The vision tower's objects, in the 27B artifact's names and formats, then
-/// the DeepStack mergers.
+/// The vision tower's objects, in the 27B artifact's names with every matrix
+/// W8, then the DeepStack mergers.
 pub fn vision_entries(g: &VisionGeometry) -> Vec<Entry> {
     let h = g.hidden;
     let mut entries = vec![
-        entry("vision/patch_embedding".into(), Q6, &[h, g.patch_dim]),
+        entry("vision/patch_embedding".into(), W8, &[h, g.patch_dim]),
         entry("vision/patch_embedding_bias".into(), BF16, &[h]),
         entry("vision/position_embedding".into(), BF16, &[g.positions, h]),
     ];
     for b in 0..g.depth {
         let n = |suffix: &str| format!("vision/layers/{b}/{suffix}");
-        entries.push(entry(n("attention/qkv"), Q4, &[3 * h, h]));
+        entries.push(entry(n("attention/qkv"), W8, &[3 * h, h]));
         entries.push(entry(n("attention/qkv_bias"), BF16, &[3 * h]));
-        entries.push(entry(n("attention/output"), Q5, &[h, h]));
+        entries.push(entry(n("attention/output"), W8, &[h, h]));
         entries.push(entry(n("attention/output_bias"), BF16, &[h]));
-        entries.push(entry(n("mlp/fc1"), Q4, &[g.intermediate, h]));
+        entries.push(entry(n("mlp/fc1"), W8, &[g.intermediate, h]));
         entries.push(entry(n("mlp/fc1_bias"), BF16, &[g.intermediate]));
-        entries.push(entry(n("mlp/fc2"), Q5, &[h, g.intermediate]));
+        entries.push(entry(n("mlp/fc2"), W8, &[h, g.intermediate]));
         entries.push(entry(n("mlp/fc2_bias"), BF16, &[h]));
         for norm in ["norm1", "norm2"] {
             entries.push(entry(n(&format!("{norm}/weight")), BF16, &[h]));
@@ -522,20 +520,26 @@ mod tests {
         assert_eq!(host, ["text_encoder/embed_tokens.weight"]);
     }
 
-    /// The vision tower is the 27B's, by name, format and shape, except where
-    /// the image model differs: the merger writes 4096 wide (the 27B 5120),
-    /// and the three DeepStack mergers are new.
+    /// The vision tower is the 27B's by name and shape, except where the
+    /// image model differs: the merger writes 4096 wide (the 27B 5120), the
+    /// three DeepStack mergers are new, and every matrix is W8 (the 27B's
+    /// blocks are Q4/Q5/Q6), the rest the 27B's BF16.
     #[test]
-    fn the_vision_tower_is_the_27bs() {
+    fn the_vision_tower_is_the_27bs_names_in_w8() {
         let ours = vision_entries(&QwenImageGeometry::qwen_image_21_turbo().vision);
         let theirs = vision_scope_27b();
         assert_eq!(ours.len(), theirs.len() + 3 * 6);
         for (a, b) in ours.iter().zip(&theirs) {
-            assert_eq!((a.name.as_str(), a.format, a.layout), (b.name, b.format, b.layout));
+            assert_eq!(a.name, b.name);
             if !a.name.starts_with("vision/merger/fc2") {
                 assert_eq!(a.shape, b.shape, "{}", a.name);
             }
+            let want = if b.format == NumericFormat::Bf16 { BF16 } else { W8 };
+            assert_eq!((a.format, a.layout), want, "{}", a.name);
         }
+        let w8 = ours.iter().filter(|e| (e.format, e.layout) == W8).count();
+        assert_eq!(w8, 1 + 27 * 4 + 2 + 3 * 2);
+        assert!(ours.iter().all(|e| [W8, BF16].contains(&(e.format, e.layout))));
         assert_eq!(ours[theirs.len()].name, "vision/deepstack/0/fc1");
         assert_eq!(ours.last().unwrap().shape, [4608], "a DeepStack norm is post-shuffle");
     }

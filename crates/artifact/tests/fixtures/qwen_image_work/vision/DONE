@@ -1,8 +1,8 @@
 {
  "files": {
   "tensors.json": {
-   "bytes": 17680,
-   "sha256": "4823bc24d92435fd1e9c83f925ca19d4677f4f4c79b6fafc3d5cc84c06ad9a99"
+   "bytes": 17683,
+   "sha256": "abdb097d4675ab42eed3a0e90039f7261be97f81b2887a41142e9f4e6cac16a8"
   },
   "vision.deepstack.0.fc1.bin": {
    "bytes": 17408,
@@ -77,32 +77,32 @@
    "sha256": "f1c6d4cfd32e271f300695040125ce76d5314207e9bf8e898ed9924faa7e9338"
   },
   "vision.layers.0.attention.output.bin": {
-   "bytes": 2688,
-   "sha256": "06d6938eea9c1b346772e7969289152be1c07a02e829be74be2f31d3ea4c4a6c"
+   "bytes": 4352,
+   "sha256": "a5830f6f84e5deb29d6823689dc0ab3a225e8d25a57a9ffe567d8557adcebcc4"
   },
   "vision.layers.0.attention.output_bias.bin": {
    "bytes": 64,
    "sha256": "4f29b97420047d242772fb8ef2a874908e142c21a2d3a42aa5592969ce8730a1"
   },
   "vision.layers.0.attention.qkv.bin": {
-   "bytes": 6528,
-   "sha256": "07494584e13a2ec107496062d993440cae602d746378564553b8114ff5d8ee6c"
+   "bytes": 13056,
+   "sha256": "16571e1b436261d8d99f1bc7ebaad60d33e46dbc965011334cb3438478b6b2cd"
   },
   "vision.layers.0.attention.qkv_bias.bin": {
    "bytes": 192,
    "sha256": "0eb3d32d9e22941337771f1d76d2d5a8a12acc11415f620cd77f422901629a82"
   },
   "vision.layers.0.mlp.fc1.bin": {
-   "bytes": 4352,
-   "sha256": "34b02da2690e4389b5b3b4274882dddd3105355844cc6251aaa87fef484f3c0e"
+   "bytes": 8704,
+   "sha256": "13cb22256339702d8efd234f71f5bdbcf33399f9a4be05202d82a05e87a67490"
   },
   "vision.layers.0.mlp.fc1_bias.bin": {
    "bytes": 128,
    "sha256": "50f24d9ac88792e821790a9e47c8d5b3b1cd1e67f43788532b6f6055a62e4426"
   },
   "vision.layers.0.mlp.fc2.bin": {
-   "bytes": 2688,
-   "sha256": "94504a50944af88a5e63a7278d0b3adc27066a76da0972c0f61da283ddac0dba"
+   "bytes": 4352,
+   "sha256": "d847a019716c3f7de4f9890091435c2649f2ca7621d2604858b0523ba18c8f76"
   },
   "vision.layers.0.mlp.fc2_bias.bin": {
    "bytes": 64,
@@ -125,32 +125,32 @@
    "sha256": "0451a668d2153a46adcb859f24bb0ab02de5dc50f7cbd0dd0b3e1f0894343da1"
   },
   "vision.layers.1.attention.output.bin": {
-   "bytes": 2688,
-   "sha256": "8dc82bfb9a082a5c9ca4780809b019aa0d700e2189864f8626c3a53ef04d355d"
+   "bytes": 4352,
+   "sha256": "96b2e0d3580c4f33f52204ad86c482b5bfc7707e8c07e89b7c2d40812757195c"
   },
   "vision.layers.1.attention.output_bias.bin": {
    "bytes": 64,
    "sha256": "8372a7011e8b5ed2ef0fd8f2e970b6a3381db7eeec4104c8533958f809c72350"
   },
   "vision.layers.1.attention.qkv.bin": {
-   "bytes": 6528,
-   "sha256": "8d43244a75c67023978a0c0c4761ea7c960439da401a448f1cfa4037f2d7101c"
+   "bytes": 13056,
+   "sha256": "b2854c83cdb6278396639cbfec3fa751a4c964b35b24d76d2b17433ea0f75ccf"
   },
   "vision.layers.1.attention.qkv_bias.bin": {
    "bytes": 192,
    "sha256": "d8741875069865c728ac07c77cdb776fc860da5df881e6ba30f2407b0302fc56"
   },
   "vision.layers.1.mlp.fc1.bin": {
-   "bytes": 4352,
-   "sha256": "9732198f6705f20c1db0ead6647bde047420535eeed3fbfd0278f9eac77cbfc6"
+   "bytes": 8704,
+   "sha256": "45561cf55528f348da2711dc0e9bb1965efb137c56b02ea1ea019ee6f61cf89b"
   },
   "vision.layers.1.mlp.fc1_bias.bin": {
    "bytes": 128,
    "sha256": "89ff80059992edffc8f9ed18585a16070e386a171513bb58fc4556b29f0dec10"
   },
   "vision.layers.1.mlp.fc2.bin": {
-   "bytes": 2688,
-   "sha256": "49d788c94f77c42626df252bb47676740aa0ed1af5a6a73647ad2597d61ffca3"
+   "bytes": 4352,
+   "sha256": "f86222839d56c959ebf789440dd7426b2461fb63df974e66c490c4e00f60f382"
   },
   "vision.layers.1.mlp.fc2_bias.bin": {
    "bytes": 64,
@@ -173,32 +173,32 @@
    "sha256": "9f80135ffab5f633c19c399cb2cb2acc90cb14a4572ddd97d9a67b640f7dc7c9"
   },
   "vision.layers.2.attention.output.bin": {
-   "bytes": 2688,
-   "sha256": "fbafd3c459cbe3d353d8ed0194c0ca3054c00821f7e99f7bc4dd96153a4299ec"
+   "bytes": 4352,
+   "sha256": "2fef7d8ff7bf723ceb55e0992bb3329f20e0808fe8e370dd34c48dd8eb99369e"
   },
   "vision.layers.2.attention.output_bias.bin": {
    "bytes": 64,
    "sha256": "7bd4f56ec76e7b1049e08c0d770a458948fe38ab40780ba1648570f86d72d346"
   },
   "vision.layers.2.attention.qkv.bin": {
-   "bytes": 6528,
-   "sha256": "2b6f7f892de9e910a613bc9e9325613e8bc866d06a41132b70f618734d35d849"
+   "bytes": 13056,
+   "sha256": "89f84ca19a1178c82e888c0f6e0a6fb684b94411edc737654f9c03a5f1bd0762"
   },
   "vision.layers.2.attention.qkv_bias.bin": {
    "bytes": 192,
    "sha256": "46b490b681e00d204262f6ca6425eb5b48caa9241e5395a25aa678dd95daa694"
   },
   "vision.layers.2.mlp.fc1.bin": {
-   "bytes": 4352,
-   "sha256": "8e71e81e3d295328b14a0614a2a1fef49ddccf5c0e4fc9c5b2a5d7b13d716456"
+   "bytes": 8704,
+   "sha256": "f147432cbd0162d5daaa794be538bbfcb45a97aa8a4371b5e5a0e919e54e7f4b"
   },
   "vision.layers.2.mlp.fc1_bias.bin": {
    "bytes": 128,
    "sha256": "95580e5606491bcd2586c7032b73c3375c7b72a4c74a8c16053aa8a3a6e6f748"
   },
   "vision.layers.2.mlp.fc2.bin": {
-   "bytes": 2688,
-   "sha256": "86c5702f3be4bf5430d4db5a74e07e9015a599f63e8ccd82b2a66934ed88e1f3"
+   "bytes": 4352,
+   "sha256": "4fe888354dc7b7f5538f9115ba469ae3ad0386f60a5765e60a5b8d5b4a224dc2"
   },
   "vision.layers.2.mlp.fc2_bias.bin": {
    "bytes": 64,
@@ -245,8 +245,8 @@
    "sha256": "bfe1ea84a2d822d44aa1782fc8887258e542ef3a3f43ab940428858d99a8f07a"
   },
   "vision.patch_embedding.bin": {
-   "bytes": 3200,
-   "sha256": "7680aa448ce6bffbc897dc03cb440ca8c20f82d77e89706f8d53fb505fec6ecf"
+   "bytes": 4352,
+   "sha256": "d2cd602bc6db27ff84d6c8f669d2000d5aa197e104eb7c9eaa23ece881976011"
   },
   "vision.patch_embedding_bias.bin": {
    "bytes": 64,

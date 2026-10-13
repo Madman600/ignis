@@ -119,11 +119,14 @@ fn a_missing_or_unknown_object_or_another_identity_is_refused_by_name() {
 /// The real geometry's DiT, VAE and text-decoder objects are the pinned
 /// checkpoint's tensors (`tools/image-converter/pin.json`, read from the
 /// safetensors headers at the pinned revision), by name and shape; the vision
-/// tower, renamed to the 27B's names, by count.
+/// tower, renamed to the 27B's names, by count. The packer's `weights_id`
+/// names the pin's revision, so the two cannot drift apart.
 #[test]
 fn the_real_inventory_is_the_pinned_checkpoints() {
     let pin = read_json(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/image-converter/pin.json"));
     assert_eq!(pin["revision"], "fc13ba1986fcb905854dc8de2f52eee395f49b5b");
+    let revision = pin["revision"].as_str().unwrap();
+    assert!(ignis_artifact::packer::qwen_image_identity().weights_id.ends_with(&revision[..7]));
     let g = QwenImageGeometry::qwen_image_21_turbo();
     let expected = |component: &str, rename: &dyn Fn(&str) -> Option<String>| {
         let mut out: Vec<(String, Vec<u64>)> = pin["tensors"][component]

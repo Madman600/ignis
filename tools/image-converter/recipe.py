@@ -7,7 +7,7 @@ encoding table).
 | text encoder decoder-layer linears (q/k/v/o, gate/up/down) | fp8 |
 | DiT modulation, timestep embedder, norm_out's linear (its modulation), every norm | bf16 |
 | token embedding (read on the host) | bf16 |
-| vision tower, merger, DeepStack mergers | the 27B's (ninfer's Qwen3.6 vision recipe): q6 patch embedding, q4 qkv/fc1, q5 output/fc2, w8 mergers, bf16 biases, norms, positions |
+| vision tower, merger, DeepStack mergers | w8 for every matrix (the patch embedding, qkv/output/fc1/fc2, the mergers), bf16 biases, norms, positions |
 | VAE, quant_conv, post_quant_conv | bf16 |
 
 Not stored: `lm_head` and the text model's final norm (the encoder's output is taken before it).
@@ -15,8 +15,10 @@ Not stored: `lm_head` and the text model's final norm (the encoder's output is t
 Object names: `text_encoder/` + the checkpoint name without `model.language_model.`;
 `transformer/` and `vae/` + the checkpoint name; the vision tower under the 27B artifact's own
 names (`vision/layers/{b}/attention/qkv`, ...: crates/artifact/src/inventory.rs
-`vision_scope_27b`) so its binder and kernels read it unchanged, and the DeepStack mergers beside
-the merger as `vision/deepstack/{i}/...`. A tensor the map does not name is refused, by name.
+`vision_scope_27b`), though not in its formats: W8 everywhere instead of the 27B's Q4/Q5/Q6
+blocks (the owner's call of 2026-10-13, on the tower's measured error); the DeepStack mergers sit
+beside the merger as `vision/deepstack/{i}/...`. A tensor the map does not name is refused, by
+name.
 """
 import math
 import re
@@ -42,13 +44,13 @@ _TEXT_DROPPED = ("lm_head.weight", _TEXT + "norm.weight")
 _VISION = "model.visual."
 _VISION_BLOCK = re.compile(r"blocks\.(\d+)\.(.+)")
 _VISION_BLOCK_PARTS = {
-    "attn.qkv.weight": ("attention/qkv", "q4"),
+    "attn.qkv.weight": ("attention/qkv", "w8"),
     "attn.qkv.bias": ("attention/qkv_bias", "bf16"),
-    "attn.proj.weight": ("attention/output", "q5"),
+    "attn.proj.weight": ("attention/output", "w8"),
     "attn.proj.bias": ("attention/output_bias", "bf16"),
-    "mlp.linear_fc1.weight": ("mlp/fc1", "q4"),
+    "mlp.linear_fc1.weight": ("mlp/fc1", "w8"),
     "mlp.linear_fc1.bias": ("mlp/fc1_bias", "bf16"),
-    "mlp.linear_fc2.weight": ("mlp/fc2", "q5"),
+    "mlp.linear_fc2.weight": ("mlp/fc2", "w8"),
     "mlp.linear_fc2.bias": ("mlp/fc2_bias", "bf16"),
     "norm1.weight": ("norm1/weight", "bf16"),
     "norm1.bias": ("norm1/bias", "bf16"),
@@ -80,7 +82,7 @@ def _vision(name, shape):
     rest = name[len(_VISION):]
     if rest == "patch_embed.proj.weight":
         # the 27B's patch embedding: [hidden, in_channels * temporal * patch * patch]
-        return Item("vision/patch_embedding", "q6", [shape[0], math.prod(shape[1:])])
+        return Item("vision/patch_embedding", "w8", [shape[0], math.prod(shape[1:])])
     if rest == "patch_embed.proj.bias":
         return Item("vision/patch_embedding_bias", "bf16", shape)
     if rest == "pos_embed.weight":

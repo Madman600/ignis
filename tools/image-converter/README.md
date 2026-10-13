@@ -16,7 +16,7 @@ is `crates/artifact/src/qwen_image.rs`.
 | `pin.py`, `pin.json` | The accepted checkpoint: the revision, every file the converter reads with its size and sha256 (a safetensors file's is its LFS oid), every tensor with its dtype and shape. `check` refuses any difference, naming it. |
 | `recipe.py` | The tensor map: spec 01's encoding table, each checkpoint tensor's object name, encoding and stored shape. A tensor it does not name is refused. |
 | `fp8.py` | FP8 E4M3FN with a bf16 scale per row (`row-scale-v1`): a copy of `tools/flash-next-converter/fp8.py`, plus the round-trip error. |
-| `rowsplit.py` | Q4/Q5/Q6 G64 and W8 G32 (`row-split-k128-v1`), the 27B vision tower's formats: adapted from the reference converter (gpillon/ninfer `a00648c`, Apache-2.0), bit-identical to it. |
+| `rowsplit.py` | Q4/Q5/Q6 G64 and W8 G32 (`row-split-k128-v1`), the 27B vision tower's formats (this tower uses W8 only): adapted from the reference converter (gpillon/ninfer `a00648c`, Apache-2.0), bit-identical to it. |
 | `work.py` | The DONE protocol, copied from `tools/flash-next-converter/layout.py`. |
 | `metadata.py` | `frontend/image_model.json` (sampler sigmas, scheduler, image processor, latent normalization, the prompt templates verbatim from diffusers 0.41.0) and the VAE's convolution shapes. |
 | `synthetic.py` | The synthetic checkpoint: 2 DiT blocks, 2 text layers, a 3-block vision tower, a small VAE, from diffusers' and transformers' own modules. |
@@ -34,7 +34,7 @@ is `crates/artifact/src/qwen_image.rs`.
 | text encoder decoder-layer linears (36 layers) | `text_encoder/layers.{l}...` | FP8, as above |
 | DiT modulation, timestep embedder, `norm_out.linear` (`norm_out`'s modulation), every norm | as above | bf16, the checkpoint's bits |
 | token embedding | `text_encoder/embed_tokens.weight` | bf16; the binder keeps it on the host |
-| vision tower, merger, 3 DeepStack mergers | the 27B's (`vision/layers/{b}/attention/qkv`, ...; `vision/deepstack/{i}/...`) | the 27B's: Q6 patch embedding (as `[1152, 1536]`), Q4 qkv/fc1, Q5 output/fc2, W8 mergers, bf16 biases, norms, positions |
+| vision tower, merger, 3 DeepStack mergers | the 27B's (`vision/layers/{b}/attention/qkv`, ...; `vision/deepstack/{i}/...`) | W8 G32 for every matrix (the patch embedding as `[1152, 1536]`, qkv/output/fc1/fc2, the mergers), bf16 biases, norms, positions |
 | VAE, `quant_conv`, `post_quant_conv` | `vae/<checkpoint name>` | bf16, the checkpoint's shapes |
 | frontend | `frontend/<file>` | the tokenizer, chat template, the checkpoint's configs, `image_model.json` |
 

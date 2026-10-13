@@ -1,11 +1,12 @@
-"""A probe for the owner (#318 M3, informational: the converter does not change on it). The artifact
-stores the vision tower in the 27B's formats, whose Q4 tensors carry 10-16% weight error: how far
-does that move the tower's outputs on the edit case's encoder image, next to plain bf16?
+"""A probe for the owner (#318 M3, informational): how far do the artifact's vision-tower formats
+move the tower's outputs on the edit case's encoder image, next to plain bf16? It measured the
+27B's formats first (Q4 tensors with 10-16% weight error: 42% at the merger), on which the owner
+made the tower W8 throughout; it measures whatever recipe.py stores.
 
 Three runs of the vision tower, its merger and its three DeepStack mergers, on the CPU:
 - `fp32`: the checkpoint's weights, computing in fp32 (the reference);
-- `artifact`: the weights the artifact holds (Q6 patch embedding, Q4 qkv/fc1, Q5 output/fc2, W8
-  mergers, `row-split-k128-v1`, decoded to fp32; bf16 biases, norms and positions), in fp32;
+- `artifact`: the weights the artifact holds (recipe.py's grouped formats, `row-split-k128-v1`,
+  decoded to fp32; bf16 biases, norms and positions), in fp32;
 - `bf16`: the checkpoint's weights, computing in bf16.
 It reports the relative L2 of the merger output and of each DeepStack feature against `fp32`.
 

@@ -1,8 +1,9 @@
 """Grouped symmetric quantization in the `row-split-k128-v1` layout: Q4G64_F16S, Q5G64_F16S,
-Q6G64_F16S and W8G32_F16S, the formats the 27B's vision tower is stored in.
+Q6G64_F16S and W8G32_F16S, the formats the 27B's vision tower is stored in. The image model's
+tower is W8 throughout (recipe.py).
 
 Adapted op (ADR 0051), copied from the reference converter so the image model's vision tower is
-encoded exactly as the 27B's was:
+encoded exactly as the 27B's formats are:
   upstream  gpillon/ninfer, commit a00648cb828457986cf5b4b4f712b4cbcd7af0d1 (kernel/vendor's pin)
   paths     tools/convert/common/quantize.py (`_canonical_scale_words`, `quantize_matrix`)
             tools/artifact/layouts.py (`row_split_geometry`, `_pack_low_nibbles`, `_pack_high_bits`,

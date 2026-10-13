@@ -40,7 +40,7 @@ def test_a_payload_that_is_not_the_artifacts_is_refused(converted):
     _, state = vision_probe.vision_state(snap)
     tampered = copy.deepcopy(record)
     for r in tampered["tensors"]:
-        if r["encoding"] == "q4":
+        if r["encoding"] == "w8":
             r["sha256"] = "0" * 64
             break
     with pytest.raises(ValueError, match="not the artifact's"):
