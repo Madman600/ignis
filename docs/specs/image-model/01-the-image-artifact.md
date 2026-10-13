@@ -91,7 +91,11 @@ The artifact is published on Hugging Face as `gpillon/ignis-image-2.1-turbo`.
 - **The yardsticks** (same tool, `record.py yardstick`, against the recorded
   oracle). Both run the pipeline **teacher-forced**:
   - at each denoising step i, the recorded fp32 input latents go in;
-  - the step's velocity is compared with the fp32 velocity of that step.
+  - the step's velocity is compared with the fp32 velocity of that step;
+  - each yardstick's DiT reads **that pipeline's own** encoder output and
+    condition latents, never the recorded fp32 ones. The velocity bound
+    therefore holds the encoder's error too, and ignis's DiT must read
+    ignis's encoder (spec 04 AC 3-4).
 
   The two pipelines:
   - **bf16**: diffusers in bf16 on the checkpoint's weights. It has no
@@ -105,17 +109,32 @@ The artifact is published on Hugging Face as `gpillon/ignis-image-2.1-turbo`.
     its W8 payloads, and every other tensor its bf16. Attention is not
     simulated.
 
-  The metrics are relative L2 against fp32:
-  - the velocity and the condition latents over the whole tensor;
+    Its limits, which the 2× must absorb:
+    - it quantizes the fp32 activation, where the kernel takes bf16. A
+      review measured the difference on the CPU: the error reads at most
+      ~0.4% of itself higher (3.00% → 3.01%);
+    - it leaves out ignis's bf16 intermediates and its 8-bit attention and
+      KV (`spec.md`).
+
+  The metrics are against fp32, in float64:
+  - the velocity and the condition latents: relative L2 over the whole
+    tensor;
   - the encoder over its **text rows** only: the positions after
     `drop_idx` whose `image_pad_mask` is 0. The DiT replaces the image-pad
-    rows with the condition latents, so their error never reaches it.
+    rows with the condition latents, so their error never reaches it. Each
+    row's relative L2 is taken, then their RMS,
+    sqrt(mean_r ‖e_r‖²/‖ref_r‖²): the DiT reads each row through an
+    RMSNorm (`txt_in`), so one large row cannot stand for the others;
+  - with a condition image, the same metric over the text rows **after the
+    vision span** only, the ones the image can reach;
+  - the first row after `drop_idx` alone, reported and never bounded.
 
   The **bound** ignis is held to is **max(2 × sim error, 5 × bf16 error)**,
-  per step, for the encoder and for the condition latents. Both factors are
-  flags with these defaults. `thresholds.json` carries both errors, the
-  bound, each quantity's metric, the factors, and the oracle's and the
-  yardstick's session ids. It is written before ignis ever runs (spec 04).
+  per step, for both encoder quantities and for the condition latents. Both
+  factors are flags with these defaults. `thresholds.json` carries both
+  errors, the bound, each quantity's metric, the factors, the oracle's and
+  the yardstick's session ids, and the artifact's sha256. It is written
+  before ignis ever runs (spec 04).
 
   A free-running comparison would measure the sampler amplifying one ULP,
   not the error: the pipeline's docstring says even the cache on/off switch
@@ -156,13 +175,18 @@ The artifact is published on Hugging Face as `gpillon/ignis-image-2.1-turbo`.
 6. `thresholds.json` holds, for each case:
    - the teacher-forced per-step velocity error of both yardsticks (bf16
      and simulated W8A8);
-   - their encoder error over the text rows, and their condition-latent
-     error;
+   - their encoder error over the text rows (and, with a condition image,
+     after the vision span), and their condition-latent error;
    - the bound max(2 × sim, 5 × bf16) for each of these.
 
-   It also holds the metrics, the factors and the oracle's session id. It is
-   written against the recorded oracle before any ignis result exists, and
-   never edited after.
+   It also holds the metrics, the factors, the artifact's sha256, and both
+   session ids: the oracle's and the yardstick's. It is written against the
+   recorded oracle before any ignis result exists, and never edited after.
+   Only a new yardstick session supersedes it, and only before any ignis
+   result exists: `--replace-thresholds` supersedes schema v1 (the
+   recorder's bf16-only file) and v2; a later schema takes
+   `--supersede-bound` as well. The old file is kept as
+   `thresholds.<its session id>.json`.
 7. The Hugging Face repo exists with the files and card above, passed the
    privacy scan, and is pinned at a revision. Its sha256s are recorded for
    spec 05's catalog entry.
@@ -280,9 +304,9 @@ and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
     with shapes and dtypes in `case.json`; the decoded `image.png`; for edit,
     the condition image as `condition.png`;
   - `thresholds.json`: the recorder's bf16-only file (written once: the
-    recorder refuses an existing one), since replaced by the yardstick
-    session's bound (below);
-  - `yardstick-report.json`: that session's report;
+    recorder refuses an existing one), since superseded by the yardstick's
+    bound (below);
+  - `yardstick-report.json`: the last yardstick session's report;
   - `manifest.json`, written last: torch 2.13.0+cu130, diffusers 0.41.0,
     transformers 5.17.0 (and the rest), the TF32 flags, the attention
     check, wall times and peaks, and `record.FIELDS`, which describes each
@@ -304,9 +328,16 @@ and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
     `cached` step, the target rows only). Block outputs are
     `step{0,1}/block{00,15,31}.npy`.
   - The RoPE table is `rope.npy`, `(S, 64, 2)`: (cos, sin) as the real and
-    imaginary parts of diffusers' complex table. The segments, `img_shapes`
-    and the kv modes per step are in `case.json`; `image_ids`,
-    `target_token_mask` and `joint_image_mask` are `.npy`.
+    imaginary parts of diffusers' complex table. Column j rotates the head's
+    adjacent channel pair (2j, 2j+1) as one complex number, not
+    `rotate_half`'s split halves (Qwen3-VL's text mrope); the 64 columns are
+    frame 8 | height 28 | width 28. The segments, `img_shapes` and the kv
+    modes per step are in `case.json`; `image_ids`, `target_token_mask` and
+    `joint_image_mask` are `.npy`.
+  - `dit_timesteps.npy` is what the DiT read: t · fl(1/1000) on CUDA (a
+    division by a scalar runs as a multiplication by its reciprocal), 1 ULP
+    (5.96e-8) off `sigmas` at steps 1, 2, 3 and 6. Spec 04 AC 2 compares
+    against `sigmas.npy` and `timesteps.npy`, which are exact.
   - `encoder_hidden_states` is the whole sequence before the final norm;
     `prompt_embeds` is it without the first `drop_idx` (14) rows, what the
     DiT reads. `condition_vae_input` is the VAE's exact input (RGBA in
@@ -336,54 +367,92 @@ and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
   template and `apply_chat_template` differ only with an image (`<image1>`
   before `<|vision_start|>`).
 - **Precision checks.** TF32 off through the legacy flags (torch 2.13 refuses
-  to read them after a mix with the new `fp32_precision` API), asserted
-  through both: `allow_tf32` False for matmul and cuDNN,
-  `float32_matmul_precision` highest. The DiT's attention runs under
+  to read them after a mix with the new `fp32_precision` API), asserted on
+  them: `allow_tf32` False for matmul and cuDNN, `float32_matmul_precision`
+  highest. The new API's cuDNN precisions read `none` (inherit), so they
+  only confirm it. The DiT's attention runs under
   `sdpa_kernel(EFFICIENT_ATTENTION)` only, which raises instead of falling
   back to the math kernel; a self-check against the math kernel gave a
-  1.07e-6 max difference. `use_kv_cache=True` is asserted from the kv modes
-  (`extract`, then `cached` ×7).
-- **thresholds.json** (schema v2) comes from `record.py yardstick`, one
-  session under the GPU lock: session `2026-10-13T20:43:05Z`, commit
-  `eee2433` (dirty: the README's uncommitted text only), on oracle session
-  `2026-10-13T18:08:17Z`. It is the bound max(2 × sim, 5 × bf16), with
-  relative L2, both yardsticks teacher-forced, and the encoder over its
-  text rows. The recorder's bf16-only file is kept as
-  `thresholds.2026-10-13T180817Z.json`.
+  1.07e-6 max difference. The text encoder's fp32 attention backend is not
+  pinned: torch picks math or memory-efficient, both fp32. `use_kv_cache=True`
+  is asserted from the kv modes (`extract`, then `cached` ×7).
+- **For spec 03.** AC 1's templates with 2 and 10 condition images and
+  AC 6's 3-image mrope table need no GPU recording: both come on the CPU
+  from the pinned processor and transformers' rope index, without weights.
+- **thresholds.json** (schema v3) comes from `record.py yardstick
+  --replace-thresholds`, one session under the GPU lock: session
+  `2026-10-13T21:45:07Z`, commit `4fa6502` (clean), on oracle session
+  `2026-10-13T18:08:17Z`. It is the bound max(2 × sim, 5 × bf16), both
+  yardsticks teacher-forced, with the encoder metrics above. Its sha256 is
+  `b09d3e4cbc67d22e401468e01c2a501b879c097a48b653ea336a2dc2336fbbca`; it
+  records the artifact's sha256 (`4205dd19...`, as above).
+  - The files it superseded are kept:
+    - `thresholds.2026-10-13T204305Z.json`: v2, the encoder pooled over its
+      text rows, sha256 `f9a57a23...`;
+    - `thresholds.2026-10-13T180817Z.json`: the recorder's bf16-only v1,
+      sha256 `a297d6d9...`.
+  - The velocity errors of both yardsticks are bit-identical to v2's: the
+    session refuses a supersede otherwise. Only the encoder metric changed.
 
-  | case | | velocity per step, % | encoder (text rows), % |
-  |---|---|---|---|
-  | t2i | bf16 | 1.17 4.49 2.36 1.22 0.76 0.73 0.73 0.67 | 8.78 |
-  | | sim | 5.51 7.12 4.09 3.52 3.14 3.02 2.88 3.53 | 17.85 |
-  | | **bound** | 11.01 22.47 11.78 7.04 6.28 6.04 5.75 7.06 | 43.88 |
-  | t2i-2k | bf16 | 2.20 4.70 1.91 1.18 0.58 0.63 0.62 0.60 | 8.78 |
-  | | sim | 4.68 5.65 3.19 2.95 2.79 2.70 2.68 3.40 | 17.85 |
-  | | **bound** | 10.99 23.49 9.54 5.90 5.57 5.39 5.36 6.79 | 43.88 |
-  | edit | bf16 | 2.08 1.78 1.48 1.16 0.69 0.61 0.64 0.73 | 6.56 |
-  | | sim | 6.89 6.27 3.09 2.99 2.74 2.65 2.65 3.81 | 15.16 |
-  | | **bound** | 13.78 12.53 7.42 5.97 5.48 5.31 5.29 7.63 | 32.82 |
+  | case | | velocity per step, % | encoder, text rows, % | after the vision span, % | row 0, % |
+  |---|---|---|---|---|---|
+  | t2i | bf16 | 1.17 4.49 2.36 1.22 0.76 0.73 0.73 0.67 | 9.85 | | 53.72 |
+  | | sim | 5.51 7.12 4.09 3.52 3.14 3.02 2.88 3.53 | 19.40 | | 93.86 |
+  | | **bound** | 11.01 22.47 11.78 7.04 6.28 6.04 5.75 7.06 | 49.27 | | none |
+  | t2i-2k | bf16 | 2.20 4.70 1.91 1.18 0.58 0.63 0.62 0.60 | 9.85 | | 53.72 |
+  | | sim | 4.68 5.65 3.19 2.95 2.79 2.70 2.68 3.40 | 19.40 | | 93.86 |
+  | | **bound** | 10.99 23.49 9.54 5.90 5.57 5.39 5.36 6.79 | 49.27 | | none |
+  | edit | bf16 | 2.08 1.78 1.48 1.16 0.69 0.61 0.64 0.73 | 6.71 | 3.22 | 30.42 |
+  | | sim | 6.89 6.27 3.09 2.99 2.74 2.65 2.65 3.81 | 14.80 | 12.88 | 21.12 |
+  | | **bound** | 13.78 12.53 7.42 5.97 5.48 5.31 5.29 7.63 | 33.55 | 25.76 | none |
 
   - **Condition latents (edit):** bf16 1.48%, sim exactly 0 (the VAE is the
     artifact's bf16, computing in fp32 as the oracle does), bound 7.38%.
-  - **Which factor sets the bound:** 5 × bf16 at the first steps (step 1 of
-    both t2i cases), 2 × sim everywhere else.
+  - **Which factor sets the bound:** 5 × bf16 sets 10 of the 29 bounds:
+    - velocity steps 1-2 of t2i, 0-2 of t2i-2k and 2 of edit (0-based);
+    - the three text-row encoder bounds;
+    - the condition latents.
+
+    2 × sim sets the rest, the edit after-vision encoder bound among them.
+  - **The bf16 yardstick's timestep.** The bf16 pipeline casts t to the
+    latents' dtype (`pipeline_qwenimage21.py:782`) and divides it by 1000 in
+    bf16, so its DiT reads a rounded σ (t 978.45 → 0.98046875); ignis feeds
+    σ. A review measured
+    the modulation's shift on the CPU: 0.57%, 0.47% and 0.34% at steps 1-3,
+    0.02-0.06% at steps 4-7, 0 at step 0.
+  - **The t2i step-1 spike.** The σ shift does not explain the spike:
+    4.49% and 4.70% at step 1 of t2i and t2i-2k, against 1.17% and 2.20%
+    at step 0. edit has the same σ shift and 1.78% at step 1. It is
+    unexplained, and it gives step 1 a 22-23% bound, so a pass at step 1 is
+    weak evidence.
   - **Checks in `oracle/yardstick-report.json`:**
     - every one of the artifact's 1,283 stored tensors was checked against
-      its sidecar sha256: the 480 FP8 and 117 W8 payloads read from the
-      container, and the 686 bf16 tensors from the loaded models;
+      its sidecar sha256 and encoding: the 480 FP8 and 117 W8 payloads read
+      from the container, and the 686 bf16 tensors from the loaded models;
     - the fp32 encoder replayed in the session has error exactly 0 against
-      the oracle;
-    - the bf16 velocity errors are bit-identical to the recorder's.
-  - **Where the encoder error lies.**
-    - t2i: one row, the first after `drop_idx`, carries 95% of the bf16
-      squared error and 70% of the sim one.
-    - edit, whole tensor: the 1024 image-pad rows carry 99.9% (bf16) and
-      99.3% (sim) of it (39.2% and 31.3% whole).
-  - **Spec 03 AC 4's premise does not hold under this bound.** The edit
-    encoder in fp32 with DeepStack off has a text-row error of 20.7%. That
-    is above the sim error (15.2%) but below the bound (32.8%), so "with
-    DeepStack off, the same test fails" cannot discriminate as written (the
-    owner's call).
+      the oracle, over the whole tensor;
+    - the velocity errors are bit-identical to v2's, and the bf16 ones to
+      the recorder's.
+  - **Where the encoder error lies.** Each text row's relative L2 is in the
+    report.
+    - t2i: row 0 (`<|im_start|>`) holds 96% of the bf16 mean square and 76%
+      of the sim one. Without it the text rows read 2.03% (bf16) and 9.75%
+      (sim). So 5 × bf16 still sets t2i's bound through row 0: with row 0 at
+      the sim level, the bound lets the other 30 rows reach 47% RMS.
+    - edit: row 0 holds 79% of the bf16 mean square and 8% of the sim one.
+      The 1024 image-pad rows carry 99.9% (bf16) and 99.3% (sim) of the
+      whole tensor's squared error.
+  - **DeepStack off (edit, fp32 encoder, DeepStack zeroed)**, spec 03 AC 4's
+    premise:
+    - over the text rows: 22.34%, under the bound (33.55%);
+    - over the text rows after the vision span: 26.85%, over the bound
+      (25.76%) by 4%;
+    - row 0, and every row before the image: exactly 0. DeepStack cannot
+      reach them.
+  - **The encoder metric of spec 03 (the coordinator's decision rule,
+    2026-10-13).** DeepStack off exceeds the bound only with the rows after
+    the vision span. So edit's AC 4 measures the text rows after the vision
+    span, and t2i's AC 3 keeps all its text rows.
 - **The vision tower's formats (informational, `vision_probe.py`).** The
   edit case's 4096 patches go through the tower, the merger and the
   DeepStack mergers on the CPU. They are compared with the checkpoint's
@@ -405,12 +474,12 @@ and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
   DiT fp32 11.7, 69.8, 16.1 s; DiT bf16 3.7, 23.4, 5.2 s; decode 0.7 s
   (GPU), 316 s (host), 1.4 s (GPU). Peak VRAM of the process (GiB, under a
   24 GiB cap, the desktop's ~2.3 aside): encoder 19.8, 19.8, 21.3; DiT 16.8,
-  20.2, 22.0. Four earlier holds (19:47-20:01) failed and taught the
-  shape above: the cap's device index, the encoder's `lm_head` cast-back
-  (OOM), a forward pre-hook that returned the module, and the 2048² decode
-  (OOM).
-- **Wall times of the yardstick session (AC 8)**, under the GPU lock
-  (2026-10-13 22:43-22:47), 227 s in all:
+  20.2, 22.0. An earlier hold (19:47-19:57) ran four attempts that failed
+  and taught the shape above: the cap's device index, the encoder's
+  `lm_head` cast-back (OOM), a forward pre-hook that returned the module,
+  and the 2048² decode (OOM).
+- **Wall times of the yardstick sessions (AC 8)**, each under the GPU lock.
+  The v2 session (2026-10-13 22:43-22:47) took 227 s in all:
   - load 26.5 s;
   - encoders 0.6, 0.2, 0.7 s in bf16 and 0.2, 0.2, 0.8 s in sim (t2i,
     t2i-2k, edit);
@@ -422,6 +491,15 @@ and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
   Peak VRAM of the process (GiB): encoder 17.6 (bf16) and 14.9 (sim), DiT
   17.1 (bf16) and 14.9 (sim). The sim holds the FP8 codes at rest and
   dequantizes one linear at a time.
+
+  The v3 session (2026-10-13 23:44-23:49) took 249 s in all, with the same
+  peaks within 0.1 GiB:
+  - load 40.6 s;
+  - encoders 0.8, 0.1, 0.8 s in bf16 and 0.3, 0.2, 0.8 s in sim;
+  - the sim swaps 24.7 s and 19.4 s; encoder to DiT 17.5 s;
+  - DiT 5.1, 24.3, 5.6 s in bf16 and 12.7, 73.9, 17.1 s in sim;
+  - the artifact's sha256, hashed beside the GPU work, was ready when the
+    DiT phase ended (0 s wait).
 - **The venv** gains torchvision 0.28.0+cu130: the checkpoint's processor
   (`Qwen2VLImageProcessorFast`, `Qwen3VLVideoProcessor`) does not build
   without it.
