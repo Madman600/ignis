@@ -1,0 +1,742 @@
+"""The diffusers recordings (spec 01, AC 5, 6 and 8): the oracle specs 03 and 04 are checked
+against, and the bf16 yardstick their tolerance comes from.
+
+The oracle is diffusers' `QwenImage21Pipeline` computing in fp32. The checkpoint is bf16, so fp32
+is a compute precision, not a weight precision: the weights stay bf16 at rest (exactly the
+checkpoint's values) and are upcast where they are used, which gives the arithmetic of
+`from_pretrained(torch_dtype=torch.float32)` bit for bit (test_record.py) in about half the memory.
+- The 36 text decoder layers, the 32 DiT blocks and `lm_head` hold bf16 at rest and are upcast
+  to fp32 inside their own forward only (`set_precision`). The hooks sit on whole layers, not on
+  leaves, because the models read a weight's dtype ahead of using it (the vision patch embedding,
+  `get_image_features`, diffusers' RMSNorm).
+- Everything else (embeddings, the vision tower and its mergers, the DiT's input projections,
+  modulation and output, the VAE) is fp32 for the whole run.
+- `Stager` keeps one of the text encoder and the DiT on the GPU and the other in host RAM; the
+  VAE stays on the GPU.
+"""
+import argparse
+import json
+import os
+import shutil
+import sys
+import time
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+from PIL import Image
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+@dataclass(frozen=True)
+class Case:
+    """One recorded case: a prompt at size x size, its noise seed, and the condition image's path
+    (None for text-to-image)."""
+    name: str
+    prompt: str
+    size: int
+    seed: int
+    image: str | None = None
+
+
+PROMPT = ('A red fox sitting in fresh snow at dawn, holding a wooden sign that reads "ignis", '
+          'detailed oil painting')
+EDIT_PROMPT = "Turn the shapes into polished glass objects and keep the transparent background"
+# spec 01's three cases: t2i at 1024^2, the same prompt at the checkpoint presets' 2048^2, and an
+# edit with one RGBA condition image at 1024^2
+CASES = {
+    "t2i": Case("t2i", PROMPT, 1024, seed=1),
+    "t2i-2k": Case("t2i-2k", PROMPT, 2048, seed=2),
+    "edit": Case("edit", EDIT_PROMPT, 1024, seed=3, image=os.path.join(HERE, "fixtures", "edit-condition.png")),
+}
+
+
+def noise(case, channels):
+    """The case's initial noise, (1, channels, size/16, size/16) float32 standard normal from a
+    fixed numpy seed: the layout spec 04 draws. The pipeline reads it packed (`_pack_latents`):
+    packed[0, y * w + x, c] == noise[0, c, y, x]."""
+    side = case.size // 16
+    rng = np.random.default_rng(case.seed)
+    return rng.standard_normal((1, channels, side, side), dtype=np.float32)
+
+
+def edit_image(size):
+    """The edit case's condition image, procedural so it carries no licence question: shapes on a
+    horizontal alpha ramp, with real transparency (alpha 0, partial and 255). The transparent
+    pixels are not white, so compositing on white (the encoder's copy) differs from the RGBA the
+    VAE reads."""
+    y, x = np.mgrid[0:size, 0:size].astype(np.float32) / size
+    rgba = np.zeros((size, size, 4), dtype=np.float32)
+    rgba[..., :3] = (40, 90, 160)                                   # under alpha 0: never shown on white
+    rgba[..., 3] = np.where(y > 0.75, np.round(255 * x), 0)        # a ramp along the bottom band
+    disc = (x - 0.32) ** 2 + (y - 0.36) ** 2 < 0.2 ** 2
+    rgba[disc] = (220, 40, 30, 255)
+    square = (x > 0.5) & (x < 0.86) & (y > 0.14) & (y < 0.5)
+    rgba[square] = (30, 170, 60, 128)
+    triangle = (y > 0.45) & (y < 0.72) & (np.abs(x - 0.66) < (y - 0.45))
+    rgba[triangle] = (250, 200, 20, 255)
+    return Image.fromarray(rgba.astype(np.uint8), "RGBA")
+
+
+def condition_image(case):
+    """The case's condition image as RGBA, or None for text-to-image."""
+    if case.image is None:
+        return None
+    with Image.open(case.image) as img:
+        return img.convert("RGBA")
+
+
+class _Fp32Forward:
+    """Forward hooks for one layer whose parameters are bf16 at rest: fp32 inside its forward."""
+
+    def __init__(self):
+        self.on = False
+
+    def pre(self, module, args):
+        if self.on:
+            for p in module.parameters():
+                p.data = p.data.to(torch.float32)
+
+    def post(self, module, args, output):
+        if self.on:
+            for p in module.parameters():
+                p.data = p.data.to(torch.bfloat16)
+
+
+def _upcast_layers(pipe):
+    """The layers that hold bf16 at rest: the bulk of the two big models."""
+    return [*pipe.text_encoder.model.language_model.layers, pipe.text_encoder.lm_head,
+            *pipe.transformer.transformer_blocks]
+
+
+def set_precision(pipe, mode):
+    """`fp32`: diffusers' fp32 arithmetic with bf16 storage for the upcast layers; `bf16`: a plain
+    bf16 pipeline. Buffers are never touched: both diffusers loads keep them fp32."""
+    if mode not in ("fp32", "bf16"):
+        raise ValueError(f"precision {mode!r}: fp32 or bf16")
+    hooks = getattr(pipe, "_ignis_fp32_forward", None)
+    layers = _upcast_layers(pipe)
+    if hooks is None:
+        hooks = _Fp32Forward()
+        for layer in layers:
+            layer.register_forward_pre_hook(hooks.pre)
+            layer.register_forward_hook(hooks.post)
+        pipe._ignis_fp32_forward = hooks
+    in_layers = {id(p) for layer in layers for p in layer.parameters()}
+    rest = torch.float32 if mode == "fp32" else torch.bfloat16
+    with torch.no_grad():
+        for component in (pipe.text_encoder, pipe.transformer, pipe.vae):
+            for p in component.parameters():
+                p.data = p.data.to(torch.bfloat16 if id(p) in in_layers else rest)
+    hooks.on = mode == "fp32"
+
+
+class Stager:
+    """One of the text encoder and the DiT on the device, the other in host RAM; the VAE stays on
+    the device (so `pipe.device` is the device). A component moves when its forward starts; VAE
+    encode and decode run with both away."""
+
+    def __init__(self, pipe, device):
+        self.pipe, self.device = pipe, torch.device(device)
+        pipe.vae.to(self.device)
+        pipe.text_encoder.register_forward_pre_hook(lambda module, args: self.stage("text_encoder"))
+        pipe.transformer.register_forward_pre_hook(lambda module, args: self.stage("transformer"))
+        for name in ("encode", "decode"):
+            original = getattr(pipe.vae, name)
+
+            def staged(*args, _original=original, **kwargs):
+                self.stage(None)
+                return _original(*args, **kwargs)
+            setattr(pipe.vae, name, staged)
+
+    def stage(self, name):
+        if self.device.type == "cpu":
+            return
+        for other in ("text_encoder", "transformer"):
+            if other != name:
+                getattr(self.pipe, other).to("cpu")
+        torch.cuda.empty_cache()
+        if name is not None:
+            getattr(self.pipe, name).to(self.device)
+
+
+def load_pipeline(checkpoint, device):
+    """diffusers' pipeline with bf16 weights, staged for `device`: the text encoder is loaded and
+    moved to the device first, so host RAM never holds more than one big model."""
+    from diffusers import QwenImage21Pipeline
+    from transformers import Qwen3VLForConditionalGeneration
+
+    text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+        os.path.join(checkpoint, "text_encoder"), dtype=torch.bfloat16)
+    text_encoder.to(device)
+    pipe = QwenImage21Pipeline.from_pretrained(checkpoint, text_encoder=text_encoder, dtype=torch.bfloat16)
+    pipe._ignis_stager = Stager(pipe, device)
+    return pipe
+
+
+def _write_json(path, value):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(json.dumps(value, indent=2) + "\n")
+
+
+def _numpy(t):
+    t = t.detach().to("cpu")
+    if t.dtype == torch.bool:
+        return t.to(torch.uint8).numpy()
+    if t.dtype == torch.bfloat16:
+        t = t.float()
+    return t.numpy()
+
+
+class _Capture:
+    """Hooks on one pipeline call that write the oracle's fields as they appear, as .npy files
+    under `out` (a field `a/b` is `out/a/b.npy`), and index them in `files`; with `out` None they
+    are kept in `arrays` instead. Every hook is on the instance and comes off when the call ends;
+    the pipeline's code is not touched."""
+
+    def __init__(self, pipe, out, blocks, block_steps, save_blocks=True):
+        self.pipe, self.out = pipe, out
+        self.blocks, self.block_steps, self.save_blocks = tuple(blocks), tuple(block_steps), save_blocks
+        self.files, self.arrays, self.kv_modes, self.dit_timesteps = {}, {}, [], []
+        self.step = -1
+        self.values = {}
+        self._undo = []
+
+    def save(self, field, tensor):
+        array = _numpy(tensor) if isinstance(tensor, torch.Tensor) else np.asarray(tensor)
+        self.files[field] = {"shape": list(array.shape), "dtype": str(array.dtype)}
+        if self.out is None:
+            self.arrays[field] = array
+            return
+        path = os.path.join(self.out, field + ".npy")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.save(path, np.ascontiguousarray(array))
+
+    def _hook(self, handle):
+        self._undo.append(handle.remove)
+
+    def _wrap(self, owner, name, wrapper):
+        original = owner.__dict__.get(name)
+        bound = getattr(owner, name)
+        setattr(owner, name, wrapper(bound))
+        self._undo.append(lambda: setattr(owner, name, original) if original is not None else delattr(owner, name))
+
+    def __enter__(self):
+        import diffusers.models.transformers.transformer_qwenimage21 as dit_module
+
+        pipe = self.pipe
+        text_model = pipe.text_encoder.model.language_model
+
+        def encoder_inputs(module, args, kwargs):
+            for key in ("input_ids", "attention_mask", "mm_token_type_ids", "pixel_values", "image_grid_thw"):
+                if kwargs.get(key) is not None:
+                    self.values[key] = kwargs[key].detach().clone()
+                    self.save(key, kwargs[key])
+        self._hook(pipe.text_encoder.register_forward_pre_hook(encoder_inputs, with_kwargs=True))
+
+        def mrope(module, args):
+            self.save("mrope_position_ids", args[1])
+        self._hook(text_model.rotary_emb.register_forward_pre_hook(mrope))
+
+        # the encoder's output is the final norm's input (the pipeline's own hook returns it)
+        def before_norm(module, args):
+            self.values["encoder_hidden_states"] = args[0].detach().clone()
+            self.save("encoder_hidden_states", args[0])
+        self._hook(text_model.norm.register_forward_pre_hook(before_norm))
+
+        def encode_prompt(original):
+            def wrapped(*args, **kwargs):
+                embeds, mask, pad = original(*args, **kwargs)
+                if mask is not None:
+                    raise AssertionError("batch 1 has no padding, but the prompt mask is not None")
+                self.values["prompt_embeds"] = embeds.detach().clone()
+                self.save("prompt_embeds", embeds)
+                self.save("image_pad_mask", pad)
+                return embeds, mask, pad
+            return wrapped
+        self._wrap(pipe, "encode_prompt", encode_prompt)
+
+        def vae_encode(original):
+            def wrapped(image, *args, **kwargs):
+                self.values["condition_vae_input"] = image.detach().clone()
+                self.save("condition_vae_input", image)
+                return original(image, *args, **kwargs)
+            return wrapped
+        self._wrap(pipe.vae, "encode", vae_encode)
+
+        def prepare_latents(original):
+            def wrapped(*args, **kwargs):
+                latents, condition = original(*args, **kwargs)
+                if condition is not None:
+                    self.save("condition_latents", condition)
+                return latents, condition
+            return wrapped
+        self._wrap(pipe, "prepare_latents", prepare_latents)
+
+        def dit_inputs(module, args, kwargs):
+            self.step += 1
+            self.kv_modes.append(kwargs.get("kv_cache_mode"))
+            self.dit_timesteps.append(float(kwargs["timestep"].reshape(-1)[0]))
+            if self.step == 0:
+                self.values["dit_encoder_hidden_states"] = kwargs["encoder_hidden_states"].detach().clone()
+                self.img_shapes = [list(s) for s in kwargs["img_shapes"][0]]
+        self._hook(pipe.transformer.register_forward_pre_hook(dit_inputs, with_kwargs=True))
+
+        def rope(module, args, output):
+            if self.step == 0:
+                self.save("rope", torch.view_as_real(output.contiguous()))
+        self._hook(pipe.transformer.pos_embed.register_forward_hook(rope))
+
+        def token_metadata(original):
+            def wrapped(image_pad_mask, img_shapes):
+                image_ids, target = original(image_pad_mask, img_shapes)
+                if self.step == 0:
+                    self.save("joint_image_mask", image_pad_mask)
+                    self.save("image_ids", image_ids)
+                    self.save("target_token_mask", target)
+                return image_ids, target
+            return wrapped
+        self._wrap(pipe.transformer, "build_token_metadata", token_metadata)
+
+        original_segments = dit_module._qwenimage21_prefix_segments
+
+        def segments(image_ids, prefix_len):
+            result = original_segments(image_ids, prefix_len)
+            if self.step == 0:
+                self.segments = [list(s) for s in result]
+            return result
+        dit_module._qwenimage21_prefix_segments = segments
+        self._undo.append(lambda: setattr(dit_module, "_qwenimage21_prefix_segments", original_segments))
+
+        for b in self.blocks:
+            def block_output(module, args, output, b=b):
+                if self.save_blocks and self.step in self.block_steps:
+                    self.save(f"step{self.step}/block{b:02d}", output)
+            self._hook(pipe.transformer.transformer_blocks[b].register_forward_hook(block_output))
+
+        def scheduler_step(original):
+            def wrapped(model_output, timestep, sample, *args, **kwargs):
+                result = original(model_output, timestep, sample, *args, **kwargs)
+                self.save(f"step{self.step}/latents_in", sample)
+                self.save(f"step{self.step}/velocity", model_output)
+                self.save(f"step{self.step}/latents_out", result[0])
+                return result
+            return wrapped
+        self._wrap(pipe.scheduler, "step", scheduler_step)
+        return self
+
+    def __exit__(self, *exc):
+        for undo in reversed(self._undo):
+            undo()
+        self._undo = []
+        return False
+
+
+def _pack(pipe, latents):
+    """(1, C, h, w) -> the (1, h * w, C) the pipeline reads."""
+    _, channels, h, w = latents.shape
+    return pipe._pack_latents(torch.from_numpy(latents), 1, channels, h, w)
+
+
+def _call(pipe, case, packed, output_type, callback=None):
+    return pipe(prompt=case.prompt, image=condition_image(case), height=case.size, width=case.size,
+                output_resolution=case.size, latents=packed.to(pipe.device), use_kv_cache=True,
+                output_type=output_type, callback_on_step_end=callback).images
+
+
+def on_white(rgba):
+    """The encoder's copy of a condition image: RGBA composited over white (the pipeline's own
+    way, `paste` with the alpha as mask)."""
+    white = Image.new("RGB", rgba.size, (255, 255, 255))
+    white.paste(rgba, mask=rgba.getchannel("A"))
+    return white
+
+
+def _check_traps(pipe, case, cap):
+    """Spec 01's traps, asserted on the run itself (test_record.py pins each on a tiny pipeline)."""
+    import metadata
+
+    ids = cap.values["input_ids"]
+    drop = pipe._drop_idx
+    prompt = case.prompt or metadata.EMPTY_PROMPT       # trap: an empty prompt becomes " "
+    image = None
+    if case.image is not None:
+        rgba = pipe.image_processor.resize(condition_image(case), width=case.size, height=case.size)
+        image = on_white(rgba)
+    # trap: the prompt is the raw template string, not apply_chat_template
+    template = metadata.TEMPLATE_T2I if image is None else metadata.TEMPLATE_TI2I
+    raw = pipe.processor(text=[template.format(prompt)], images=None if image is None else [image],
+                         return_tensors="pt")
+    if not torch.equal(ids.cpu(), raw["input_ids"]):
+        raise AssertionError("the encoder's input_ids are not the raw template's")
+    # trap: drop_idx is the length of the system message through the chat template
+    system = f"<|im_start|>system\n{metadata.SYSTEM_PROMPT}<|im_end|>\n"
+    if pipe.processor.tokenizer.decode(ids[0, :drop].tolist()) != system:
+        raise AssertionError(f"drop_idx {drop} does not end the system message")
+    # trap: the encoder output is the final norm's input, not its output
+    hidden, embeds = cap.values["encoder_hidden_states"], cap.values["prompt_embeds"]
+    if not (torch.equal(embeds, hidden[:, drop:]) and torch.equal(cap.values["dit_encoder_hidden_states"], embeds)):
+        raise AssertionError("prompt_embeds are not the final norm's input after drop_idx")
+    if image is not None:
+        # trap: the encoder sees the image on white, the VAE reads all four channels
+        want = raw["pixel_values"].to(cap.values["pixel_values"].device)
+        if not torch.equal(cap.values["pixel_values"], want.to(cap.values["pixel_values"].dtype)):
+            raise AssertionError("pixel_values are not the image composited on white")
+        read = cap.values["condition_vae_input"][0, 3, 0].cpu()
+        alpha = torch.from_numpy(np.asarray(rgba)[..., 3].astype(np.float32)) / 127.5 - 1
+        if (read.float() - alpha.to(read.dtype).float()).abs().max() > 1e-6:
+            raise AssertionError("the VAE did not read the condition image's alpha")
+    # use_kv_cache=True: the prefix is extracted at the first step and read at every other
+    if cap.kv_modes != ["extract"] + ["cached"] * (len(cap.kv_modes) - 1):
+        raise AssertionError(f"kv cache modes {cap.kv_modes}: not use_kv_cache=True's layout")
+
+
+def record_case(pipe, case, out, blocks=(0, 15, 31), block_steps=(0, 1)):
+    """Runs the pipeline on `case` and writes every field of spec 01's list under `out` (empty):
+    .npy files indexed in `case.json`, the decoded `image.png`. Returns the case record."""
+    os.makedirs(out, exist_ok=True)
+    if os.listdir(out):
+        raise ValueError(f"{out} is not empty: a recording never mixes two runs")
+    channels = pipe.transformer.config.in_channels
+    latents = noise(case, channels)
+    with _Capture(pipe, out, blocks, block_steps) as cap:
+        cap.save("noise", latents)
+        images = _call(pipe, case, _pack(pipe, latents), "pil")
+    _check_traps(pipe, case, cap)
+    images[0].save(os.path.join(out, "image.png"))
+    cap.save("timesteps", pipe.scheduler.timesteps)
+    cap.save("sigmas", pipe.scheduler.sigmas)
+    cap.save("dit_timesteps", np.array(cap.dit_timesteps, dtype=np.float32))
+    info = {
+        "case": {"name": case.name, "prompt": case.prompt, "size": case.size, "seed": case.seed,
+                 "image": None if case.image is None else os.path.basename(case.image)},
+        "drop_idx": pipe._drop_idx,
+        "sequence": {"text_encoder": cap.files["input_ids"]["shape"][1],
+                     "dit": cap.files["image_ids"]["shape"][0]},
+        "img_shapes": cap.img_shapes,
+        "segments": cap.segments,
+        "kv_cache_modes": cap.kv_modes,
+        "sigmas": [float(s) for s in pipe.scheduler.sigmas],
+        "blocks": list(blocks),
+        "block_steps": list(block_steps),
+        "files": cap.files,
+    }
+    _write_json(os.path.join(out, "case.json"), info)
+    return info
+
+
+def rel_l2(x, ref):
+    """||x - ref||_2 / ||ref||_2 over the whole tensor, in float64."""
+    x, ref = np.asarray(x, dtype=np.float64), np.asarray(ref, dtype=np.float64)
+    return float(np.linalg.norm(x - ref) / np.linalg.norm(ref))
+
+
+def yardstick(pipe, case, recorded):
+    """The pipeline's per-step error against a recording, teacher-forced: step i's recorded input
+    latents go in (in the pipeline's dtype, so rounded to bf16 in bf16), and its velocity is
+    compared with step i's recorded velocity. Also the encoder's error (prompt_embeds) and, with a
+    condition image, the condition latents'. Relative L2 (`rel_l2`)."""
+    with open(os.path.join(recorded, "case.json"), encoding="utf-8") as f:
+        info = json.load(f)
+    steps = len(info["sigmas"]) - 1
+
+    def load(field):
+        return np.load(os.path.join(recorded, field + ".npy"))
+    inputs = [load(f"step{i}/latents_in") for i in range(steps)]
+
+    def force(pipe_, i, t, tensors):
+        if i + 1 == steps:
+            return {}
+        latents = tensors["latents"]
+        return {"latents": torch.from_numpy(inputs[i + 1]).to(latents.device, latents.dtype)}
+
+    with _Capture(pipe, None, (), (), save_blocks=False) as cap:
+        _call(pipe, case, torch.from_numpy(inputs[0]), "latent", callback=force)
+    _check_traps(pipe, case, cap)
+    errors = {"velocity": [rel_l2(cap.arrays[f"step{i}/velocity"], load(f"step{i}/velocity")) for i in range(steps)],
+              "encoder": rel_l2(cap.arrays["prompt_embeds"], load("prompt_embeds"))}
+    if case.image is not None:
+        errors["condition_latents"] = rel_l2(cap.arrays["condition_latents"], load("condition_latents"))
+    return errors
+
+
+def write_thresholds(path, errors, factor, session):
+    """thresholds.json (spec 01, AC 6): per case, the bf16 teacher-forced error of each step and
+    `factor` times it, the encoder's error and `factor` times it. Written once: an existing file
+    is never replaced (it must not move after any ignis result exists)."""
+    cases = {}
+    for name, e in errors.items():
+        cases[name] = {
+            "velocity": {"bf16_error": e["velocity"], "threshold": [factor * x for x in e["velocity"]]},
+            "encoder": {"bf16_error": e["encoder"], "threshold": factor * e["encoder"]},
+        }
+        if e.get("condition_latents") is not None:
+            cases[name]["condition_latents"] = {"bf16_error": e["condition_latents"]}
+    value = {
+        "schema": "ignis-image-thresholds-v1",
+        "metric": "relative L2, ||x - fp32||_2 / ||fp32||_2 over the whole tensor, float64",
+        "yardstick": "diffusers QwenImage21Pipeline in bf16, teacher-forced: step i's recorded fp32 input "
+                     "latents in, its velocity against step i's recorded fp32 velocity",
+        "factor": factor,
+        "session": session,
+        "cases": cases,
+    }
+    with open(path, "x", encoding="utf-8", newline="") as f:
+        f.write(json.dumps(value, indent=2) + "\n")
+    return value
+
+
+def fp32_ieee():
+    """TF32 off for matmul and cuDNN, set through the legacy flags only (torch 2.13 refuses to read
+    them back after a mix with the new `fp32_precision` API) and asserted through both APIs: cuDNN
+    convolutions default to TF32. Returns the flags for the manifest."""
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    return check_fp32_ieee()
+
+
+def check_fp32_ieee():
+    """Asserts TF32 is off for matmul and cuDNN (conv and RNN); returns the flags."""
+    flags = {"matmul.allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+             "cudnn.allow_tf32": torch.backends.cudnn.allow_tf32,
+             "float32_matmul_precision": torch.get_float32_matmul_precision(),
+             "matmul.fp32_precision": torch.backends.cuda.matmul.fp32_precision,
+             "cudnn.conv.fp32_precision": torch.backends.cudnn.conv.fp32_precision,
+             "cudnn.rnn.fp32_precision": torch.backends.cudnn.rnn.fp32_precision}
+    if (flags["matmul.allow_tf32"] or flags["cudnn.allow_tf32"] or flags["float32_matmul_precision"] != "highest"
+            or "tf32" in (flags["matmul.fp32_precision"], flags["cudnn.conv.fp32_precision"],
+                          flags["cudnn.rnn.fp32_precision"])):
+        raise AssertionError(f"TF32 is on: {flags}")
+    return flags
+
+
+def efficient_attention_only():
+    """SDPA restricted to the memory-efficient kernel: a call it cannot serve raises instead of
+    falling back to the math kernel, which at 2048^2 in fp32 would materialise a ~35 GB score
+    matrix."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    return sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION])
+
+
+def _guard_dit(pipe, on):
+    """The DiT's forward under `efficient_attention_only` (on), or its own forward again (off)."""
+    if on:
+        forward = pipe.transformer.forward
+
+        def guarded(*args, **kwargs):
+            with efficient_attention_only():
+                return forward(*args, **kwargs)
+        pipe.transformer.forward = guarded
+    elif "forward" in pipe.transformer.__dict__:
+        del pipe.transformer.forward
+
+
+def _attention_selfcheck(device):
+    """The memory-efficient kernel against the math kernel on a small fp32 problem with TF32 off:
+    it must not compute in reduced precision. Returns the max abs difference."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    g = torch.Generator(device=device).manual_seed(0)
+    q, k, v = (torch.randn(1, 8, 333, 128, generator=g, device=device) for _ in range(3))
+    with efficient_attention_only():
+        fast = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    with sdpa_kernel([SDPBackend.MATH]):
+        exact = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    diff = float((fast - exact).abs().max())
+    if diff > 1e-5:
+        raise AssertionError(f"memory-efficient fp32 attention is {diff:.3g} off the math kernel")
+    return diff
+
+
+GB = 1e9
+# What each case directory holds (spec 01's list), for the manifest and the spec 03/04 readers.
+# Arrays are .npy (little-endian, C order); masks are uint8; L is the encoder's sequence, S the
+# DiT's joint sequence, N = (size/16)^2 the target's latent tokens, C = 64.
+FIELDS = {
+    "noise": "(1, C, size/16, size/16) f32, the initial noise; packed[0, y*w+x, c] = noise[0, c, y, x]",
+    "input_ids": "(1, L) i64, the raw template tokenized by the processor (image pads expanded)",
+    "attention_mask": "(1, L) i64, all ones (batch 1)",
+    "mm_token_type_ids": "(1, L) the processor's token types (1 at image pads), read by transformers' mrope",
+    "pixel_values": "edit: (patches, 1536) f32, the condition image on white as the processor prepares it",
+    "image_grid_thw": "edit: (1, 3) i64",
+    "mrope_position_ids": "(3, 1, L) i64, the text model's rotary positions (t, h, w)",
+    "encoder_hidden_states": "(1, L, 4096) f32, the last decoder layer's output, before the final norm",
+    "prompt_embeds": "(1, L - drop_idx, 4096) f32, encoder_hidden_states without the system message: the DiT's text input",
+    "image_pad_mask": "(1, L - drop_idx) u8, 1 at the encoder's image pads",
+    "condition_vae_input": "edit: (1, 4, 1, size, size) f32, the RGBA in [-1, 1] the VAE encodes",
+    "condition_latents": "edit: (1, Nc, C) f32, packed and normalized ((z - mean) / std)",
+    "rope": "(S, 64, 2) f32, the DiT's 3-axis RoPE table as (cos, sin) = (real, imag) of diffusers' complex table",
+    "joint_image_mask": "(S,) u8, 1 at image tokens of the joint sequence (4 latent tokens per image pad)",
+    "image_ids": "(S,) i64, -1 at text, the image block's index elsewhere (conditions first, target last)",
+    "target_token_mask": "(S,) u8, 1 at the target image's tokens",
+    "timesteps": "(steps,) f32, the scheduler's timesteps (sigma * 1000)",
+    "sigmas": "(steps + 1,) f32, the scheduler's sigmas, terminal 0 included",
+    "dit_timesteps": "(steps,) f32, the timestep the DiT reads (timesteps / 1000)",
+    "step{i}/latents_in": "(1, N, C) f32, step i's input latents (packed)",
+    "step{i}/velocity": "(1, N, C) f32, step i's predicted velocity (target rows)",
+    "step{i}/latents_out": "(1, N, C) f32, step i's output: latents_in + (sigma[i+1] - sigma[i]) * velocity",
+    "step{i}/block{b}": "steps 0 and 1 (the spec's 1 and 2), blocks 0, 15, 31: the block's output; "
+                        "step 0 is the prefill, (1, S, 4096), step 1 a cached step, (1, N, 4096)",
+    "image.png": "the decoded RGBA image",
+    "condition.png": "edit: the condition image, as checked in",
+    "case.json": "the case, drop_idx, the sequence lengths, img_shapes, the prefix segments (start, end, is_text), "
+                 "the kv cache modes per step, the sigmas, and every .npy's shape and dtype",
+}
+
+
+def _preflight(out, device, min_free_disk_gb, disk_budget_gb, min_free_ram_gb, min_free_vram_gb):
+    """Refuses to start unless `out` is new and the disk, host RAM and VRAM have room. Returns
+    what it measured."""
+    import psutil
+    if os.path.exists(out) and os.listdir(out):
+        raise FileExistsError(f"{out} is not empty: the oracle is recorded once (delete it to record again)")
+    os.makedirs(out, exist_ok=True)
+    measured = {"free_disk_gb": shutil.disk_usage(out).free / GB,
+                "free_ram_gb": psutil.virtual_memory().available / GB, "free_vram_gb": None}
+    if measured["free_disk_gb"] < min_free_disk_gb + disk_budget_gb:
+        raise RuntimeError(f"{measured['free_disk_gb']:.1f} GB free on {out}'s disk: the recordings need "
+                           f"{disk_budget_gb} GB above the {min_free_disk_gb} GB floor")
+    if measured["free_ram_gb"] < min_free_ram_gb:
+        raise RuntimeError(f"{measured['free_ram_gb']:.1f} GB of host RAM free, below {min_free_ram_gb} GB")
+    if device.type == "cuda":
+        measured["free_vram_gb"] = torch.cuda.mem_get_info(device)[0] / GB
+        if measured["free_vram_gb"] < min_free_vram_gb:
+            raise RuntimeError(f"{measured['free_vram_gb']:.1f} GB of VRAM free, below {min_free_vram_gb} GB")
+    return measured
+
+
+def _versions():
+    import importlib.metadata as md
+    import convert
+    v = convert.versions()
+    for lib in ("accelerate", "torchvision", "tokenizers", "pillow", "psutil"):
+        v[lib] = md.version(lib)
+    v["cuda"] = torch.version.cuda
+    v["cudnn"] = torch.backends.cudnn.version()
+    return v
+
+
+def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), factor=5.0,
+        min_free_disk_gb=12.0, disk_budget_gb=10.0, min_free_ram_gb=24.0, min_free_vram_gb=27.0,
+        max_vram_gb=25.5, log=print):
+    """One session: every case recorded in fp32, then the bf16 yardstick on the same weights, then
+    thresholds.json and manifest.json (written last: its presence means the run completed)."""
+    import convert
+    device = torch.device(device)
+    started = time.time()
+    resources = _preflight(out, device, min_free_disk_gb, disk_budget_gb, min_free_ram_gb, min_free_vram_gb)
+    tf32 = fp32_ieee()
+    attention = {"dit_fp32": "memory-efficient SDPA only (sdpa_kernel), asserted by construction",
+                 "selfcheck_max_abs_diff": None}
+    if device.type == "cuda":
+        if max_vram_gb:
+            total = torch.cuda.get_device_properties(device).total_memory
+            torch.cuda.set_per_process_memory_fraction(min(1.0, max_vram_gb * GB / total), device)
+        attention["selfcheck_max_abs_diff"] = _attention_selfcheck(device)
+    session = {"id": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **convert.tool_commit()}
+    log(f"session {session['id']}: free disk {resources['free_disk_gb']:.1f} GB, RAM {resources['free_ram_gb']:.1f} GB, "
+        f"VRAM {resources['free_vram_gb']}")
+
+    t = time.time()
+    pipe = load_pipeline(checkpoint, device)
+    load_s = time.time() - t
+    log(f"loaded in {load_s:.0f} s")
+
+    def peak():
+        if device.type != "cuda":
+            return None
+        value = torch.cuda.max_memory_allocated(device) / GB
+        torch.cuda.reset_peak_memory_stats(device)
+        return round(value, 2)
+
+    entries = {}
+    set_precision(pipe, "fp32")
+    _guard_dit(pipe, device.type == "cuda")
+    for case in cases:
+        check_fp32_ieee()
+        peak()
+        t = time.time()
+        directory = os.path.join(out, case.name)
+        record_case(pipe, case, directory, blocks, block_steps)
+        if case.image is not None:
+            shutil.copyfile(case.image, os.path.join(directory, "condition.png"))
+        entries[case.name] = {"prompt": case.prompt, "size": case.size, "seed": case.seed,
+                              "image": None if case.image is None else "condition.png",
+                              "fp32_wall_s": round(time.time() - t, 1), "fp32_peak_vram_gb": peak()}
+        log(f"fp32 {case.name}: {entries[case.name]['fp32_wall_s']} s, peak {entries[case.name]['fp32_peak_vram_gb']} GB")
+
+    _guard_dit(pipe, False)
+    set_precision(pipe, "bf16")
+    errors = {}
+    for case in cases:
+        t = time.time()
+        errors[case.name] = yardstick(pipe, case, os.path.join(out, case.name))
+        entries[case.name].update(bf16_wall_s=round(time.time() - t, 1), bf16_peak_vram_gb=peak())
+        log(f"bf16 {case.name}: {entries[case.name]['bf16_wall_s']} s, velocity error "
+            f"{[round(e, 5) for e in errors[case.name]['velocity']]}, encoder {errors[case.name]['encoder']:.5f}")
+    write_thresholds(os.path.join(out, "thresholds.json"), errors, factor, session)
+
+    revision = os.path.basename(os.path.normpath(checkpoint))
+    with open(os.path.join(HERE, "pin.json"), encoding="utf-8") as f:
+        pinned = json.load(f)
+    size = sum(os.path.getsize(os.path.join(root, name)) for root, _, files in os.walk(out) for name in files)
+    manifest = {
+        "schema": "ignis-image-oracle-v1",
+        "session": session,
+        "checkpoint": {"repo": pinned["repo"] if pinned["revision"] == revision else None, "revision": revision},
+        "versions": _versions(),
+        "device": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+        "pipeline": "diffusers QwenImage21Pipeline, batch 1, use_kv_cache=True, default attention processor "
+                    "(QwenImage21AttnProcessor); fp32 compute: weights bf16 at rest (the checkpoint's), the text "
+                    "decoder layers, lm_head and the DiT blocks upcast to fp32 in their own forward, everything else "
+                    "fp32 (bit-identical to from_pretrained(torch_dtype=float32), test_record.py)",
+        "use_kv_cache": True,
+        "tf32": tf32,
+        "attention": attention,
+        "noise": "numpy.random.default_rng(seed).standard_normal((1, 64, size/16, size/16), dtype=float32)",
+        "cases": entries,
+        "fields": FIELDS,
+        "blocks": list(blocks),
+        "block_steps": list(block_steps),
+        "thresholds": "thresholds.json",
+        "resources": resources,
+        "wall_s": {"load": round(load_s, 1), "total": round(time.time() - started, 1)},
+        "bytes": size,
+    }
+    _write_json(os.path.join(out, "manifest.json"), manifest)
+    log(f"done: {size / GB:.2f} GB in {out}, {manifest['wall_s']['total']} s")
+    return manifest
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run", help="record the cases in fp32, then the bf16 yardstick; writes thresholds.json")
+    r.add_argument("--checkpoint", required=True, help="the pinned snapshot directory")
+    r.add_argument("--out", default="F:/ai/models/ignis-image-2.1-turbo/oracle")
+    r.add_argument("--device", default="cuda")
+    r.add_argument("--cases", default=",".join(CASES), help="comma-separated, from " + ", ".join(CASES))
+    r.add_argument("--blocks", default="0,15,31", help="DiT blocks whose outputs are recorded")
+    r.add_argument("--block-steps", default="0,1", help="denoising steps (0-based) whose block outputs are recorded")
+    r.add_argument("--factor", type=float, default=5.0, help="threshold = factor x the bf16 error")
+    r.add_argument("--min-free-disk-gb", type=float, default=12.0, help="the disk floor kept free after the run")
+    r.add_argument("--disk-budget-gb", type=float, default=10.0, help="room the recordings may take")
+    r.add_argument("--min-free-ram-gb", type=float, default=24.0)
+    r.add_argument("--min-free-vram-gb", type=float, default=27.0)
+    r.add_argument("--max-vram-gb", type=float, default=25.5, help="this process's VRAM cap (0: none)")
+    a = ap.parse_args(argv)
+    ints = lambda text: tuple(int(x) for x in text.split(",") if x)
+    try:
+        run(a.checkpoint, a.out, a.device, [CASES[n] for n in a.cases.split(",")], ints(a.blocks),
+            ints(a.block_steps), a.factor, a.min_free_disk_gb, a.disk_budget_gb, a.min_free_ram_gb,
+            a.min_free_vram_gb, a.max_vram_gb, log=lambda *x: print(*x, flush=True))
+    except BaseException as e:
+        print(f"RECORD FAILED: {type(e).__name__}: {e}", flush=True)
+        raise
+    print("RECORD DONE", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

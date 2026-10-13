@@ -1,0 +1,405 @@
+"""The recorder (spec 01, AC 5-6) on a tiny Qwen-Image-2.1 checkpoint: the real processor (the
+pinned checkpoint's tokenizer, chat template and image config) with tiny diffusers and
+transformers modules, CPU only. The tiny pipeline runs the same code as the real one, so the
+precision scheme, every recorded field and every trap are checked here; only the size, the device
+and the attention backend wait for the GPU run."""
+import json
+import os
+import shutil
+
+import numpy as np
+import pytest
+import torch
+from PIL import Image
+
+import record
+
+SNAPSHOT = "F:/ai/models/hf/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba1986fcb905854dc8de2f52eee395f49b5b"
+pytestmark = pytest.mark.skipif(not os.path.isdir(SNAPSHOT), reason=f"{SNAPSHOT} (the pinned checkpoint) is not here")
+
+# the real checkpoint's token ids, tiny everything else
+TEXT = dict(hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4,
+            num_key_value_heads=2, head_dim=16, vocab_size=151936, rms_norm_eps=1e-6, rope_theta=5000000,
+            max_position_embeddings=4096,
+            rope_scaling={"rope_type": "default", "mrope_section": [2, 3, 3], "mrope_interleaved": True})
+VISION = dict(depth=3, hidden_size=32, intermediate_size=64, num_heads=2, patch_size=16, temporal_patch_size=2,
+              in_channels=3, spatial_merge_size=2, out_hidden_size=64, num_position_embeddings=16,
+              deepstack_visual_indexes=[0, 1, 2], hidden_act="gelu_pytorch_tanh")
+DIT = dict(num_layers=2, num_attention_heads=4, attention_head_dim=16, mlp_ratio=3, in_channels=16, out_channels=16,
+           patch_size=1, axes_dims_rope=[4, 6, 6], context_in_dim=64, causal_condition=True)
+VAE = dict(base_dim=2, decoder_base_dim=3, z_dim=16, dim_mult=[1, 2, 4, 8, 8], num_res_blocks=2, in_channels=4,
+           out_channels=4, is_residual=True, temperal_downsample=[False, True, True, True],
+           latents_mean=[0.1 * i for i in range(16)], latents_std=[1.0 + 0.1 * i for i in range(16)])
+T2I = record.Case("t2i", "A red fox in the snow, holding a sign that reads \"ignis\"", 64, seed=1)
+BLOCKS = (0, 1)
+
+
+def _randomize(module, g):
+    for p in module.parameters():
+        p.data = (torch.randn(p.shape, generator=g) * 0.05).to(torch.bfloat16)
+
+
+@pytest.fixture(scope="module")
+def tiny(tmp_path_factory):
+    """A bf16 checkpoint in the diffusers layout: the pinned processor, scheduler and sigmas, tiny
+    seeded-random modules."""
+    from diffusers import AutoencoderKLQwenImage21, QwenImage21Transformer2DModel
+    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+
+    out = tmp_path_factory.mktemp("tiny")
+    with open(os.path.join(SNAPSHOT, "text_encoder", "config.json"), encoding="utf-8") as f:
+        real = json.load(f)
+    ids = {k: real[k] for k in ("image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id")}
+    g = torch.Generator().manual_seed(0)
+    torch.manual_seed(0)
+    text = Qwen3VLForConditionalGeneration(Qwen3VLConfig(text_config=TEXT, vision_config=VISION,
+                                                         tie_word_embeddings=False, **ids))
+    dit = QwenImage21Transformer2DModel(**DIT)
+    vae = AutoencoderKLQwenImage21(**VAE)
+    for name, model in (("text_encoder", text), ("transformer", dit), ("vae", vae)):
+        _randomize(model, g)
+        model.save_pretrained(str(out / name))
+    for sub in ("processor", "scheduler"):
+        shutil.copytree(os.path.join(SNAPSHOT, sub), str(out / sub))
+    shutil.copy(os.path.join(SNAPSHOT, "model_index.json"), str(out / "model_index.json"))
+    return str(out)
+
+
+@pytest.fixture(scope="module")
+def edit(tiny):
+    """The edit case at the processor's minimum size, 256x256: the checked-in image's pattern."""
+    path = os.path.join(tiny, "edit-condition-256.png")
+    record.edit_image(256).save(path)
+    return record.Case("edit", "Make the shapes look like glass", 256, seed=2, image=path)
+
+
+@pytest.fixture(params=["t2i", "edit"])
+def case(request, edit):
+    return T2I if request.param == "t2i" else edit
+
+
+def _reference(tiny, dtype):
+    """diffusers' own load: what the recorder must compute."""
+    from diffusers import QwenImage21Pipeline
+    return QwenImage21Pipeline.from_pretrained(tiny, dtype=dtype)
+
+
+def _latents(pipe, case):
+    h, w = case.size // 16, case.size // 16
+    noise = torch.from_numpy(record.noise(case, pipe.transformer.config.in_channels))
+    image = record.condition_image(case)
+    return pipe(prompt=case.prompt, image=image, height=case.size, width=case.size,
+                output_resolution=case.size, latents=pipe._pack_latents(noise, 1, noise.shape[1], h, w),
+                output_type="latent", use_kv_cache=True).images
+
+
+def test_fp32_compute_with_bf16_weights_is_diffusers_fp32_bit_for_bit(tiny, case):
+    pipe = record.load_pipeline(tiny, "cpu")
+    record.set_precision(pipe, "fp32")
+    got = _latents(pipe, case)
+    want = _latents(_reference(tiny, torch.float32), case)
+    assert got.dtype == torch.float32 and torch.equal(got, want)
+    # at rest the repeated blocks hold bf16, as before the run
+    assert {p.dtype for p in pipe.transformer.transformer_blocks.parameters()} == {torch.bfloat16}
+    assert {p.dtype for p in pipe.text_encoder.model.language_model.layers.parameters()} == {torch.bfloat16}
+
+
+def test_bf16_mode_is_a_plain_bf16_load_bit_for_bit(tiny, case):
+    pipe = record.load_pipeline(tiny, "cpu")
+    record.set_precision(pipe, "fp32")
+    record.set_precision(pipe, "bf16")
+    got = _latents(pipe, case)
+    want = _latents(_reference(tiny, torch.bfloat16), case)
+    assert got.dtype == torch.bfloat16 and torch.equal(got, want)
+
+
+@pytest.fixture(scope="module")
+def recorded(tiny, edit, tmp_path_factory):
+    """Both cases recorded by the fp32 pipeline: {case name: (case, its directory, case.json)}."""
+    pipe = record.load_pipeline(tiny, "cpu")
+    record.set_precision(pipe, "fp32")
+    out = {}
+    for case in (T2I, edit):
+        directory = str(tmp_path_factory.mktemp(case.name))
+        out[case.name] = (case, directory, record.record_case(pipe, case, directory, blocks=BLOCKS))
+    return out
+
+
+def _npy(directory, name):
+    return np.load(os.path.join(directory, name + ".npy"))
+
+
+def test_every_field_is_written_and_indexed(recorded):
+    hidden, latent = TEXT["hidden_size"], DIT["in_channels"]
+    for name, (case, directory, info) in recorded.items():
+        with open(os.path.join(directory, "case.json"), encoding="utf-8") as f:
+            assert json.load(f) == info
+        for field, entry in info["files"].items():
+            a = _npy(directory, field)
+            assert list(a.shape) == entry["shape"] and str(a.dtype) == entry["dtype"], field
+        n = info["sequence"]["text_encoder"]
+        drop = info["drop_idx"]
+        side = case.size // 16
+        target = side * side
+        assert _npy(directory, "input_ids").shape == (1, n)
+        assert _npy(directory, "encoder_hidden_states").shape == (1, n, hidden)
+        assert _npy(directory, "prompt_embeds").shape == (1, n - drop, hidden)
+        assert _npy(directory, "image_pad_mask").shape == (1, n - drop)
+        assert _npy(directory, "mrope_position_ids").shape == (3, 1, n)
+        assert _npy(directory, "noise").shape == (1, latent, side, side)
+        joint = info["sequence"]["dit"]
+        assert _npy(directory, "rope").shape == (joint, sum(DIT["axes_dims_rope"]) // 2, 2)
+        assert _npy(directory, "image_ids").shape == _npy(directory, "target_token_mask").shape == (joint,)
+        assert info["segments"] and info["segments"][-1][1] == joint - target
+        steps = len(info["sigmas"]) - 1
+        assert steps == 8 and _npy(directory, "timesteps").shape == (steps,)
+        for i in range(steps):
+            for field in ("latents_in", "velocity", "latents_out"):
+                assert _npy(directory, f"step{i}/{field}").shape == (1, target, latent)
+        # step 0 runs the whole joint sequence (the prefix is extracted), step 1 the target only
+        for b in BLOCKS:
+            assert _npy(directory, f"step0/block{b:02d}").shape == (1, joint, DIT["num_attention_heads"] * 16)
+            assert _npy(directory, f"step1/block{b:02d}").shape == (1, target, DIT["num_attention_heads"] * 16)
+        assert info["kv_cache_modes"] == ["extract"] + ["cached"] * (steps - 1)
+        from PIL import Image
+        with Image.open(os.path.join(directory, "image.png")) as img:
+            assert img.mode == "RGBA" and img.size == (case.size, case.size)
+        if case.image:
+            condition = side * side  # the condition image is the target's size here
+            assert _npy(directory, "condition_latents").shape == (1, condition, latent)
+            assert _npy(directory, "condition_vae_input").shape == (1, 4, 1, case.size, case.size)
+            grid = _npy(directory, "image_grid_thw")
+            assert grid.tolist() == [[1, case.size // 16, case.size // 16]]
+            assert _npy(directory, "pixel_values").shape == (case.size // 16 * case.size // 16, 3 * 2 * 16 * 16)
+            assert joint == n - drop + 3 * condition // 4 + target
+
+
+def test_each_step_is_the_euler_update_of_its_velocity(recorded):
+    """Spec 04's sampler: sigmas are the checkpoint's sample_sigmas then 0, x += (s_next - s) * v."""
+    with open(os.path.join(SNAPSHOT, "model_index.json"), encoding="utf-8") as f:
+        sigmas = json.load(f)["sample_sigmas"] + [0.0]
+    for case, directory, info in recorded.values():
+        assert np.array_equal(_npy(directory, "sigmas"), np.array(sigmas, dtype=np.float32))
+        assert np.array_equal(_npy(directory, "timesteps"), np.array(sigmas[:-1], dtype=np.float32) * 1000)
+        side = case.size // 16
+        noise = _npy(directory, "noise")
+        assert np.array_equal(_npy(directory, "step0/latents_in")[0], noise[0].reshape(noise.shape[1], -1).T)
+        for i in range(8):
+            x, v = _npy(directory, f"step{i}/latents_in"), _npy(directory, f"step{i}/velocity")
+            want = x + (np.float32(sigmas[i + 1]) - np.float32(sigmas[i])) * v
+            np.testing.assert_allclose(_npy(directory, f"step{i}/latents_out"), want, rtol=0, atol=1e-6)
+            if i:
+                assert np.array_equal(x, _npy(directory, f"step{i - 1}/latents_out"))
+
+
+def test_the_recording_is_diffusers_fp32(tiny, recorded):
+    reference = _reference(tiny, torch.float32)
+    for case, directory, info in recorded.values():
+        assert np.array_equal(_latents(reference, case).numpy(), _npy(directory, "step7/latents_out"))
+        with torch.no_grad():
+            embeds, _, pad = reference.encode_prompt(case.prompt, image=None if case.image is None else [
+                reference.image_processor.resize(record.condition_image(case), width=case.size, height=case.size)])
+        assert np.array_equal(embeds.numpy(), _npy(directory, "prompt_embeds"))
+        assert np.array_equal(pad.numpy(), _npy(directory, "image_pad_mask").astype(bool))
+
+
+# The traps spec 01 lists, each pinned on the recording.
+
+def test_trap_the_prompt_is_the_raw_template_not_apply_chat_template(tiny, recorded):
+    """The two differ where an image is: the raw template names it `<image1>` before
+    `<|vision_start|>`, the chat template does not. Without an image they coincide."""
+    import metadata
+    from PIL import Image
+    from transformers import Qwen3VLProcessor
+    processor = Qwen3VLProcessor.from_pretrained(os.path.join(tiny, "processor"))
+    case, directory, _ = recorded["t2i"]
+    assert _npy(directory, "input_ids")[0].tolist() == processor.tokenizer(
+        metadata.TEMPLATE_T2I.format(case.prompt))["input_ids"]
+    case, directory, _ = recorded["edit"]
+    rgba = record.condition_image(case)
+    on_white = Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba).convert("RGB")
+    ids = _npy(directory, "input_ids")[0].tolist()
+    raw = processor(text=[metadata.TEMPLATE_TI2I.format(case.prompt)], images=[on_white])["input_ids"][0]
+    chat = processor.apply_chat_template(
+        [{"role": "system", "content": [{"type": "text", "text": metadata.SYSTEM_PROMPT}]},
+         {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": case.prompt}]}],
+        tokenize=False, add_generation_prompt=True)
+    assert ids == list(raw)
+    assert ids != list(processor(text=[chat], images=[on_white])["input_ids"][0])
+
+
+def test_trap_drop_idx_is_the_chat_templated_system_message(tiny, recorded):
+    import metadata
+    from transformers import Qwen3VLProcessor
+    tokenizer = Qwen3VLProcessor.from_pretrained(os.path.join(tiny, "processor")).tokenizer
+    for case, directory, info in recorded.values():
+        ids = _npy(directory, "input_ids")[0].tolist()
+        drop = info["drop_idx"]
+        assert tokenizer.decode(ids[:drop]) == f"<|im_start|>system\n{metadata.SYSTEM_PROMPT}<|im_end|>\n"
+        assert tokenizer.decode(ids[drop:drop + 2]) == "<|im_start|>user"
+
+
+def test_trap_an_empty_prompt_becomes_a_space(tiny, tmp_path):
+    import metadata
+    from transformers import Qwen3VLProcessor
+    tokenizer = Qwen3VLProcessor.from_pretrained(os.path.join(tiny, "processor")).tokenizer
+    pipe = record.load_pipeline(tiny, "cpu")
+    record.set_precision(pipe, "fp32")
+    record.record_case(pipe, record.Case("empty", "", 64, seed=3), str(tmp_path), blocks=BLOCKS)
+    ids = _npy(str(tmp_path), "input_ids")[0].tolist()
+    assert ids == tokenizer(metadata.TEMPLATE_T2I.format(" "))["input_ids"]
+    assert ids != tokenizer(metadata.TEMPLATE_T2I.format(""))["input_ids"]
+
+
+def test_trap_the_encoder_output_is_taken_before_the_final_norm(tiny, recorded):
+    norm = _reference(tiny, torch.float32).text_encoder.model.language_model.norm
+    for case, directory, info in recorded.values():
+        hidden = _npy(directory, "encoder_hidden_states")
+        assert np.array_equal(_npy(directory, "prompt_embeds"), hidden[:, info["drop_idx"]:])
+        with torch.no_grad():
+            normed = norm(torch.from_numpy(hidden)).numpy()
+        assert not np.allclose(normed, hidden, atol=1e-3)
+
+
+def test_trap_the_encoder_sees_the_image_on_white_and_the_vae_reads_rgba(recorded):
+    from PIL import Image
+    from transformers import Qwen3VLProcessor
+    processor = Qwen3VLProcessor.from_pretrained(os.path.join(SNAPSHOT, "processor")).image_processor
+    case, directory, _ = recorded["edit"]
+    rgba = record.condition_image(case)
+    alpha = np.asarray(rgba)[..., 3]
+    assert {0, 255} <= set(np.unique(alpha).tolist()) and ((alpha > 0) & (alpha < 255)).any()
+    on_white = Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba).convert("RGB")
+    dropped = rgba.convert("RGB")
+    pixels = _npy(directory, "pixel_values")
+    # one 8-bit step is 2/255 after the processor's (x/255 - 0.5)/0.5
+    assert np.abs(pixels - processor(images=[on_white], return_tensors="np")["pixel_values"]).max() <= 2 / 255 + 1e-6
+    assert np.abs(pixels - processor(images=[dropped], return_tensors="np")["pixel_values"]).max() > 1
+    vae = _npy(directory, "condition_vae_input")[0, :, 0]
+    np.testing.assert_allclose(vae[3], alpha / 127.5 - 1, atol=1e-6)
+    hidden_rgb = np.asarray(rgba)[alpha == 0][:, :3]
+    np.testing.assert_allclose(vae[:3].transpose(1, 2, 0)[alpha == 0], hidden_rgb / 127.5 - 1, atol=1e-6)
+    assert (hidden_rgb != 255).any()
+
+
+def test_a_run_that_breaks_a_trap_is_refused(tiny, tmp_path):
+    pipe = record.load_pipeline(tiny, "cpu")
+    record.set_precision(pipe, "fp32")
+    pipe._drop_idx += 1
+    with pytest.raises(AssertionError, match="drop_idx"):
+        record.record_case(pipe, T2I, str(tmp_path), blocks=BLOCKS)
+
+
+# The bf16 yardstick (AC 6).
+
+def _copy_case(directory, tmp_path):
+    copy = str(tmp_path / "case")
+    shutil.copytree(directory, copy)
+    return copy
+
+
+def test_the_yardstick_is_teacher_forced_step_by_step(tiny, recorded, tmp_path):
+    """Fed each step's recorded input, the fp32 pipeline reproduces each recorded velocity: a
+    perturbed input at step 3 changes step 3's velocity only."""
+    case, directory, _ = recorded["t2i"]
+    copy = _copy_case(directory, tmp_path)
+    x = _npy(copy, "step3/latents_in")
+    np.save(os.path.join(copy, "step3", "latents_in.npy"), x * np.float32(1.25))
+    pipe = record.load_pipeline(tiny, "cpu")
+    record.set_precision(pipe, "fp32")
+    errors = record.yardstick(pipe, case, copy)
+    assert errors["encoder"] == 0
+    assert [e == 0 for e in errors["velocity"]] == [i != 3 for i in range(8)]
+
+
+def test_the_bf16_yardstick_measures_each_step_against_fp32(tiny, recorded):
+    pipe = record.load_pipeline(tiny, "cpu")
+    record.set_precision(pipe, "bf16")
+    for case, directory, _ in recorded.values():
+        errors = record.yardstick(pipe, case, directory)
+        assert len(errors["velocity"]) == 8 and all(0 < e < 0.1 for e in errors["velocity"]), errors
+        assert 0 < errors["encoder"] < 0.1
+        assert (errors.get("condition_latents") is not None) == (case.image is not None)
+
+
+def test_thresholds_hold_5x_each_step_and_are_written_once(tmp_path):
+    path = str(tmp_path / "thresholds.json")
+    # binary fractions, so 5x is exact
+    errors = {"t2i": {"velocity": [0.015625, 0.03125], "encoder": 0.00390625},
+              "edit": {"velocity": [0.0625, 0.125], "encoder": 0.0078125, "condition_latents": 0.001953125}}
+    record.write_thresholds(path, errors, factor=5.0, session={"id": "s"})
+    with open(path, encoding="utf-8") as f:
+        t = json.load(f)
+    assert t["factor"] == 5.0 and t["session"] == {"id": "s"}
+    assert t["cases"]["t2i"]["velocity"] == {"bf16_error": [0.015625, 0.03125], "threshold": [0.078125, 0.15625]}
+    assert t["cases"]["edit"]["encoder"] == {"bf16_error": 0.0078125, "threshold": 0.0390625}
+    assert t["cases"]["edit"]["condition_latents"] == {"bf16_error": 0.001953125}
+    with pytest.raises(FileExistsError):
+        record.write_thresholds(path, errors, factor=5.0, session={"id": "s"})
+
+
+# The GPU run's guards, checked where they can be on the CPU.
+
+def test_fp32_ieee_turns_tf32_off_for_matmul_and_cudnn():
+    torch.backends.cudnn.allow_tf32 = True  # torch's default: cuDNN convolutions in TF32
+    with pytest.raises(AssertionError, match="TF32"):
+        record.check_fp32_ieee()
+    flags = record.fp32_ieee()
+    assert not torch.backends.cuda.matmul.allow_tf32 and not torch.backends.cudnn.allow_tf32
+    assert "tf32" not in (torch.backends.cudnn.conv.fp32_precision, torch.backends.cuda.matmul.fp32_precision)
+    assert flags["matmul.allow_tf32"] is False and flags["cudnn.allow_tf32"] is False
+
+
+def test_the_attention_guard_refuses_a_fallback_to_math():
+    q = torch.randn(1, 2, 8, 16)
+    with record.efficient_attention_only():
+        with pytest.raises(RuntimeError):
+            torch.nn.functional.scaled_dot_product_attention(q, q, q)  # no memory-efficient kernel on the CPU
+    torch.nn.functional.scaled_dot_product_attention(q, q, q)
+
+
+# The real run's cases and the whole run.
+
+def test_the_three_cases_are_the_specs():
+    t2i, t2i_2k, edit = (record.CASES[n] for n in ("t2i", "t2i-2k", "edit"))
+    assert (t2i.size, t2i_2k.size, edit.size) == (1024, 2048, 1024)
+    assert t2i.prompt == t2i_2k.prompt and t2i.image is None and t2i_2k.image is None
+    assert edit.image == os.path.join(record.HERE, "fixtures", "edit-condition.png")
+    assert len({c.seed for c in record.CASES.values()}) == 3
+
+
+def test_the_checked_in_condition_image_is_the_procedural_one():
+    with Image.open(record.CASES["edit"].image) as checked_in:
+        assert checked_in.mode == "RGBA" and checked_in.size == (1024, 1024)
+        pixels = np.asarray(checked_in)
+    assert np.array_equal(pixels, np.asarray(record.edit_image(1024)))
+    alpha = pixels[..., 3]
+    assert (alpha == 0).any() and (alpha == 255).any() and ((alpha > 0) & (alpha < 255)).any()
+    assert os.path.getsize(record.CASES["edit"].image) < 32 * 1024
+
+
+def _run(tiny, edit, out):
+    return record.run(tiny, out, "cpu", [T2I, edit], blocks=BLOCKS, factor=5.0, min_free_disk_gb=0,
+                      disk_budget_gb=0, min_free_ram_gb=0, min_free_vram_gb=0, max_vram_gb=0)
+
+
+def test_a_run_records_every_case_then_the_yardstick_in_one_session(tiny, edit, tmp_path):
+    out = str(tmp_path / "oracle")
+    manifest = _run(tiny, edit, out)
+    with open(os.path.join(out, "manifest.json"), encoding="utf-8") as f:
+        assert json.load(f) == manifest
+    with open(os.path.join(out, "thresholds.json"), encoding="utf-8") as f:
+        thresholds = json.load(f)
+    assert thresholds["session"] == manifest["session"] and set(thresholds["cases"]) == {"t2i", "edit"}
+    for name in ("t2i", "edit"):
+        assert len(thresholds["cases"][name]["velocity"]["threshold"]) == 8
+        entry = manifest["cases"][name]
+        assert entry["fp32_wall_s"] > 0 and entry["bf16_wall_s"] > 0
+        assert os.path.isfile(os.path.join(out, name, "case.json"))
+    assert os.path.isfile(os.path.join(out, "edit", "condition.png"))
+    assert manifest["use_kv_cache"] is True and manifest["tf32"]["cudnn.allow_tf32"] is False
+    for lib in ("torch", "diffusers", "transformers"):
+        assert manifest["versions"][lib]
+    assert manifest["checkpoint"]["revision"] == os.path.basename(tiny)
+    with pytest.raises(FileExistsError):
+        _run(tiny, edit, out)
