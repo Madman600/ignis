@@ -464,3 +464,140 @@ def test_a_run_records_every_case_then_the_yardstick_in_one_session(tiny, edit, 
     assert manifest["checkpoint"]["revision"] == os.path.basename(tiny)
     with pytest.raises(FileExistsError):
         _run(tiny, edit, out)
+
+
+# The encoder metric, DeepStack off and the simulated W8A8 yardstick (AC 6).
+
+def test_the_encoder_metric_is_the_text_rows(recorded, tmp_path):
+    case, directory, _ = recorded["t2i"]
+    embeds = _npy(directory, "prompt_embeds")
+    noisy = embeds * np.float32(1.5)
+    assert not _npy(directory, "image_pad_mask").any()
+    assert record.encoder_error(noisy, directory) == record.rel_l2(noisy, embeds)
+    case, directory, _ = recorded["edit"]
+    embeds, pad = _npy(directory, "prompt_embeds"), _npy(directory, "image_pad_mask")[0].astype(bool)
+    assert pad.any() and (~pad).any()
+    on_pads = embeds.copy()
+    on_pads[0, pad] += 1
+    assert record.encoder_error(on_pads, directory) == 0
+    on_text = embeds.copy()
+    on_text[0, np.flatnonzero(~pad)[-1]] += 1
+    assert record.encoder_error(on_text, directory) > 0
+
+
+def test_deepstack_off_moves_the_edit_cases_text_rows_only_while_on(tiny, recorded):
+    pipe = record.load_pipeline(tiny, "cpu")
+    record.set_precision(pipe, "fp32")
+    case, directory, _ = recorded["edit"]
+    with record.deepstack_off(pipe):
+        off = record.encode(pipe, case)
+        t2i, t2i_directory, _ = recorded["t2i"]
+        assert record.encoder_error(record._numpy(record.encode(pipe, t2i).embeds), t2i_directory) == 0
+    assert record.encoder_error(record._numpy(off.embeds), directory) > 0
+    assert record.encoder_error(record._numpy(record.encode(pipe, case).embeds), directory) == 0
+
+
+@pytest.fixture(scope="module")
+def tiny_artifact(tiny, edit, tmp_path_factory):
+    """The tiny checkpoint converted and packed by the Rust packer: (artifact, {source: record})."""
+    import subprocess
+
+    import convert
+    import pin
+    if not os.path.isfile(convert.PACKER):
+        pytest.skip(f"{convert.PACKER} is not built")
+    root = tmp_path_factory.mktemp("tiny-artifact")
+    paths = sorted(os.path.relpath(os.path.join(d, f), tiny).replace(os.sep, "/")
+                   for d, _, files in os.walk(tiny) for f in files)
+    p = pin.from_checkpoint(tiny, "tiny/qwen-image-2.1", os.path.basename(tiny), paths)
+    work = str(root / "work")
+    converted = convert.convert(tiny, p, work, status="fixture", log=lambda *a: None)
+    artifact = str(root / "tiny-v2.ninfer")
+    subprocess.run([convert.PACKER, "--family", "qwen-image", "--work", work, "--out", artifact,
+                    "--accept-status", "fixture"], check=True, capture_output=True)
+    return artifact, {r["source"]: r for r in converted["tensors"]}
+
+
+def _sim(tiny, tiny_artifact, quantize_input=True):
+    artifact, records = tiny_artifact
+    pipe = record.load_pipeline(tiny, "cpu")
+    record.set_precision(pipe, "fp32")
+    for comp in ("text_encoder", "transformer", "vae"):
+        record.simquant(getattr(pipe, comp), comp, record.Artifact(artifact), records)
+    for m in pipe.text_encoder.modules():
+        if isinstance(m, record._SimQuantLinear):
+            m.quantize_input = quantize_input
+    for m in pipe.transformer.modules():
+        if isinstance(m, record._SimQuantLinear):
+            m.quantize_input = quantize_input
+    return pipe
+
+
+def test_the_sim_pipeline_without_activation_quantization_is_fp32_on_the_artifacts_weights(tiny, tiny_artifact, case):
+    """The swap changes nothing but the weights: with the inputs left unquantized, the sim pipeline is
+    the fp32 pipeline whose FP8 and W8 weights are what their payloads decode to, bit for bit."""
+    import convert
+    import fp8
+    import recipe
+    import rowsplit
+    artifact, records = tiny_artifact
+    container = record.Artifact(artifact)
+    want = record.load_pipeline(tiny, "cpu")
+    record.set_precision(want, "fp32")
+    for comp in ("text_encoder", "transformer"):
+        for name, p in getattr(want, comp).named_parameters():
+            item = recipe.plan(comp, name, list(p.shape))
+            if item is not None and item.encoding == "fp8":
+                p.data = fp8.decode_fp32(container.payload(item.object), item.shape)
+            elif item is not None and item.encoding == "w8":
+                p.data = rowsplit.decode(container.payload(item.object), "w8", item.shape).reshape(p.shape)
+    got = _sim(tiny, tiny_artifact, quantize_input=False)
+    assert torch.equal(_latents(got, case), _latents(want, case))
+
+
+def test_the_sim_yardstick_measures_the_quantization(tiny, recorded, tiny_artifact):
+    pipe = _sim(tiny, tiny_artifact)
+    for case, directory, _ in recorded.values():
+        errors = record.yardstick(pipe, case, directory)
+        assert all(0 < e < 0.5 for e in errors["velocity"]) and 0 < errors["encoder"] < 0.5, errors
+        # the VAE is the artifact's bf16, computing in fp32 as the oracle does
+        assert errors.get("condition_latents", 0) == 0
+
+
+def test_a_yardstick_session_replaces_the_thresholds_with_the_bound(tiny, edit, recorded, tiny_artifact, tmp_path):
+    artifact, records = tiny_artifact
+    out = str(tmp_path / "oracle")
+    manifest = _run(tiny, edit, out)
+    with open(os.path.join(out, "thresholds.json"), encoding="utf-8") as f:
+        bf16_only = json.load(f)
+
+    def session(replace):
+        return record.run_yardstick(tiny, out, artifact, "cpu", [T2I, edit], replace=replace, top=3,
+                                    min_free_ram_gb=0, min_free_vram_gb=0, max_vram_gib=0, log=lambda *a: None)
+    with pytest.raises(FileExistsError, match="--replace-thresholds"):
+        session(False)
+    value, report = session(True)
+    kept = os.path.join(out, f"thresholds.{bf16_only['session']['id'].replace(':', '')}.json")
+    with open(kept, encoding="utf-8") as f:
+        assert json.load(f) == bf16_only
+    with open(os.path.join(out, "thresholds.json"), encoding="utf-8") as f:
+        assert json.load(f) == value
+    with open(os.path.join(out, "yardstick-report.json"), encoding="utf-8") as f:
+        assert json.load(f) == json.loads(json.dumps(report))
+    assert value["oracle_session"] == manifest["session"] and value["session"]["id"]
+    assert value["factors"] == {"sim": 2.0, "bf16": 5.0} and value["artifact"]["tensors_checked"] == len(records)
+    sim = _sim(tiny, tiny_artifact)
+    for case, directory, _ in recorded.values():
+        t = value["cases"][case.name]
+        assert t["velocity"]["bf16_error"] == bf16_only["cases"][case.name]["velocity"]["bf16_error"]
+        assert t["velocity"]["sim_error"] == record.yardstick(sim, case, directory)["velocity"]
+        for quantity in ("velocity", "encoder"):
+            s, b = np.atleast_1d(t[quantity]["sim_error"]), np.atleast_1d(t[quantity]["bf16_error"])
+            assert np.array_equal(np.atleast_1d(t[quantity]["bound"]), np.maximum(2 * s, 5 * b))
+        checks = report["checks"][case.name]
+        assert checks["fp32_replay_encoder"] == 0 and checks["bf16_velocity_vs_replaced"] == 0
+        breakdown = report["encoder_breakdown"][case.name]["sim"]
+        assert breakdown["text_rows"]["rel_l2"] == pytest.approx(t["encoder"]["sim_error"], rel=1e-12)
+        assert len(breakdown["top_rows_by_ref_norm"]) == 3
+    assert report["checks"]["edit"]["deepstack_off_encoder"] > 0
+    assert report["encoder_breakdown"]["edit"]["bf16"]["image_pad_rows"]["rows"] > 0

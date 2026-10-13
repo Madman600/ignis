@@ -1,5 +1,6 @@
 """The diffusers recordings (spec 01, AC 5, 6 and 8): the oracle specs 03 and 04 are checked
-against, and the bf16 yardstick their tolerance comes from.
+against, and the two yardsticks their tolerance comes from (bf16, and simulated W8A8 on the
+artifact's own values).
 
 The oracle is diffusers' `QwenImage21Pipeline` computing in fp32. The checkpoint is bf16, so fp32
 is a compute precision, not a weight precision: the weights stay bf16 at rest (exactly the
@@ -21,11 +22,16 @@ checkpoint's values) and are upcast where they are used, which gives the arithme
 - The VAE's causal feature cache keeps nothing for a single frame (`_NoRetain`).
 
     python record.py run --checkpoint SNAPSHOT_DIR [--out F:/ai/models/ignis-image-2.1-turbo/oracle]
+    python record.py yardstick --checkpoint SNAPSHOT_DIR [--oracle DIR] [--artifact NINFER]
+                               [--sim-factor 2] [--bf16-factor 5] [--replace-thresholds]
 
-`run` writes one directory per case (`FIELDS`), thresholds.json and, last, manifest.json; it
-prints RECORD DONE or RECORD FAILED at the end.
+`run` writes one directory per case (`FIELDS`), a bf16-only thresholds.json and, last,
+manifest.json; it prints RECORD DONE or RECORD FAILED at the end. `yardstick` (`run_yardstick`)
+runs both yardsticks against that recording, without recording it again, and writes the bound
+ignis is held to as thresholds.json (`write_bounds`), with a report; YARDSTICK DONE or FAILED.
 """
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -36,6 +42,10 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from PIL import Image
+
+import fp8
+import recipe
+import rowsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -554,12 +564,28 @@ def encode(pipe, case):
     return _encode(pipe, case, None)
 
 
+def text_rows(embeds, image_pad_mask):
+    """The rows of prompt_embeds, (1, L - drop_idx, D), that the DiT reads as text: those whose
+    image_pad_mask is 0, every row for text-to-image. The DiT puts the condition latents in place
+    of the image-pad rows, so their values never reach it."""
+    pad = np.asarray(image_pad_mask)[0].astype(bool)
+    return np.asarray(embeds)[0][~pad]
+
+
+def encoder_error(embeds, recorded):
+    """The encoder metric of thresholds.json: `rel_l2` over the text rows (`text_rows`, the
+    recording's image_pad_mask) against the recording's prompt_embeds."""
+    pad = np.load(os.path.join(recorded, "image_pad_mask.npy"))
+    return rel_l2(text_rows(embeds, pad), text_rows(np.load(os.path.join(recorded, "prompt_embeds.npy")), pad))
+
+
 def yardstick(pipe, case, recorded, prompt=None):
     """The pipeline's per-step error against a recording, teacher-forced: step i's recorded input
     latents go in (in the pipeline's dtype, so rounded to bf16 in bf16), and its velocity is
-    compared with step i's recorded velocity. Also the encoder's error (prompt_embeds) and, with a
-    condition image, the condition latents'. Relative L2 (`rel_l2`). `prompt` is this pipeline's
-    own encoder phase (`encode`), run here when None."""
+    compared with step i's recorded velocity. Also the encoder's error (`encoder_error`, the text
+    rows; `encoder_whole` over every row) and, with a condition image, the condition latents'.
+    Relative L2 (`rel_l2`). `prompt` is this pipeline's own encoder phase (`encode`), run here when
+    None."""
     with open(os.path.join(recorded, "case.json"), encoding="utf-8") as f:
         info = json.load(f)
     steps = len(info["sigmas"]) - 1
@@ -575,20 +601,24 @@ def yardstick(pipe, case, recorded, prompt=None):
         return {"latents": torch.from_numpy(inputs[i + 1]).to(latents.device, latents.dtype)}
 
     prompt = prompt if prompt is not None else encode(pipe, case)
+    if not np.array_equal(_numpy(prompt.pad), load("image_pad_mask")):
+        raise AssertionError("the encoder's image_pad_mask is not the recording's")
     with _Capture(pipe, None, prompt=prompt) as cap:
         _call(pipe, case, torch.from_numpy(inputs[0]), "latent", callback=force)
     _check_denoise_traps(pipe, case, cap, prompt)
     errors = {"velocity": [rel_l2(cap.arrays[f"step{i}/velocity"], load(f"step{i}/velocity")) for i in range(steps)],
-              "encoder": rel_l2(_numpy(prompt.embeds), load("prompt_embeds"))}
+              "encoder": encoder_error(_numpy(prompt.embeds), recorded),
+              "encoder_whole": rel_l2(_numpy(prompt.embeds), load("prompt_embeds"))}
     if case.image is not None:
         errors["condition_latents"] = rel_l2(cap.arrays["condition_latents"], load("condition_latents"))
     return errors
 
 
 def write_thresholds(path, errors, factor, session):
-    """thresholds.json (spec 01, AC 6): per case, the bf16 teacher-forced error of each step and
-    `factor` times it, the encoder's error and `factor` times it. Written once: an existing file
-    is never replaced (it must not move after any ignis result exists)."""
+    """The recording session's bf16-only thresholds.json (schema v1): per case, the bf16
+    teacher-forced error of each step and `factor` times it, the encoder's error (its text rows)
+    and `factor` times it. Written once: an existing file is never replaced. `yardstick`
+    supersedes it with the bound of both yardsticks (`write_bounds`)."""
     cases = {}
     for name, e in errors.items():
         cases[name] = {
@@ -599,11 +629,218 @@ def write_thresholds(path, errors, factor, session):
             cases[name]["condition_latents"] = {"bf16_error": e["condition_latents"]}
     value = {
         "schema": "ignis-image-thresholds-v1",
-        "metric": "relative L2, ||x - fp32||_2 / ||fp32||_2 over the whole tensor, float64",
+        "metric": "relative L2, ||x - fp32||_2 / ||fp32||_2 over the whole tensor (the encoder: its text rows), "
+                  "float64",
         "yardstick": "diffusers QwenImage21Pipeline in bf16, teacher-forced: step i's recorded fp32 input "
                      "latents in, its velocity against step i's recorded fp32 velocity",
         "factor": factor,
         "session": session,
+        "cases": cases,
+    }
+    with open(path, "x", encoding="utf-8", newline="") as f:
+        f.write(json.dumps(value, indent=2) + "\n")
+    return value
+
+
+# The simulated W8A8 yardstick: the pipeline as ignis quantizes it, computing in fp32. The bf16
+# yardstick holds no quantization error, so 5x it alone would fail every step of a correct ignis.
+
+E4M3_MAX = 448.0
+# #319's floor (kernel/src/image/fp8_quant.cuh, kE4m3MinAmax = 0x1.cp-118): 448 * 2^-126, the
+# smallest amax whose scale amax / 448 is a normal fp32
+E4M3_MIN_AMAX = 7 * 2.0 ** -120
+
+
+def fake_quant_e4m3(x):
+    """x through #319's per-token E4M3 activations (kernel/include/ignis_image_gemm.h,
+    kernel/src/image/fp8_quant.cuh), in fp32: per row of the last dimension, amax = max |x|,
+    scale = amax / 448 and inverse = 448 / amax (two correctly rounded fp32 divisions), codes =
+    E4M3(x * inverse) with the product rounded once in fp32, then to nearest even and saturated to
+    +-448; a row whose amax is below `E4M3_MIN_AMAX` (an all-zero row among them) gets scale 1 and
+    zero codes. Returns scale * e4m3(codes), what the GEMM multiplies back. The input is the fp32
+    activation: no bf16 rounding before the quantization."""
+    amax = x.abs().amax(-1, keepdim=True)
+    full = torch.full_like(amax, E4M3_MAX)
+    quantized = amax >= E4M3_MIN_AMAX
+    # tensor by tensor: a division by a scalar runs as a multiplication by its reciprocal on the GPU
+    scale = torch.where(quantized, amax / full, torch.ones_like(amax))
+    inverse = torch.where(quantized, full / amax, torch.zeros_like(amax))
+    # torch's cast does not saturate (480 and above become NaN): the clamp is the kernel's satfinite
+    codes = (x * inverse).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+    return codes.float() * scale
+
+
+class _SimQuantLinear(torch.nn.Module):
+    """An FP8 linear as ignis runs it (W8A8), simulated in fp32: the weight is the artifact's
+    payload, E4M3 codes times their row's bf16 scale (exact in fp32, `fp8.decode_fp32`), dequantized
+    in each forward so that only the codes stay resident; the input goes through `fake_quant_e4m3`
+    (`quantize_input`). None of the FP8 linears has a bias."""
+
+    def __init__(self, codes, scales, quantize_input=True):
+        super().__init__()
+        self.register_buffer("codes", codes, persistent=False)
+        self.register_buffer("scales", scales, persistent=False)
+        self.quantize_input = quantize_input
+
+    def forward(self, x):
+        weight = self.codes.float() * self.scales.float()[:, None]
+        return torch.nn.functional.linear(fake_quant_e4m3(x) if self.quantize_input else x, weight)
+
+
+def sim_linear(payload, shape, device):
+    """The _SimQuantLinear of an FP8_E4M3FN_ROW_BF16S / row-scale-v1 payload, on `device`."""
+    rows, cols = shape
+    n = rows * cols
+    buf = bytearray(payload)
+    codes = torch.frombuffer(buf, dtype=torch.uint8, count=n).view(torch.float8_e4m3fn).view(rows, cols)
+    scales = torch.frombuffer(buf, dtype=torch.bfloat16, count=rows, offset=n + (-n % fp8.ALIGN))
+    return _SimQuantLinear(codes.to(device), scales.to(device))
+
+
+class Artifact:
+    """The packed `.ninfer` v2 container's objects, read back with the framing of crates/artifact's
+    reader (as tools/flash-next-converter/container.py reads it): an 8-byte magic, the directory's
+    JSON length as a little-endian u64, the JSON directory, then the payload from the next
+    4096-byte boundary; object offsets are payload-relative."""
+    MAGIC = b"NINFER\x00\x02"
+
+    def __init__(self, path):
+        self.path = path
+        with open(path, "rb") as f:
+            prefix = f.read(16)
+            if prefix[:8] != self.MAGIC:
+                raise ValueError(f"{path}: not a .ninfer v2 container")
+            n = int.from_bytes(prefix[8:16], "little")
+            self.directory = json.loads(f.read(n))
+        self.payload_start = -(-(16 + n) // 4096) * 4096
+        self.objects = {o["name"]: o for o in self.directory["objects"]}
+
+    def payload(self, name):
+        o = self.objects[name]
+        with open(self.path, "rb") as f:
+            f.seek(self.payload_start + o["offset"])
+            return f.read(o["bytes"])
+
+
+def simquant(model, comp, artifact, records):
+    """Makes `model` (the pipeline's text encoder, DiT or VAE, `comp` in recipe.py's terms) compute
+    with what the artifact stores, from the artifact's own bytes:
+    - a linear recipe.py stores as FP8 becomes the _SimQuantLinear of its payload;
+    - a grouped-format (vision) weight takes what its payload decodes to, in fp32;
+    - every other stored tensor is bf16, the checkpoint's bits, which it must hash to.
+    Every payload read and every bf16 tensor must hash to its record in the artifact's conversion
+    record (`records`, by source name): the M3 probe's proof, on the packed bytes. One way: the
+    replaced linears' bf16 weights are gone. Returns the count per encoding."""
+    import hashlib
+    counts = {}
+    # by name, so that no list holds a replaced linear's bf16 weight until the end (on the GPU,
+    # the bf16 and the codes of a whole model would not fit together)
+    for name in [name for name, _ in model.named_parameters()]:
+        p = model.get_parameter(name)
+        item = recipe.plan(comp, name, list(p.shape))
+        if item is None:
+            continue
+        record = records.get(f"{comp}/{name}")
+        if item.encoding == "bf16":
+            data = p.detach().to(torch.bfloat16).cpu().contiguous().view(torch.int16).numpy().tobytes()
+        else:
+            data = artifact.payload(item.object)
+        if record is None or record["sha256"] != hashlib.sha256(data).hexdigest():
+            raise ValueError(f"{comp}/{name}: not the artifact's {item.object}")
+        if item.encoding == "fp8":
+            parent, _, child = name[:-len(".weight")].rpartition(".")
+            setattr(model.get_submodule(parent), child, sim_linear(data, item.shape, p.device))
+        elif item.encoding != "bf16":
+            p.data = rowsplit.decode(data, item.encoding, item.shape).reshape(p.shape).to(p.device)
+        counts[item.encoding] = counts.get(item.encoding, 0) + 1
+    return counts
+
+
+@contextlib.contextmanager
+def deepstack_off(pipe):
+    """The text model without DeepStack: the vision features it adds after its first layers are
+    dropped (as if zero)."""
+    text_model = pipe.text_encoder.model.language_model
+    text_model._deepstack_process = lambda hidden_states, visual_pos_masks, visual_embeds: hidden_states
+    try:
+        yield
+    finally:
+        del text_model._deepstack_process
+
+
+def encoder_breakdown(embeds, recorded, top=8):
+    """Where an encoder error lies, against the recording's prompt_embeds: the share of the squared
+    error and of the squared reference norm, and the relative L2, of the text rows and of the
+    image-pad rows, and the `top` rows by reference norm and by error norm."""
+    ref = np.load(os.path.join(recorded, "prompt_embeds.npy"))[0].astype(np.float64)
+    pad = np.load(os.path.join(recorded, "image_pad_mask.npy"))[0].astype(bool)
+    err = np.linalg.norm(np.asarray(embeds, dtype=np.float64)[0] - ref, axis=-1) ** 2
+    norm = np.linalg.norm(ref, axis=-1) ** 2
+
+    def part(rows):
+        return {"rows": int(rows.sum()), "error_share": float(err[rows].sum() / err.sum()),
+                "norm_share": float(norm[rows].sum() / norm.sum()),
+                "rel_l2": float(np.sqrt(err[rows].sum() / norm[rows].sum())) if rows.any() else None}
+
+    def rows(order):
+        return [{"row": int(i), "image_pad": bool(pad[i]), "ref_norm": float(np.sqrt(norm[i])),
+                 "error_norm": float(np.sqrt(err[i])), "error_share": float(err[i] / err.sum())}
+                for i in order[:top]]
+    return {"whole": float(np.sqrt(err.sum() / norm.sum())), "text_rows": part(~pad), "image_pad_rows": part(pad),
+            "top_rows_by_ref_norm": rows(np.argsort(-norm)), "top_rows_by_error": rows(np.argsort(-err))}
+
+
+# What each quantity of thresholds.json measures.
+METRICS = {
+    "velocity": "step i's predicted velocity, (1, N, 64): relative L2 ||x - fp32||_2 / ||fp32||_2 over the whole "
+                "tensor in float64, teacher-forced (step i's recorded fp32 input latents in)",
+    "encoder": "prompt_embeds, (1, L - drop_idx, 4096), the encoder's last hidden state before the final norm: "
+               "relative L2 over its text rows only, the rows whose recorded image_pad_mask is 0 (every row for "
+               "text-to-image); the DiT replaces the image-pad rows with the condition latents",
+    "condition_latents": "the edit case's condition latents, (1, Nc, 64), packed and normalized: relative L2 over "
+                         "the whole tensor",
+}
+YARDSTICKS = {
+    "bf16": "diffusers QwenImage21Pipeline in bf16 (the checkpoint's weights), encoder, DiT and VAE, teacher-forced",
+    "sim": "simulated W8A8, teacher-forced: the pipeline computing in fp32 on the artifact's stored values; each "
+           "linear the artifact stores as FP8 (FP8_E4M3FN_ROW_BF16S / row-scale-v1, the text encoder's and the "
+           "DiT's) uses its payload's E4M3 codes x bf16 row scales and fake-quantizes its fp32 input per token to "
+           "E4M3 with scale amax / 448 (#319's kernel: zero rows scale 1, the 7 * 2^-120 amax floor, round to "
+           "nearest even, saturate); the vision tower its W8 payloads decoded; every other tensor the artifact's "
+           "bf16; attention not simulated (fp32)",
+}
+
+
+def write_bounds(path, sim, bf16, sim_factor, bf16_factor, oracle_session, session, artifact):
+    """thresholds.json, schema v2 (spec 01, AC 6): per case, each step's velocity, the encoder and
+    the condition latents, the error of both yardsticks (`sim`, `bf16`: yardstick's errors per
+    case) and the bound ignis is held to, max(sim_factor x sim, bf16_factor x bf16); each
+    quantity's metric; the factors; the oracle's session and this one's; the artifact measured.
+    Refuses an existing file."""
+    def bound(s, b):
+        return max(sim_factor * s, bf16_factor * b)
+    cases = {}
+    for name in sim:
+        s, b = sim[name], bf16[name]
+        cases[name] = {
+            "velocity": {"sim_error": s["velocity"], "bf16_error": b["velocity"],
+                         "bound": [bound(x, y) for x, y in zip(s["velocity"], b["velocity"])]},
+            "encoder": {"sim_error": s["encoder"], "bf16_error": b["encoder"], "bound": bound(s["encoder"], b["encoder"])},
+        }
+        if s.get("condition_latents") is not None:
+            cases[name]["condition_latents"] = {
+                "sim_error": s["condition_latents"], "bf16_error": b["condition_latents"],
+                "bound": bound(s["condition_latents"], b["condition_latents"])}
+    value = {
+        "schema": "ignis-image-thresholds-v2",
+        "bound": "max(factors.sim x sim_error, factors.bf16 x bf16_error), per quantity: each step's velocity, the "
+                 "encoder, the condition latents",
+        "factors": {"sim": sim_factor, "bf16": bf16_factor},
+        "metrics": METRICS,
+        "yardsticks": YARDSTICKS,
+        "oracle_session": oracle_session,
+        "session": session,
+        "artifact": artifact,
         "cases": cases,
     }
     with open(path, "x", encoding="utf-8", newline="") as f:
@@ -869,6 +1106,136 @@ def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), 
     return manifest
 
 
+ARTIFACT = "F:/ai/models/ignis-image-2.1-turbo/ignis_image_2_1_turbo-v2.ninfer"
+
+
+def run_yardstick(checkpoint, oracle, artifact, device, cases, sim_factor=2.0, bf16_factor=5.0, replace=False,
+                  report=None, top=8, min_free_ram_gb=24.0, min_free_vram_gb=27.0, max_vram_gib=24.0, log=print):
+    """One session of both yardsticks against an existing oracle, which it never records again (the
+    fp32 oracle does not depend on the artifact), then thresholds.json (`write_bounds`) and the
+    report (default ORACLE/yardstick-report.json). An existing thresholds.json is replaced only with
+    `replace`, and kept as thresholds.<its session id>.json. In order: the bf16 encoder on every
+    case; the fp32 encoder replayed (its error against the oracle is the session's wiring check)
+    and, for a case with an image, with DeepStack off (spec 03 AC 4's premise); the encoder made
+    sim (`simquant`), the sim encoder; the encoder dropped, the bf16 DiT; the DiT and the VAE made
+    sim, the sim DiT."""
+    import hashlib
+
+    import convert
+    import psutil
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    started = time.time()
+    with open(os.path.join(oracle, "manifest.json"), encoding="utf-8") as f:
+        manifest = json.load(f)
+    sidecar = artifact + ".conversion.json"
+    with open(sidecar, "rb") as f:
+        raw = f.read()
+    conversion = json.loads(raw)
+    revision = os.path.basename(os.path.normpath(checkpoint))
+    if not manifest["checkpoint"]["revision"] == conversion["source"]["revision"] == revision:
+        raise ValueError(f"the oracle ({manifest['checkpoint']['revision']}), the artifact "
+                         f"({conversion['source']['revision']}) and the checkpoint ({revision}) are not one revision")
+    thresholds = os.path.join(oracle, "thresholds.json")
+    old = None
+    if os.path.exists(thresholds):
+        if not replace:
+            raise FileExistsError(f"{thresholds} exists: --replace-thresholds keeps it under its session's name")
+        with open(thresholds, encoding="utf-8") as f:
+            old = json.load(f)
+    free_ram = psutil.virtual_memory().available / GB
+    if free_ram < min_free_ram_gb:
+        raise RuntimeError(f"{free_ram:.1f} GB of host RAM free, below {min_free_ram_gb} GB")
+    fp32_ieee()
+    if device.type == "cuda":
+        free_vram = torch.cuda.mem_get_info(device)[0] / GB
+        if free_vram < min_free_vram_gb:
+            raise RuntimeError(f"{free_vram:.1f} GB of VRAM free, below {min_free_vram_gb} GB")
+        if max_vram_gib:
+            total = torch.cuda.get_device_properties(device).total_memory
+            torch.cuda.set_per_process_memory_fraction(min(1.0, max_vram_gib * 2**30 / total), device)
+    session = {"id": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **convert.tool_commit()}
+    log(f"yardstick session {session['id']} on oracle session {manifest['session']['id']}")
+    records = {t["source"]: t for t in conversion["tensors"]}
+    container = Artifact(artifact)
+    dirs = {case.name: os.path.join(oracle, case.name) for case in cases}
+    wall, peaks = {}, {}
+
+    def timed(key, work):
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        t = time.time()
+        result = work()
+        wall[key] = round(time.time() - t, 1)
+        if device.type == "cuda":
+            peaks[key] = round(torch.cuda.max_memory_allocated(device) / 2**30, 2)
+        log(f"{key}: {wall[key]} s, peak {peaks.get(key)} GiB")
+        return result
+
+    pipe = timed("load", lambda: load_pipeline(checkpoint, device))
+    checks = {case.name: {} for case in cases}
+    # the encoder phase
+    set_precision(pipe, "bf16")
+    prompts16 = {case.name: timed(f"bf16_encoder_{case.name}", lambda: encode(pipe, case)) for case in cases}
+    set_precision(pipe, "fp32")
+    for case in cases:
+        checks[case.name]["fp32_replay_encoder"] = encoder_error(_numpy(encode(pipe, case).embeds), dirs[case.name])
+        if case.image is not None:
+            with deepstack_off(pipe):
+                off = encode(pipe, case)
+            checks[case.name]["deepstack_off_encoder"] = encoder_error(_numpy(off.embeds), dirs[case.name])
+    counts = {"text_encoder": timed("sim_install_text_encoder",
+                                    lambda: simquant(pipe.text_encoder, "text_encoder", container, records))}
+    prompts_sim = {case.name: timed(f"sim_encoder_{case.name}", lambda: encode(pipe, case)) for case in cases}
+    # the DiT phase
+    timed("encoder_to_dit", lambda: denoise_phase(pipe, device))
+    set_precision(pipe, "bf16")
+    bf16 = {case.name: timed(f"bf16_dit_{case.name}", lambda: yardstick(pipe, case, dirs[case.name], prompts16[case.name]))
+            for case in cases}
+    set_precision(pipe, "fp32")
+    counts["transformer"] = timed("sim_install_dit", lambda: simquant(pipe.transformer, "transformer", container, records))
+    counts["vae"] = simquant(pipe.vae, "vae", container, records)
+    checked = sum(n for c in counts.values() for n in c.values())
+    if checked != len(records):
+        raise AssertionError(f"{checked} stored tensors checked, the artifact records {len(records)}")
+    _guard_dit(pipe, device.type == "cuda")
+    sim = {case.name: timed(f"sim_dit_{case.name}", lambda: yardstick(pipe, case, dirs[case.name], prompts_sim[case.name]))
+           for case in cases}
+    _guard_dit(pipe, False)
+
+    if old is not None:
+        os.replace(thresholds, os.path.join(oracle, f"thresholds.{old['session']['id'].replace(':', '')}.json"))
+    value = write_bounds(thresholds, sim, bf16, sim_factor, bf16_factor, manifest["session"], session,
+                         {"file": os.path.basename(artifact), "bytes": os.path.getsize(artifact),
+                          "identity": container.directory.get("identity"),
+                          "conversion_sha256": hashlib.sha256(raw).hexdigest(), "tensors_checked": checked})
+    for case in cases:
+        c = checks[case.name]
+        c["encoder_bound"] = value["cases"][case.name]["encoder"]["bound"]
+        if "deepstack_off_encoder" in c:
+            c["deepstack_off_fails_the_bound"] = c["deepstack_off_encoder"] > c["encoder_bound"]
+        if old is not None and case.name in old["cases"]:
+            c["bf16_velocity_vs_replaced"] = max(abs(x - y) for x, y in zip(
+                bf16[case.name]["velocity"], old["cases"][case.name]["velocity"]["bf16_error"]))
+    result = {
+        "session": session,
+        "oracle_session": manifest["session"],
+        "replaced": None if old is None else old.get("schema"),
+        "errors": {"sim": sim, "bf16": bf16},
+        "encoder_breakdown": {case.name: {"sim": encoder_breakdown(_numpy(prompts_sim[case.name].embeds), dirs[case.name], top),
+                                          "bf16": encoder_breakdown(_numpy(prompts16[case.name].embeds), dirs[case.name], top)}
+                              for case in cases},
+        "checks": checks,
+        "tensors_checked": counts,
+        "wall_s": dict(wall, total=round(time.time() - started, 1)),
+        "peak_vram_gib": peaks,
+    }
+    _write_json(report or os.path.join(oracle, "yardstick-report.json"), result)
+    log(f"done: thresholds.json and the report in {oracle}, {result['wall_s']['total']} s")
+    return value, result
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -888,16 +1255,40 @@ def main(argv=None):
     r.add_argument("--host-decode-from", type=int, default=2048,
                    help="decode images this many pixels a side or more on the host (0: never)")
     r.add_argument("--max-vram-gib", type=float, default=24.0, help="this process's VRAM cap in GiB, desktop excluded (0: none)")
+    y = sub.add_parser("yardstick", help="the bf16 and the simulated W8A8 yardsticks against the existing oracle; "
+                                         "writes thresholds.json (the bound) and a report")
+    y.add_argument("--checkpoint", required=True, help="the pinned snapshot directory")
+    y.add_argument("--oracle", default="F:/ai/models/ignis-image-2.1-turbo/oracle")
+    y.add_argument("--artifact", default=ARTIFACT, help="the packed artifact, its .conversion.json beside it")
+    y.add_argument("--device", default="cuda")
+    y.add_argument("--cases", default=",".join(CASES), help="comma-separated, from " + ", ".join(CASES))
+    y.add_argument("--sim-factor", type=float, default=2.0,
+                   help="bound = max(sim-factor x the simulated W8A8 error, bf16-factor x the bf16 error)")
+    y.add_argument("--bf16-factor", type=float, default=5.0)
+    y.add_argument("--replace-thresholds", action="store_true",
+                   help="replace an existing thresholds.json, kept as thresholds.<its session id>.json")
+    y.add_argument("--report", help="the encoder breakdown and the checks (default ORACLE/yardstick-report.json)")
+    y.add_argument("--top-rows", type=int, default=8, help="rows listed by reference norm and by error in the report")
+    y.add_argument("--min-free-ram-gb", type=float, default=24.0)
+    y.add_argument("--min-free-vram-gb", type=float, default=27.0)
+    y.add_argument("--max-vram-gib", type=float, default=24.0, help="this process's VRAM cap in GiB, desktop excluded (0: none)")
     a = ap.parse_args(argv)
     ints = lambda text: tuple(int(x) for x in text.split(",") if x)
+    log = lambda *x: print(*x, flush=True)
+    what = "RECORD" if a.cmd == "run" else "YARDSTICK"
     try:
-        run(a.checkpoint, a.out, a.device, [CASES[n] for n in a.cases.split(",")], ints(a.blocks),
-            ints(a.block_steps), a.factor, a.min_free_disk_gb, a.disk_budget_gb, a.min_free_ram_gb,
-            a.min_free_vram_gb, a.max_vram_gib, a.host_decode_from, log=lambda *x: print(*x, flush=True))
+        if a.cmd == "run":
+            run(a.checkpoint, a.out, a.device, [CASES[n] for n in a.cases.split(",")], ints(a.blocks),
+                ints(a.block_steps), a.factor, a.min_free_disk_gb, a.disk_budget_gb, a.min_free_ram_gb,
+                a.min_free_vram_gb, a.max_vram_gib, a.host_decode_from, log=log)
+        else:
+            run_yardstick(a.checkpoint, a.oracle, a.artifact, a.device, [CASES[n] for n in a.cases.split(",")],
+                          a.sim_factor, a.bf16_factor, a.replace_thresholds, a.report, a.top_rows, a.min_free_ram_gb,
+                          a.min_free_vram_gb, a.max_vram_gib, log=log)
     except BaseException as e:
-        print(f"RECORD FAILED: {type(e).__name__}: {e}", flush=True)
+        print(f"{what} FAILED: {type(e).__name__}: {e}", flush=True)
         raise
-    print("RECORD DONE", flush=True)
+    print(f"{what} DONE", flush=True)
     return 0
 
 
