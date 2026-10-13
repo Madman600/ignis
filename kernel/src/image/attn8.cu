@@ -19,7 +19,8 @@
 //                                          and ldmatrix: "Adapted from FlashInfer"
 //                                          (flashinfer-ai/flashinfer v0.1.5 include/flashinfer/
 //                                          {permuted_smem,cp_async,mma}.cuh, Copyright (c) 2023 by
-//                                          FlashInfer team, Apache-2.0).
+//                                          FlashInfer team, Apache-2.0); now in attn_smem.cuh,
+//                                          shared with the encoder attention.
 //
 // Changes from upstream (ours to change, no parity claim):
 //   - torch removed; D = 128, 32 heads, one layout, no templates over granularity or dtype.
@@ -43,6 +44,7 @@
 //     sentinel); the 1 / sum is __frcp_rn; output BF16 or fp32 stored from registers.
 
 #include "attn8_layout.cuh"
+#include "attn_smem.cuh"
 #include "ignis_image_attn.h"
 #include "image_common.cuh"
 #include "image_mma.cuh"
@@ -68,33 +70,7 @@ constexpr int kSmemQ = 0, kSmemStage0 = kCtaQ * kAttnDim, kStageBytes = 2 * kCta
 constexpr int kSmemK = 0, kSmemV = kCtaK * kAttnDim;  // within a stage
 constexpr int kSmemBytes = kSmemStage0 + 2 * kStageBytes;  // 16 + 2 x (8 + 8) KiB = 48 KiB
 constexpr uint32_t kOnesE4m3 = 0x38383838u;  // four E4M3 1.0
-
-// Byte offset of 16-byte chunk `chunk` of `row` in a tile of 128-byte rows (Q, K: chunk ^ row % 8)
-// or 64-byte rows (V transposed: chunk ^ (row / 2) % 4) -- FlashInfer's k128B / k64B swizzles.
-__device__ __forceinline__ int swz128(int row, int chunk) { return row * 128 + ((chunk ^ (row & 7)) << 4); }
-__device__ __forceinline__ int swz64(int row, int chunk) { return row * 64 + ((chunk ^ ((row >> 1) & 3)) << 4); }
-
-__device__ __forceinline__ void cp_async16(void *smem, const void *gmem) {
-  const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
-
-__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void *smem) {
-  const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(s));
-}
-
-__device__ __forceinline__ float neg_inf() { return __int_as_float(0xFF800000u); }
-
-__device__ __forceinline__ float ex2(float x) {
-  float y;
-  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-  return y;
-}
+// Q and K tiles use attn_smem.cuh's 128-byte swizzle, V transposed its 64-byte one.
 
 __device__ __forceinline__ uint32_t e4m3x4(float a, float b, float c, float d) {  // a in the low byte
   const uint32_t lo = static_cast<uint16_t>(__nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3));
