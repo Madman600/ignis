@@ -799,3 +799,16 @@ add_test(NAME ignis_kernel_image_attn_test COMMAND ignis_kernel_image_attn_test)
 add_executable(ignis_image_attn_bench bench_image_attn.cu)
 target_include_directories(ignis_image_attn_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_image_attn_bench PRIVATE ignis_kernel ignis_vendor CUDA::nvml)
+# The encoder attention (acceptance 5, kernel/include/ignis_image_encoder_attn.h; an adapted op,
+# FlashAttention-2's forward): one causal GQA 32/8 sequence from 1 to 41,000 tokens against fp64
+# that replays the kernel's softmax (a tight bound) and against plain fp64 attention. GPU (ADR
+# 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_image_encoder_attn_test test_image_encoder_attn.cu)
+target_include_directories(ignis_kernel_image_encoder_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_image_encoder_attn_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_image_encoder_attn_test COMMAND ignis_kernel_image_encoder_attn_test)
+# Its speed (acceptance 5 "TOPS") with the SM clock and board power, and the encoder's 36 layers.
+# A timing is a finding: a tool, NOT registered with CTest.
+add_executable(ignis_image_encoder_attn_bench bench_image_encoder_attn.cu)
+target_include_directories(ignis_image_encoder_attn_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_image_encoder_attn_bench PRIVATE ignis_kernel ignis_vendor CUDA::nvml)

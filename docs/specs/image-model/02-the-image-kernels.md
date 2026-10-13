@@ -365,7 +365,8 @@ would close the gap, largest first:
   adapts `thu-ml/SageAttention` d1a57a5 `csrc/qattn` (the sm89/sm120 path),
   whose smem, cp.async and mma helpers are themselves adapted from FlashInfer
   v0.1.5; all Apache-2.0. The file header and `kernel/NOTICE` give the
-  chain. The quantizers (`attn8_quant.cu`) and the layout
+  chain. Those helpers now live in `attn_smem.cuh`, shared with the encoder
+  attention (AC 5). The quantizers (`attn8_quant.cu`) and the layout
   (`attn8_layout.cuh`) are our own.
 - The upstream was fetched as data into this worktree's
   `.scratch/upstream/sageattention`, pinned at d1a57a5. Nothing of it was
@@ -569,3 +570,198 @@ under Apache-2.0. Nothing comes from CUTLASS 3.x or FlashInfer's
 **AC 9.** The CTest runs in the profile's kernel stage. The Rust `--ignored`
 test drives the bindings: quantize, store two runs, three calls checked
 against fp64 of the unquantized inputs, and a refusal. The bench is a tool.
+
+### The encoder attention (AC 5)
+
+**Where.**
+- ABI: `kernel/include/ignis_image_encoder_attn.h`:
+  `ignis_image_encoder_attn`, `ignis_image_encoder_attn_last_error`.
+- Code: `kernel/src/image/encoder_attn.cu`, an adapted op (ADR 0051 tier 2)
+  of FlashAttention-2's forward (`Dao-AILab/flash-attention` v2.8.3,
+  060c918, BSD-3-Clause).
+  - FA2 is CuTe code, and CuTe is CUTLASS 3.x, so no FA2 code is compiled.
+  - The kernel takes FA2's structure and its operation forms:
+    `compute_attn_1rowblock`, `softmax.h`, `mask.h` and the tile for
+    consumer SMs.
+  - The data movement and the MMAs are written out as `mma.sync`,
+    `ldmatrix` and `cp.async`.
+  - The shared-memory helpers moved from `attn8.cu` to `attn_smem.cuh`
+    (FlashInfer through SageAttention, Apache-2.0); both attentions
+    include it.
+- The upstream was fetched as data into this worktree's
+  `.scratch/upstream/flash-attention`, pinned at 060c918. The checkout is
+  sparse: `csrc/flash_attn/src`, `LICENSE` and `AUTHORS`. Nothing of it was
+  built or run.
+- Tests: the CTest `ignis_kernel_image_encoder_attn_test`
+  (`kernel/tests/test_image_encoder_attn.cu`) and the Rust `--ignored` test
+  `crates/core/tests/image_encoder_attn_gpu.rs` (bindings in
+  `crates/core/src/image_encoder_attn.rs`). Speed:
+  `ignis_image_encoder_attn_bench` (`kernel/tests/bench_image_encoder_attn.cu`,
+  a tool).
+
+**One sequence per call.** The encoder runs one prompt per job:
+- Turbo has no CFG and no negative prompt (spec.md);
+- the condition images' vision tokens sit inside the prompt's one causal
+  sequence (spec 03).
+
+So the op takes one sequence, with as many queries as keys, and no batch or
+segments. It also takes non-causal calls, which the bench uses for the bar's
+geometry.
+
+**The ABI.**
+- Q, K and V are BF16 base pointers with row strides. The fused QKV GEMM's
+  output [tokens][6144] is read in place: q at column 0, k at 4096, v at
+  5120.
+- GQA: query head h reads KV head h / 4.
+- O is BF16 for the leaf, or fp32 for the test.
+- The call takes a stream, allocates nothing, and is graph-capturable and
+  deterministic.
+- It needs no prepare call: 48 KiB of shared memory is within the default
+  limit.
+
+**The kernel.**
+- **Tile:** 64 queries × 64 keys, 4 warps of 16 rows: FA2's causal tile for
+  consumer SMs (sm86/sm89). FA2's own table sends sm120 to its datacenter
+  tile, 128 × 64, which needs 64 KiB. This one uses 48 KiB and 182
+  registers, so two CTAs fit an SM.
+- **Pipeline:** FA2's.
+  - Single K and V buffers. V of block n loads during QK^T, and K of block
+    n − 1 during the softmax and PV. Two barriers per block.
+  - Key blocks are walked from the last down. Masked blocks (the diagonal,
+    a partial last block) take their own path behind one warp-uniform
+    branch.
+  - Causal CTAs launch heaviest first.
+- **Softmax:** FA2's operation forms: the running max kept in raw scores,
+  one FMA for the exponent, ex2.approx. Two changes:
+  - the row sum adds the BF16-rounded P that multiply V, not FA2's fp32 P.
+    So O is a convex combination of V's rows whatever the rounding, as in
+    the 8-bit attention;
+  - a row whose max did not move is rescaled by exactly 1.
+- **Past the sequence:** tiles are zero-filled, never read. FA2 clears only
+  V's first block.
+
+**Mechanics (AC 5).** The reference is our own fp64 code. It replays the
+kernel per 64-key block, in the kernel's order. s_j = q · k_j is exact in
+fp64, since BF16 products are exact; the kernel's fp32 S'_j is not, and the
+test bounds what follows from that:
+- **S.** Per k16 step: 19 · 2^-25 · (|partial| + error + Σ|q_d k_d|). This
+  is the BF16 accumulation probe of the instruction bench (P4 = 25): each of
+  an instruction's 16 products and its accumulator loses at most 2^-25 of
+  the largest addend, and the result is one fp32 rounding.
+- **The max and the exponent.** The kernel's max m' is within em, the
+  largest S error seen, of the replay's m. Its exponent fl(S'c − fl(m'c))
+  is within dx_j = c (e_j + em)(1 + 2^-22) + 2^-23 (|mc| + |x_j|) of
+  x_j = (s_j − m) c.
+- **P.** P'_j = BF16(ex2.approx(x')), and ex2 is within 2^-20 of 2^x. So
+  P'_j lies between the BF16 values of 2^(x_j ∓ dx_j)(1 ∓ 2^-20). The replay
+  takes BF16(2^x_j). Where that interval holds two BF16 values, the
+  numerator's error gains the width times |v| and the denominator's the
+  width.
+- **Rescales.** One happens when the max rises, or when it comes within
+  2 em of rising, since the kernel may then rescale where the replay does
+  not. Each adds ex2's error, the argument's two roundings and the
+  products' one.
+- **PV:** 19 · 2^-25 per k16 step.
+- **The row sum:** 16 · 2^-24 of the sum per block (16 terms per lane), then
+  the quad's two adds.
+- **The end:** two roundings, then the quotient.
+
+`--bound-factor` multiplies the whole bound (default 1). The same call with
+BF16 output must equal the fp32 output rounded, bit for bit. Against plain
+fp64 attention on the BF16 inputs, the relative RMS error per head is gated
+at `--max-rel-rms` (default 2^-8, BF16's unit roundoff).
+
+**The inputs** are what spec 03's text model hands the attention, laid out
+as the fused QKV row:
+- **q and k:** RMSNorm'd per head with weights shared by the heads (Qwen3's
+  q_norm / k_norm), then RoPE (rotate-half, θ 5e6). Four low-frequency
+  outlier channels make some heads sharp and the first token a sink.
+- **V:** Gaussian, with per-channel scales and offsets.
+- **Zero queries:** head 7 has one at every 97th token, so those rows
+  attend uniformly.
+
+**Guards.**
+- Each call reads a device copy of the first `tokens` rows followed by 64
+  rows of NaN: a kernel that read past the sequence would make NaN outputs.
+- Outputs start as NaN.
+
+**Rows checked:** 64 per head at an odd stride shifted by the head, so the
+32 heads together cover every residue mod 128, plus rows 0, 5, 63, 64, 127,
+128 and the last.
+
+The table gives the worst error over the bound, the bound's median over
+|O|, and the worst head's relative RMS error against plain fp64 (fp32
+output):
+
+| call | tokens | worst / bound | bound / \|O\| | rel. RMS vs fp64 |
+|---|---|---|---|---|
+| causal, the smallest | 1, 2, 7 | ≤ 0.095 | 1.8e-6 | ≤ 6.7e-4 |
+| causal, tile edges | 63, 64, 65, 127, 128, 129 | 0.913 | 2.9e-6-4.9e-6 | ≤ 5.8e-4 |
+| causal, tile edges, a t2i prompt | 191, 192, 193, 300 | 0.989 | 2.9e-5-3.9e-5 | ≤ 5.4e-4 |
+| causal, a 2,000-token prompt | 2,048 | 0.989 | 2.0e-4 | 3.6e-4 |
+| causal | 4,097 | 0.949 | 2.7e-4 | 3.3e-4 |
+| causal, 10 images and a 2,000-token prompt | 12,400 | 0.740 | 4.4e-4 | 3.0e-4 |
+| causal, the longest 10-image prompt | 41,000 | 0.740 | 8.6e-4 | 2.8e-4 |
+| non-causal | 1, 65, 300, 4,097 | ≤ 0.989 | 1.8e-6-3.7e-4 | ≤ 6.2e-4 |
+
+- **0 outputs over the bound**, in every call.
+- The BF16 output equals the fp32 output rounded, bit for bit, in every
+  call.
+- **The bound is tight.** With `--bound-factor 0.5`, every causal length
+  from 63 up has 27-344 outputs over it, so the bound is within 2× of the
+  worst error at every length. A worst near 1 fits one P rounded to the
+  neighbouring BF16 value, which the bound adds in full.
+- The median grows with the number of k16 steps, as the 8-bit attention's
+  does: 8.6e-4 of |O| at 41,000 keys, below BF16's resolution.
+
+**Speed** (2026-10-13, `ignis_image_encoder_attn_bench`, GPU lock in timing
+mode, card power limit 575 W). The SM clock and board power are NVML's
+means over the second half of a window of at least 1 s. TOPS = 4 · N² · 128
+· 32 / time, half of that for a causal call:
+
+| call | N | ms | TOPS | SM clock | board |
+|---|---|---|---|---|---|
+| causal | 300 | 0.013 | 57 | | |
+| causal | 2,048 | 0.182 | 189 | 2704 MHz | 501 W |
+| causal | 4,096 | 0.679 | 202 | 2637 MHz | 575 W |
+| causal | 12,400 | 6.093 | 207 | 2608 MHz | 575 W |
+| causal | 16,384 | 10.71 | 205 | 2614 MHz | 577 W |
+| causal | 32,768 | 42.70 | 206 | 2587 MHz | 575 W |
+| causal | 41,000 | 66.40 | 207 | 2598 MHz | 575 W |
+| non-causal | 4,096 | 1.400 | 196 | 2683 MHz | 573 W |
+| non-causal | 8,192 | 5.466 | 201 | 2640 MHz | 577 W |
+| non-causal | 16,384 | 21.51 | 205 | 2610 MHz | 575 W |
+| non-causal | 32,768 | 85.65 | 205 | 2587 MHz | 576 W |
+
+The encoder's 36 attention layers take:
+- 0.47 ms for a 300-token t2i prompt;
+- 6.6 ms for a 2,048-token one;
+- 219 ms for 10 images and a 2,000-token prompt (12,400 tokens);
+- 2.39 s at 41,000 tokens.
+
+**Against the bar (FA2 on the 5090: 208-215 TOPS from 4K to 32K,
+non-causal): 196-205 non-causal and 202-207 causal from 4K up, 94-99% of
+it.**
+- The card sits at its 575 W limit (the literature's numbers are at 600 W)
+  and 2.6 GHz. That is ~80 TOPS/GHz, 92% of the BF16 MMA's 86.5 per clock
+  (the instruction table above).
+- A short prompt is latency-bound: 300 tokens are 32 heads × 5 query tiles,
+  0.013 ms.
+- Tuning stopped at the first version: one tile, measured once, near the
+  bar and at the power limit.
+
+**AC 8.** `encoder_attn.cu`'s header and `kernel/NOTICE` ("Adapted ops (ADR
+0051)") name FlashAttention v2.8.3 (060c9188), the five files and the
+BSD-3-Clause licence; NOTICE carries the licence's text. `attn_smem.cuh`'s
+header gives FlashInfer through SageAttention (Apache-2.0). Nothing comes
+from CUTLASS 3.x (FA2's CuTe is not taken) or from FlashInfer's
+`csrc/fmha_v2`.
+
+**AC 9.** The CTest runs in the profile's kernel stage. The Rust `--ignored`
+test drives the bindings, each call against fp64 computed in Rust:
+- causal and non-causal calls;
+- fp32 and BF16 output, into a strided O;
+- Q, K and V from the fused row and from separate buffers;
+- a refusal, which comes back with the leaf's message.
+
+The bench is a tool.
