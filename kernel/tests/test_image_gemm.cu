@@ -8,7 +8,9 @@
 //              quantizer's own codes and scales, the payload's codes and BF16 row scales), at
 //              every linear shape of the DiT and the text encoder (rows x cols below) and tokens
 //              from 1 to a 10-image condition prefix (41,000). Outputs are poisoned first; each
-//              call runs twice and must agree bit for bit.
+//              call runs twice and must agree bit for bit. Every other tile configuration the
+//              bench's sweep times (kernel/src/image/fp8_gemm_internal.h) is held to the same
+//              check at the edge shapes: one token, partial token and output-row tiles, K = 128.
 //   quant      the W8A8 product's error against the unquantized one (fp64 of BF16 x and BF16 W,
 //              W quantized per row as the converter does), reported with the weight-only error
 //              beside it; gated only by a loose sanity flag.
@@ -38,6 +40,7 @@
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
 #include "ignis_image_gemm.h"
+#include "image/fp8_gemm_internal.h"
 #include "moe_fixture.h"
 
 #include <algorithm>
@@ -239,7 +242,8 @@ std::vector<uint8_t> y_row_bytes(const DeviceBytes &dy, int t, int rows, bool f3
   return download<uint8_t>(static_cast<const uint8_t *>(dy.p) + static_cast<std::size_t>(t) * rows * width, rows * width);
 }
 
-void mechanics_arm(const Options &o, int tokens, int rows, int cols, bool f32_out) {
+// `config` < 0: the public entry point; else that tile configuration (fp8_gemm_internal.h).
+void mechanics_arm(const Options &o, int tokens, int rows, int cols, bool f32_out, int config = -1) {
   const std::vector<uint8_t> w = make_weight(static_cast<uint32_t>(7000 + rows + cols), rows, cols, 0.004f);
   const std::vector<uint16_t> x = make_activations(static_cast<uint32_t>(600 + cols), tokens, cols, {});
   const std::size_t width = f32_out ? 4 : 2;
@@ -248,13 +252,18 @@ void mechanics_arm(const Options &o, int tokens, int rows, int cols, bool f32_ou
   upload(dw, w);
   upload(dx, x);
   MOE_CUDA(cudaMemset(dy.p, 0xFF, dy.bytes));  // poison: an unwritten output is a NaN
+  auto gemm = [&] {
+    return config < 0 ? ignis_image_gemm_w8a8(dw.p, rows, cols, dc.p, ds.as<float>(), tokens, dy.p, f32_out ? 1 : 0, nullptr)
+                      : ignis_image::gemm_w8a8_config(config, dw.p, rows, cols, dc.p, ds.as<float>(), tokens, dy.p,
+                                                      f32_out ? 1 : 0, nullptr);
+  };
   IMG_RC(ignis_image_quantize_tokens(dx.p, tokens, cols, dc.p, ds.as<float>(), nullptr));
-  IMG_RC(ignis_image_gemm_w8a8(dw.p, rows, cols, dc.p, ds.as<float>(), tokens, dy.p, f32_out ? 1 : 0, nullptr));
+  IMG_RC(gemm());
   MOE_CUDA(cudaDeviceSynchronize());
   const std::vector<int> ts = sample(tokens, 160, 131), rs = sample(rows, 384, 263);
   std::vector<std::vector<uint8_t>> first;
   for (int t : ts) first.push_back(y_row_bytes(dy, t, rows, f32_out));
-  IMG_RC(ignis_image_gemm_w8a8(dw.p, rows, cols, dc.p, ds.as<float>(), tokens, dy.p, f32_out ? 1 : 0, nullptr));
+  IMG_RC(gemm());
   MOE_CUDA(cudaDeviceSynchronize());
   bool same = true;
   for (std::size_t i = 0; i < ts.size(); ++i) same = same && y_row_bytes(dy, ts[i], rows, f32_out) == first[i];
@@ -285,9 +294,12 @@ void mechanics_arm(const Options &o, int tokens, int rows, int cols, bool f32_ou
       if (err / tol > worst || std::isnan(err)) worst = std::isnan(err) ? 1e300 : err / tol;
     }
   }
-  std::printf("  gemm %5d x %5d x %5d tokens, %s out: worst error %.3f of bound, %d over (%zu x %zu sampled)%s\n", rows,
-              cols, tokens, f32_out ? "fp32" : "bf16", worst, bad, ts.size(), rs.size(), same ? "" : ", NOT deterministic");
-  const std::string what = "gemm [" + std::to_string(rows) + "][" + std::to_string(cols) + "] x " + std::to_string(tokens);
+  const std::string tile = config < 0 ? "" : ", configuration " + std::to_string(config);
+  std::printf("  gemm %5d x %5d x %5d tokens, %s out%s: worst error %.3f of bound, %d over (%zu x %zu sampled)%s\n", rows,
+              cols, tokens, f32_out ? "fp32" : "bf16", tile.c_str(), worst, bad, ts.size(), rs.size(),
+              same ? "" : ", NOT deterministic");
+  const std::string what =
+      "gemm [" + std::to_string(rows) + "][" + std::to_string(cols) + "] x " + std::to_string(tokens) + tile;
   check(bad == 0, what + " within the bound of the dequantized fp64 GEMM");
   check(same, what + ": a second run agrees bit for bit");
 }
@@ -405,6 +417,13 @@ int main(int argc, char **argv) {
     int i = 0;
     for (int tokens : {1, 2, 17, 129, 4096, 16512}) mechanics_arm(o, tokens, s.rows, s.cols, (i++ + s.rows / 64) % 2 == 1);
     if (s.dit) mechanics_arm(o, 41000, s.rows, s.cols, false);
+  }
+  std::printf("every tile configuration (the bench's sweep) at the edge shapes\n");
+  for (int config = 0; config < ignis_image::gemm_config_count(); ++config) {
+    mechanics_arm(o, 1, 64, 4096, true, config);
+    mechanics_arm(o, 129, 4096, 128, false, config);
+    mechanics_arm(o, 300, 1040, 4096, true, config);
+    mechanics_arm(o, 4096, 4096, 12288, false, config);
   }
   gemm_refusals();
 

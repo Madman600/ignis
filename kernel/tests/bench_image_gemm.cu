@@ -14,9 +14,13 @@
 // A timing is a finding, not a pass/fail: a tool, not a CTest. Run it with the card to itself
 // (GPU lock, timing mode).
 //
-//   ignis_image_gemm_bench [--tokens N] [--reps N] [--warmup-ms N]
+//   ignis_image_gemm_bench [--tokens N] [--reps N] [--warmup-ms N] [--sweep]
+//
+// --sweep times every tile configuration (kernel/src/image/fp8_gemm_internal.h) instead of the
+// default one alone.
 
 #include "ignis_image_gemm.h"
+#include "image/fp8_gemm_internal.h"
 
 #include <cuda_runtime.h>
 #include <nvml.h>
@@ -144,6 +148,8 @@ int main(int argc, char **argv) {
   const int tokens = arg_int(argc, argv, "--tokens", 4096);
   const int reps = arg_int(argc, argv, "--reps", 20);
   const int warmup_ms = arg_int(argc, argv, "--warmup-ms", 300);
+  bool sweep = false;
+  for (int i = 1; i < argc; ++i) sweep = sweep || std::strcmp(argv[i], "--sweep") == 0;
   cudaDeviceProp prop{};
   BENCH_CUDA(cudaGetDeviceProperties(&prop, 0));
   if (nvmlInit_v2() == NVML_SUCCESS) nvmlDeviceGetHandleByIndex_v2(0, &g_nvml);
@@ -182,17 +188,8 @@ int main(int argc, char **argv) {
       {"img_in", hidden, 64},
       {"proj_out", 64, hidden},
   };
-  std::printf("GEMM alone (BF16 out)                          rows x  cols      ms   TFLOPS   SM MHz  board W\n");
   std::vector<Weight> weights;
-  for (const Case &c : cases) {
-    const Weight w = make_weight(c.rows, c.cols, 99u + c.rows + c.cols);
-    weights.push_back(w);
-    const Timing t = time_it(
-        [&] { BENCH_RC(ignis_image_gemm_w8a8(w.p, w.rows, w.cols, codes, scales, tokens, y, 0, nullptr)); }, reps,
-        warmup_ms);
-    const double tflops = 2.0 * tokens * c.rows * c.cols / (t.ms * 1e-3) / 1e12;
-    std::printf("  %-44s %5d x %5d %7.3f %8.1f %8u %8.0f\n", c.what, c.rows, c.cols, t.ms, tflops, t.mhz, t.watts);
-  }
+  for (const Case &c : cases) weights.push_back(make_weight(c.rows, c.cols, 99u + c.rows + c.cols));
 
   std::printf("standalone quantization                         cols      ms     GB/s\n");
   double quant_ms[2] = {};
@@ -205,28 +202,48 @@ int main(int argc, char **argv) {
     quant_ms[qi++] = t.ms;
   }
 
-  // One DiT block's linears with separate weights: q, k, v, out [4096][4096]; gate, up
-  // [12288][4096]; down [4096][12288]; four quantizations (block input, attention output,
-  // modulated MLP input, SwiGLU output).
-  const Weight &sq = weights[0], &gu = weights[1], &dn = weights[2];
-  const Timing block = time_it(
-      [&] {
-        BENCH_RC(ignis_image_quantize_tokens(x, tokens, hidden, codes, scales, nullptr));
-        for (int i = 0; i < 3; ++i) BENCH_RC(ignis_image_gemm_w8a8(sq.p, hidden, hidden, codes, scales, tokens, y, 0, nullptr));
-        BENCH_RC(ignis_image_quantize_tokens(x, tokens, hidden, codes, scales, nullptr));
-        BENCH_RC(ignis_image_gemm_w8a8(sq.p, hidden, hidden, codes, scales, tokens, y, 0, nullptr));
-        BENCH_RC(ignis_image_quantize_tokens(x, tokens, hidden, codes, scales, nullptr));
-        for (int i = 0; i < 2; ++i) BENCH_RC(ignis_image_gemm_w8a8(gu.p, inter, hidden, codes, scales, tokens, y, 0, nullptr));
-        BENCH_RC(ignis_image_quantize_tokens(x, tokens, inter, codes, scales, nullptr));
-        BENCH_RC(ignis_image_gemm_w8a8(dn.p, hidden, inter, codes, scales, tokens, y, 0, nullptr));
-      },
-      reps, warmup_ms);
-  const double block_flop = 2.0 * tokens * (4.0 * hidden * hidden + 3.0 * hidden * inter);
-  const double quant_share = (3 * quant_ms[0] + quant_ms[1]) / block.ms;
-  std::printf("one DiT block's linears + 4 quantizations: %.3f ms, %.1f TFLOPS overall (quantization %.1f%%, %u MHz, "
-              "%.0f W); x 32 blocks = %.1f ms per denoising step\n",
-              block.ms, block_flop / (block.ms * 1e-3) / 1e12, 100.0 * quant_share, block.mhz, block.watts,
-              32.0 * block.ms);
+  const int first = sweep ? 0 : ignis_image::gemm_default_config();
+  const int last = sweep ? ignis_image::gemm_config_count() - 1 : first;
+  for (int config = first; config <= last; ++config) {
+    std::printf("configuration %d: %s%s\n", config, ignis_image::gemm_config_name(config),
+                config == ignis_image::gemm_default_config() ? " (the default)" : "");
+    auto gemm = [&](const Weight &w) {
+      BENCH_RC(ignis_image::gemm_w8a8_config(config, w.p, w.rows, w.cols, codes, scales, tokens, y, 0, nullptr));
+    };
+    std::printf("  GEMM alone (BF16 out)                        rows x  cols      ms   TFLOPS   SM MHz  board W\n");
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+      const Weight &w = weights[i];
+      if (ignis_image::gemm_w8a8_config(config, w.p, w.rows, w.cols, codes, scales, tokens, y, 0, nullptr) != 0) {
+        std::printf("    %-42s %5d x %5d   (not taken: %s)\n", cases[i].what, w.rows, w.cols, ignis_image_gemm_last_error());
+        continue;
+      }
+      const Timing t = time_it([&] { gemm(w); }, reps, warmup_ms);
+      const double tflops = 2.0 * tokens * w.rows * w.cols / (t.ms * 1e-3) / 1e12;
+      std::printf("    %-42s %5d x %5d %7.3f %8.1f %8u %8.0f\n", cases[i].what, w.rows, w.cols, t.ms, tflops, t.mhz, t.watts);
+    }
+    // One DiT block's linears with separate weights: q, k, v, out [4096][4096]; gate, up
+    // [12288][4096]; down [4096][12288]; four quantizations (block input, attention output,
+    // modulated MLP input, SwiGLU output).
+    const Weight &sq = weights[0], &gu = weights[1], &dn = weights[2];
+    const Timing block = time_it(
+        [&] {
+          BENCH_RC(ignis_image_quantize_tokens(x, tokens, hidden, codes, scales, nullptr));
+          for (int i = 0; i < 3; ++i) gemm(sq);
+          BENCH_RC(ignis_image_quantize_tokens(x, tokens, hidden, codes, scales, nullptr));
+          gemm(sq);
+          BENCH_RC(ignis_image_quantize_tokens(x, tokens, hidden, codes, scales, nullptr));
+          for (int i = 0; i < 2; ++i) gemm(gu);
+          BENCH_RC(ignis_image_quantize_tokens(x, tokens, inter, codes, scales, nullptr));
+          gemm(dn);
+        },
+        reps, warmup_ms);
+    const double block_flop = 2.0 * tokens * (4.0 * hidden * hidden + 3.0 * hidden * inter);
+    const double quant_share = (3 * quant_ms[0] + quant_ms[1]) / block.ms;
+    std::printf("  one DiT block's linears + 4 quantizations: %.3f ms, %.1f TFLOPS overall (quantization %.1f%%, %u MHz, "
+                "%.0f W); x 32 blocks = %.1f ms per denoising step\n",
+                block.ms, block_flop / (block.ms * 1e-3) / 1e12, 100.0 * quant_share, block.mhz, block.watts,
+                32.0 * block.ms);
+  }
   for (Weight &w : weights) cudaFree(w.p);
   cudaFree(x);
   cudaFree(codes);
