@@ -1,0 +1,8 @@
+{
+  "_class_name": "QwenImage21Pipeline",
+  "sample_sigmas": [
+    1.0,
+    0.75,
+    0.5
+  ]
+}

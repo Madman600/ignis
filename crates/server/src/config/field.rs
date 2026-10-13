@@ -29,6 +29,9 @@ pub fn scope(family: ModelFamily) -> &'static str {
     match family {
         ModelFamily::Qwen38_27b => "qwen38",
         ModelFamily::FlashNext => "qwen38flashnext",
+        // Not in FAMILIES yet: spec image-model/05 gives the image model its
+        // config group and decides which fields it takes.
+        ModelFamily::QwenImage21 => "qwenimage21",
     }
 }
 
@@ -449,6 +452,9 @@ mod tests {
             assert_eq!(family_of_scope(&scope(family).to_ascii_uppercase()), Some(family));
         }
         assert_eq!(family_of_scope("qwen3.8-27b"), None, "a model id is not a scope");
+        // the image model has a spelling but no config scope until spec image-model/05
+        assert_eq!(scope(ModelFamily::QwenImage21), "qwenimage21");
+        assert_eq!(family_of_scope("qwenimage21"), None);
     }
 
     #[test]

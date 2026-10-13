@@ -82,21 +82,24 @@ pub const MAX_WINDOWS: usize = (HEADER_BYTES - CRC_TABLE_AT - 4) / 4;
 /// The tier's budget when `--kv-disk-bytes` is unnamed (spec vram-budget/03):
 /// 4 GiB on Flash-Next (owner 2026-10-08: 4 GiB to start, about three
 /// whole-context lanes), whose pool is smallest while its experts stream;
-/// off on the 27B, whose KV-RAM arena is its last tier unless named.
+/// off on the 27B, whose KV-RAM arena is its last tier unless named; off on
+/// the image model, which keeps no KV (spec image-model/05 owns its serving).
 pub fn default_bytes(family: ModelFamily) -> u64 {
     match family {
         ModelFamily::FlashNext => 4 << 30,
-        ModelFamily::Qwen38_27b => 0,
+        ModelFamily::Qwen38_27b | ModelFamily::QwenImage21 => 0,
     }
 }
 
 /// The fewest tokens a disk restore must save over the tier above it to be
 /// taken (spec vram-budget/03): a read of a short prefix costs more than its
 /// prefill. Flash-Next's prefill is the slower, so its floor is the lower.
+/// The image model has no tier: no restore is ever worth it.
 pub fn restore_floor_tokens(family: ModelFamily) -> u32 {
     match family {
         ModelFamily::FlashNext => 8_192,
         ModelFamily::Qwen38_27b => 16_384,
+        ModelFamily::QwenImage21 => u32::MAX,
     }
 }
 
@@ -805,6 +808,15 @@ impl DiskStore {
 mod tests {
     use super::*;
     use ignis_artifact::AlignedBuffer;
+
+    /// The image model (ADR 0050) keeps no KV: no disk tier by default, and
+    /// no restore ever clears its floor.
+    #[test]
+    fn the_image_model_has_no_disk_tier() {
+        assert_eq!(default_bytes(ModelFamily::QwenImage21), 0);
+        assert_eq!(restore_floor_tokens(ModelFamily::QwenImage21), u32::MAX);
+        assert_eq!(default_bytes(ModelFamily::FlashNext), 4 << 30);
+    }
 
     fn temp_location(tag: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);

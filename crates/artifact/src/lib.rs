@@ -33,6 +33,7 @@ pub mod inventory;
 pub mod materializer;
 pub mod normalize;
 pub mod packer;
+pub mod qwen_image;
 pub mod f64_reference;
 pub mod vision;
 pub mod writer;

@@ -1,0 +1,100 @@
+{
+ "files": {
+  "tensors.json": {
+   "bytes": 7437,
+   "sha256": "0a7bbada31578121fae1de1ec1a27084920b0185c66e58457876854c3edb8313"
+  },
+  "text_encoder.embed_tokens.weight.bin": {
+   "bytes": 32768,
+   "sha256": "a544b87b756e0f218ce8f23c3510d5ea430855d4e6af2fe7944fee29dbad578f"
+  },
+  "text_encoder.layers.0.input_layernorm.weight.bin": {
+   "bytes": 128,
+   "sha256": "025c47e0e99d6c4b39a8e4e60eb4df419d4d12fef18770866dfbc00d9bf6c7e4"
+  },
+  "text_encoder.layers.0.mlp.down_proj.weight.bin": {
+   "bytes": 8320,
+   "sha256": "52549056ae2a2df690df8d0e1af3ab88981fe729203306be2ba15b3eff7c136a"
+  },
+  "text_encoder.layers.0.mlp.gate_proj.weight.bin": {
+   "bytes": 8448,
+   "sha256": "50a522ca5deffae2c63b3d1d84c66bd1de524ca324fe633245297d9027c665a2"
+  },
+  "text_encoder.layers.0.mlp.up_proj.weight.bin": {
+   "bytes": 8448,
+   "sha256": "8b5a2773a72e9d057a40f55a56fab2210a7ac01f52af6cbcd030be8dfe0f668b"
+  },
+  "text_encoder.layers.0.post_attention_layernorm.weight.bin": {
+   "bytes": 128,
+   "sha256": "bc508ef6d9cb193c50d8453e09bd78c6a30860a94a9f02eec420a194ce98a5bf"
+  },
+  "text_encoder.layers.0.self_attn.k_norm.weight.bin": {
+   "bytes": 32,
+   "sha256": "15490f7d2f82e45515267ae8df0a912764baafef5b2e06f81f9151b6f4594ef7"
+  },
+  "text_encoder.layers.0.self_attn.k_proj.weight.bin": {
+   "bytes": 2112,
+   "sha256": "5817b907a3270c59a3a8660c523c0339f5dc46f7e0390888ef36f4d525edf819"
+  },
+  "text_encoder.layers.0.self_attn.o_proj.weight.bin": {
+   "bytes": 4224,
+   "sha256": "2a957059625468c6ec080be898140d3a5a410cdfb7ff96318a5aa2a2f2c6e800"
+  },
+  "text_encoder.layers.0.self_attn.q_norm.weight.bin": {
+   "bytes": 32,
+   "sha256": "707eddfef16217c76e848c04e8cca441f16bd0de7e4efece2d357026a11b7576"
+  },
+  "text_encoder.layers.0.self_attn.q_proj.weight.bin": {
+   "bytes": 4224,
+   "sha256": "3a28defac5d6f14b553a1921c59e2ea9780f0d6493e86b204a6baeae03b17664"
+  },
+  "text_encoder.layers.0.self_attn.v_proj.weight.bin": {
+   "bytes": 2112,
+   "sha256": "cf0b427fd893368321171301c625aa4e585a1c29eb58bcb6841ba928ec773988"
+  },
+  "text_encoder.layers.1.input_layernorm.weight.bin": {
+   "bytes": 128,
+   "sha256": "ddfe1c493d967f3e21b1fef4c435160cb75719e1548117e6fbe3fdc75bc52b00"
+  },
+  "text_encoder.layers.1.mlp.down_proj.weight.bin": {
+   "bytes": 8320,
+   "sha256": "07c2a53177eabd095a6e53e1c1af54017421fc91aa3e25d010334e9e604b4e38"
+  },
+  "text_encoder.layers.1.mlp.gate_proj.weight.bin": {
+   "bytes": 8448,
+   "sha256": "7e8a7bf4e35d9e1206bc6e6b398854f472e929a43289d58ab784e6b102009059"
+  },
+  "text_encoder.layers.1.mlp.up_proj.weight.bin": {
+   "bytes": 8448,
+   "sha256": "fa832deb1868e0ddbebedd9a3bf384fbca5ad0e4bea8cb883348cdc6cdcda35e"
+  },
+  "text_encoder.layers.1.post_attention_layernorm.weight.bin": {
+   "bytes": 128,
+   "sha256": "3fdf53b9e6b846ee45192382c927c11c854c2b7f22985c9c56749981ad7481d3"
+  },
+  "text_encoder.layers.1.self_attn.k_norm.weight.bin": {
+   "bytes": 32,
+   "sha256": "8eeef68b920284a9e83ee4f0f1f65f8bd960594ba44ba21ce18193373cf43eb2"
+  },
+  "text_encoder.layers.1.self_attn.k_proj.weight.bin": {
+   "bytes": 2112,
+   "sha256": "456ca4f43a7c46c41cb4b71db99068addb4d6c1f4c7fd4e812699e40a1d4bfce"
+  },
+  "text_encoder.layers.1.self_attn.o_proj.weight.bin": {
+   "bytes": 4224,
+   "sha256": "c3f09730f934d33f54ffcff261d26a1a71a6243249972ad70f96feb2ca5c0cd4"
+  },
+  "text_encoder.layers.1.self_attn.q_norm.weight.bin": {
+   "bytes": 32,
+   "sha256": "b4a39f3be8d17a2e0abac0d106f17cd7f41681c91feff29f1668cc648ad09c9d"
+  },
+  "text_encoder.layers.1.self_attn.q_proj.weight.bin": {
+   "bytes": 4224,
+   "sha256": "d12446d8d2ce4ce743b6b713531c9532c76007629841bcfbb1d604ad4388ea01"
+  },
+  "text_encoder.layers.1.self_attn.v_proj.weight.bin": {
+   "bytes": 2112,
+   "sha256": "820635c7d6eaf41da0990b45d9c5ec476cbe26cccb90a801b84cfd4dc706d90e"
+  }
+ }
+}

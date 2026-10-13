@@ -34,8 +34,8 @@ pub enum LayerKind {
 }
 
 /// Which model a topology describes (ADR 0043: two models, one loaded at a
-/// time). It names the program the forward runs; every count and shape is
-/// still read off the topology's own fields.
+/// time; ADR 0050 adds the image model). It names the program the forward
+/// runs; every count and shape is still read off the topology's own fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {
     /// Qwen 3.8-27B: one residual stream and a dense MLP in every layer. The
@@ -44,6 +44,10 @@ pub enum ModelFamily {
     /// Qwen3.8-Flash-Next: four hyper-connection streams, an MoE block in
     /// every layer, QSA layers with an indexer, and the n-gram embedding.
     FlashNext,
+    /// Qwen-Image-2.1-Turbo (ADR 0050): a Qwen3-VL text encoder, a diffusion
+    /// transformer and a VAE, from its own artifact (spec image-model/01). No
+    /// [`ModelConfig`] describes it: that topology is a text model's.
+    QwenImage21,
 }
 
 /// Flash-Next's mixture-of-experts block, one per layer: the router picks
@@ -765,9 +769,9 @@ impl LayerKind {
 
 impl ModelFamily {
     /// The family an artifact's identity `model_id` names, or `None` for an
-    /// artifact of neither model (a test fixture).
+    /// artifact of no family (a test fixture).
     pub fn of_model_id(model_id: &str) -> Option<Self> {
-        [ModelFamily::Qwen38_27b, ModelFamily::FlashNext]
+        [ModelFamily::Qwen38_27b, ModelFamily::FlashNext, ModelFamily::QwenImage21]
             .into_iter()
             .find(|family| family.model_id() == model_id)
     }
@@ -776,11 +780,13 @@ impl ModelFamily {
     /// prompt reuse on (`--reuse-retained-host`): two per decode lane on the 27B
     /// (GitHub #281); 8 on Flash-Next, a chain link and a checkpoint for
     /// three agents and a shared system block, ~1 GiB of pinned images
-    /// beside 37.7 GB of pinned experts (spec flash-next/05).
+    /// beside 37.7 GB of pinned experts (spec flash-next/05). None on the
+    /// image model, which keeps no sequences.
     pub fn default_retained_host_slots(self) -> u32 {
         match self {
             ModelFamily::Qwen38_27b => 2 * crate::N_DECODE_LANES as u32,
             ModelFamily::FlashNext => 8,
+            ModelFamily::QwenImage21 => 0,
         }
     }
 
@@ -794,7 +800,7 @@ impl ModelFamily {
     /// is one decode round per chunk (ADR 0018); 50 splits time evenly.
     pub fn default_decode_share_percent(self) -> u32 {
         match self {
-            ModelFamily::Qwen38_27b | ModelFamily::FlashNext => 25,
+            ModelFamily::Qwen38_27b | ModelFamily::FlashNext | ModelFamily::QwenImage21 => 25,
         }
     }
 
@@ -805,17 +811,19 @@ impl ModelFamily {
     /// 27B, whose cut costs ~19 ms and whose prefills keep their splits.
     pub fn opener_page_rides_capture(self) -> bool {
         match self {
-            ModelFamily::Qwen38_27b => false,
+            ModelFamily::Qwen38_27b | ModelFamily::QwenImage21 => false,
             ModelFamily::FlashNext => true,
         }
     }
 
     /// The `model_id` of this family's artifacts, and the id it is served
-    /// under by default.
+    /// under by default. The image model's is its published name (ADR 0050:
+    /// "Qwen" is never the primary name of a derivative of its weights).
     pub fn model_id(self) -> &'static str {
         match self {
             ModelFamily::Qwen38_27b => "qwen3.8-27b",
             ModelFamily::FlashNext => "qwen3.8-flash-next",
+            ModelFamily::QwenImage21 => "ignis-image-2.1-turbo",
         }
     }
 
@@ -830,11 +838,13 @@ impl ModelFamily {
     }
 
     /// The model's speculative backend: the 27B's DFlash2 drafter, or
-    /// Flash-Next's own MTP head (spec flash-next/07).
-    pub fn drafter(self) -> crate::SpeculativeBackend {
+    /// Flash-Next's own MTP head (spec flash-next/07). The image model
+    /// decodes no tokens and has none.
+    pub fn drafter(self) -> Option<crate::SpeculativeBackend> {
         match self {
-            ModelFamily::Qwen38_27b => crate::SpeculativeBackend::Dflash2,
-            ModelFamily::FlashNext => crate::SpeculativeBackend::Mtp,
+            ModelFamily::Qwen38_27b => Some(crate::SpeculativeBackend::Dflash2),
+            ModelFamily::FlashNext => Some(crate::SpeculativeBackend::Mtp),
+            ModelFamily::QwenImage21 => None,
         }
     }
 
@@ -843,14 +853,18 @@ impl ModelFamily {
         match self {
             ModelFamily::Qwen38_27b => "Qwen3.8-27B",
             ModelFamily::FlashNext => "Qwen3.8-Flash-Next",
+            ModelFamily::QwenImage21 => "Qwen-Image-2.1",
         }
     }
 
-    /// `enum ignis_model_family`.
+    /// `enum ignis_model_family`. The text leaf's enum has no image entry:
+    /// the image model never builds a [`ModelConfig`] (its leaf is spec
+    /// image-model/04's), so 2 is reserved for it here.
     pub fn abi_code(self) -> i32 {
         match self {
             ModelFamily::Qwen38_27b => 0,
             ModelFamily::FlashNext => 1,
+            ModelFamily::QwenImage21 => 2,
         }
     }
 }
@@ -1339,10 +1353,26 @@ mod tests {
     fn a_model_id_names_its_family() {
         assert_eq!(ModelFamily::of_model_id("qwen3.8-27b"), Some(ModelFamily::Qwen38_27b));
         assert_eq!(ModelFamily::of_model_id("qwen3.8-flash-next"), Some(ModelFamily::FlashNext));
+        // ADR 0050: served as `ignis-image-2.1-turbo`, "Qwen" never its primary name.
+        assert_eq!(ModelFamily::of_model_id("ignis-image-2.1-turbo"), Some(ModelFamily::QwenImage21));
+        assert_eq!(ModelFamily::QwenImage21.model_id(), ignis_artifact::qwen_image::MODEL_ID);
         assert_eq!(ModelFamily::of_model_id("fixture-model"), None);
-        for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
+        for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext, ModelFamily::QwenImage21] {
             assert_eq!(ModelFamily::of_model_id(family.model_id()), Some(family));
         }
+    }
+
+    /// The image model (ADR 0050) is a family without the text machinery: no
+    /// vision tower taking chat image parts, no readouts, no drafter, no
+    /// retained host slots. Its name is the architecture's.
+    #[test]
+    fn the_image_model_has_no_text_machinery() {
+        let image = ModelFamily::QwenImage21;
+        assert_eq!(image.name(), "Qwen-Image-2.1");
+        assert!(!image.takes_images() && !image.serves_readouts() && !image.opener_page_rides_capture());
+        assert_eq!(image.drafter(), None);
+        assert_eq!(image.default_retained_host_slots(), 0);
+        assert_eq!(ModelFamily::FlashNext.drafter(), Some(crate::SpeculativeBackend::Mtp));
     }
 
     /// What each model can serve beyond text: Flash-Next has no vision
@@ -1353,10 +1383,10 @@ mod tests {
     fn flash_next_serves_text_only() {
         let dense = ModelFamily::Qwen38_27b;
         assert!(dense.takes_images() && dense.serves_readouts());
-        assert_eq!(dense.drafter(), crate::SpeculativeBackend::Dflash2);
+        assert_eq!(dense.drafter(), Some(crate::SpeculativeBackend::Dflash2));
         let flash = ModelFamily::FlashNext;
         assert!(!flash.takes_images() && !flash.serves_readouts());
-        assert_eq!(flash.drafter(), crate::SpeculativeBackend::Mtp);
+        assert_eq!(flash.drafter(), Some(crate::SpeculativeBackend::Mtp));
     }
 
     const MIB: u64 = 1024 * 1024;
