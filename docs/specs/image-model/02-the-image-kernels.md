@@ -159,3 +159,145 @@ Measured 2026-10-13 on the RTX 5090 (driver 596.36, CUDA 13.1, power limit
 .block_scale.scale_vec::1X` with every block scale 2^0
 (`kernel/src/image/image_mma.cuh`, `mma_e4m3_mx_unit_f32`). The per-token
 and per-row scales are applied in the epilogue.
+
+### The FP8 W8A8 GEMM and the activation quantization (AC 2, AC 3)
+
+**Where.**
+- ABI: `kernel/include/ignis_image_gemm.h`: `ignis_image_gemm_prepare`,
+  `ignis_image_quantize_tokens`, `ignis_image_gemm_w8a8`,
+  `ignis_image_gemm_last_error`.
+- Code: `kernel/src/image/` (`fp8_gemm.cu`, `fp8_gemm_internal.h`,
+  `fp8_quant.cu`, `fp8_quant.cuh`, `image_mma.cuh`, `image_common.*`). All our
+  own (ADR 0051 tier 1); CUTLASS 2.x sm80 and vLLM's `scaled_mm_sm120` were
+  read, nothing was copied, so `kernel/NOTICE` has nothing to add.
+- Tests: the CTest `ignis_kernel_image_gemm_test`
+  (`kernel/tests/test_image_gemm.cu`) and the Rust `--ignored` test
+  `crates/core/tests/image_gemm_gpu.rs` (bindings in
+  `crates/core/src/image_gemm.rs`). Speed: `ignis_image_gemm_bench`
+  (`kernel/tests/bench_image_gemm.cu`, a tool).
+
+**The activation contract (AC 3).** Activations reach the GEMM as E4M3FN
+codes `[tokens][cols]` plus fp32 `scales[tokens]`:
+- `scales[t] = amax_t / 448`, or 1 for an all-zero row;
+- `codes[t][c] = E4M3(x[t][c] · (448 / amax_t))`, rounded to nearest even
+  and saturated, each step one fp32 operation.
+
+`ignis_image_quantize_tokens` is the standalone producer.
+`fp8_quant.cuh` holds the device steps, so a norm, modulation, SwiGLU or
+attention-output epilogue can emit the same pair and drop the separate pass.
+For now it is a separate kernel, whose cost is in the speed table below.
+
+**The kernel.**
+- Weights: the row-scale-v1 payload as it is.
+- Instruction: `kind::mxf8f6f4` with unit scales.
+- Tile: 128 tokens × 256 output rows, 8 warps of 64 × 64, 64 code bytes per
+  stage, 4 cp.async stages (96 KiB). Shared rows are XOR-swizzled.
+  Fragments are double-buffered across k32 steps.
+- Raster: groups of 8 token tiles.
+- Epilogue: `(acc · scales[t]) · wscale[r]`, BF16 or fp32.
+- No atomics: each output is computed by one fixed sequence, so a second run
+  agrees bit for bit (tested).
+- Shapes taken: `cols` a multiple of 64, `rows` a multiple of 16, any number
+  of tokens.
+
+**Mechanics (AC 2).** The reference is our own fp64 GEMM of the dequantized
+operands: the quantizer's codes and scales, and the payload's codes and BF16
+row scales. Shapes are the real linears (spec.md's model table), rows × cols:
+- 4096 × 64: `img_in`;
+- 64 × 4096: `proj_out`;
+- 4096 × 4096: q/k/v/out, `txt_in`, encoder q/o;
+- 1024 × 4096: encoder k/v;
+- 6144 × 4096: encoder q/k/v fused;
+- 12288 × 4096: SwiGLU gate or up, DiT q/k/v fused;
+- 24576 × 4096: gate and up fused;
+- 4096 × 12288: down.
+
+Every shape runs at 1, 2, 17, 129, 4096 and 16,512 tokens, and the DiT's
+shapes also at 41,000 (a 10-image prefix). At large token counts the check
+samples 161 rows covering every residue mod 128 and 385 columns covering
+every residue mod 256.
+
+The bound comes from the M1 probes. Per instruction, its 32 products and its
+accumulator input each lose at most 2^-25 of the largest addend, and its
+result one fp32 rounding:
+
+`|y − ref| ≤ F · ⌈cols/32⌉ · 35 · 2^-25 · Σ|terms| + |ref| · (2^-23 + 2^-8 for BF16)`
+
+`F` is `--bound-factor`, default 1.
+
+**Result:** 0 outputs over the bound, at every shape and token count.
+- fp32 outputs use 0.1-10% of the bound.
+- BF16 outputs use 27-99%; that is BF16's own half ulp.
+- The six other tile configurations pass the same check at the edge shapes.
+- Run time: 1 min 40 s.
+
+**Quantization error**, against the unquantized product. The reference is
+fp64 of BF16 x times BF16 W, with W quantized per row as a converter would.
+Shapes are 4096 tokens × (4096 × 4096) and (4096 × 12288):
+
+| x | W8A8 relative RMS | cosine | weights only |
+|---|---|---|---|
+| Gaussian | 3.75-3.81% | 0.99927-0.99930 | 2.66-2.67% |
+| Gaussian, 8 channels at 20× | 3.64-3.67% | 0.99933-0.99934 | 2.65-2.70% |
+
+The inputs are synthetic. The error on real DiT activations comes with spec
+01's recordings and spec 04's end-to-end test. The CTest gates only on
+`--max-quant-rel-rms` (default 0.1), as a sanity check.
+
+**Speed (2026-10-13, 4096 target tokens = 1024², BF16 out, GPU lock in
+timing mode, card power limit 575 W).** NVML read the SM clock and board
+power halfway through each run.
+
+| linear | rows × cols | ms | TFLOPS | SM clock | board |
+|---|---|---|---|---|---|
+| to_q / to_k / to_v / to_out | 4096 × 4096 | 0.273 | 504 | 2902 MHz | 229 W |
+| SwiGLU gate or up | 12288 × 4096 | 0.769 | 536 | 2677 MHz | 419 W |
+| SwiGLU down | 4096 × 12288 | 0.797 | 517 | 2527 MHz | 535 W |
+| q/k/v fused | 12288 × 4096 | 0.770 | 536 | 2527 MHz | 535 W |
+| gate+up fused | 24576 × 4096 | 1.589 | 519 | 2550 MHz | 579 W |
+| `img_in` | 4096 × 64 | 0.037 | 58 | | |
+| `proj_out` | 64 × 4096 | 0.062 | 35 | | |
+
+**One DiT block** (separate q, k, v, out, gate, up, down, plus their four
+quantizations): 3.608 ms, **495 TFLOPS**. The quantization is 3.4% of that.
+The 32 blocks' linears take 115.5 ms per denoising step at 1024².
+
+**Quantization alone:**
+- 4096 tokens × 4096: 0.012 ms. The data fits in L2 (4.2 TB/s).
+- 4096 tokens × 12288: 0.087 ms (1.75 TB/s, DRAM-class).
+- At 16,512 tokens: 1.5-1.7 TB/s, and 5.0% of a block.
+
+**The tile sweep.** `--sweep`, block TFLOPS at 1024²:
+
+| config | tile | block TFLOPS |
+|---|---|---|
+| 0 | 128 × 128, BK 64, 4 stages, 2 × 4 warps | 465 |
+| 1 | 128 × 128, BK 64, 3 stages, 2 CTAs/SM | 469 |
+| 2 | 128 × 128, BK 128, 3 stages | 491 |
+| 3 | 128 × 256, BK 64, 3 stages | 476 |
+| 4 | 256 × 128, BK 64, 3 stages | 464 |
+| 5 | 128 × 128, BK 64, 3 stages, 2 × 2 warps, 2 CTAs/SM | 490 |
+| 6 | 128 × 256, BK 64, 4 stages | **492** (default) |
+
+**Against the literature bar (~690-740): 495-536 TFLOPS, about 72% of it.**
+Speed is a target, not a gate, so tuning stopped after the sweep. What
+would close the gap, largest first:
+1. **The main loop.** On the large shapes it runs at about 61-65% of the
+   clock-adjusted peak (345.5 TFLOPS/GHz × 2.5-2.7 GHz). Not diagnosed: no
+   Nsight Compute run was made. Candidates:
+   - L2 traffic: a 128 × 256 tile brings 171 FLOP per byte, about 3 TB/s
+     from L2 now and about 5 TB/s at peak;
+   - barrier and ldmatrix latency with 8 warps per SM;
+   - the epilogue's 4-byte stores.
+
+   The next step is one ncu run on the 12288 × 4096 shape. A TMA-fed,
+   warp-specialized pipeline is the structural answer if latency is the
+   cause.
+2. **Wave quantization.** At 4096 tokens a 4096-row output has 512 tiles,
+   which is 3.01 waves of 170 SMs, so it takes 4 waves. Those shapes run at
+   ~50% of the clock peak, at 2.9 GHz and 229 W. A stream-K split of the
+   last wave would recover most of it, for 4 of a block's 7 linears.
+3. **Power.** The card is limited to 575 W; the literature's numbers are at
+   600 W. The wide GEMMs reach 575-580 W and drop to 2.0-2.6 GHz.
+4. **Fusing the quantization** into the producers: 3.4% at 1024² and 5.0%
+   at 16,512 tokens.

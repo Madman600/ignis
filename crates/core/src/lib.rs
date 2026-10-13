@@ -52,6 +52,8 @@ pub mod gqa_layer;
 pub mod gpu_profile;
 pub mod host;
 pub mod hq_ring;
+#[cfg(feature = "cuda")]
+pub mod image_gemm;
 pub mod identity;
 pub mod kv;
 pub mod kv_format;
