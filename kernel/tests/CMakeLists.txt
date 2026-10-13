@@ -762,3 +762,13 @@ endforeach()
 # Spec flash-next/04 acceptance 7: the hq route against the BF16 route on real Flash-Next KV rows.
 target_compile_definitions(ignis_kernel_flash_next_sparse_attention_hq_test PRIVATE
   IGNIS_HQ_KV_FLASH_NEXT_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_flash_next.bin")
+
+# --- the image model's kernels (spec image-model/02, GitHub #319): OURS -----------------------
+#
+# The tensor-core instruction microbenchmark (acceptance 1): BF16 m16n8k16, FP8 kind::f8f6f4 and
+# unit-scale kind::mxf8f6f4 rates on register-resident operands, plus the one-instruction
+# semantics and accumulation probes the FP8 GEMM's error bound rests on. A timing is a finding,
+# not a pass/fail: a tool, NOT registered with CTest.
+add_executable(ignis_mma_peak_bench bench_mma_peak.cu)
+target_include_directories(ignis_mma_peak_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_mma_peak_bench PRIVATE CUDA::cudart)

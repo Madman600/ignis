@@ -118,3 +118,44 @@ In steps 2-8 only the target's queries run, over [prefix ; target].
 9. Every test above runs in the GPU profile (`--ignored`). Each fp64
    reference is our own CPU code, so this spec does not wait for 01's
    recordings, except the RoPE comparison in AC 7.
+
+## As built
+
+### The instruction microbenchmark (AC 1)
+
+`kernel/tests/bench_mma_peak.cu` (`ignis_mma_peak_bench`, a tool, not a
+CTest). Register-resident operands, 680 blocks × 256 threads, eight
+independent accumulator chains per warp, 300 ms warm-up per loop, ten timed
+launches. Block 0 reads `clock64` and `%globaltimer` around its loop, so each
+rate carries the SM clock it ran at.
+
+Measured 2026-10-13 on the RTX 5090 (driver 596.36, CUDA 13.1, power limit
+575 W), under the GPU lock:
+
+| loop | SASS | TFLOPS | SM clock | TFLOPS/GHz | % of nominal per clock |
+|---|---|---|---|---|---|
+| BF16 m16n8k16, FP32 accumulate | `HMMA.16816.F32.BF16` | 250.6 | 2898 MHz | 86.5 | 99% of 209.5 @ 2407 |
+| FP8 `kind::f8f6f4`, FP32 accumulate | `QMMA.16832.F32.E4M3.E4M3` | 489.3 | 2850 MHz | 171.7 | 99% of 419 @ 2407 |
+| FP8 `kind::mxf8f6f4`, unit UE8M0 scales, FP32 accumulate | `QMMA.SF.16832.F32.E4M3.E4M3.E8` | **911.4** | 2638 MHz | **345.5** | 99% of **838** @ 2407 |
+| FP8 `kind::f8f6f4`, FP16 accumulate (reference) | `QMMA.16832.F16.E4M3.E4M3` | 946.5 | 2722 MHz | 347.7 | 100% of 838 @ 2407 |
+
+- **The block-scaled form runs at twice the plain form's rate**: 2.01×
+  per clock (1.86× in raw TFLOPS, because the card drops its clock at the
+  higher power). It reaches the FP16-accumulate rate while accumulating in
+  FP32: the survey's single source is confirmed on this card.
+- **Same results.** On random operands the block-scaled form with unit
+  scales gives the plain form's results bit for bit, and both give fp64's
+  exactly on operands whose sums fit fp32.
+- **Accumulation precision.** Probes of one instruction (C = 2^8 plus a
+  product 2^(8−e); two products; one large and 31 small products) are exact
+  up to e = 23 for all three FP32-accumulating forms, as fp32 is. With
+  C = 2^8 plus 32 products of 2^(8−e) the result stays exact to e = 25 and
+  drops the products at e = 26: within one instruction, addends more than
+  2^25 below the largest are truncated. That is close to fp32 and far from
+  Hopper's ~14-bit FP8 accumulation, so the GEMM's mechanics bound is an
+  fp32-class bound per instruction.
+
+**The GEMM's inner instruction:** `mma.sync.m16n8k32.kind::mxf8f6f4
+.block_scale.scale_vec::1X` with every block scale 2^0
+(`kernel/src/image/image_mma.cuh`, `mma_e4m3_mx_unit_f32`). The per-token
+and per-row scales are applied in the epilogue.
