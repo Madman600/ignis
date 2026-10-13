@@ -220,6 +220,14 @@ def test_the_recording_is_diffusers_fp32(tiny, recorded):
                 reference.image_processor.resize(record.condition_image(case), width=case.size, height=case.size)])
         assert np.array_equal(embeds.numpy(), _npy(directory, "prompt_embeds"))
         assert np.array_equal(pad.numpy(), _npy(directory, "image_pad_mask").astype(bool))
+        # the decode phase is the pipeline's own decode
+        h = case.size // 16
+        noise = torch.from_numpy(record.noise(case, reference.transformer.config.in_channels))
+        image = reference(prompt=case.prompt, image=record.condition_image(case), height=case.size, width=case.size,
+                          output_resolution=case.size, latents=reference._pack_latents(noise, 1, noise.shape[1], h, h),
+                          output_type="pil", use_kv_cache=True).images[0]
+        with Image.open(os.path.join(directory, "image.png")) as recorded_image:
+            assert np.array_equal(np.asarray(recorded_image), np.asarray(image))
 
 
 # The traps spec 01 lists, each pinned on the recording.
@@ -369,13 +377,12 @@ def test_fp32_ieee_turns_tf32_off_for_matmul_and_cudnn():
     assert flags["matmul.allow_tf32"] is False and flags["cudnn.allow_tf32"] is False
 
 
-def test_the_gpu_staging_and_the_dit_guard_change_nothing(tiny, recorded, tmp_path):
-    """The GPU run's DiT staging (device for the forward, host for each decode) and the attention
-    guard around the DiT's forward, with the device and the guard the CPU allows."""
+def test_the_dit_guard_changes_nothing(tiny, recorded, tmp_path):
+    """The attention guard around the DiT's forward (on the GPU, memory-efficient SDPA only), with
+    a guard the CPU allows."""
     import contextlib
     pipe = record.load_pipeline(tiny, "cpu")
     record.set_precision(pipe, "fp32")
-    record._stage_dit(pipe, torch.device("cpu"))
     entered = []
 
     def guard():
@@ -435,7 +442,7 @@ def test_a_run_records_every_case_then_the_yardstick_in_one_session(tiny, edit, 
     record.set_precision(fresh, "bf16")
     for name in ("t2i", "edit"):
         entry = manifest["cases"][name]
-        for phase in ("fp32_encoder", "bf16_encoder", "fp32_dit_vae", "bf16_dit"):
+        for phase in ("fp32_encoder", "bf16_encoder", "fp32_dit", "bf16_dit", "fp32_decode"):
             assert entry[phase + "_wall_s"] >= 0
         # the phased run (all prompts, the encoder dropped, then all DiT work) records what one
         # pipeline call per case records, bit for bit

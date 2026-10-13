@@ -166,47 +166,39 @@ def _no_retain(vae):
     clear_cache()
 
 
-def _stage_dit(pipe, device):
-    """On a GPU, while the DiT runs: the DiT on the device for its forward and in host RAM for each
-    VAE decode, which at 2048^2 in fp32 needs the room."""
-    def on_device(module, args):
-        module.to(device)  # a pre-hook's return value would replace the forward's arguments
-    pipe.transformer.register_forward_pre_hook(on_device)
-    decode = pipe.vae.decode
-
-    def staged(*args, **kwargs):
-        pipe.transformer.to("cpu")
-        if torch.cuda.is_initialized():
-            torch.cuda.empty_cache()
-        return decode(*args, **kwargs)
-    pipe.vae.decode = staged
-
-
 def load_pipeline(checkpoint, device):
     """diffusers' pipeline with bf16 weights, for the encoder phase: the text encoder on `device`,
     the DiT and the VAE in host RAM until `denoise_phase`. Host RAM never holds both big models."""
     from diffusers import QwenImage21Pipeline
     from transformers import Qwen3VLForConditionalGeneration
 
-    device = torch.device(device)
     text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
         os.path.join(checkpoint, "text_encoder"), dtype=torch.bfloat16)
     text_encoder.to(device)
     pipe = QwenImage21Pipeline.from_pretrained(checkpoint, text_encoder=text_encoder, dtype=torch.bfloat16)
     _no_retain(pipe.vae)
-    if device.type == "cuda":
-        _stage_dit(pipe, device)
     return pipe
 
 
-def denoise_phase(pipe, device):
-    """After every prompt is encoded: on a GPU the text encoder's weights are dropped (to `meta`;
-    `pipe.device` then resolves to the GPU the DiT is on), and the DiT and the VAE go to `device`."""
+def _drop(module, device):
+    """On a GPU, a model no later phase needs: its weights go to `meta` (`pipe.device` then
+    resolves to a component still on the GPU)."""
     if torch.device(device).type == "cuda":
-        pipe.text_encoder.to("meta")
+        module.to("meta")
         torch.cuda.empty_cache()
+
+
+def denoise_phase(pipe, device):
+    """After every prompt is encoded: the text encoder is dropped and the DiT and the VAE go to
+    `device`."""
+    _drop(pipe.text_encoder, device)
     pipe.vae.to(device)
     pipe.transformer.to(device)
+
+
+def decode_phase(pipe, device):
+    """After the DiT's last step: the DiT is dropped, so the VAE has the device to itself."""
+    _drop(pipe.transformer, device)
 
 
 def _write_json(path, value):
@@ -485,14 +477,14 @@ def record_prompt(pipe, case, out):
 
 def record_denoise(pipe, case, out, prompt, blocks=(0, 15, 31), block_steps=(0, 1)):
     """The DiT phase's recording, on `prompt` from `record_prompt`: the noise, the condition
-    latents, the RoPE table and segments, every step, the block outputs, the decoded image.
-    Writes `case.json`, the index of both phases' fields, and returns it."""
+    latents, the RoPE table and segments, every step, the block outputs (the pipeline stops at its
+    final latents; `record_image` decodes them). Writes `case.json`, the index of both phases'
+    fields, and returns it."""
     latents = noise(case, pipe.transformer.config.in_channels)
     with _Capture(pipe, out, blocks, block_steps, prompt=prompt) as cap:
         cap.save("noise", latents)
-        images = _call(pipe, case, _pack(pipe, latents), "pil")
+        _call(pipe, case, _pack(pipe, latents), "latent")
     _check_denoise_traps(pipe, case, cap, prompt)
-    images[0].save(os.path.join(out, "image.png"))
     cap.save("timesteps", pipe.scheduler.timesteps)
     cap.save("sigmas", pipe.scheduler.sigmas)
     cap.save("dit_timesteps", np.array(cap.dit_timesteps, dtype=np.float32))
@@ -514,10 +506,38 @@ def record_denoise(pipe, case, out, prompt, blocks=(0, 15, 31), block_steps=(0, 
     return info
 
 
+def decode_image(pipe, case, latents, device):
+    """The pipeline's own decode of its final (packed) latents, on `device`: `__call__`'s tail after
+    the denoising loop (diffusers 0.41.0, pipeline_qwenimage21.py), line for line. A 2048^2 decode
+    in fp32 needs more than the GPU budget, so the recorder runs it on the host (`run`)."""
+    vae = pipe.vae.to(device)
+    latents = torch.as_tensor(latents).to(device)
+    latents = pipe._unpack_latents(latents, case.size, case.size, pipe.vae_scale_factor)
+    latents = latents.to(vae.dtype)
+    shape = (1, vae.config.z_dim, 1, 1, 1)
+    latents_mean = torch.tensor(vae.config.latents_mean).view(shape).to(latents.device, latents.dtype)
+    latents_std = torch.tensor(vae.config.latents_std).view(shape).to(latents.device, latents.dtype)
+    latents = latents * latents_std + latents_mean
+    with torch.no_grad():
+        image = vae.decode(latents, return_dict=False)[0][:, :, 0]
+    return pipe.image_processor.postprocess(image, output_type="pil")[0]
+
+
+def record_image(pipe, case, out, device):
+    """The decode phase's recording: `image.png` from the recorded final latents, decoded on
+    `device`."""
+    with open(os.path.join(out, "case.json"), encoding="utf-8") as f:
+        last = len(json.load(f)["sigmas"]) - 2
+    latents = np.load(os.path.join(out, f"step{last}", "latents_out.npy"))
+    decode_image(pipe, case, latents, device).save(os.path.join(out, "image.png"))
+
+
 def record_case(pipe, case, out, blocks=(0, 15, 31), block_steps=(0, 1)):
-    """Both phases of one case on one pipeline: every field of spec 01's list under `out` (empty),
+    """Every phase of one case on one pipeline: every field of spec 01's list under `out` (empty),
     .npy files indexed in `case.json`, the decoded `image.png`. Returns the case record."""
-    return record_denoise(pipe, case, out, record_prompt(pipe, case, out), blocks, block_steps)
+    info = record_denoise(pipe, case, out, record_prompt(pipe, case, out), blocks, block_steps)
+    record_image(pipe, case, out, pipe.device)
+    return info
 
 
 def rel_l2(x, ref):
@@ -719,9 +739,10 @@ def _versions():
 
 
 def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), factor=5.0,
-        min_free_disk_gb=12.0, disk_budget_gb=10.0, min_free_ram_gb=24.0, min_free_vram_gb=27.0,
-        max_vram_gib=24.0, log=print):
+        min_free_disk_gb=12.0, disk_budget_gb=10.0, min_free_ram_gb=40.0, min_free_vram_gb=27.0,
+        max_vram_gib=24.0, host_decode_from=2048, log=print):
     """One session: every case recorded in fp32, then the bf16 yardstick on the same weights, then
+    the images decoded (on the host from `host_decode_from` pixels a side; 0: never), then
     thresholds.json and manifest.json (written last: its presence means the run completed)."""
     import convert
     device = torch.device(device)
@@ -785,10 +806,10 @@ def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), 
     _guard_dit(pipe, device.type == "cuda")
     for case in cases:
         check_fp32_ieee()
-        timed(entries[case.name], "fp32_dit_vae", lambda: record_denoise(
+        timed(entries[case.name], "fp32_dit", lambda: record_denoise(
             pipe, case, os.path.join(out, case.name), prompts32[case.name], blocks, block_steps))
-        log(f"fp32 dit+vae {case.name}: {entries[case.name]['fp32_dit_vae_wall_s']} s, "
-            f"peak {entries[case.name]['fp32_dit_vae_peak_vram_gib']} GiB")
+        log(f"fp32 dit {case.name}: {entries[case.name]['fp32_dit_wall_s']} s, "
+            f"peak {entries[case.name]['fp32_dit_peak_vram_gib']} GiB")
     _guard_dit(pipe, False)
     set_precision(pipe, "bf16")
     errors = {}
@@ -797,6 +818,15 @@ def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), 
             pipe, case, os.path.join(out, case.name), prompts16[case.name]))
         log(f"bf16 {case.name}: velocity error {[round(e, 5) for e in errors[case.name]['velocity']]}, "
             f"encoder {errors[case.name]['encoder']:.5f}")
+    # the decode phase: the VAE alone, in fp32
+    decode_phase(pipe, device)
+    set_precision(pipe, "fp32")
+    for case in cases:
+        check_fp32_ieee()
+        where = torch.device("cpu") if host_decode_from and case.size >= host_decode_from else device
+        entries[case.name]["decode_device"] = str(where)
+        timed(entries[case.name], "fp32_decode", lambda: record_image(pipe, case, os.path.join(out, case.name), where))
+        log(f"fp32 decode {case.name} on {where}: {entries[case.name]['fp32_decode_wall_s']} s")
     write_thresholds(os.path.join(out, "thresholds.json"), errors, factor, session)
 
     revision = os.path.basename(os.path.normpath(checkpoint))
@@ -813,8 +843,10 @@ def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), 
                     "(QwenImage21AttnProcessor); fp32 compute: weights bf16 at rest (the checkpoint's), the text "
                     "decoder layers, lm_head and the DiT blocks upcast to fp32 in their own forward, everything else "
                     "fp32; each call split at encode_prompt (the encoder phase for every case, then the DiT phase "
-                    "replaying its output); the VAE keeps no single-frame causal cache. All bit-identical to "
-                    "from_pretrained(torch_dtype=float32) (test_record.py)",
+                    "replaying its output up to the final latents), then the decode phase (the pipeline's decode "
+                    "tail, the VAE alone, on the host for the cases in decode_device cpu); the VAE keeps no "
+                    "single-frame causal cache. All bit-identical to from_pretrained(torch_dtype=float32) on one "
+                    "device (test_record.py)",
         "use_kv_cache": True,
         "tf32": tf32,
         "attention": attention,
@@ -847,15 +879,18 @@ def main(argv=None):
     r.add_argument("--factor", type=float, default=5.0, help="threshold = factor x the bf16 error")
     r.add_argument("--min-free-disk-gb", type=float, default=12.0, help="the disk floor kept free after the run")
     r.add_argument("--disk-budget-gb", type=float, default=10.0, help="room the recordings may take")
-    r.add_argument("--min-free-ram-gb", type=float, default=24.0)
+    r.add_argument("--min-free-ram-gb", type=float, default=40.0,
+                   help="host RAM free at the start: the 2048^2 fp32 host decode peaks at ~36 GB")
     r.add_argument("--min-free-vram-gb", type=float, default=27.0)
+    r.add_argument("--host-decode-from", type=int, default=2048,
+                   help="decode images this many pixels a side or more on the host (0: never)")
     r.add_argument("--max-vram-gib", type=float, default=24.0, help="this process's VRAM cap in GiB, desktop excluded (0: none)")
     a = ap.parse_args(argv)
     ints = lambda text: tuple(int(x) for x in text.split(",") if x)
     try:
         run(a.checkpoint, a.out, a.device, [CASES[n] for n in a.cases.split(",")], ints(a.blocks),
             ints(a.block_steps), a.factor, a.min_free_disk_gb, a.disk_budget_gb, a.min_free_ram_gb,
-            a.min_free_vram_gb, a.max_vram_gib, log=lambda *x: print(*x, flush=True))
+            a.min_free_vram_gb, a.max_vram_gib, a.host_decode_from, log=lambda *x: print(*x, flush=True))
     except BaseException as e:
         print(f"RECORD FAILED: {type(e).__name__}: {e}", flush=True)
         raise
