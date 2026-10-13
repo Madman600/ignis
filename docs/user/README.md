@@ -1404,7 +1404,7 @@ Git for Windows' `usr\bin` on `PATH`). `make` alone lists every target.
 | `make dev-ui` / `run-ui` | Server plus Playground hot reload as one session; Ctrl+C stops both. |
 | `make web-dev` / `web-mock` | Vite alone, against a running engine or an in-process fake one. |
 | `make smoke` / `canary` | One `/v1/models` + a short completion / the canary suite. |
-| `make metrics` | Scrape the metrics listener of a server started with `METRICS=1`. |
+| `make metrics` | Scrape the metrics listener (on by default; a server started with `METRICS=0` has none). |
 | `make test` / `test-all` / `ci` | `cargo test` / plus web typecheck and vitest / what a CI job runs. |
 | `make gpu-status` / `gpu-guard` / `gpu-profile` | Who holds the card / refuse when it is held / the explicit GPU test profile. |
 | `make watch CUDA=0` | Rebuild + restart on every Rust change (cargo-watch). |
@@ -1436,7 +1436,7 @@ speculation off (`SPEC=` leaves it to the server, and the `rtx5090` profile
 speculates with dflash2). `VISION=1` loads the tower; `UNCENSORED=1` loads
 [the uncensored variant](#the-uncensored-variant) in place of the default
 image, served as `qwen3.8-27b-abliterated`; `ROPE_SCALING=yarn:4` rescales the
-envelope further (`none` keeps the trained table); `METRICS=1` starts the metrics listener; `API_KEY=` and `EXPOSE=` set
+envelope further (`none` keeps the trained table); the metrics listener is on (`METRICS=0` starts without it); `API_KEY=` and `EXPOSE=` set
 the access flags; `IDLE_UNLOAD=<secs>` sets [idle unload](#idle-unload)
 (`IDLE_UNLOAD=0` for a measurement); `ARGS='…'` passes anything verbatim.
 

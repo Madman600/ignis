@@ -15,10 +15,11 @@ UI ?= 1
 
 # 1 = pass --server-metrics (ADR 0017): Prometheus text at GET /metrics on its own
 # listener (METRICS_BIND, no key, never exposed) and, with UI=1, at
-# /ui/metrics on BIND (behind API_KEY when set). Off until #90 measures it on
-# the GPU, so gate runs started through make do not carry it by default.
+# /ui/metrics on BIND (behind API_KEY when set). On by default since
+# 2026-10-13 (the owner's call; #90 proved it costs the inference path nothing);
+# METRICS=0 starts without it, as a gate run that must not carry it does.
 # make metrics scrapes the metrics listener.
-METRICS ?= 0
+METRICS ?= 1
 # The metrics listener (--server-metrics-bind). Empty = the server's 127.0.0.1:9464.
 METRICS_BIND ?=
 
