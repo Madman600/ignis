@@ -265,7 +265,8 @@ The 32 blocks' linears take 115.5 ms per denoising step at 1024².
 **Quantization alone:**
 - 4096 tokens × 4096: 0.012 ms. The data fits in L2 (4.2 TB/s).
 - 4096 tokens × 12288: 0.087 ms (1.75 TB/s, DRAM-class).
-- At 16,512 tokens: 1.5-1.7 TB/s, and 5.0% of a block.
+- At 16,512 tokens: 1.5-1.7 TB/s, and 5.0% of a block (measured with
+  configuration 0, whose block took 15.2 ms there).
 
 **The tile sweep.** `--sweep`, block TFLOPS at 1024²:
 
@@ -299,5 +300,5 @@ would close the gap, largest first:
    last wave would recover most of it, for 4 of a block's 7 linears.
 3. **Power.** The card is limited to 575 W; the literature's numbers are at
    600 W. The wide GEMMs reach 575-580 W and drop to 2.0-2.6 GHz.
-4. **Fusing the quantization** into the producers: 3.4% at 1024² and 5.0%
-   at 16,512 tokens.
+4. **Fusing the quantization** into the producers: 3.4% at 1024² and about
+   5% at 16,512 tokens.
