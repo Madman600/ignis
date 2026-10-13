@@ -11,8 +11,8 @@
 //   segments the prefix's calls (step 1): a 4096-token image block and a 160-token text
 //            segment, both over a 10-image prefix;
 //   quant    the standalone quantizers: Q of 4096 queries, the target's run, a 10-image prefix.
-// Each case warms for --warmup-ms, then times --reps launches (at least ~20 ms of them) with events;
-// the SM clock and the board power are NVML's means over that window, sampled every millisecond.
+// Each case warms for --warmup-ms, then times --reps launches (at least a second of them) with
+// events; the SM clock and the board power are NVML's means over the window's second half.
 //
 // A timing is a finding, not a pass/fail: a tool, not a CTest. Run it with the card to itself
 // (GPU lock, timing mode).
@@ -68,9 +68,12 @@ struct Timing {
 
 nvmlDevice_t g_nvml = nullptr;
 
-// Warm `run` for warmup_ms, then time `reps` calls. A thread samples NVML every millisecond while
-// the timed calls run (the mean of the samples is reported); a case shorter than one sample
-// interval is repeated until it spans a few.
+// Warm `run` for warmup_ms, then time `reps` calls, repeated until they span at least
+// kTimedMinMs (for calls of 0.1 ms or more). NVML's board power is a running average over about a second and its clock reading
+// lags too, so a thread samples both every millisecond over the window's second half only and the
+// mean is reported.
+constexpr double kTimedMinMs = 1000.0;
+
 Timing time_it(const std::function<void()> &run, int reps, int warmup_ms) {
   cudaEvent_t e0, e1;
   BENCH_CUDA(cudaEventCreate(&e0));
@@ -88,11 +91,14 @@ Timing time_it(const std::function<void()> &run, int reps, int warmup_ms) {
     ++warm;
   }
   const double estimate_ms = spent / warm;
-  reps = std::max(reps, static_cast<int>(std::ceil(20.0 / std::max(estimate_ms, 1e-3))));  // >= ~20 ms timed
+  // Kernels under 0.1 ms keep --reps: a second of them back to back would time the launches.
+  if (estimate_ms >= 0.1) reps = std::max(reps, static_cast<int>(std::ceil(kTimedMinMs / estimate_ms)));
+  const double window_ms = reps * estimate_ms;
   std::atomic<bool> sampling{true};
   double mhz_sum = 0.0, w_sum = 0.0;
   int samples = 0;
   std::thread sampler([&] {
+    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<long long>(window_ms * 500.0)));
     while (sampling.load() && g_nvml != nullptr) {
       unsigned mhz = 0, mw = 0;
       if (nvmlDeviceGetClockInfo(g_nvml, NVML_CLOCK_SM, &mhz) == NVML_SUCCESS &&
@@ -111,6 +117,14 @@ Timing time_it(const std::function<void()> &run, int reps, int warmup_ms) {
   BENCH_CUDA(cudaEventSynchronize(e1));
   sampling = false;
   sampler.join();
+  if (samples == 0 && g_nvml != nullptr) {  // a window too short to sample: one reading after it
+    unsigned mhz = 0, mw = 0;
+    nvmlDeviceGetClockInfo(g_nvml, NVML_CLOCK_SM, &mhz);
+    nvmlDeviceGetPowerUsage(g_nvml, &mw);
+    mhz_sum = mhz;
+    w_sum = mw / 1000.0;
+    samples = 1;
+  }
   if (samples > 0) {
     t.mhz = static_cast<unsigned>(mhz_sum / samples + 0.5);
     t.watts = w_sum / samples;
