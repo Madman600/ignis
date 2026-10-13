@@ -36,9 +36,9 @@
 //   E_i = E_{i-1} + F * 35 * 2^-25 * (|S_{i-1}| + E_{i-1} + sum_{step i} |e4m3(a) e4m3(w)|)
 //   |y - ref| <= E_last * |scales[t] * wscale[r]| + |ref| * (2^-23 + BF16's 2^-8)
 // with F = --bound-factor (default 1). The rows sampled at large token counts reach the end of the
-// range at an odd stride coprime with the count (span_stride), so every token tile is checked and
-// the rows cover every residue mod 128, the columns every residue mod 256: every warp, fragment and
-// lane position of a tile.
+// range at an odd stride coprime with the count (span_stride), so up to 16,512 tokens every token
+// tile is checked (at 41,000 the 161 rows hit 161 of 321 tiles), and the rows cover every residue
+// mod 128, the columns every residue mod 256: every warp, fragment and lane position of a tile.
 //
 //   ignis_kernel_image_gemm_test [--bound-factor F] [--max-quant-rel-rms R]
 //

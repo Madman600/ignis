@@ -142,6 +142,9 @@ fn encoder_attention_through_the_bindings_matches_fp64() {
         Case { what: "causal, separate Q / K / V buffers, fp32 out", qkv: separate, causal: true, f32_out: true },
     ];
     for case in &cases {
+        // Poison O (NaN in fp32 and in BF16) so an output the call fails to write is caught.
+        dev.copy_h2d(&o, 0, &vec![0xFFu8; o.len() as usize]).expect("poison");
+        dev.synchronize().expect("poison sync");
         let attended = unsafe { image_encoder_attn::attention(case.qkv, tokens as u32, case.causal, scale, ptr(&o), o_stride as u32, case.f32_out, std::ptr::null_mut()) };
         if !ran(attended, case.what) {
             return;
@@ -167,7 +170,8 @@ fn encoder_attention_through_the_bindings_matches_fp64() {
                     ww += w * w;
                 }
             }
-            worst_rel = worst_rel.max((ee / ww).sqrt());
+            let rel = (ee / ww).sqrt();
+            worst_rel = worst_rel.max(if rel.is_nan() { f64::INFINITY } else { rel });
         }
         // fp32 output sits ~5e-4 from fp64, BF16 output ~2e-3 (spec 02 "As built"); a misplaced
         // argument is an O(1) error.

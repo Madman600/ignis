@@ -2,8 +2,9 @@
 // spec image-model/02 acceptance 5, GitHub #319) -- an ADAPTED op (ADR 0051 tier 2).
 //
 // Upstream: Dao-AILab/flash-attention v2.8.3, commit 060c9188beec3a8b62b33a3bfa6d5d2d44975fab,
-// BSD-3-Clause ("Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file";
-// the files say "Copyright (c) 2024, Tri Dao"):
+// BSD-3-Clause ("Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file. All
+// rights reserved."; the files say "Copyright (c) 2024, Tri Dao", utils.h and
+// flash_fwd_launch_template.h "Copyright (c) 2023, Tri Dao"; the licence text is in kernel/NOTICE):
 //   csrc/flash_attn/src/flash_fwd_kernel.h  compute_attn_1rowblock: one CTA per (query block,
 //                                           head), the key blocks walked from the last one down,
 //                                           the load order (V of block n during S = Q K^T, K of
@@ -55,19 +56,18 @@ namespace {
 constexpr int kHeadsQ = 32, kHeadsKv = 8, kDim = 128;
 constexpr int kWarps = 4, kThreads = kWarps * 32;
 
-// A tile: BM query rows per CTA (BM / 4 per warp) and BN keys per block. Shared memory holds Q,
-// K and V, each row of 128 BF16 as two 128-byte halves (FA2's kBlockKSmem = 64): half hf of row r
-// at (hf * rows + r) * 128, its 16-byte chunks swizzled by swz128.
-template <int BM_, int BN_> struct Tile {
-  static constexpr int BM = BM_, BN = BN_;
-  static constexpr int kRowsW = BM / kWarps;   // query rows per warp
-  static constexpr int kTilesM = kRowsW / 16;  // m16 tiles per warp
-  static constexpr int kTilesN = BN / 8;       // n8 key tiles of S
-  static constexpr int kSmemQ = 0, kSmemK = BM * 256, kSmemV = kSmemK + BN * 256, kSmem = kSmemV + BN * 256;
-  static_assert(kRowsW % 16 == 0 && BN % 16 == 0, "whole m16 tiles per warp, whole k16 steps per block");
-};
-// The header's key block is 64 (the CTest replays it).
-using DefaultTile = Tile<64, 64>;
+// The tile: kBM query rows per CTA (kBM / 4 per warp) and kBN keys per block, the header's key
+// block of 64 (the CTest replays it). Shared memory holds Q, K and V, each row of 128 BF16 as two
+// 128-byte halves (FA2's kBlockKSmem = 64): half hf of row r at (hf * rows + r) * 128, its 16-byte
+// chunks swizzled by swz128.
+constexpr int kBM = 64, kBN = 64;
+constexpr int kRowsW = kBM / kWarps;   // query rows per warp
+constexpr int kTilesM = kRowsW / 16;   // m16 tiles per warp
+constexpr int kTilesN = kBN / 8;       // n8 key tiles of S
+constexpr int kSmemQ = 0, kSmemK = kBM * 256, kSmemV = kSmemK + kBN * 256, kSmem = kSmemV + kBN * 256;
+static_assert(kRowsW % 16 == 0 && kBN % 16 == 0, "whole m16 tiles per warp, whole k16 steps per block");
+// The launch raises no shared-memory limit (no prepare call): the tile stays within the default.
+static_assert(kSmem <= 48 * 1024, "the tile must fit the default 48 KiB of dynamic shared memory");
 
 // Byte offset of 16-byte chunk `chunk` (0..15) of `row` in a tile of `rows` rows.
 __device__ __forceinline__ int tile_at(int rows, int row, int chunk) {
@@ -103,21 +103,21 @@ __device__ __forceinline__ uint32_t round_p(float lo, float hi, float &sum) {
   return *reinterpret_cast<const uint32_t *>(&b);
 }
 
-template <class T> __global__ void __launch_bounds__(kThreads, 2) encoder_attn_kernel(Args p) {
+__global__ void __launch_bounds__(kThreads, 2) encoder_attn_kernel(Args p) {
   extern __shared__ __align__(128) uint8_t smem[];
-  constexpr int BM = T::BM, BN = T::BN, TM = T::kTilesM, TN = T::kTilesN;
+  constexpr int BM = kBM, BN = kBN, TM = kTilesM, TN = kTilesN;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int g = lane >> 2, t = lane & 3;
   const int h = blockIdx.x, hk = h / (kHeadsQ / kHeadsKv);
   const int mb = p.causal ? p.m_blocks - 1 - static_cast<int>(blockIdx.y) : static_cast<int>(blockIdx.y);
-  const int q0 = mb * BM, row0 = q0 + warp * T::kRowsW;
+  const int q0 = mb * BM, row0 = q0 + warp * kRowsW;
   const int keys = p.causal ? min(q0 + BM, p.tokens) : p.tokens;
   const int n_blocks = (keys + BN - 1) / BN;
   const __nv_bfloat16 *kh = p.k + hk * kDim, *vh = p.v + hk * kDim;
 
   // Prologue: Q, then the last block's K.
-  load_tile<BM>(smem + T::kSmemQ, p.q + h * kDim, p.q_stride, q0, p.tokens, tid);
-  load_tile<BN>(smem + T::kSmemK, kh, p.kv_stride, (n_blocks - 1) * BN, p.tokens, tid);
+  load_tile<BM>(smem + kSmemQ, p.q + h * kDim, p.q_stride, q0, p.tokens, tid);
+  load_tile<BN>(smem + kSmemK, kh, p.kv_stride, (n_blocks - 1) * BN, p.tokens, tid);
   cp_async_commit();
 
   float acc[TM][kDim / 8][4];
@@ -137,7 +137,7 @@ template <class T> __global__ void __launch_bounds__(kThreads, 2) encoder_attn_k
   // ldmatrix lanes (image_mma.cuh's fragment tables): A (Q) rows lane & 15, chunk half lane >> 4;
   // B (K) rows (lane & 7) plus 8 for lanes 16..31, chunk half (lane >> 3) & 1; B (V, transposed)
   // keys lane & 15, chunk half lane >> 4.
-  const int a_row = warp * T::kRowsW + (lane & 15), a_half = lane >> 4;
+  const int a_row = warp * kRowsW + (lane & 15), a_half = lane >> 4;
   const int b_row = (lane & 7) + ((lane >> 4) << 3), b_half = (lane >> 3) & 1;
   const int v_row = lane & 15, v_half = lane >> 4;
 
@@ -146,7 +146,7 @@ template <class T> __global__ void __launch_bounds__(kThreads, 2) encoder_attn_k
     // Block nb's K (and Q) have landed; every warp is done with the previous block's V.
     cp_async_wait<0>();
     __syncthreads();
-    load_tile<BN>(smem + T::kSmemV, vh, p.kv_stride, key0, p.tokens, tid);
+    load_tile<BN>(smem + kSmemV, vh, p.kv_stride, key0, p.tokens, tid);
     cp_async_commit();
 
     // S = Q K^T in fp32.
@@ -161,11 +161,11 @@ template <class T> __global__ void __launch_bounds__(kThreads, 2) encoder_attn_k
     for (int kk = 0; kk < kDim / 16; ++kk) {
       uint32_t qa[TM][4];
 #pragma unroll
-      for (int fq = 0; fq < TM; ++fq) ldmatrix_x4(qa[fq], smem + T::kSmemQ + tile_at(BM, a_row + fq * 16, 2 * kk + a_half));
+      for (int fq = 0; fq < TM; ++fq) ldmatrix_x4(qa[fq], smem + kSmemQ + tile_at(BM, a_row + fq * 16, 2 * kk + a_half));
 #pragma unroll
       for (int fk = 0; fk < BN / 16; ++fk) {
         uint32_t kb[4];
-        ldmatrix_x4(kb, smem + T::kSmemK + tile_at(BN, fk * 16 + b_row, 2 * kk + b_half));
+        ldmatrix_x4(kb, smem + kSmemK + tile_at(BN, fk * 16 + b_row, 2 * kk + b_half));
         const uint32_t b0[2] = {kb[0], kb[1]}, b1[2] = {kb[2], kb[3]};
 #pragma unroll
         for (int fq = 0; fq < TM; ++fq) {
@@ -194,7 +194,7 @@ template <class T> __global__ void __launch_bounds__(kThreads, 2) encoder_attn_k
     // Block nb's V has landed; every warp is done with K, so the next block's K may load.
     cp_async_wait<0>();
     __syncthreads();
-    if (nb > 0) load_tile<BN>(smem + T::kSmemK, kh, p.kv_stride, key0 - BN, p.tokens, tid);
+    if (nb > 0) load_tile<BN>(smem + kSmemK, kh, p.kv_stride, key0 - BN, p.tokens, tid);
     cp_async_commit();
 
     // softmax_rescale_o: the running max, the rescale, P in BF16 and its row sum.
@@ -233,7 +233,7 @@ template <class T> __global__ void __launch_bounds__(kThreads, 2) encoder_attn_k
 #pragma unroll
       for (int fd = 0; fd < kDim / 16; ++fd) {
         uint32_t vb[4];
-        ldmatrix_x4_trans(vb, smem + T::kSmemV + tile_at(BN, kk * 16 + v_row, 2 * fd + v_half));
+        ldmatrix_x4_trans(vb, smem + kSmemV + tile_at(BN, kk * 16 + v_row, 2 * fd + v_half));
         const uint32_t b0[2] = {vb[0], vb[1]}, b1[2] = {vb[2], vb[3]};
 #pragma unroll
         for (int fq = 0; fq < TM; ++fq) {
@@ -289,11 +289,13 @@ extern "C" int32_t ignis_image_encoder_attn(const void *q, const void *k, const 
     return fail(op + ": kv_row_stride must be >= 1024 and a multiple of 8");
   }
   if (o_row_stride < 4096 || o_row_stride % 8 != 0) return fail(op + ": o_row_stride must be >= 4096 and a multiple of 8");
+  if (q_row_stride > 0x7FFFFFFFu || kv_row_stride > 0x7FFFFFFFu || o_row_stride > 0x7FFFFFFFu) {
+    return fail(op + ": row strides must be at most 2^31 - 1");
+  }
   if (!aligned(q, 16) || !aligned(k, 16) || !aligned(v, 16) || !aligned(o, 16)) {
     return fail(op + ": q, k, v and o must be 16-byte aligned");
   }
   if (!std::isfinite(scale) || !(scale > 0.0f)) return fail(op + ": scale must be finite and > 0");
-  using T = DefaultTile;
   Args a{};
   a.q = static_cast<const __nv_bfloat16 *>(q);
   a.k = static_cast<const __nv_bfloat16 *>(k);
@@ -306,7 +308,7 @@ extern "C" int32_t ignis_image_encoder_attn(const void *q, const void *k, const 
   a.o = o;
   a.o_stride = static_cast<int>(o_row_stride);
   a.o_f32 = o_f32 != 0 ? 1 : 0;
-  a.m_blocks = static_cast<int>((tokens + T::BM - 1) / T::BM);
-  encoder_attn_kernel<T><<<dim3(kHeadsQ, a.m_blocks), kThreads, T::kSmem, static_cast<cudaStream_t>(stream)>>>(a);
+  a.m_blocks = static_cast<int>((tokens + kBM - 1) / kBM);
+  encoder_attn_kernel<<<dim3(kHeadsQ, a.m_blocks), kThreads, kSmem, static_cast<cudaStream_t>(stream)>>>(a);
   return check_launch(op.c_str());
 }

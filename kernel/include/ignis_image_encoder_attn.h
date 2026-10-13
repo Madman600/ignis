@@ -9,9 +9,10 @@
  * it). Causal (query i sees keys 0 .. i), or non-causal (every key).
  *
  * Addressing: token t's query head h at q + t * q_row_stride + h * 128 (elements), its KV head g
- * at k + t * kv_row_stride + g * 128 and v + t * kv_row_stride + g * 128. The fused QKV GEMM's
- * output [tokens][6144] is read as it is: q = qkv, k = qkv + 4096, v = qkv + 5120, both strides
- * 6144. O: token t's head h at o + t * o_row_stride + h * 128, BF16, or fp32 when `o_f32`.
+ * at k + t * kv_row_stride + g * 128 and v + t * kv_row_stride + g * 128. The fused QKV row
+ * [tokens][6144], after the QK norm and mrope applied to it in place, is read as it is: q = qkv,
+ * k = qkv + 4096, v = qkv + 5120, both strides 6144. O: token t's head h at o + t * o_row_stride +
+ * h * 128, BF16, or fp32 when `o_f32`.
  *
  * The numerics (what the CTest replays): keys are visited in blocks of 64, from the last block a
  * query sees down to block 0. Per block, S = q . k in fp32 on BF16 tensor cores; the running max

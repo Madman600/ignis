@@ -18,8 +18,9 @@
 // heads attend sharply and the first token a sink there, then rotated by RoPE (rotate-half pairs,
 // θ 5e6, position = token); V Gaussian with per-channel scales and offsets. QK-normed q and k keep
 // |S| bounded, so the bound's band stays narrow. Every call reads a device copy of the first
-// `tokens` rows followed by 64 rows of NaN: a kernel that reads past the sequence turns them into
-// NaN outputs. Outputs start as NaN too, so an unwritten one fails.
+// `tokens` rows followed by 64 rows of NaN: a kernel that multiplies V rows past the sequence turns
+// them into NaN outputs. The guard covers V only: a K row past it is masked to -inf whatever it
+// holds, and a Q row past it is never stored. Outputs start as NaN too, so an unwritten one fails.
 //
 // The mechanics reference replays the kernel per 64-key block (the header's), from the last block a
 // row sees down to block 0. s_j = q . k_j is exact in fp64 (BF16 products are exact); the kernel's
@@ -431,6 +432,7 @@ void refusals() {
   check(attn(q, 16, kQkv, kQkv + 2, kScale, o.p, kHD) != 0, "a kv row stride off 8 refused");
   check(attn(q, 16, kQkv, kQkv, kScale, o.p, kHD - 8) != 0, "an output row stride below 4096 refused");
   check(attn(q, 16, kQkv, kQkv, kScale, o.p, kHD + 4) != 0, "an output row stride off 8 refused");
+  check(attn(q, 16, 0x80000000u, kQkv, kScale, o.p, kHD) != 0, "a row stride of 2^31 refused");
   check(attn(q + 4, 16, kQkv, kQkv, kScale, o.p, kHD) != 0, "q off 16 bytes refused");
   check(attn(q, 16, kQkv, kQkv, kScale, static_cast<char *>(o.p) + 8, kHD) != 0, "o off 16 bytes refused");
   check(attn(q, 16, kQkv, kQkv, 0.0f, o.p, kHD) != 0, "a zero scale refused");

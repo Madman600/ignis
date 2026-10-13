@@ -608,10 +608,12 @@ struct DeviceRun {
   explicit DeviceRun(int tokens) : bytes(ignis_image_attn_kv8_bytes(tokens)), n(tokens) {}
 };
 
-// The rows checked: per head, i * stride + h mod q_tokens for i < want (all rows when few). The
-// stride is the smallest odd number >= (q_tokens - 1) / (want - 1), rounded up, coprime with
-// q_tokens: the rows are distinct and reach the end of the call, and the head's shift makes the
-// heads together cover every residue mod 128.
+// The rows checked: per head, i * stride + h mod q_tokens for i < want (all rows when few), plus
+// the last row. The stride is the smallest odd number >= (q_tokens - 1) / (want - 1), rounded up,
+// coprime with q_tokens: the rows are distinct and spread to the end of the call, and the head's
+// shift makes the heads together cover every residue mod 128. The shift can stop a head's rows
+// short of the last 128-query tile (at 16,384 queries they end at 16,182 + h), so the last row is
+// added: every call compares its last CTA.
 std::vector<int> rows_for(int q_tokens, int h, int want) {
   std::vector<int> rows;
   if (q_tokens <= want) {
@@ -622,6 +624,7 @@ std::vector<int> rows_for(int q_tokens, int h, int want) {
   if (stride % 2 == 0) ++stride;
   while (std::gcd(stride, static_cast<long long>(q_tokens)) != 1) stride += 2;
   for (int i = 0; i < want; ++i) rows.push_back(static_cast<int>((i * stride + h) % q_tokens));
+  if (std::find(rows.begin(), rows.end(), q_tokens - 1) == rows.end()) rows.push_back(q_tokens - 1);
   return rows;
 }
 

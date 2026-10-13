@@ -3,10 +3,10 @@
 //! wrapper that turns its return code into a `Result` carrying the leaf's own message.
 //!
 //! The op is the text encoder's (spec image-model/03), which calls it inside the kernel leaf: one
-//! causal sequence, 32 query heads over 8 KV heads of 128, BF16, read straight from the fused QKV
-//! GEMM's output. These bindings exist for Rust-side tests and tools that drive it directly. Every
-//! pointer argument is a device pointer the caller vouches for, so the wrapper is `unsafe`; the
-//! shapes and alignments it takes are checked by the leaf.
+//! causal sequence, 32 query heads over 8 KV heads of 128, BF16, read from the fused QKV row after
+//! the QK norm and mrope applied to it in place. These bindings exist for Rust-side tests and tools
+//! that drive it directly. Every pointer argument is a device pointer the caller vouches for, so
+//! the wrapper is `unsafe`; the shapes and alignments it takes are checked by the leaf.
 //!
 //! The op is asynchronous on the stream it is given (null: the legacy default stream) and carries
 //! no synchronization. `CudaDevice`'s copies run on its own non-blocking load stream, which never

@@ -21,7 +21,7 @@ each with a reference test at the image model's real geometry.
 |---|---|---|---|
 | linears | FP8 W8A8 GEMM: activations quantized per token to E4M3, weights per output row, FP32 accumulate, row × column scale epilogue | extends `ignis_fp8_linear`'s `mma.sync` path. CUTLASS 2.x sm80 multistage and vLLM's `scaled_mm_sm120` as reading | our own |
 | DiT attention | SageAttention2++: Q/K INT8 with K smoothing, V FP8 per channel, PV FP8 with FP16 accumulate folded into FP32, D=128, 32 heads | `thu-ml/SageAttention`, `csrc/qattn` sm89/sm120 path, torch removed (Apache-2.0) | adapted |
-| encoder attention | FlashAttention-2 forward, bf16, causal, GQA 32/8, D=128 | `Dao-AILab/flash-attention` `csrc/flash_attn/src`, c10 and dropout stubbed (BSD-3) | adapted |
+| encoder attention | FlashAttention-2 forward, bf16, causal, GQA 32/8, D=128 | `Dao-AILab/flash-attention` `csrc/flash_attn/src`: structure and softmax forms, raw PTX (BSD-3) | adapted |
 | VAE convolution | implicit-GEMM conv2d, bf16, the shapes in spec 01's `conversion.json` (3×3 stride 1 pad 1, 3×3 stride 2 after a (0,1,0,1) pad, 1×1) | CUTLASS 2.x Ampere implicit-GEMM fprop and ggml `conv2d_implicit_gemm` as reading or source (BSD-3 / MIT) | ours or adapted |
 | VAE mid-block attention | one head, D = 768 (encoder) / 1152 (decoder), over the latent grid: row-tiled QKᵀ, softmax, PV on the bf16 GEMM, with a fixed workspace | — | our own |
 | DiT elementwise | LayerNorm without affine × (1 + scale), with the per-token choice of the t row or the t=0 row; `x + tanh(gate) · y`; QK RMSNorm + 3-axis RoPE (complex form, adjacent pairs); SwiGLU; GELU-tanh; zero-centred RMSNorm (w + 1) | our existing norm/RoPE ops extended. FlashInfer `fused_dit_layernorm.cuh` and `fused_qk_rmsnorm_rope.cuh` as reading or source (Apache-2.0) | ours or adapted |
@@ -265,7 +265,8 @@ Every shape runs at 1, 2, 17, 129, 4096, 16,512 and 41,000 tokens (a
 385 output columns, i · stride mod count plus the last one. The stride is
 the smallest odd number ≥ (count − 1) / (want − 1), rounded up, that is
 coprime with the count. So the samples are distinct and reach the end of the
-range: every token tile and every output-row tile is compared. The rows
+range: every output-row tile is compared, and every token tile up to 16,512
+tokens (at 41,000 tokens the 161 rows hit 161 of 321 tiles). The rows
 cover every residue mod 128 and the columns every residue mod 256. Before
 the review fix the stride was rounded down, which left the end of the range
 unsampled: 4096 output rows reached 3447, so tile 14 was never compared.
@@ -443,7 +444,8 @@ about 1 GiB per 1024² condition image over 32 layers, as spec'd.
   - one call over A = the whole prefix and B = the target's run.
 - Every call takes a stream, allocates nothing, is graph-capturable and is
   deterministic. Q, K, V and O are addressed with a row stride, so the
-  fused QKV GEMM's output can be read as it is.
+  fused QKV row can be read as it is, after the QK norm and RoPE applied to
+  it in place.
 - `scale` must be finite and > 0 (refused otherwise). A negative scale
   would turn max(S) · c into the row's minimum, and 0 gives NaN on masked
   keys.
@@ -498,12 +500,15 @@ them ("Real Q, K and V"); spec 04's end-to-end test has the last word.
 
 **The cases** (`ignis_kernel_image_attn_test`, about 75 s with the fp64
 references on 16 threads). Each check covers 64 query rows per head (all
-rows of a smaller call), i · stride + h mod the call's rows. The stride is
-the smallest odd number ≥ (rows − 1) / 63, rounded up, that is coprime with
-the row count. So the rows are distinct and reach the end of the call, and
-the head's shift makes the 32 heads together cover every residue mod 128.
-Before the review fix the stride was rounded down: 160 queries were checked
-at rows 0-94 only. The prefix layouts are:
+rows of a smaller call), i · stride + h mod the call's rows, plus the
+call's last row. The stride is the smallest odd number ≥ (rows − 1) / 63,
+rounded up, that is coprime with the row count. So the rows are distinct
+and spread to the end of the call, and the head's shift makes the 32 heads
+together cover every residue mod 128. The last row is added because the
+shift alone stops short: at 16,384 queries a head's rows end at
+16,182 + h, which never compares the last 128-query CTA. Before the first
+review fix the stride was rounded down: 160 queries were checked at rows
+0-94 only. The prefix layouts are:
 - 0 images: text 200;
 - 1 image: text 20, image 4096, text 160;
 - 10 images: text 20, then image 4096 and text 7 ten times, the last text
@@ -515,13 +520,13 @@ head's cosine (centred) and relative RMS error:
 
 | call | queries × keys | worst / bound | bound / \|O\| | cosine (centred) | rel. RMS |
 |---|---|---|---|---|---|
-| target over [prefix ; target], 0 images | 4096 × 4296 | 0.81 | 1.5e-4 | 0.99950 (0.99831) | 3.2% |
-| target over [prefix ; target], 1 image | 4096 × 8372 | 0.70 | 2.9e-4 | 0.99973 (0.99803) | 2.3% |
-| target over [prefix ; target], 10 images | 4096 × 45,299 | 0.53 | 1.5e-3 | 0.99990 (0.99811) | 1.4% |
-| target over [prefix ; target], 0 images, 2048² | 16,384 × 16,584 | 0.66 | 5.6e-4 | 0.99958 (0.99834) | 2.9% |
-| image block 1 of 1 (truncated keys) | 4096 × 4116 | 0.94 | 1.4e-4 | 0.99985 (0.99802) | 1.7% |
-| image blocks 1 and 10 of 10 | 4096 × 4116 / 41,043 | 0.85 / 0.42 | 1.4e-4 / 1.4e-3 | ≥ 0.99978 (0.99799) | ≤ 2.1% |
-| text segments, causal bottom-right | 7-200 × 20-41,203 | ≤ 0.98 | 4.5e-6-1.4e-3 | ≥ 0.99954 (0.99779) | ≤ 3.0% |
+| target over [prefix ; target], 0 images | 4096 × 4296 | 0.81 | 1.5e-4 | 0.99951 (0.99830) | 3.2% |
+| target over [prefix ; target], 1 image | 4096 × 8372 | 0.70 | 2.9e-4 | 0.99973 (0.99805) | 2.3% |
+| target over [prefix ; target], 10 images | 4096 × 45,299 | 0.53 | 1.5e-3 | 0.99990 (0.99812) | 1.4% |
+| target over [prefix ; target], 0 images, 2048² | 16,384 × 16,584 | 0.66 | 5.6e-4 | 0.99959 (0.99834) | 2.9% |
+| image block 1 of 1 (truncated keys) | 4096 × 4116 | 0.94 | 1.4e-4 | 0.99985 (0.99803) | 1.7% |
+| image blocks 1 and 10 of 10 | 4096 × 4116 / 41,043 | 0.85 / 0.42 | 1.4e-4 / 1.4e-3 | ≥ 0.99978 (0.99798) | ≤ 2.1% |
+| text segments, causal bottom-right | 7-200 × 20-41,203 | ≤ 0.98 | 4.5e-6-1.4e-3 | ≥ 0.99954 (0.99781) | ≤ 3.0% |
 | small odd sizes (partial blocks, both runs, causal over two runs) | 1-200 × 1-207 | ≤ 0.04 | ≤ 2.1e-5 | ≥ 0.99950 (0.99825) | ≤ 3.2% |
 
 - **0 outputs over the bound**, in every call.
@@ -552,7 +557,7 @@ head's cosine (centred) and relative RMS error:
 - **The shared mean:** the target run's mean is the prefix's byte for byte,
   and its K codes restate from that mean bit for bit.
 - **Negative control:** the same bound computed without the rescale fails
-  32,767 of 32,768 outputs (1 image, where the target's V spread is 2.5× the
+  36,735 of 36,736 outputs (1 image, where the target's V spread is 2.5× the
   prefix's).
 - **Storage:** the prefix run is byte for byte as stored after every call
   that read it, in every layout and profile.
@@ -563,23 +568,25 @@ head's cosine (centred) and relative RMS error:
 
 | inputs | images | split | one run | split vs one run |
 |---|---|---|---|---|
-| DiT-like | 0 | 0.99950 (0.99831), 3.2% | 0.99956 (0.99829), 3.0% | 1.7% |
-| DiT-like | 1 | 0.99973 (0.99803), 2.3% | 0.99970 (0.99807), 2.5% | 1.2% |
-| DiT-like | 10 | 0.99990 (0.99811), 1.4% | 0.99988 (0.99811), 1.6% | 0.5% |
-| DiT-like, 2048² | 0 | 0.99958 (0.99834), 2.9% | 0.99965 (0.99831), 2.6% | 1.3% |
-| K means apart | 0 | 0.99726 (0.99484), 7.9% | 0.99915 (0.99806), 4.1% | 5.0% |
-| K means apart | 1 | 0.99766 (0.99490), 6.9% | 0.99870 (0.99763), 5.1% | 3.9% |
-| K means apart | 10 | 0.99798 (0.99384), 6.4% | 0.99814 (0.99585), 6.1% | 3.2% |
+| DiT-like | 0 | 0.99951 (0.99830), 3.2% | 0.99956 (0.99828), 3.0% | 1.7% |
+| DiT-like | 1 | 0.99973 (0.99805), 2.3% | 0.99970 (0.99808), 2.4% | 1.2% |
+| DiT-like | 10 | 0.99990 (0.99812), 1.4% | 0.99988 (0.99812), 1.6% | 0.5% |
+| DiT-like, 2048² | 0 | 0.99959 (0.99834), 2.9% | 0.99966 (0.99831), 2.6% | 1.3% |
+| K means apart | 0 | 0.99729 (0.99476), 7.8% | 0.99916 (0.99808), 4.1% | 5.0% |
+| K means apart | 1 | 0.99767 (0.99490), 6.9% | 0.99871 (0.99765), 5.1% | 3.9% |
+| K means apart | 10 | 0.99800 (0.99391), 6.3% | 0.99816 (0.99585), 6.1% | 3.2% |
 
   "K means apart" puts an offset of 10σ in four channel pairs (d, d + 64)
   per head, at a per-head angle for the prefix, rotated by 2 rad for the
   target (as RoPE rotates a pair's mean differently at text and target
   positions). The prefix's mean is then ~17 off in those channels of every
   target key.
-  - On DiT-like inputs the split costs nothing measurable.
+  - On DiT-like inputs the split stays within 0.3 points of one run's
+    relative RMS error (3.2% against 3.0% at 0 images, 2.9% against 2.6%
+    at 2048²).
   - With the means apart it costs most at 0 images (the review's M2). There,
     a ~200-token text mean smooths 4096 target keys, and the relative RMS
-    error is 7.9% against 4.1% for one run; the cosine still clears 0.99.
+    error is 7.8% against 4.1% for one run; the cosine still clears 0.99.
   - This arm is a measurement, not a gate. Spec 04's Seams name the exact
     fallback if real data shows target-K error: the target run's own mean,
     plus q · (m_t − m_p) on run B's exponents.
@@ -588,13 +595,13 @@ head's cosine (centred) and relative RMS error:
 at ±3.45σ. Two profiles add what stretches a block's amax, each at 0, 1 and
 10 images (split / one run):
 - **A heavy tail** on q, k and v (one value in 256 at 6×, up to ~20σ):
-  cosine ≥ 0.99662 (centred 0.99561), relative RMS ≤ 8.2%. Gated at 0.99,
+  cosine ≥ 0.99659 (centred 0.99561), relative RMS ≤ 8.3%. Gated at 0.99,
   passes.
 - **Outlier channels**, the GEMM test's "8 channels at 20×": q's channel 37
   and k's channel 91 in heads 0, 4, …, 28, Gaussian.
   - Mechanics: 0 over the bound.
-  - Accuracy: the worst head is always one of those 8. Its cosine is 0.916
-    / 0.908 at 0 images, 0.939 / 0.952 at 1 and 0.962 / 0.941 at 10, with
+  - Accuracy: the worst head is always one of those 8. Its cosine is 0.918
+    / 0.908 at 0 images, 0.939 / 0.953 at 1 and 0.962 / 0.948 at 10, with
     relative RMS 29-43%. **Below AC 4's 0.99.**
   - Cause: a 20× channel sets the 32-row Q block's or the 64-key K block's
     INT8 amax. The other 127 channels keep ~2 levels per σ, so the scores
@@ -784,9 +791,9 @@ segments. It also takes non-causal calls, which the bench uses for the bar's
 geometry.
 
 **The ABI.**
-- Q, K and V are BF16 base pointers with row strides. The fused QKV GEMM's
-  output [tokens][6144] is read in place: q at column 0, k at 4096, v at
-  5120.
+- Q, K and V are BF16 base pointers with row strides. The fused QKV row
+  [tokens][6144] is read in place, after the QK norm and mrope applied to
+  it in place: q at column 0, k at 4096, v at 5120.
 - GQA: query head h reads KV head h / 4.
 - O is BF16 for the leaf, or fp32 for the test.
 - The call takes a stream, allocates nothing, and is graph-capturable and
@@ -857,7 +864,9 @@ as the fused QKV row:
 
 **Guards.**
 - Each call reads a device copy of the first `tokens` rows followed by 64
-  rows of NaN: a kernel that read past the sequence would make NaN outputs.
+  rows of NaN: a kernel that multiplied V rows past the sequence would make
+  NaN outputs. The guard covers V only: a K row past the sequence is masked
+  to −inf whatever it holds, and a Q row past it is never stored.
 - Outputs start as NaN.
 
 **Rows checked:** 64 per head, as in the 8-bit attention's test: i · stride
@@ -889,6 +898,12 @@ output):
   neighbouring BF16 value, which the bound adds in full.
 - The median grows with the number of k16 steps, as the 8-bit attention's
   does: 8.3e-4 of |O| at 41,000 keys, below BF16's resolution.
+- **What only the shorter calls pin.** One key's weight is about 1/N of
+  |O|. Against the bound's median that is 4.9e-4 against 2.1e-4 at 2,048
+  tokens (caught), 2.4e-4 against 2.7e-4 at 4,097 (borderline) and 8e-5
+  against 4.3e-4 at 12,400 (not caught). So a one-key mask error, a causal
+  limit off by one, is pinned up to about 2K tokens: by the small calls
+  (1-300 tokens, bound ≤ 4.8e-5 of |O|, every tile edge) and the 2,048 one.
 
 **Speed** (2026-10-13, `ignis_image_encoder_attn_bench`, GPU lock in timing
 mode, card power limit 575 W). The SM clock and board power are NVML's
@@ -916,8 +931,8 @@ The encoder's 36 attention layers take:
 - 2.39 s at 41,000 tokens.
 
 **Against the bar (FA2 on the 5090: 208-215 TOPS from 4K to 32K,
-non-causal): 196-205 non-causal and 202-207 causal from 4K up, 94-99% of
-it.**
+non-causal): 196-205 non-causal at the same lengths, 94-96% of it like for
+like. Causal calls run at 202-207 from 4K up.**
 - The card sits at its 575 W limit (the literature's numbers are at 600 W)
   and 2.6 GHz. That is ~80 TOPS/GHz, 92% of the BF16 MMA's 86.5 per clock
   (the instruction table above).

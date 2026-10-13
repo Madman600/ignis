@@ -67,8 +67,9 @@ The image model's encoder attention (`ignis_image_encoder_attn`): the text
 encoder's causal GQA 32/8 attention, FlashAttention-2's forward.
 - Upstream: `Dao-AILab/flash-attention` v2.8.3, commit
   `060c9188beec3a8b62b33a3bfa6d5d2d44975fab`, BSD-3-Clause, "Copyright (c)
-  2022, the respective contributors, as shown by the AUTHORS file" (the files
-  say "Copyright (c) 2024, Tri Dao"):
+  2022, the respective contributors, as shown by the AUTHORS file. All rights
+  reserved." (the files say "Copyright (c) 2024, Tri Dao", and `utils.h` and
+  `flash_fwd_launch_template.h` "Copyright (c) 2023, Tri Dao"):
   - `csrc/flash_attn/src/flash_fwd_kernel.h`: `compute_attn_1rowblock`, the
     walk over key blocks from the last one down and its load order;
   - `softmax.h`: the online softmax's operation forms (`softmax_rescale_o`,
