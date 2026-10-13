@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::frontend::{ChatMessage, ChatRenderOptions, FrontendSet, Tokenizer};
 
-pub use decode::{decode_image, DecodeFailure};
+pub use decode::{decode_image, decode_image_rgba, DecodeFailure};
 pub use resize::{smart_resize, Size};
 
 /// Side of one vision patch, in pixels.
@@ -60,6 +60,15 @@ pub struct Rgb8Image {
     pub width: u32,
     pub height: u32,
     pub rgb: Vec<u8>,
+}
+
+/// A decoded image with its alpha: `width x height` RGBA8 pixels, row-major
+/// ([`decode_image_rgba`], the image model's condition images).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rgba8Image {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
 }
 
 /// A media item's patch grid (temporal, height, width), in patches — not

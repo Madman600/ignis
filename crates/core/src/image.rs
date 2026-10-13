@@ -102,6 +102,34 @@ impl TargetLatents {
     pub fn zeros(size: ImageSize) -> Self {
         Self { size, values: vec![0.0; LATENT_CHANNELS * size.latent_cells()] }
     }
+
+    /// A `size` target's starting noise from `seed` alone (spec
+    /// image-model/04 §Noise): standard normal values, ignis's own draw —
+    /// splitmix64's stream from `seed`, two uniforms a pair of values through
+    /// Box–Muller. The same seed gives the same latents on the same build and
+    /// machine; it is not diffusers' noise (spec image-model/05 §Seams).
+    pub fn noise(size: ImageSize, seed: u64) -> Self {
+        let mut latents = Self::zeros(size);
+        // The k-th output of splitmix64 seeded with `seed`, as a uniform in
+        // [0, 1) on 53 bits.
+        let uniform = |k: u64| {
+            let mut z = seed.wrapping_add(k.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for (pair, values) in latents.values.chunks_mut(2).enumerate() {
+            let k = 2 * pair as u64;
+            // 1 − u is in (0, 1]: its logarithm is finite.
+            let radius = (-2.0 * (1.0 - uniform(k)).ln()).sqrt();
+            let angle = std::f64::consts::TAU * uniform(k + 1);
+            values[0] = (radius * angle.cos()) as f32;
+            if let Some(second) = values.get_mut(1) {
+                *second = (radius * angle.sin()) as f32;
+            }
+        }
+        latents
+    }
 }
 
 /// A condition prefix the runner holds, until
@@ -155,6 +183,16 @@ impl std::fmt::Display for ImageError {
 pub trait ImageRunner: Send {
     /// The load's plan: the condition budget and the sampler sigmas.
     fn plan(&self) -> &ImagePlan;
+
+    /// The tokens `prompt` takes in a condition prefix with `images`
+    /// condition images: every token the runner's template and tokenizer lay
+    /// out for it but the images' own. A prefix holds this plus
+    /// [`ImageSize::latent_cells`] of each condition image (one image-pad
+    /// slot becomes 2 × 2 latent tokens, spec image-model/04), the count
+    /// [`ImageRunner::encode_condition`] refuses past the budget — so the
+    /// server, which holds no tokenizer for the image model, fits the
+    /// condition images to the budget before it encodes them.
+    fn prompt_tokens(&self, prompt: &str, images: usize) -> u64;
 
     /// The encoder over the prompt and the condition images, the VAE encode
     /// of each image, and the DiT over the prefix tokens at t = 0: the
@@ -228,9 +266,9 @@ impl FakeImageRunner {
     }
 
     /// The prefix's tokens, as [`FakeImageRunner`] counts them.
-    fn tokens(condition: &ImageCondition) -> u64 {
-        let words = condition.prompt.split_whitespace().count().max(1);
-        (words + condition.images.iter().map(|image| image.size.latent_cells()).sum::<usize>()) as u64
+    fn tokens(&self, condition: &ImageCondition) -> u64 {
+        let images = condition.images.iter().map(|image| image.size.latent_cells() as u64).sum::<u64>();
+        self.prompt_tokens(&condition.prompt, condition.images.len()) + images
     }
 }
 
@@ -244,8 +282,13 @@ impl ImageRunner for FakeImageRunner {
         &self.plan
     }
 
+    /// One token a word, at least one.
+    fn prompt_tokens(&self, prompt: &str, _images: usize) -> u64 {
+        prompt.split_whitespace().count().max(1) as u64
+    }
+
     fn encode_condition(&mut self, condition: &ImageCondition) -> Result<ConditionId, ImageError> {
-        let (tokens, budget) = (Self::tokens(condition), self.plan.condition_budget_tokens);
+        let (tokens, budget) = (self.tokens(condition), self.plan.condition_budget_tokens);
         if tokens > budget {
             return Err(ImageError::OverBudget { tokens, budget });
         }
@@ -413,6 +456,34 @@ mod tests {
         assert_eq!(runner.denoise_step(id, &mut latents, 1.0, 0.0, None), Err(ImageError::NoSuchCondition(id)));
         runner.release_condition(other);
         assert_eq!(held.load(Ordering::SeqCst), 0);
+    }
+
+    /// The job's noise is a standard normal draw that only its seed decides.
+    #[test]
+    fn the_noise_is_standard_normal_and_the_seed_alone_decides_it() {
+        let size = ImageSize::new(1024, 1024);
+        let noise = TargetLatents::noise(size, 42);
+        assert_eq!(noise.values.len(), LATENT_CHANNELS * 4096);
+        let n = noise.values.len() as f64;
+        let mean = noise.values.iter().map(|&v| f64::from(v)).sum::<f64>() / n;
+        let variance = noise.values.iter().map(|&v| (f64::from(v) - mean).powi(2)).sum::<f64>() / n;
+        assert!(mean.abs() < 0.01, "mean {mean}");
+        assert!((variance - 1.0).abs() < 0.01, "variance {variance}");
+        assert!(noise.values.iter().all(|v| v.is_finite()));
+        assert_eq!(TargetLatents::noise(size, 42), noise, "the same seed, the same noise");
+        assert_ne!(TargetLatents::noise(size, 43).values, noise.values);
+    }
+
+    /// The prefix the fake refuses is the one the server fits to: the prompt's
+    /// tokens plus each image's latent cells.
+    #[test]
+    fn the_fake_counts_its_prefix_as_the_prompt_tokens_plus_the_latent_cells() {
+        let runner = FakeImageRunner::new(ImagePlan { condition_budget_tokens: 4096 + 2, sample_sigmas: vec![1.0] });
+        assert_eq!(runner.prompt_tokens("make it blue", 1), 3);
+        assert_eq!(runner.prompt_tokens("", 0), 1);
+        let image = RgbaImage { size: ImageSize::new(1024, 1024), pixels: vec![0; 1024 * 1024 * 4] };
+        let edit = ImageCondition { prompt: "make it blue".into(), images: vec![image] };
+        assert_eq!(runner.tokens(&edit), 3 + 4096);
     }
 
     #[test]

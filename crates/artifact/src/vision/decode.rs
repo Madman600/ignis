@@ -18,10 +18,14 @@
 //!
 //! Each decoder checks the frame size against the pixel limit as soon as
 //! the header gives it, before allocating the frame.
+//!
+//! [`decode_image_rgba`] is the image model's (spec image-model/05): its
+//! condition images keep their alpha, so PNG and WebP are decoded with it
+//! and a JPEG is opaque.
 
 use std::io::Cursor;
 
-use super::{jpeg, InvalidMedia, Rgb8Image};
+use super::{jpeg, InvalidMedia, Rgb8Image, Rgba8Image};
 
 /// Why [`decode_image`] produced no image.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +53,33 @@ pub fn decode_image(bytes: &[u8], max_pixels: u64) -> Result<Rgb8Image, DecodeFa
     } else {
         Err(DecodeFailure::Invalid(InvalidMedia::Unsupported(
             "unrecognised image format (PNG, JPEG, WebP and GIF are accepted)".to_owned(),
+        )))
+    }
+}
+
+/// Decode `bytes` to RGBA8, picking the decoder from the magic bytes: PNG
+/// (palette and tRNS expanded, 16-bit samples keep their high byte, gray
+/// replicated) and WebP with their alpha, JPEG opaque with its EXIF
+/// orientation applied. GIF is refused: the image model takes PNG, JPEG and
+/// WebP. A frame larger than `max_pixels` is refused before it is decoded.
+pub fn decode_image_rgba(bytes: &[u8], max_pixels: u64) -> Result<Rgba8Image, DecodeFailure> {
+    let opaque = |image: Rgb8Image| Rgba8Image {
+        width: image.width,
+        height: image.height,
+        rgba: image.rgb.chunks_exact(3).flat_map(|px| [px[0], px[1], px[2], 0xff]).collect(),
+    };
+    if bytes.is_empty() {
+        return Err(undecodable("media bytes are empty"));
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        decode_png_rgba(bytes, max_pixels)
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        decode_webp_rgba(bytes, max_pixels)
+    } else if bytes.starts_with(&[0xff, 0xd8]) {
+        jpeg::decode(bytes, max_pixels).map(opaque)
+    } else {
+        Err(DecodeFailure::Invalid(InvalidMedia::Unsupported(
+            "unrecognised image format (PNG, JPEG and WebP are accepted)".to_owned(),
         )))
     }
 }
@@ -84,6 +115,28 @@ fn decode_png(bytes: &[u8], max_pixels: u64) -> Result<Rgb8Image, DecodeFailure>
         }
     }
     Ok(Rgb8Image { width, height, rgb })
+}
+
+fn decode_png_rgba(bytes: &[u8], max_pixels: u64) -> Result<Rgba8Image, DecodeFailure> {
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let header = decoder.read_header_info().map_err(undecodable)?;
+    check_pixels(header.width, header.height, max_pixels)?;
+    let mut reader = decoder.read_info().map_err(undecodable)?;
+    let size = reader.output_buffer_size().ok_or_else(|| undecodable("PNG frame is too large"))?;
+    let mut buffer = vec![0u8; size];
+    let info = reader.next_frame(&mut buffer).map_err(undecodable)?;
+    let channels = info.color_type.samples();
+    let mut rgba = Vec::with_capacity(info.width as usize * info.height as usize * 4);
+    for px in buffer[..info.buffer_size()].chunks_exact(channels) {
+        match channels {
+            1 => rgba.extend_from_slice(&[px[0], px[0], px[0], 0xff]),
+            2 => rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]),
+            3 => rgba.extend_from_slice(&[px[0], px[1], px[2], 0xff]),
+            _ => rgba.extend_from_slice(&px[..4]),
+        }
+    }
+    Ok(Rgba8Image { width: info.width, height: info.height, rgba })
 }
 
 fn decode_gif(bytes: &[u8], max_pixels: u64) -> Result<Rgb8Image, DecodeFailure> {
@@ -143,6 +196,21 @@ fn decode_webp(bytes: &[u8], max_pixels: u64) -> Result<Rgb8Image, DecodeFailure
     Ok(Rgb8Image { width, height, rgb })
 }
 
+fn decode_webp_rgba(bytes: &[u8], max_pixels: u64) -> Result<Rgba8Image, DecodeFailure> {
+    let mut decoder = image_webp::WebPDecoder::new(Cursor::new(bytes)).map_err(undecodable)?;
+    let (width, height) = decoder.dimensions();
+    check_pixels(width, height, max_pixels)?;
+    let size = decoder.output_buffer_size().ok_or_else(|| undecodable("WebP frame is too large"))?;
+    let mut buffer = vec![0u8; size];
+    decoder.read_image(&mut buffer).map_err(undecodable)?;
+    let rgba = if decoder.has_alpha() {
+        buffer
+    } else {
+        buffer.chunks_exact(3).flat_map(|px| [px[0], px[1], px[2], 0xff]).collect()
+    };
+    Ok(Rgba8Image { width, height, rgba })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +231,37 @@ mod tests {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
         bytes.extend((0..=255u8).cycle().take(1024));
         assert!(matches!(decode_image(&bytes, LIMIT), Err(DecodeFailure::Invalid(InvalidMedia::Undecodable(_)))));
+    }
+
+    /// The image model's decode keeps a PNG's alpha (the values Pillow reads
+    /// from the fixture), its colour is the RGB decode's, and an opaque
+    /// format is alpha 255; GIF is refused.
+    #[test]
+    fn the_rgba_decode_keeps_the_alpha_and_makes_the_rest_opaque() {
+        let png = include_bytes!("../../tests/fixtures/vision/images/alpha.png");
+        let rgba = decode_image_rgba(png, LIMIT).unwrap();
+        assert_eq!((rgba.width, rgba.height), (300, 200));
+        let alpha: Vec<u8> = rgba.rgba.chunks_exact(4).map(|px| px[3]).collect();
+        assert_eq!(alpha.iter().map(|&a| u64::from(a)).sum::<u64>(), 7_620_200);
+        assert_eq!(alpha.iter().filter(|&&a| a == 0).count(), 400);
+        assert_eq!(&rgba.rgba[..4], &[0, 0, 211, 0]);
+        let at = |x: usize, y: usize| &rgba.rgba[(y * 300 + x) * 4..][..4];
+        assert_eq!(at(150, 100), &[128, 128, 248, 127]);
+        let rgb = decode_image(png, LIMIT).unwrap();
+        assert!(rgba.rgba.chunks_exact(4).zip(rgb.rgb.chunks_exact(3)).all(|(a, b)| a[..3] == *b));
+        for opaque in [
+            &include_bytes!("../../tests/fixtures/vision/images/lossless.webp")[..],
+            &include_bytes!("../../tests/fixtures/vision/images/odd_width.jpg")[..],
+            &include_bytes!("../../tests/fixtures/vision/images/on_grid.png")[..],
+        ] {
+            let rgba = decode_image_rgba(opaque, LIMIT).unwrap();
+            let rgb = decode_image(opaque, LIMIT).unwrap();
+            assert_eq!((rgba.width, rgba.height), (rgb.width, rgb.height));
+            assert!(rgba.rgba.chunks_exact(4).zip(rgb.rgb.chunks_exact(3)).all(|(a, b)| a[..3] == *b && a[3] == 0xff));
+        }
+        let gif = include_bytes!("../../tests/fixtures/vision/images/animated.gif");
+        assert!(matches!(decode_image_rgba(gif, LIMIT), Err(DecodeFailure::Invalid(InvalidMedia::Unsupported(_)))));
+        assert_eq!(decode_image_rgba(png, 59_999), Err(DecodeFailure::Pixels(60_000)));
     }
 
     #[test]
