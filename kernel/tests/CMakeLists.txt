@@ -786,3 +786,11 @@ add_test(NAME ignis_kernel_image_gemm_test COMMAND ignis_kernel_image_gemm_test)
 add_executable(ignis_image_gemm_bench bench_image_gemm.cu image_gemm_sweep.cu)
 target_include_directories(ignis_image_gemm_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_image_gemm_bench PRIVATE ignis_kernel ignis_vendor CUDA::nvml)
+# The 8-bit DiT attention (acceptance 4, kernel/include/ignis_image_attn.h; an adapted op): the
+# quantizers against their definitions, every call the DiT makes against fp64 on the same
+# quantized operands (a tight bound) and on the unquantized inputs (cosine per head). GPU
+# (ADR 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_image_attn_test test_image_attn.cu)
+target_include_directories(ignis_kernel_image_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_image_attn_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_image_attn_test COMMAND ignis_kernel_image_attn_test)
