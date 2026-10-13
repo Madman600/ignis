@@ -229,7 +229,7 @@ result one fp32 rounding:
 - fp32 outputs use 0.1-10% of the bound.
 - BF16 outputs use 27-99%; that is BF16's own half ulp.
 - The six other tile configurations pass the same check at the edge shapes.
-- Run time: 1 min 40 s.
+- Run time: about 2 minutes.
 
 **Quantization error**, against the unquantized product. The reference is
 fp64 of BF16 x times BF16 W, with W quantized per row as a converter would.
