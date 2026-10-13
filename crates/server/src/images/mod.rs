@@ -2,13 +2,19 @@
 //! model as the server holds it — its runner ([`ignis_core::image`]) and the
 //! count of the image jobs on it.
 //!
-//! The image routes, the job queue, the condition budget and the PNG build on
-//! this: the queue admits each job through [`ImageJobs::wait`] and runs it
-//! through [`ImageModel::with_runner`], one at a time, so the idle clock and a
-//! switch's drain read the jobs ([`ImageJobs::in_flight`]) as they read a text
-//! model's lanes.
+//! The image routes ([`routes`]), the job and its queue ([`job`]), the
+//! condition budget ([`budget`]) and the PNG build on this: the queue admits
+//! each job through [`ImageJobs::admit`] and runs it in its turn
+//! ([`Waiting::turn`]) through [`ImageModel::with_runner`], one at a time,
+//! so the idle clock and a switch's drain read the jobs
+//! ([`ImageJobs::in_flight`]) as they read a text model's lanes.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+pub mod budget;
+pub mod job;
+pub(crate) mod routes;
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ignis_core::image::{ImagePlan, ImageRunner};
@@ -68,33 +74,71 @@ impl ImageModel {
 }
 
 /// The image jobs waiting and running on the loaded image model: what tells
-/// the idle clock it is in use and a switch's drain when it is done (spec
-/// image-model/05 §The queue). The queue counts each job here, from its
+/// the idle clock it is in use and a switch's drain when it is done, and the
+/// queue that runs them (spec image-model/05 §The queue): one at a time, in
+/// the order they were admitted. The queue counts each job here, from its
 /// admission until its last image, and stops admitting once it is closed.
 #[derive(Debug, Default)]
 pub struct ImageJobs {
-    waiting: AtomicU32,
-    running: AtomicU32,
+    state: Mutex<Queue>,
+    /// Told whenever the turn may have passed: a job ended, a waiting one
+    /// left, the queue closed.
+    changed: tokio::sync::Notify,
     closed: AtomicBool,
 }
 
+/// The queue under its lock.
+#[derive(Debug, Default)]
+struct Queue {
+    /// The tickets of the jobs waiting, in the order they were admitted: the
+    /// order is fixed there, whenever each job then asks for its turn.
+    waiting: VecDeque<u64>,
+    running: u32,
+    next: u64,
+}
+
 impl ImageJobs {
-    /// One job admitted: it waits until [`Waiting::start`], and leaves the
-    /// count when the guard is dropped — run, refused or cancelled alike.
+    fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.state.lock().expect("image queue lock")
+    }
+
+    /// One job counted as waiting, at the back of the queue: it waits until
+    /// [`Waiting::start`] or [`Waiting::turn`], and leaves the count when the
+    /// guard is dropped — run, refused or cancelled alike.
     pub fn wait(self: &Arc<Self>) -> Waiting {
-        self.waiting.fetch_add(1, Ordering::SeqCst);
-        Waiting(Arc::clone(self))
+        let mut queue = self.queue();
+        let ticket = queue.next;
+        queue.next += 1;
+        queue.waiting.push_back(ticket);
+        Waiting { jobs: Some(Arc::clone(self)), ticket }
+    }
+
+    /// One job admitted to the back of the queue, counted as waiting, when
+    /// at most `depth` (`image.queue_depth`) would then wait behind the one
+    /// running; `None` when the queue is full or closed.
+    pub fn admit(self: &Arc<Self>, depth: u32) -> Option<Waiting> {
+        let mut queue = self.queue();
+        if self.is_closed() || queue.waiting.len() as u64 + u64::from(queue.running) > u64::from(depth) {
+            return None;
+        }
+        let ticket = queue.next;
+        queue.next += 1;
+        queue.waiting.push_back(ticket);
+        Some(Waiting { jobs: Some(Arc::clone(self)), ticket })
     }
 
     /// The jobs waiting and running now.
     pub fn in_flight(&self) -> InFlight {
-        InFlight { waiting: self.waiting.load(Ordering::SeqCst), running: self.running.load(Ordering::SeqCst) }
+        let queue = self.queue();
+        InFlight { waiting: queue.waiting.len() as u32, running: queue.running }
     }
 
     /// The model is going away (a switch, an unload): the queue admits no job
-    /// from now, and cancels the ones it has between denoising steps.
+    /// from now, the waiting ones never get their turn, and the running one
+    /// is cancelled between denoising steps.
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        self.changed.notify_waiters();
     }
 
     /// Whether [`ImageJobs::close`] was called.
@@ -103,22 +147,61 @@ impl ImageJobs {
     }
 }
 
-/// A job counted as waiting ([`ImageJobs::wait`]), until dropped or started.
+/// A job counted as waiting ([`ImageJobs::wait`], [`ImageJobs::admit`]),
+/// until dropped or started.
 #[derive(Debug)]
-pub struct Waiting(Arc<ImageJobs>);
+pub struct Waiting {
+    jobs: Option<Arc<ImageJobs>>,
+    ticket: u64,
+}
 
 impl Waiting {
-    /// The job runs: counted as running until the returned guard is dropped,
-    /// and never as neither in between.
-    pub fn start(self) -> Running {
-        self.0.running.fetch_add(1, Ordering::SeqCst);
-        Running(Arc::clone(&self.0))
+    /// The job runs now, whatever its place: counted as running until the
+    /// returned guard is dropped, and never as neither nor both in between.
+    pub fn start(mut self) -> Running {
+        let jobs = self.jobs.take().expect("a waiting job starts once");
+        let mut queue = jobs.queue();
+        queue.waiting.retain(|&ticket| ticket != self.ticket);
+        queue.running += 1;
+        drop(queue);
+        Running(jobs)
+    }
+
+    /// Wait for the job's turn — no job running, and every job admitted
+    /// before it run or gone — and start it ([`Waiting::start`]). `None` once
+    /// the queue is closed. Dropping the future leaves the queue.
+    pub async fn turn(mut self) -> Option<Running> {
+        let jobs = Arc::clone(self.jobs.as_ref().expect("a waiting job"));
+        loop {
+            // Asked before the state is read, so no change between the two
+            // goes unseen.
+            let changed = jobs.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut queue = jobs.queue();
+                if jobs.is_closed() {
+                    return None;
+                }
+                if queue.running == 0 && queue.waiting.front() == Some(&self.ticket) {
+                    queue.waiting.pop_front();
+                    queue.running += 1;
+                    self.jobs = None;
+                    drop(queue);
+                    return Some(Running(Arc::clone(&jobs)));
+                }
+            }
+            changed.await;
+        }
     }
 }
 
 impl Drop for Waiting {
     fn drop(&mut self) {
-        self.0.waiting.fetch_sub(1, Ordering::SeqCst);
+        if let Some(jobs) = &self.jobs {
+            jobs.queue().waiting.retain(|&ticket| ticket != self.ticket);
+            jobs.changed.notify_waiters();
+        }
     }
 }
 
@@ -128,7 +211,8 @@ pub struct Running(Arc<ImageJobs>);
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.0.running.fetch_sub(1, Ordering::SeqCst);
+        self.0.queue().running -= 1;
+        self.0.changed.notify_waiters();
     }
 }
 
@@ -152,6 +236,72 @@ mod tests {
         assert!(!jobs.is_closed());
         jobs.close();
         assert!(jobs.is_closed());
+    }
+
+    /// Spec image-model/05 §The queue: `depth` jobs wait behind the running
+    /// one and one more is refused; a closed queue admits none.
+    #[test]
+    fn the_queue_admits_up_to_its_depth_behind_the_running_job() {
+        let jobs = Arc::new(ImageJobs::default());
+        let running = jobs.admit(2).expect("an empty queue admits").start();
+        let waiting: Vec<Waiting> = (0..2).map(|_| jobs.admit(2).expect("room to wait")).collect();
+        assert_eq!(jobs.in_flight(), InFlight { waiting: 2, running: 1 });
+        assert!(jobs.admit(2).is_none(), "a third would wait past the depth");
+        assert_eq!(jobs.in_flight(), InFlight { waiting: 2, running: 1 }, "a refusal counts nothing");
+        drop(running);
+        let again = jobs.admit(2);
+        assert!(again.is_some(), "room again");
+        drop((again, waiting));
+        let one = jobs.admit(0).map(Waiting::start);
+        assert!(one.is_some(), "depth 0 runs one");
+        assert!(jobs.admit(0).is_none(), "with none waiting");
+        drop(one);
+        jobs.close();
+        assert!(jobs.admit(4).is_none(), "a closed queue admits nothing");
+        assert!(jobs.in_flight().is_idle());
+    }
+
+    /// The turn goes one at a time in the order of admission, whenever each
+    /// job asks for it; a job that leaves the queue gives its place up; a
+    /// closed queue gives no turn.
+    #[tokio::test]
+    async fn the_turn_goes_one_at_a_time_in_the_order_of_admission() {
+        let jobs = Arc::new(ImageJobs::default());
+        let first = jobs.admit(8).unwrap().turn().await.expect("an empty queue's turn at once");
+        let tickets: Vec<Waiting> = (0..4).map(|_| jobs.admit(8).unwrap()).collect();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut waiters = Vec::new();
+        // They ask for their turn in the reverse order, and the second leaves.
+        for (job, waiting) in tickets.into_iter().enumerate().rev() {
+            if job == 1 {
+                drop(waiting);
+                continue;
+            }
+            let order = Arc::clone(&order);
+            waiters.push(tokio::spawn(async move {
+                let running = waiting.turn().await.expect("an open queue");
+                order.lock().unwrap().push(job);
+                tokio::task::yield_now().await;
+                drop(running);
+            }));
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(jobs.in_flight(), InFlight { waiting: 3, running: 1 });
+        drop(first);
+        for waiter in waiters {
+            waiter.await.unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), [0, 2, 3]);
+        assert!(jobs.in_flight().is_idle());
+
+        let running = jobs.admit(8).unwrap().start();
+        let waiting = jobs.admit(8).unwrap();
+        let closed = tokio::spawn(async move { waiting.turn().await.is_none() });
+        tokio::task::yield_now().await;
+        jobs.close();
+        assert!(closed.await.unwrap(), "a waiting job gets no turn once closed");
+        drop(running);
+        assert!(jobs.in_flight().is_idle());
     }
 
     /// The shutdown drops the runner, and a call after it finds none.

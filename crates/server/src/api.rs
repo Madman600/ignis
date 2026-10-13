@@ -12,6 +12,9 @@
 //! - `POST /v1/responses` — the OpenAI Responses API, streaming (SSE) and
 //!   not, and `GET /v1/responses`, its WebSocket mode (`crate::responses`,
 //!   GitHub #282).
+//! - `POST /v1/images/generations` and `POST /v1/images/edits` — OpenAI's
+//!   Images API on the image model (`crate::images::routes`, spec
+//!   image-model/05).
 //!
 //! Error shape: OpenAI's `{"error": {message, type, code}}` body with the
 //! matching status (400 bad request, 404 unknown model, 413 oversized
@@ -181,6 +184,15 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
             "/v1/systemone",
             post(crate::decide::decide).options(cors_preflight),
         )
+        // Spec image-model/05: the image model's routes. An edit's form
+        // carries up to ten condition images, so its body limit is the media
+        // one on every load: the image model has no vision acquirer, which is
+        // what widens it for the chat routes.
+        .routes(routes!(crate::images::routes::create_image))
+        .routes({
+            let (schemas, paths, edits) = routes!(crate::images::routes::create_image_edit);
+            (schemas, paths, edits.layer(axum::extract::DefaultBodyLimit::max(MEDIA_REQUEST_BODY_LIMIT)))
+        })
         .route("/v1/models", options(cors_preflight))
         .route("/v1/models/switch", options(cors_preflight))
         .route("/v1/models/catalog", options(cors_preflight))
@@ -192,6 +204,8 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         .route("/v1/detokenize", options(cors_preflight))
         .route("/v1/responses", options(cors_preflight))
         .route("/v1/decide", options(cors_preflight))
+        .route("/v1/images/generations", options(cors_preflight))
+        .route("/v1/images/edits", options(cors_preflight))
         .split_for_parts();
     describe_fields(&mut document);
     (router, document)
@@ -445,13 +459,16 @@ async fn count_use(State(server): State<Arc<Server>>, req: Request, next: Next) 
 
 /// The routes whose `POST` uses the model (ADR 0049 §2: what the serving
 /// gate holds, apart from the routes that only report state or drive a
-/// switch): the completions, the decision and its alias, and the counting
-/// routes, which read the model's tokenizer. The Responses socket's upgrade
-/// is not one: its jobs count, one by one (`crate::responses::socket`). A
+/// switch): the completions, the decision and its alias, the counting
+/// routes, which read the model's tokenizer, and the image routes. The
+/// Responses socket's upgrade is not one: its jobs count, one by one
+/// (`crate::responses::socket`). A
 /// test classifies every documented `/v1` operation as one of these or as
 /// one that does not use the model, so a new route is never left out unseen.
-const MODEL_ROUTES: [&str; 6] =
-    ["/v1/chat/completions", "/v1/responses", "/v1/decide", "/v1/systemone", "/v1/tokenize", "/v1/detokenize"];
+const MODEL_ROUTES: [&str; 8] = [
+    "/v1/chat/completions", "/v1/responses", "/v1/decide", "/v1/systemone", "/v1/tokenize", "/v1/detokenize",
+    "/v1/images/generations", "/v1/images/edits",
+];
 
 /// Whether a request uses the model ([`MODEL_ROUTES`]), for idle unload.
 fn uses_the_model(method: &axum::http::Method, path: &str) -> bool {
@@ -876,7 +893,7 @@ const GREEDY_NEUTRAL: SamplingDefaults = SamplingDefaults {
 
 /// A seed of the request's own, for a request that sent none: two identical
 /// seedless requests are two independent samples.
-fn fresh_seed() -> u64 {
+pub(crate) fn fresh_seed() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     std::collections::hash_map::RandomState::new().build_hasher().finish()
 }
@@ -2976,12 +2993,20 @@ fn engine_error_chunk() -> Event {
 
 /// The OpenAI error body (`{"error": {...}}`). Every failure on this
 /// surface answers in this shape, `/v1/decide` included.
-#[derive(Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ApiError {
     error: ErrorBody,
 }
 
-#[derive(Serialize, ToSchema)]
+impl ApiError {
+    /// The body naming no field: what a stream that already answered `200`
+    /// ends with.
+    pub(crate) fn new(type_: &str, code: &str, message: &str) -> Self {
+        Self { error: ErrorBody { message: message.into(), r#type: type_.into(), code: code.into(), param: None } }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ErrorBody {
     message: String,
     r#type: String,

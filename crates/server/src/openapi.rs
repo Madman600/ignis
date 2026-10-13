@@ -60,7 +60,8 @@ pub const DOCS_PATH: &str = "/v1/docs";
         description = "\
 The inference surface of an `ignis` server: OpenAI-compatible chat \
 completions and responses, plus `/v1/decide` (ADR 0034), which reads an \
-answer out of the model's own readout instead of generating one.\n\n\
+answer out of the model's own readout instead of generating one; and, with \
+the image model loaded (ADR 0050), OpenAI's image generations and edits.\n\n\
 Every operation below is served by the listener this page was loaded \
 from. When the server runs with `--server-api-key`, they answer `401` without a \
 bearer token — this page and the document do not, so *Authorize* is how \
@@ -99,6 +100,7 @@ checkpoint is NVFP4: merge and re-export instead); more than one loaded model \
         (name = "responses", description = "The OpenAI responses API."),
         (name = "tokenize", description = "A prompt's token count, and token ids back to text, without serving anything."),
         (name = "decide", description = "Typed decisions read from the readout (ADR 0034)."),
+        (name = "images", description = "Images from the image model: generations and edits (ADR 0050)."),
     ),
 )]
 pub struct ApiDoc;

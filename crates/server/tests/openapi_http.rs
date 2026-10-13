@@ -102,6 +102,9 @@ fn the_document_lists_exactly_the_v1_surface() {
         // GitHub #282: the Responses API's WebSocket mode, deliberately.
         "get /v1/responses",
         "post /v1/decide",
+        // Spec image-model/05: the image model's routes.
+        "post /v1/images/generations",
+        "post /v1/images/edits",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -255,6 +258,47 @@ fn the_streaming_half_is_documented_as_its_own_content_type() {
     let ok = &document["paths"]["/v1/chat/completions"]["post"]["responses"]["200"]["content"];
     assert!(ok["application/json"].is_object(), "{ok}");
     assert!(ok["text/event-stream"].is_object(), "{ok}");
+}
+
+/// Spec image-model/05 AC 13: both image routes, their ignis extensions,
+/// their streamed events and their errors are in the document — the edit as
+/// a multipart form.
+#[test]
+fn the_image_routes_document_their_extensions_events_and_errors() {
+    let document = document();
+    for path in ["/v1/images/generations", "/v1/images/edits"] {
+        let post = &document["paths"][path]["post"];
+        assert_eq!(post["tags"][0], "images", "{path}");
+        let ok = &post["responses"]["200"]["content"];
+        assert_eq!(ok["application/json"]["schema"]["$ref"], "#/components/schemas/ImagesResponse", "{path}");
+        assert_eq!(ok["text/event-stream"]["schema"]["$ref"], "#/components/schemas/ImageStreamEvent", "{path}");
+        for status in ["400", "401", "404", "409", "500", "503"] {
+            assert!(post["responses"][status].is_object(), "{path} {status}");
+        }
+        let description = post["description"].as_str().unwrap_or_default();
+        let errors = post["responses"]["503"]["description"].as_str().unwrap_or_default();
+        assert!(errors.contains("engine_full") && errors.contains("model_stopped"), "{path}: {errors}");
+        assert!(description.contains("progress") && description.contains("completed"), "{path}: {description}");
+    }
+    let generation = &document["paths"]["/v1/images/generations"]["post"];
+    assert_eq!(generation["requestBody"]["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/GenerationRequest");
+    let edit = &document["paths"]["/v1/images/edits"]["post"]["requestBody"]["content"]["multipart/form-data"];
+    assert_eq!(edit["schema"]["$ref"], "#/components/schemas/EditForm", "{edit}");
+    let schemas = &document["components"]["schemas"];
+    for field in ["seed", "prompt_enhancement", "size", "n", "background", "stream"] {
+        assert!(schemas["GenerationRequest"]["properties"][field].is_object(), "{field}");
+    }
+    assert!(schemas["EditForm"].to_string().contains("image[]"), "{}", schemas["EditForm"]);
+    assert!(schemas["ImagesResponse"]["properties"]["seed"].is_object());
+    assert!(schemas["ImagesResponse"]["properties"]["condition_sizes"].is_object());
+    let events = schemas["ImageStreamEvent"].to_string();
+    for event in ["ProgressEvent", "CompletedEvent", "ErrorEvent"] {
+        assert!(events.contains(event), "{events}");
+    }
+    let phases = schemas["Phase"].to_string();
+    for phase in ["enhancing", "switching", "loading", "encoding", "denoising", "decoding"] {
+        assert!(phases.contains(phase), "{phases}");
+    }
 }
 
 #[test]
