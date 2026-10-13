@@ -1,6 +1,6 @@
 # The image model in ignis — the feature, its tickets, and how to run them
 
-GitHub: the five tickets are created on the owner's OK of these specs.
+GitHub: specs 01-05 are #318-#322.
 
 The feature-level document the image-model tickets decompose
 (`docs/agents/issue-tracker.md`). Read this first, then the ticket's spec.

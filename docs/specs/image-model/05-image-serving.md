@@ -1,6 +1,6 @@
 # 05 — image serving: the model kind, the image routes, the queue, the Playground, prompt enhancement
 
-GitHub: (on the owner's OK). ADR 0050, ADR 0049 (idle unload), ADR 0047
+GitHub: #322. ADR 0050, ADR 0049 (idle unload), ADR 0047
 (catalog), ADR 0046 (config v2). Feature: `spec.md`. Needs 04 for the real
 leaf; everything here is built and tested against a fake image leaf first.
 

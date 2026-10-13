@@ -1,6 +1,6 @@
 # 04 — the image leaf: the DiT, the condition prefix, the sampler, the VAE, and the end-to-end check
 
-GitHub: (on the owner's OK). ADR 0050, ADR 0009 (Step ABI). Feature:
+GitHub: #321. ADR 0050, ADR 0009 (Step ABI). Feature:
 `spec.md`. Builds on 01, 02 and 03.
 
 ## Problem

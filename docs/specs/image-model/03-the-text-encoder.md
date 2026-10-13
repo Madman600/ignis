@@ -1,6 +1,6 @@
 # 03 — the text encoder: Qwen3-VL-8B's text model, its vision tower and DeepStack
 
-GitHub: (on the owner's OK). ADR 0050. Feature: `spec.md`. Builds on 01
+GitHub: #320. ADR 0050. Feature: `spec.md`. Builds on 01
 (artifact, recordings) and 02 (FP8 GEMM, encoder attention).
 
 ## Problem

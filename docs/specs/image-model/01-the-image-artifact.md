@@ -1,6 +1,6 @@
 # 01 — the image artifact: the converter, the published release, and the diffusers recordings
 
-GitHub: (on the owner's OK). ADR 0050, ADR 0051. Feature: `spec.md`.
+GitHub: #318. ADR 0050, ADR 0051. Feature: `spec.md`.
 
 ## Problem
 

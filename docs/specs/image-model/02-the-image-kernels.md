@@ -1,6 +1,6 @@
 # 02 — the image kernels: FP8 GEMM, 8-bit attention, encoder attention, convolution, fused ops
 
-GitHub: (on the owner's OK). ADR 0050, ADR 0051. Feature: `spec.md`. Survey:
+GitHub: #319. ADR 0050, ADR 0051. Feature: `spec.md`. Survey:
 [kernels for the image model on the 5090](../../findings/2026-10-13-image-model-kernels-on-the-5090.md).
 
 ## Problem
