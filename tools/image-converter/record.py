@@ -14,7 +14,10 @@ checkpoint's values) and are upcast where they are used, which gives the arithme
 - Each pipeline call is split at `encode_prompt`, the only thing the rest of `__call__` reads from
   the text encoder: an encoder phase runs every case's prompt (fp32 then bf16) with the encoder on
   the GPU and the DiT in host RAM; the encoder is then dropped and a DiT phase replays those
-  outputs with the DiT and the VAE on the GPU (the DiT steps out to host RAM for each VAE decode).
+  outputs with the DiT and the VAE on the GPU, up to the final latents. Last, with the DiT dropped,
+  a decode phase runs the pipeline's own decode tail (`decode_image`): on the GPU at 1024^2, on
+  the host at 2048^2, where the fp32 decode does not fit the GPU budget (33.5 GiB peak working set
+  on the host, 185 s).
 - The VAE's causal feature cache keeps nothing for a single frame (`_NoRetain`).
 
     python record.py run --checkpoint SNAPSHOT_DIR [--out F:/ai/models/ignis-image-2.1-turbo/oracle]
