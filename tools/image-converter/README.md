@@ -89,10 +89,13 @@ The fp32 arithmetic is diffusers' own at about half the memory: the weights stay
 checkpoint's) and the token embedding, the text layers, `lm_head` and the DiT blocks are upcast to
 fp32 in their own forward; everything else is fp32. Each call is split at `encode_prompt`: every
 prompt runs first with the encoder on the GPU, then the encoder is dropped and the DiT phase replays
-them. The VAE keeps no single-frame causal cache. `test_record.py` shows all of it bit-identical to
-`from_pretrained(torch_dtype=float32)` and one call per case. TF32 is off (asserted) and the DiT's
-attention is restricted to the memory-efficient SDPA kernel, which raises rather than fall back to
-a dense fp32 score matrix.
+them up to the final latents; then the DiT is dropped and the pipeline's own decode tail runs with
+the VAE alone, on the host from `--host-decode-from` (2048) pixels a side, where the fp32 decode
+does not fit the GPU budget. The VAE keeps no single-frame causal cache. `test_record.py` shows all
+of it bit-identical to `from_pretrained(torch_dtype=float32)` and one call per case. TF32 is off
+(asserted) and the DiT's attention is restricted to the memory-efficient SDPA kernel, which raises
+rather than fall back to a dense fp32 score matrix. The session needs ~22 GiB of VRAM and, for the
+host decode, 40 GB of free host RAM (`--min-free-ram-gb`); it took 494 s.
 
 ## The conversion
 
