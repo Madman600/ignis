@@ -5,11 +5,11 @@
 //               definitions restated on the host, bit for bit: the Q and K codes and scales, the
 //               V codes in their transposed, permuted layout, the V scales, the zero padding; the
 //               K mean against fp64 (a fixed-order fp32 sum); the target run's mean copied from
-//               the prefix's.
+//               the prefix's; edge blocks of zeros, of 1e-37 and at the floor.
 //   calls       at the DiT's geometry (32 heads of 128, 1024² = 4096 latent tokens per image):
-//               the target over [prefix ; target] for 0, 1 and 10 condition images, image
-//               blocks over their truncated keys, and text segments causal aligned bottom-right,
-//               each call checked two ways:
+//               the target over [prefix ; target] for 0, 1 and 10 condition images (and a 2048²
+//               target, 16,384 queries), image blocks over their truncated keys, and text segments
+//               causal aligned bottom-right, each call checked two ways:
 //     mechanics against fp64 attention on the same quantized, smoothed operands, the bound
 //               derived below. The output is fp32 for this check; the same call with BF16 output
 //               must then be the fp32 output rounded to BF16, bit for bit (and so deterministic).
@@ -19,7 +19,12 @@
 //               and the target run (the prefix's mean, its own V scales), rescaling the
 //               accumulator at the boundary. The mechanics bound holds; the same bound computed
 //               WITHOUT the rescale must fail (a negative control: the check sees a lost
-//               rescale); and quantizing [prefix ; target] as one run instead is reported.
+//               rescale); the prefix run is byte for byte as stored after every call that read
+//               it; and the split's error against fp64 is reported beside that of quantizing
+//               [prefix ; target] as one run, at 0, 1 and 10 images.
+//   inputs      DiT-like (make_sequence), and three harder profiles at 0, 1 and 10 images: a heavy
+//               tail (cosine gated); Q and K outlier channels at 20x, and prefix and target K means
+//               far apart (both measured: the cosine reported, not gated).
 //   refusals    what the op does not take.
 //
 // The mechanics reference replays the kernel's softmax: per 64-key block in the kernel's order,
@@ -29,7 +34,8 @@
 //   P_j = E4M3(2^x_j): ex2.approx is within kExp2Rel of 2^x, so a code differs from the fp64
 //         one only where 2^x_j (1 +- kExp2Rel) straddles an E4M3 rounding midpoint; such a key
 //         adds that ulp * |v| to the numerator's and that ulp to the denominator's error.
-//   the rescale by 2^(m_old - m_new) when the max rises: ex2 again plus one fp32 rounding.
+//   the rescale by 2^fl32(m_old - m_new) when the max rises (the subtraction replayed): ex2
+//         again plus one fp32 rounding.
 //   PV and the row sum (fp32 accumulation on tensor cores): per k32 step 35 * 2^-25 * (|acc| +
 //         error so far + the step's sum |P v|), as the GEMM's bound (bench_mma_peak's probes).
 //   the run boundary: the ratio vscale_A / vscale_B and the product, two fp32 roundings.
@@ -37,7 +43,8 @@
 //         |dO| <= (|dN| + |O| |dD|) / (D - |dD|).
 // The whole bound is multiplied by --bound-factor F (default 1).
 //
-//   ignis_kernel_image_attn_test [--bound-factor F] [--min-cosine C] [--cases edges,small,0,1,10,refusals]
+//   ignis_kernel_image_attn_test [--bound-factor F] [--min-cosine C]
+//                                [--cases edges,small,0,1,10,16k,shift,tail,outliers,refusals]
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
@@ -51,6 +58,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -162,12 +170,38 @@ float gauss(uint32_t stream, uint64_t i) {
   return (static_cast<float>(s) - 510.0f) * (1.0f / 147.8f);
 }
 
+// gauss() with a heavy tail: one value in 256 at 6x, so up to ~20 sigma.
+float heavy(uint32_t stream, uint64_t i) {
+  const float g = gauss(stream, i);
+  return (hash_u32(stream + 1000, i) & 255u) == 0 ? 6.0f * g : g;
+}
+
 enum TokenKind { kText = 0, kImage = 1, kTarget = 2 };
+
+// The inputs beyond the DiT-like default (the review of #319's AC 4):
+//   kTail      a heavy tail on q, k and v (heavy(): up to ~20 sigma).
+//   kOutliers  outlier channels as the GEMM test's "8 channels at 20x": q's channel 37 and k's
+//              channel 91 in heads 0, 4, .., 28, Gaussian. They stretch a 32-row Q block's and a
+//              64-key K block's amax for the other 127 channels.
+//   kKShift    prefix and target K means far apart: in four channel pairs (d, d + 64) per head,
+//              d in {10, 23, 36, 49} (RoPE's rotate-half pairs), an offset of 10 sigma at a
+//              per-head angle for the prefix, rotated by 2 rad for the target (text and target
+//              positions rotate a pair's mean differently). The prefix's mean is then ~17 off in
+//              those channels of every target key.
+enum class Profile { kPlain, kTail, kOutliers, kKShift };
+
+const char *profile_name(Profile p) {
+  return p == Profile::kTail       ? "heavy-tail"
+         : p == Profile::kOutliers ? "outlier-channel"
+         : p == Profile::kKShift   ? "K-means-apart"
+                                   : "DiT-like";
+}
 
 // A joint sequence [prefix ; target] of BF16 q, k, v [tokens][4096] with DiT-like statistics:
 // K with a per-channel mean (what smoothing removes), shifted for text and for the target; V
 // with per-channel scales and offsets, the target's spread 2.5x the prefix's (so the run
-// boundary's rescale matters); Q at a per-head temperature from flat to peaked.
+// boundary's rescale matters); Q at a per-head temperature from flat to peaked. `profile` adds
+// the above.
 struct Sequence {
   std::vector<int> kinds;  // per token
   int prefix = 0, target = 0;
@@ -175,7 +209,8 @@ struct Sequence {
   int tokens() const { return prefix + target; }
 };
 
-Sequence make_sequence(const std::vector<std::pair<TokenKind, int>> &prefix_runs, int target, uint32_t seed) {
+Sequence make_sequence(const std::vector<std::pair<TokenKind, int>> &prefix_runs, int target, uint32_t seed,
+                       Profile profile = Profile::kPlain) {
   Sequence s;
   for (const auto &r : prefix_runs) s.kinds.insert(s.kinds.end(), r.second, r.first);
   s.prefix = static_cast<int>(s.kinds.size());
@@ -194,14 +229,36 @@ Sequence make_sequence(const std::vector<std::pair<TokenKind, int>> &prefix_runs
     vo[i] = hash_uniform(seed + 15, i, 2.0f);
   }
   for (int h = 0; h < kHeads; ++h) qs[h] = 0.5f + 2.5f * std::fabs(hash_uniform(seed + 16, h, 1.0f));
+  // kKShift: the offset of channel d's pair for the prefix (target: rotated by 2 rad).
+  std::vector<float> kshift_prefix(kHD, 0.0f), kshift_target(kHD, 0.0f);
+  if (profile == Profile::kKShift) {
+    for (int h = 0; h < kHeads; ++h) {
+      for (int d : {10, 23, 36, 49}) {
+        const double phi = 3.141592653589793 * hash_uniform(seed + 17, h * kDim + d, 1.0f);
+        kshift_prefix[h * kDim + d] = static_cast<float>(10.0 * std::cos(phi));
+        kshift_prefix[h * kDim + d + 64] = static_cast<float>(10.0 * std::sin(phi));
+        kshift_target[h * kDim + d] = static_cast<float>(10.0 * std::cos(phi + 2.0));
+        kshift_target[h * kDim + d + 64] = static_cast<float>(10.0 * std::sin(phi + 2.0));
+      }
+    }
+  }
+  const bool tail = profile == Profile::kTail, outliers = profile == Profile::kOutliers;
   parallel_for(s.tokens(), [&](int t) {
     const int kind = s.kinds[t];
     for (int i = 0; i < kHD; ++i) {
       const std::size_t at = static_cast<std::size_t>(t) * kHD + i;
       const float shift = kind == kText ? shift_text[i] : kind == kTarget ? shift_target[i] : 0.0f;
-      s.q[at] = f32_to_bf16(qs[i / kDim] * gauss(seed + 1, at));
-      s.k[at] = f32_to_bf16(gauss(seed + 2, at) + mu[i] + shift);
-      s.v[at] = f32_to_bf16(vs[i] * gauss(seed + 3, at) * (kind == kTarget ? 2.5f : 1.0f) + vo[i]);
+      float qx = tail ? heavy(seed + 1, at) : gauss(seed + 1, at);
+      float kx = tail ? heavy(seed + 2, at) : gauss(seed + 2, at);
+      const float vx = tail ? heavy(seed + 3, at) : gauss(seed + 3, at);
+      if (outliers && (i / kDim) % 4 == 0) {
+        qx *= i % kDim == 37 ? 20.0f : 1.0f;
+        kx *= i % kDim == 91 ? 20.0f : 1.0f;
+      }
+      const float kshift = kind == kTarget ? kshift_target[i] : kshift_prefix[i];
+      s.q[at] = f32_to_bf16(qs[i / kDim] * qx);
+      s.k[at] = f32_to_bf16(kx + mu[i] + shift + kshift);
+      s.v[at] = f32_to_bf16(vs[i] * vx * (kind == kTarget ? 2.5f : 1.0f) + vo[i]);
     }
   });
   return s;
@@ -378,6 +435,7 @@ struct Call {
   const Run *b = nullptr;
   int b_first = 0;
   bool causal = false;
+  bool cosine_gated = true;  // false: the cosine against fp64 is reported, not gated
   int keys() const { return a_keys + (b != nullptr ? b->n : 0); }
 };
 
@@ -456,7 +514,7 @@ void mechanics_row(const Call &call, const Q8 &q, const HeadOperands &op, int h,
       }
       const float m_new = std::max(m, std::fmaf(smax, c, -kOffset));
       if (m_new != m) {
-        const double o = std::exp2(static_cast<double>(m) - m_new);  // 0 at the first block
+        const double o = std::exp2(static_cast<double>(f32_sub(m, m_new)));  // fl32(m - m_new), as the kernel; 0 first
         for (int cc = 0; cc < kDim; ++cc) {
           EN[cc] = (EN[cc] + std::fabs(N[cc]) * (kExp2Rel + 0x1p-24)) * o * (1.0 + kExp2Rel);
           N[cc] *= o;
@@ -542,17 +600,20 @@ struct DeviceRun {
   explicit DeviceRun(int tokens) : bytes(ignis_image_attn_kv8_bytes(tokens)), n(tokens) {}
 };
 
-// The rows checked: per head, an odd stride over the call's queries (all of them when few),
-// shifted by the head so the heads together cover every residue mod 128.
+// The rows checked: per head, i * stride + h mod q_tokens for i < want (all rows when few). The
+// stride is the smallest odd number >= (q_tokens - 1) / (want - 1), rounded up, coprime with
+// q_tokens: the rows are distinct and reach the end of the call, and the head's shift makes the
+// heads together cover every residue mod 128.
 std::vector<int> rows_for(int q_tokens, int h, int want) {
   std::vector<int> rows;
   if (q_tokens <= want) {
     for (int i = 0; i < q_tokens; ++i) rows.push_back(i);
     return rows;
   }
-  int stride = (q_tokens - 1) / (want - 1);
-  if (stride % 2 == 0) --stride;
-  for (int i = 0; i < want; ++i) rows.push_back((i * stride + h) % q_tokens);
+  long long stride = (q_tokens - 1 + want - 2) / (want - 1);
+  if (stride % 2 == 0) ++stride;
+  while (std::gcd(stride, static_cast<long long>(q_tokens)) != 1) stride += 2;
+  for (int i = 0; i < want; ++i) rows.push_back(static_cast<int>((i * stride + h) % q_tokens));
   return rows;
 }
 
@@ -561,6 +622,7 @@ struct Verdict {
   double worst = 0.0;
   double min_cos = 1.0, min_centred = 1.0, max_rel_rms = 0.0;
   double median_bound = 0.0;  // the bound over |reference|, median over the checked outputs
+  int worst_head = 0;         // the head with the lowest cosine
 };
 
 Verdict run_call(const Options &o, const Sequence &s, const Call &call, DeviceBytes &d_q8, const DeviceBytes &d_a,
@@ -642,6 +704,7 @@ Verdict run_call(const Options &o, const Sequence &s, const Call &call, DeviceBy
   for (int h = 0; h < kHeads; ++h) {
     v.over += over[h];
     v.worst = std::max(v.worst, worst[h]);
+    if (cosv[h] < v.min_cos) v.worst_head = h;
     v.min_cos = std::min(v.min_cos, cosv[h]);
     v.min_centred = std::min(v.min_centred, centred[h]);
     v.max_rel_rms = std::max(v.max_rel_rms, rel[h]);
@@ -656,12 +719,13 @@ Verdict run_call(const Options &o, const Sequence &s, const Call &call, DeviceBy
               call.what.c_str(), call.q_tokens, call.keys(), call.causal ? " causal" : "", v.worst, v.median_bound, v.over,
               bf16_diff == 0 ? "bit for bit" : "NO");
   if (quant_check) {
-    std::printf("; per head cosine >= %.5f (centred %.5f), rel RMS <= %.4f", v.min_cos, v.min_centred, v.max_rel_rms);
+    std::printf("; per head cosine >= %.5f (head %d; centred %.5f), rel RMS <= %.4f", v.min_cos, v.worst_head,
+                v.min_centred, v.max_rel_rms);
   }
   std::printf("\n");
   check(v.over == 0, call.what + ": within the mechanics bound of fp64 on the quantized operands");
   check(bf16_diff == 0, call.what + ": the BF16 output is the fp32 output rounded, bit for bit");
-  if (quant_check) check(v.min_cos >= o.min_cosine, call.what + ": cosine per head >= --min-cosine");
+  if (quant_check && call.cosine_gated) check(v.min_cos >= o.min_cosine, call.what + ": cosine per head >= --min-cosine");
   return v;
 }
 
@@ -694,10 +758,20 @@ std::vector<Segment> segments_of(const std::vector<std::pair<TokenKind, int>> &r
   return segs;
 }
 
-void case_images(const Options &o, int images, int target, bool all_segments) {
+enum class Segments { kNone, kSome, kAll };
+
+// The calls for `images` condition images and a `target`-token target:
+//   the target over [prefix ; target] as the leaf runs it (the split: the prefix run stored alone,
+//   the target run with the prefix's mean), checked;
+//   the same over [prefix ; target] stored as one run, checked, and the two errors against fp64
+//   on the unquantized inputs reported side by side (the cost of the split, not gated);
+//   the prefix's own segment calls (step 1).
+// The prefix run must come out of all of them byte for byte as it was stored.
+void case_images(const Options &o, int images, int target, Segments segments, Profile profile) {
   const auto layout = prefix_layout(images);
-  const Sequence s = make_sequence(layout, target, 100 + images);
-  std::printf("%d condition image(s): prefix %d tokens, target %d\n", images, s.prefix, s.target);
+  const Sequence s = make_sequence(layout, target, 100 + images, profile);
+  std::printf("%d condition image(s), %s inputs: prefix %d tokens, target %d\n", images, profile_name(profile), s.prefix,
+              s.target);
   DeviceBytes dq(s.q.size() * 2), dk(s.k.size() * 2), dv(s.v.size() * 2);
   upload(dq, s.q);
   upload(dk, s.k);
@@ -711,9 +785,13 @@ void case_images(const Options &o, int images, int target, bool all_segments) {
   const Run rp = download_run(prefix.bytes, s.prefix), rt = download_run(tgt.bytes, s.target);
   check_run(s, 0, rp, nullptr, "prefix");
   check_run(s, s.prefix, rt, &rp, "target (the prefix's mean)");
+  const std::vector<uint8_t> stored = download<uint8_t>(prefix.bytes.p, prefix.bytes.bytes);
 
   DeviceBytes q8(ignis_image_attn_q8_bytes(std::max(s.target, s.prefix)));
-  // The target over [prefix ; target].
+  // The target over [prefix ; target]. Two profiles measure rather than gate the cosine: K means
+  // apart (the split's cost, for spec 04's data to decide) and outlier channels, where the heads
+  // with a 20x channel stay below 0.99 (per-block INT8 Q and K: spec image-model/02 "As built").
+  const bool gated = profile != Profile::kKShift && profile != Profile::kOutliers;
   Call t;
   t.what = "target over [prefix ; target]";
   t.q_first = s.prefix;
@@ -722,10 +800,11 @@ void case_images(const Options &o, int images, int target, bool all_segments) {
   t.a_keys = s.prefix;
   t.b = &rt;
   t.b_first = s.prefix;
-  run_call(o, s, t, q8, prefix.bytes, &tgt.bytes, dq);
+  t.cosine_gated = gated;
+  const Verdict split = run_call(o, s, t, q8, prefix.bytes, &tgt.bytes, dq);
   check_q8(s, s.prefix, download_q8(q8, s.target), "target");
 
-  if (images == 1) {
+  if (images == 1 && profile == Profile::kPlain) {
     // Negative control: the same check without the boundary rescale must fail.
     const Q8 q = download_q8(q8, s.target);
     DeviceBytes d_o(static_cast<std::size_t>(s.target) * kHD * 4);
@@ -750,8 +829,10 @@ void case_images(const Options &o, int images, int target, bool all_segments) {
     std::printf("  negative control: without the boundary rescale, %lld of %lld outputs fall outside the bound\n",
                 over.load(), total.load());
     check(over * 2 > total, "prefix: the mechanics check sees a lost boundary rescale");
+  }
 
-    // [prefix ; target] quantized as one run instead: its own mean and V scales.
+  // [prefix ; target] quantized as one run instead: its own mean and V scales.
+  {
     DeviceRun joint(s.tokens());
     ATT_RC(ignis_image_attn_store_kv(at(dk, 0), at(dv, 0), s.tokens(), kHD, nullptr, 0, joint.bytes.p, nullptr));
     MOE_CUDA(cudaDeviceSynchronize());
@@ -761,26 +842,33 @@ void case_images(const Options &o, int images, int target, bool all_segments) {
     j.a = &rj;
     j.a_keys = s.tokens();
     j.b = nullptr;
-    run_call(o, s, j, q8, joint.bytes, nullptr, dq);
-    // Split against joint, directly.
-    DeviceBytes d_j(static_cast<std::size_t>(s.target) * kHD * 4);
+    const Verdict one = run_call(o, s, j, q8, joint.bytes, nullptr, dq);
+    // Split against one run, directly (the q8 buffer holds the target's queries).
+    DeviceBytes d_s(static_cast<std::size_t>(s.target) * kHD * 4), d_j(static_cast<std::size_t>(s.target) * kHD * 4);
+    ATT_RC(ignis_image_attn(q8.p, s.target, prefix.bytes.p, s.prefix, s.prefix, tgt.bytes.p, s.target, 0, kScale, d_s.p,
+                            kHD, 1, nullptr));
     ATT_RC(ignis_image_attn(q8.p, s.target, joint.bytes.p, s.tokens(), s.tokens(), nullptr, 0, 0, kScale, d_j.p, kHD, 1,
                             nullptr));
+    const auto ys = download<float>(d_s.p, static_cast<std::size_t>(s.target) * kHD);
     const auto yj = download<float>(d_j.p, static_cast<std::size_t>(s.target) * kHD);
     double num = 0, den = 0;
-    for (std::size_t i = 0; i < y.size(); ++i) {
-      num += (y[i] - yj[i]) * (y[i] - yj[i]);
+    for (std::size_t i = 0; i < ys.size(); ++i) {
+      num += (ys[i] - yj[i]) * (ys[i] - yj[i]);
       den += static_cast<double>(yj[i]) * yj[i];
     }
-    std::printf("  split (stored prefix + target run) against one run: relative RMS difference %.4f\n", std::sqrt(num / den));
+    std::printf("  the split's cost, against fp64 on the unquantized inputs: split cosine >= %.5f (centred %.5f), rel RMS "
+                "<= %.4f; one run cosine >= %.5f (centred %.5f), rel RMS <= %.4f; split against one run: rel RMS %.4f\n",
+                split.min_cos, split.min_centred, split.max_rel_rms, one.min_cos, one.min_centred, one.max_rel_rms,
+                std::sqrt(num / den));
   }
 
   // The prefix's own calls (step 1): each segment over the stored prefix truncated at its end.
   const std::vector<Segment> segs = segments_of(layout);
   for (std::size_t si = 0; si < segs.size(); ++si) {
     const Segment &g = segs[si];
-    const bool pick = all_segments || si == 0 || si == 1 || si + 1 == segs.size() || si + 2 == segs.size() ||
-                      (g.text && si == segs.size() / 2);
+    const bool pick = segments == Segments::kAll ||
+                      (segments == Segments::kSome && (si == 0 || si == 1 || si + 1 == segs.size() ||
+                                                       si + 2 == segs.size() || (g.text && si == segs.size() / 2)));
     if (!pick) continue;
     Call c;
     c.what = std::string(g.text ? "text" : "image") + " segment [" + std::to_string(g.start) + ", " + std::to_string(g.end) +
@@ -790,8 +878,15 @@ void case_images(const Options &o, int images, int target, bool all_segments) {
     c.a = &rp;
     c.a_keys = g.end;
     c.causal = g.text;
+    c.cosine_gated = gated;
     run_call(o, s, c, q8, prefix.bytes, nullptr, dq);
   }
+
+  // Storage: the calls only read the prefix run.
+  MOE_CUDA(cudaDeviceSynchronize());
+  const bool same = download<uint8_t>(prefix.bytes.p, prefix.bytes.bytes) == stored;
+  std::printf("  the prefix run after every call that read it: %s\n", same ? "byte for byte as stored" : "CHANGED");
+  check(same, "prefix: the stored run is unchanged by the calls that read it");
 }
 
 // Small, odd sizes: partial blocks everywhere, both runs, truncation, causal with an offset.
@@ -866,13 +961,34 @@ void case_small(const Options &o) {
   run_call(o, s, c5, q8, prefix.bytes, &tgt70.bytes, dq);
 }
 
-// The quantizers' edge rows: a Q block and a V channel of zeros (scale 1, zero codes).
+// The quantizers' edge blocks, each restated bit for bit and its scale pinned:
+//   zeros                    scale 1, zero codes;
+//   every magnitude 1e-37    below the floor: scale 1, zero codes (a regression to `amax > 0`
+//                            would give a subnormal scale and full codes);
+//   every magnitude at the floor (127 * 2^-126 for Q and K, 448 * 2^-126 for V): scale 2^-126.
+// Signs alternate by token, so a head whose keys are all +-a has a K mean of exactly 0 and
+// |k - mean| = a.
 void case_edges() {
   Sequence s = make_sequence({{kText, 100}}, 0, 9);
-  for (int t = 32; t < 64; ++t) {
-    for (int d = 0; d < kDim; ++d) s.q[static_cast<std::size_t>(t) * kHD + 3 * kDim + d] = 0;  // head 3, block 1
+  const float tiny = 1e-37f;
+  auto at = [](int t, int h, int d) { return static_cast<std::size_t>(t) * kHD + h * kDim + d; };
+  auto pm = [](int t, float a) { return f32_to_bf16(t % 2 != 0 ? -a : a); };
+  for (int t = 32; t < 64; ++t) {  // Q block 1 (rows 32..63) of heads 3, 4, 6
+    for (int d = 0; d < kDim; ++d) {
+      s.q[at(t, 3, d)] = 0;
+      s.q[at(t, 4, d)] = pm(t, tiny);
+      s.q[at(t, 6, d)] = pm(t, kInt8MinAmax);
+    }
   }
-  for (int t = 0; t < 100; ++t) s.v[static_cast<std::size_t>(t) * kHD + 5 * kDim + 17] = 0;  // head 5, channel 17
+  for (int t = 0; t < 100; ++t) {
+    for (int d = 0; d < kDim; ++d) {  // every key of heads 9 and 10
+      s.k[at(t, 9, d)] = pm(t, tiny);
+      s.k[at(t, 10, d)] = pm(t, kInt8MinAmax);
+    }
+    s.v[at(t, 5, 17)] = 0;  // V channels
+    s.v[at(t, 6, 17)] = pm(t, tiny);
+    s.v[at(t, 6, 18)] = pm(t, kE4m3MinAmax);
+  }
   DeviceBytes dq(s.q.size() * 2), dk(s.k.size() * 2), dv(s.v.size() * 2);
   upload(dq, s.q);
   upload(dk, s.k);
@@ -886,7 +1002,15 @@ void case_edges() {
   const Q8 q = download_q8(q8, 100);
   check_run(s, 0, r, nullptr, "edges");
   check_q8(s, 0, q, "edges");
+  const float floor_scale = std::ldexp(1.0f, -126);
+  auto kscale = [&](int h, int b) { return r.kscale[static_cast<std::size_t>(h) * (r.n_pad / 64) + b]; };
   check(q.scale(3, 40) == 1.0f && r.vscale[5 * kDim + 17] == 1.0f, "edges: a zero Q block and a zero V channel have scale 1");
+  check(q.scale(4, 40) == 1.0f && kscale(9, 0) == 1.0f && kscale(9, 1) == 1.0f && r.vscale[6 * kDim + 17] == 1.0f,
+        "edges: Q, K and V blocks of 1e-37 have scale 1");
+  check(q.scale(6, 40) == floor_scale && kscale(10, 0) == floor_scale && kscale(10, 1) == floor_scale &&
+            r.vscale[6 * kDim + 18] == floor_scale,
+        "edges: Q, K and V blocks at the floor have scale 2^-126");
+  std::printf("  edge blocks: zeros and 1e-37 at scale 1, the floor at scale 2^-126 (Q, K, V)\n");
 }
 
 void refusals() {
@@ -907,6 +1031,11 @@ void refusals() {
   check(attn(16, 256, 256, nullptr, 0, 0, o.p, kHD + 4) != 0, "attn: an output row stride off 8 refused");
   check(ignis_image_attn(nullptr, 16, kv.p, 256, 256, nullptr, 0, 0, kScale, o.p, kHD, 0, nullptr) != 0,
         "attn: NULL q8 refused");
+  // A negative scale makes max(S) * c the row's minimum (P saturates); 0 makes NaN on masked keys.
+  check(ignis_image_attn(q8.p, 16, kv.p, 256, 256, nullptr, 0, 0, 0.0f, o.p, kHD, 0, nullptr) != 0,
+        "attn: a zero scale refused");
+  check(ignis_image_attn(q8.p, 16, kv.p, 256, 256, nullptr, 0, 0, -kScale, o.p, kHD, 0, nullptr) != 0,
+        "attn: a negative scale refused");
   check(ignis_image_attn_quantize_q(x.p, 0, kHD, q8.p, nullptr) != 0, "quantize_q: zero tokens refused");
   check(ignis_image_attn_quantize_q(static_cast<char *>(x.p) + 8, 16, kHD, q8.p, nullptr) != 0,
         "quantize_q: q off 16 bytes refused");
@@ -934,7 +1063,7 @@ int main(int argc, char **argv) {
   o.min_cosine = arg_double(argc, argv, "--min-cosine", o.min_cosine);
   int devices = 0;
   MOE_CUDA(cudaGetDeviceCount(&devices));
-  std::string cases = "edges,small,0,1,10,refusals";
+  std::string cases = "edges,small,0,1,10,16k,shift,tail,outliers,refusals";
   for (int i = 1; i + 1 < argc; ++i) {
     if (std::strcmp(argv[i], "--cases") == 0) cases = argv[i + 1];
   }
@@ -943,9 +1072,20 @@ int main(int argc, char **argv) {
               cases.c_str());
   if (want("edges")) case_edges();
   if (want("small")) case_small(o);
-  if (want("0")) case_images(o, 0, 4096, true);
-  if (want("1")) case_images(o, 1, 4096, true);
-  if (want("10")) case_images(o, 10, 4096, false);
+  if (want("0")) case_images(o, 0, 4096, Segments::kAll, Profile::kPlain);
+  if (want("1")) case_images(o, 1, 4096, Segments::kAll, Profile::kPlain);
+  if (want("10")) case_images(o, 10, 4096, Segments::kSome, Profile::kPlain);
+  // A 2048² target (16,384 queries), as the bench times it.
+  if (want("16k")) case_images(o, 0, 16384, Segments::kNone, Profile::kPlain);
+  for (int images : {0, 1, 10}) {
+    if (want("shift")) case_images(o, images, 4096, Segments::kNone, Profile::kKShift);
+  }
+  for (int images : {0, 1, 10}) {
+    if (want("tail")) case_images(o, images, 4096, Segments::kNone, Profile::kTail);
+  }
+  for (int images : {0, 1, 10}) {
+    if (want("outliers")) case_images(o, images, 4096, Segments::kNone, Profile::kOutliers);
+  }
   if (want("refusals")) refusals();
   if (g_failed != 0) {
     std::fprintf(stderr, "test_image_attn: %d failure(s)\n", g_failed);

@@ -29,7 +29,8 @@
 //     amax / 448 rather than SA2++'s amax / 2.25 (spec image-model/02 "As built").
 //   - The denominator is the tensor-core row sum of the same E4M3 P that multiply V, not the
 //     fp32 sum of P before rounding: O is a convex combination of the V rows whatever P's
-//     rounding, so V's per-channel offset does not leak into the error.
+//     rounding, so V's per-channel offset does not amplify P's rounding error. The offset still
+//     costs V's own E4M3 resolution: V is not smoothed.
 //   - Two K/V runs per call (the stored condition prefix, then the target), with the fp32
 //     accumulator rescaled per channel by vscale_A / vscale_B when the key loop crosses them.
 //   - Causal aligned bottom-right (query i sees keys 0 .. i + keys - queries), masked on every
@@ -64,11 +65,14 @@ constexpr int kTilesQ = 2;   // m16 tiles per warp (32 query rows)
 constexpr int kTilesK = 4;   // n16 key tiles per block (64 keys)
 constexpr int kTilesV = 8;   // n16 channel tiles (128 channels)
 constexpr int kInnerQK = 4;  // k32 steps over D = 128 INT8
-constexpr float kExpOffset = 8.807f;  // 2^8.807 ~ 448: P's largest value fills E4M3
+constexpr float kExpOffset = 8.807f;  // ~log2 448, SageAttention's: P's largest value fills E4M3 (derived, not tuned)
 // Shared memory: Q, then two K/V stages (the next block's K and V load while this one computes).
 constexpr int kSmemQ = 0, kSmemStage0 = kCtaQ * kAttnDim, kStageBytes = 2 * kCtaK * kAttnDim;
 constexpr int kSmemK = 0, kSmemV = kCtaK * kAttnDim;  // within a stage
 constexpr int kSmemBytes = kSmemStage0 + 2 * kStageBytes;  // 16 + 2 x (8 + 8) KiB = 48 KiB
+// The launch sets no cudaFuncAttributeMaxDynamicSharedMemorySize: more than 48 KiB would need a
+// prepare call, as the GEMM has.
+static_assert(kSmemBytes <= 48 * 1024, "attn8 runs without a prepare call: dynamic shared memory <= 48 KiB");
 constexpr uint32_t kOnesE4m3 = 0x38383838u;  // four E4M3 1.0
 // Q and K tiles use attn_smem.cuh's 128-byte swizzle, V transposed its 64-byte one.
 
@@ -420,7 +424,7 @@ extern "C" int32_t ignis_image_attn(const void *q8, uint32_t q_tokens, const voi
   if (!aligned(q8, 16) || !aligned(kv_a, 16) || (kv_b != nullptr && !aligned(kv_b, 16)) || !aligned(o, 16)) {
     return fail(op + ": q8, the runs and o must be 16-byte aligned");
   }
-  if (!std::isfinite(scale)) return fail(op + ": scale must be finite");
+  if (!std::isfinite(scale) || !(scale > 0.0f)) return fail(op + ": scale must be finite and > 0");
   const Q8Layout ql = q8_layout(q_tokens);
   AttnArgs p{};
   p.q = static_cast<const int8_t *>(q8);

@@ -9,6 +9,12 @@
 //! caller vouches for, so the wrappers are `unsafe`; the shapes and alignments they take are
 //! checked by the leaf.
 //!
+//! The ops are asynchronous on the stream they are given (null: the legacy default stream) and
+//! carry no synchronization. `CudaDevice`'s copies run on its own non-blocking load stream, which
+//! never waits for the legacy stream, so a caller that uploads inputs or reads outputs through
+//! `CudaDevice` orders the copies itself: `moe::stream_sync(null)` after an op, before the copy
+//! that reads its output (as `tests/image_attn_gpu.rs` does).
+//!
 //! An adapted op (ADR 0051, tier 2): the kernel adapts SageAttention2++ (Apache-2.0); provenance
 //! in `kernel/NOTICE`.
 

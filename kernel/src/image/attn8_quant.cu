@@ -125,7 +125,7 @@ __global__ void __launch_bounds__(kStatsThreads) kv_stats_kernel(const __nv_bflo
     const int i = threadIdx.x;
     mean[col + i] = mean_from != nullptr ? mean_from[col + i] : __fdiv_rn(red[0][i][0], static_cast<float>(n));
     const float amax = red[1][i][0];
-    vscale[col + i] = amax >= kAttnE4m3MinAmax ? __fdiv_rn(amax, 448.0f) : 1.0f;
+    vscale[col + i] = e4m3_token_scale(amax);
   }
 }
 

@@ -35,9 +35,10 @@
 // each output's k32 steps in the kernel's order, with S_i the exact prefix sum after step i,
 //   E_i = E_{i-1} + F * 35 * 2^-25 * (|S_{i-1}| + E_{i-1} + sum_{step i} |e4m3(a) e4m3(w)|)
 //   |y - ref| <= E_last * |scales[t] * wscale[r]| + |ref| * (2^-23 + BF16's 2^-8)
-// with F = --bound-factor (default 1). The rows sampled at large token counts span the whole
-// range with an odd stride, covering every residue mod 128, the columns every residue mod 256, so
-// every warp, fragment and lane position of a tile is checked.
+// with F = --bound-factor (default 1). The rows sampled at large token counts reach the end of the
+// range at an odd stride coprime with the count (span_stride), so every token tile is checked and
+// the rows cover every residue mod 128, the columns every residue mod 256: every warp, fragment and
+// lane position of a tile.
 //
 //   ignis_kernel_image_gemm_test [--bound-factor F] [--max-quant-rel-rms R]
 //
@@ -53,6 +54,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -284,20 +286,28 @@ double weight_scale(const std::vector<uint8_t> &payload, int rows, int cols, int
   return bf16_to_f32(s);
 }
 
-// `want` distinct indices in [0, count): all of them when few, else i * stride for i < want, plus
-// the last. The stride is the largest odd number with (want - 1) * stride < count, so the sample
-// spans the whole range and -- an odd stride being invertible mod any power of two -- covers every
-// residue mod a power of two up to `want`.
+// The sampling stride for `want` of `count` indices: the smallest odd number >= (count - 1) /
+// (want - 1), rounded up, that is coprime with count. Then i * stride mod count for i < want are
+// distinct, reach the end of the range, and -- an odd stride being invertible mod any power of
+// two -- cover every residue mod a power of two up to `want` that divides count.
+int span_stride(int count, int want) {
+  int stride = (count - 1 + want - 2) / (want - 1);
+  if (stride % 2 == 0) ++stride;
+  while (std::gcd(stride, count) != 1) stride += 2;
+  return stride;
+}
+
+// `want` distinct indices in [0, count): all of them when few, else i * stride mod count for
+// i < want, plus the last.
 std::vector<int> sample(int count, int want) {
   std::vector<int> s;
   if (count <= want) {
     for (int i = 0; i < count; ++i) s.push_back(i);
     return s;
   }
-  int stride = (count - 1) / (want - 1);
-  if (stride % 2 == 0) --stride;
-  for (int i = 0; i < want; ++i) s.push_back(i * stride);
-  if (s.back() != count - 1) s.push_back(count - 1);
+  const long long stride = span_stride(count, want);
+  for (int i = 0; i < want; ++i) s.push_back(static_cast<int>(i * stride % count));
+  if (std::find(s.begin(), s.end(), count - 1) == s.end()) s.push_back(count - 1);
   return s;
 }
 

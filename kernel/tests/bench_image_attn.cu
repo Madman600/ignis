@@ -1,7 +1,7 @@
 // The 8-bit DiT attention's speed (spec image-model/02 acceptance 4 "Speed", GitHub #319) --
 // OURS. TOPS = 4 * queries * keys * 128 * 32 / time (QK^T and PV, two operations per
-// multiply-add; half that for a causal call), against SageAttention2++'s 5090 bar of ~583-643
-// TOPS for head size 128, non-causal (its 5090_sageattn2++.png, 1K-32K).
+// multiply-add; half that for a causal call), against SageAttention2++'s 5090 bar of ~618-643
+// TOPS for head size 128, non-causal (its 5090_sageattn2++.png, 4K-32K, as the kernel survey reads it).
 //
 //   target   the target's queries over [condition prefix ; target], at 1024² (4096 queries) and
 //            2048² (16384), for 0, 1 and 10 condition images: the call every denoising step

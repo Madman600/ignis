@@ -59,6 +59,18 @@ first denoising step; the result is the same up to rounding.
   - **Positions:** the 3-axis RoPE positions follow diffusers' `pos_embed`
     for the layout. The block and segment structure follows
     `build_token_metadata` and `_qwenimage21_prefix_segments`.
+- **The 8-bit attention's K mean** (spec 02 AC 4). Each step stores the
+  target's K/V run smoothed with the prefix's K mean. That is exact, but the
+  target's INT8 blocks lose resolution when its keys sit far from that mean;
+  with 0 condition images the prefix is ~200 text tokens. Spec 02's "As
+  built" measures the cost on synthetic inputs. If this leaf's real data
+  shows target-K error, the exact alternative is:
+  - the target run gets its own K mean m_t;
+  - the attention adds q · (m_t − m_p) per query, times the softmax scale,
+    to the exponents of run B's keys, so every key is scored as against
+    m_p.
+
+  It is not built; the end-to-end check here decides.
 - **Modulation.** The timestep embedder (256 sinusoidal features, then an MLP)
   gives `temb` at σ, and at 0 for the prefix. One shared linear produces the
   four 4096-wide chunks, scale and gate for attention and for the MLP, that

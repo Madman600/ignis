@@ -60,6 +60,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -316,18 +317,21 @@ void reference_row(const float *q, const KvHead &kv, int i, int tokens, bool cau
 
 // ---- one call, end to end ---------------------------------------------------------------------
 
-// The rows checked: per head, an odd stride over the call's rows (all of them when few), shifted by
-// the head so the heads together cover every residue mod 128, plus the first and last rows, the
-// tile edges 63, 64, 127, 128 and row 5 (head 7's zero query).
+// The rows checked: per head, i * stride + h mod tokens for i < want (all rows when few), the
+// stride the smallest odd number >= (tokens - 1) / (want - 1), rounded up, coprime with tokens (as
+// the 8-bit attention's test): distinct rows reaching the end of the call, the heads together
+// covering every residue mod 128. Plus the first and last rows, the tile edges 63, 64, 127, 128
+// and row 5 (head 7's zero query).
 std::vector<int> rows_for(int tokens, int h, int want) {
   std::vector<int> rows;
   if (tokens <= want) {
     for (int i = 0; i < tokens; ++i) rows.push_back(i);
     return rows;
   }
-  int stride = (tokens - 1) / (want - 1);
-  if (stride % 2 == 0) --stride;
-  for (int i = 0; i < want; ++i) rows.push_back((i * stride + h) % tokens);
+  long long stride = (tokens - 1 + want - 2) / (want - 1);
+  if (stride % 2 == 0) ++stride;
+  while (std::gcd(stride, static_cast<long long>(tokens)) != 1) stride += 2;
+  for (int i = 0; i < want; ++i) rows.push_back(static_cast<int>((i * stride + h) % tokens));
   for (int r : {0, 5, 63, 64, 127, 128, tokens - 1}) {
     if (r < tokens && std::find(rows.begin(), rows.end(), r) == rows.end()) rows.push_back(r);
   }

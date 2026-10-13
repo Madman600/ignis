@@ -8,6 +8,12 @@
 //! argument is a device pointer the caller vouches for, so the wrappers are `unsafe`; the shapes
 //! and alignments they take are checked by the leaf.
 //!
+//! The ops are asynchronous on the stream they are given (null: the legacy default stream) and
+//! carry no synchronization. `CudaDevice`'s copies run on its own non-blocking load stream, which
+//! never waits for the legacy stream, so a caller that uploads inputs or reads outputs through
+//! `CudaDevice` orders the copies itself: `moe::stream_sync(null)` after an op, before the copy
+//! that reads its output (as `tests/image_gemm_gpu.rs` does).
+//!
 //! Our own implementation (ADR 0051, tier 1).
 
 #![cfg(feature = "cuda")]

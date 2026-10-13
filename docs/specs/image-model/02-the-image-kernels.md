@@ -93,10 +93,25 @@ In steps 2-8 only the target's queries run, over [prefix ; target].
        images;
      - the image-segment calls over truncated keys;
      - the text-segment calls with bottom-right causality.
-   - **Prefix handling.** The prefix stored in step 1 and read in step 2 gives
-     the same result as quantizing [prefix ; target] at once within the
-     mechanics bound. This tests the shared K mean and the accumulator
-     rescale.
+   - **Prefix handling.** The target's call over [stored prefix run ; target
+     run] matches fp64 attention on exactly those stored operands within the
+     mechanics bound, for 0, 1 and 10 condition images. The prefix run is
+     quantized alone in step 1, with its own K mean and V scales. The target
+     run is stored with the prefix's K mean and its own V scales. Literal
+     equality with quantizing [prefix ; target] at once cannot hold, because
+     that changes the mean, the V scales and the 64-key blocks. So the seams
+     are tested directly:
+     - **shared K mean:** the target run's mean is the prefix's, byte for
+       byte, and its K codes restate from that mean bit for bit;
+     - **accumulator rescale:** a negative control, the reference computed
+       without the rescale on inputs whose target V spread differs from the
+       prefix's, fails on most outputs;
+     - **storage:** the prefix run is byte-identical after every call that
+       read it;
+     - **cost of the split:** its error against fp64 on the unquantized
+       inputs is reported beside that of one run of [prefix ; target], not
+       gated. This covers 0, 1 and 10 images, including inputs whose prefix
+       and target K means differ strongly.
    - **Speed.** TOPS reported against ~620-640.
 5. The encoder attention (adapted FlashAttention-2):
    - matches fp64 causal GQA 32/8 attention at D=128 for sequences from 1 to
@@ -246,9 +261,14 @@ row scales. Shapes are the real linears (spec.md's model table), rows × cols:
 - 4096 × 12288: down.
 
 Every shape runs at 1, 2, 17, 129, 4096, 16,512 and 41,000 tokens (a
-10-image prefix). At large token counts the check samples 161 rows and 385
-columns, each at an odd stride over the whole range plus the last one, so
-they cover every residue mod 128 and mod 256.
+10-image prefix). At large token counts the check samples 161 token rows and
+385 output columns, i · stride mod count plus the last one. The stride is
+the smallest odd number ≥ (count − 1) / (want − 1), rounded up, that is
+coprime with the count. So the samples are distinct and reach the end of the
+range: every token tile and every output-row tile is compared. The rows
+cover every residue mod 128 and the columns every residue mod 256. Before
+the review fix the stride was rounded down, which left the end of the range
+unsampled: 4096 output rows reached 3447, so tile 14 was never compared.
 
 **The encoder's longest prompt.** It is 10 × 1024 vision slots plus the
 template and the prompt text: about 12,400 tokens with spec 03's longest
@@ -272,12 +292,12 @@ kernel's order. With `S_i` the exact fp64 prefix sum after step `i`:
 | K | per-k32 bound (now) | whole-row Σ\|terms\| bound (before, review's simulation) |
 |---|---|---|
 | 64 | 4.9e-6 | 1.1e-5 |
-| 4096 | 1.26e-4 | 4.9e-3 |
+| 4096 | 1.27e-4 | 4.9e-3 |
 | 12288 | 3.4e-4 | 1.9e-2 |
 
 **Result:** 0 outputs over the bound, at every shape and token count.
-- fp32 outputs use 3-13% of the bound.
-- BF16 outputs use 85-99%; that is BF16's own half ulp.
+- fp32 outputs use 3-14% of the bound.
+- BF16 outputs use 86-99.5%; that is BF16's own half ulp.
 - The six other tile configurations pass the same check at the edge shapes.
 - Run time: about 2 minutes.
 
@@ -390,7 +410,12 @@ accumulation for PV. Both run at the 838 class.
 - **The denominator is the row sum of the same E4M3 P that multiplies V**,
   as an MMA against ones; SA2 sums the fp32 P before rounding. So O is a
   convex combination of V's rows whatever P's rounding, and V's channel
-  offset adds no error. The MMA count rises by 3%.
+  offset does not amplify P's rounding error. The offset still costs V's
+  own E4M3 resolution: the test's channels of spread 0.25 and offset ±2
+  lose about 3 bits. V is not smoothed (the coordinator's call, to revisit
+  only if spec 04's data needs it). With this denominator, smoothing V by a
+  shared per-channel mean would be exact up to D's rounding. The MMA count
+  rises by 3%.
 - **Two K/V runs per call.** When the key loop crosses from run A (the
   stored prefix) to run B (the target), the fp32 accumulator is rescaled
   per channel by vscale_A / vscale_B.
@@ -417,6 +442,20 @@ about 1 GiB per 1024² condition image over 32 layers, as spec'd.
 - Every call takes a stream, allocates nothing, is graph-capturable and is
   deterministic. Q, K, V and O are addressed with a row stride, so the
   fused QKV GEMM's output can be read as it is.
+- `scale` must be finite and > 0 (refused otherwise). A negative scale
+  would turn max(S) · c into the row's minimum, and 0 gives NaN on masked
+  keys.
+- **Two preconditions the op cannot check:**
+  - run B must have been stored with `mean_from` = run A. The kernel never
+    reads the means, so a run B smoothed with another mean gives silently
+    wrong scores;
+  - `mean_from_tokens` must be run A's exact token count. It locates the
+    mean in the run's layout, and a wrong count silently reads another
+    region. Spec 04's prefix handle carries the count.
+- The ops are asynchronous and carry no synchronization. Spec 04's Rust
+  driver orders the `CudaDevice` load-stream copies (noise upload,
+  velocity copy-out) against them itself, with `stream_sync(null)`; the
+  bindings' docs say so.
 
 **Mechanics.** The reference is our own fp64 code on the same quantized,
 smoothed operands (the q8 buffer and the runs, read back). It replays the
@@ -430,7 +469,8 @@ S is exact in int32. What it cannot replay it bounds:
   2^x (PTX ISA); the test takes 2^-20. A key whose 2^x · (1 ± 2^-20)
   straddles a rounding midpoint adds that ulp · |v| to the numerator's
   error and that ulp to the denominator's.
-- **The rescales** when the max rises: ex2 again, plus one rounding.
+- **The rescales** when the max rises: ex2 of fl32(m_old − m_new) (the
+  subtraction replayed as the kernel rounds it), plus one rounding.
 - **PV and the row sum:** per k32 step, 35 · 2^-25 · (|acc| + the error so
   far + Σ|P v|), as in the GEMM.
 - **The run boundary** (two roundings) and **the end** (three).
@@ -450,61 +490,119 @@ inputs are synthetic but DiT-shaped:
   spread is 2.5× the prefix's;
 - Q runs at a per-head temperature from flat to peaked.
 
-The error on real activations comes with spec 01's recordings and spec 04's
-end-to-end test.
+Three harder profiles follow below the main table: a heavy tail, outlier
+channels, and prefix and target K means far apart. The error on real
+activations comes with spec 01's recordings and spec 04's end-to-end test.
 
-**The cases** (`ignis_kernel_image_attn_test`, about 30 s with the fp64
+**The cases** (`ignis_kernel_image_attn_test`, about 75 s with the fp64
 references on 16 threads). Each check covers 64 query rows per head (all
-rows of a smaller call), at an odd stride shifted by head, so the 32 heads
-together cover every residue mod 128. The prefix layouts are:
+rows of a smaller call), i · stride + h mod the call's rows. The stride is
+the smallest odd number ≥ (rows − 1) / 63, rounded up, that is coprime with
+the row count. So the rows are distinct and reach the end of the call, and
+the head's shift makes the 32 heads together cover every residue mod 128.
+Before the review fix the stride was rounded down: 160 queries were checked
+at rows 0-94 only. The prefix layouts are:
 - 0 images: text 200;
 - 1 image: text 20, image 4096, text 160;
 - 10 images: text 20, then image 4096 and text 7 ten times, the last text
   160 (41,203 tokens).
 
-The target is 4096 tokens (1024²). The table gives the worst error over
-the bound, the bound's median over |O|, and the worst head's cosine
-(centred) and relative RMS error:
+The target is 4096 tokens (1024²), and once 16,384 (2048²). The table gives
+the worst error over the bound, the bound's median over |O|, and the worst
+head's cosine (centred) and relative RMS error:
 
 | call | queries × keys | worst / bound | bound / \|O\| | cosine (centred) | rel. RMS |
 |---|---|---|---|---|---|
 | target over [prefix ; target], 0 images | 4096 × 4296 | 0.81 | 1.5e-4 | 0.99950 (0.99831) | 3.2% |
 | target over [prefix ; target], 1 image | 4096 × 8372 | 0.70 | 2.9e-4 | 0.99973 (0.99803) | 2.3% |
 | target over [prefix ; target], 10 images | 4096 × 45,299 | 0.53 | 1.5e-3 | 0.99990 (0.99811) | 1.4% |
+| target over [prefix ; target], 0 images, 2048² | 16,384 × 16,584 | 0.66 | 5.6e-4 | 0.99958 (0.99834) | 2.9% |
 | image block 1 of 1 (truncated keys) | 4096 × 4116 | 0.94 | 1.4e-4 | 0.99985 (0.99802) | 1.7% |
 | image blocks 1 and 10 of 10 | 4096 × 4116 / 41,043 | 0.85 / 0.42 | 1.4e-4 / 1.4e-3 | ≥ 0.99978 (0.99799) | ≤ 2.1% |
-| text segments, causal bottom-right | 7-200 × 20-41,203 | ≤ 0.98 | 4.5e-6-1.4e-3 | ≥ 0.99954 (0.99786) | ≤ 3.0% |
-| small odd sizes (partial blocks, both runs, causal over two runs) | 1-100 × 1-207 | ≤ 0.05 | ≤ 1.8e-5 | ≥ 0.99948 (0.99830) | ≤ 3.2% |
+| text segments, causal bottom-right | 7-200 × 20-41,203 | ≤ 0.98 | 4.5e-6-1.4e-3 | ≥ 0.99954 (0.99779) | ≤ 3.0% |
+| small odd sizes (partial blocks, both runs, causal over two runs) | 1-200 × 1-207 | ≤ 0.04 | ≤ 2.1e-5 | ≥ 0.99950 (0.99825) | ≤ 3.2% |
 
 - **0 outputs over the bound**, in every call.
 - The BF16 output equals the fp32 output rounded, bit for bit, in every call.
 - The quantizers equal their restated definitions bit for bit, padding
   included. The prefix's K mean is within the fp32-sum error of fp64; the
   target's run carries the prefix's mean, byte for byte.
+- **Edge blocks** of Q, K and V check the floors: blocks of zeros and of
+  1e-37 get scale 1 and zero codes, and blocks at the floor (127 · 2^-126
+  for Q and K, 448 · 2^-126 for V) get scale 2^-126. A regression to
+  `amax > 0` fails there.
 - A worst near 1 is one E4M3 rounding flip of P, which the bound adds in
   full. The median shows how tight the bound is: from 5e-6 to 1.5e-3 of
   |O|, growing with the number of k32 steps. That is 10-1000× below the
   quantization error.
+- **What only the small cases pin.** At 4K keys and more, the bound (1e-4
+  to 1.5e-3 of |O|) is 10-100× one key's weight (~2e-5 at 45K keys). So a
+  one-key mask error or an `a_keys` off by one is caught only by the small
+  cases, whose bound is ≤ 2.1e-5 of |O|: one row and one key, the truncated
+  prefix, causal over two runs.
 
-**Prefix handling.** "The prefix stored in step 1 and read in step 2 gives
-the same result as quantizing [prefix ; target] at once within the
-mechanics bound" cannot hold literally. Quantizing the concatenation at once
-gives other operands: one K mean over both, V scales over both, and K blocks
-that straddle the boundary. So the two results differ at the quantization
-level, not the mechanics level. As built:
+**Prefix handling** (AC 4's text above):
 - **The two-run call is checked against fp64 of the operands the split path
   stores**: the prefix's run (its own mean and V scales) and the target's
   run (the prefix's mean, its own V scales), concatenated. That is the
   target rows above. A lost boundary rescale or a second mean would be an
   O(1) error there.
+- **The shared mean:** the target run's mean is the prefix's byte for byte,
+  and its K codes restate from that mean bit for bit.
 - **Negative control:** the same bound computed without the rescale fails
   32,767 of 32,768 outputs (1 image, where the target's V spread is 2.5× the
   prefix's).
-- **The shared mean:** the target run's mean is the prefix's byte for byte,
-  and its K codes restate from that mean bit for bit.
-- **Against one run of [prefix ; target]** (its own mean and scales), the
-  split result differs by a relative RMS of 1.2%. Both reach cosine 0.9997
-  against the unquantized fp64.
+- **Storage:** the prefix run is byte for byte as stored after every call
+  that read it, in every layout and profile.
+- **The cost of the split.** One run of [prefix ; target] has its own mean
+  and V scales; the split is the leaf's layout. Both are checked against
+  their own operands (0 over) and compared to fp64 on the unquantized
+  inputs. Worst head's cosine (centred) and relative RMS:
+
+| inputs | images | split | one run | split vs one run |
+|---|---|---|---|---|
+| DiT-like | 0 | 0.99950 (0.99831), 3.2% | 0.99956 (0.99829), 3.0% | 1.7% |
+| DiT-like | 1 | 0.99973 (0.99803), 2.3% | 0.99970 (0.99807), 2.5% | 1.2% |
+| DiT-like | 10 | 0.99990 (0.99811), 1.4% | 0.99988 (0.99811), 1.6% | 0.5% |
+| DiT-like, 2048² | 0 | 0.99958 (0.99834), 2.9% | 0.99965 (0.99831), 2.6% | 1.3% |
+| K means apart | 0 | 0.99726 (0.99484), 7.9% | 0.99915 (0.99806), 4.1% | 5.0% |
+| K means apart | 1 | 0.99766 (0.99490), 6.9% | 0.99870 (0.99763), 5.1% | 3.9% |
+| K means apart | 10 | 0.99798 (0.99384), 6.4% | 0.99814 (0.99585), 6.1% | 3.2% |
+
+  "K means apart" puts an offset of 10σ in four channel pairs (d, d + 64)
+  per head, at a per-head angle for the prefix, rotated by 2 rad for the
+  target (as RoPE rotates a pair's mean differently at text and target
+  positions). The prefix's mean is then ~17 off in those channels of every
+  target key.
+  - On DiT-like inputs the split costs nothing measurable.
+  - With the means apart it costs most at 0 images (the review's M2). There,
+    a ~200-token text mean smooths 4096 target keys, and the relative RMS
+    error is 7.9% against 4.1% for one run; the cosine still clears 0.99.
+  - This arm is a measurement, not a gate. Spec 04's Seams name the exact
+    fallback if real data shows target-K error: the target run's own mean,
+    plus q · (m_t − m_p) on run B's exponents.
+
+**Harder inputs (the review's M3).** gauss() is an Irwin-Hall sum, bounded
+at ±3.45σ. Two profiles add what stretches a block's amax, each at 0, 1 and
+10 images (split / one run):
+- **A heavy tail** on q, k and v (one value in 256 at 6×, up to ~20σ):
+  cosine ≥ 0.99662 (centred 0.99561), relative RMS ≤ 8.2%. Gated at 0.99,
+  passes.
+- **Outlier channels**, the GEMM test's "8 channels at 20×": q's channel 37
+  and k's channel 91 in heads 0, 4, …, 28, Gaussian.
+  - Mechanics: 0 over the bound.
+  - Accuracy: the worst head is always one of those 8. Its cosine is 0.916
+    / 0.908 at 0 images, 0.939 / 0.952 at 1 and 0.962 / 0.941 at 10, with
+    relative RMS 29-43%. **Below AC 4's 0.99.**
+  - Cause: a 20× channel sets the 32-row Q block's or the 64-key K block's
+    INT8 amax. The other 127 channels keep ~2 levels per σ, so the scores
+    carry noise of ~0.1 × the head's temperature. K's mean smoothing does
+    not help.
+  - Status: the arm is reported, not gated, and is flagged to the
+    coordinator. An exact per-channel Q/K migration scale (q_d / s_d,
+    k_d · s_d, fixed per layer and head) is the known remedy; whether real
+    DiT activations need it is for spec 01's recordings and spec 04's
+    end-to-end check.
 
 **Speed** (2026-10-13, `ignis_image_attn_bench`, GPU lock in timing mode,
 card power limit 575 W). The SM clock and board power are NVML's means over
@@ -536,9 +634,10 @@ A denoising step's 32 attention layers at 1024² take 21.8 ms with 0
 condition images, 38.7 ms with 1 and 189 ms with 10. The quantizers are
 13.5%, 7.6% and 1.6% of that.
 
-**Against the bar (SA2++ on the 5090: 583-643 TOPS from 1K to 32K): 500-573
-TOPS on the bar's own geometry (86-89% of it at 8K-32K), 560-570 at 2048²
-and 489-523 at 1024².**
+**Against the bar (SA2++ on the 5090: 618-643 TOPS from 4K to 32K, the
+survey's figure): 500-573 TOPS on the bar's own geometry (81% at 4K to 89%
+at 32K, taking the bar's low and high ends), 560-570 at 2048² and 489-523 at
+1024².**
 - **Per clock.** Nsight Compute (clocks locked at 2.01 GHz, N = 16,384)
   puts the tensor pipe 72% busy: 233 TOPS/GHz against the 322.8 the bench
   measures for alternating INT8 and FP8 instructions. The stalls are the
@@ -685,9 +784,10 @@ as the fused QKV row:
   rows of NaN: a kernel that read past the sequence would make NaN outputs.
 - Outputs start as NaN.
 
-**Rows checked:** 64 per head at an odd stride shifted by the head, so the
-32 heads together cover every residue mod 128, plus rows 0, 5, 63, 64, 127,
-128 and the last.
+**Rows checked:** 64 per head, as in the 8-bit attention's test: i · stride
++ h mod the row count, the stride odd and coprime with the count. So the rows
+reach the end of the call and the 32 heads together cover every residue mod
+128. Plus rows 0, 5, 63, 64, 127, 128 and the last.
 
 The table gives the worst error over the bound, the bound's median over
 |O|, and the worst head's relative RMS error against plain fp64 (fp32
@@ -696,23 +796,23 @@ output):
 | call | tokens | worst / bound | bound / \|O\| | rel. RMS vs fp64 |
 |---|---|---|---|---|
 | causal, the smallest | 1, 2, 7 | ≤ 0.095 | 1.8e-6 | ≤ 6.7e-4 |
-| causal, tile edges | 63, 64, 65, 127, 128, 129 | 0.913 | 2.9e-6-4.9e-6 | ≤ 5.8e-4 |
-| causal, tile edges, a t2i prompt | 191, 192, 193, 300 | 0.989 | 2.9e-5-3.9e-5 | ≤ 5.4e-4 |
-| causal, a 2,000-token prompt | 2,048 | 0.989 | 2.0e-4 | 3.6e-4 |
-| causal | 4,097 | 0.949 | 2.7e-4 | 3.3e-4 |
-| causal, 10 images and a 2,000-token prompt | 12,400 | 0.740 | 4.4e-4 | 3.0e-4 |
-| causal, the longest 10-image prompt | 41,000 | 0.740 | 8.6e-4 | 2.8e-4 |
+| causal, tile edges | 63, 64, 65, 127, 128, 129 | ≤ 0.989 | 2.9e-6-1.1e-5 | ≤ 5.8e-4 |
+| causal, tile edges, a t2i prompt | 191, 192, 193, 300 | ≤ 0.994 | 2.7e-5-4.8e-5 | ≤ 5.7e-4 |
+| causal, a 2,000-token prompt | 2,048 | 0.913 | 2.1e-4 | 3.8e-4 |
+| causal | 4,097 | 0.971 | 2.7e-4 | 3.5e-4 |
+| causal, 10 images and a 2,000-token prompt | 12,400 | 0.740 | 4.3e-4 | 3.0e-4 |
+| causal, the longest 10-image prompt | 41,000 | 0.740 | 8.3e-4 | 2.9e-4 |
 | non-causal | 1, 65, 300, 4,097 | ≤ 0.989 | 1.8e-6-3.7e-4 | ≤ 6.2e-4 |
 
 - **0 outputs over the bound**, in every call.
 - The BF16 output equals the fp32 output rounded, bit for bit, in every
   call.
 - **The bound is tight.** With `--bound-factor 0.5`, every causal length
-  from 63 up has 27-344 outputs over it, so the bound is within 2× of the
+  from 63 up has 32-411 outputs over it, so the bound is within 2× of the
   worst error at every length. A worst near 1 fits one P rounded to the
   neighbouring BF16 value, which the bound adds in full.
 - The median grows with the number of k16 steps, as the 8-bit attention's
-  does: 8.6e-4 of |O| at 41,000 keys, below BF16's resolution.
+  does: 8.3e-4 of |O| at 41,000 keys, below BF16's resolution.
 
 **Speed** (2026-10-13, `ignis_image_encoder_attn_bench`, GPU lock in timing
 mode, card power limit 575 W). The SM clock and board power are NVML's

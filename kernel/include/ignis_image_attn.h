@@ -87,14 +87,18 @@ int32_t ignis_image_attn_quantize_q(const void *q, uint32_t tokens, uint32_t row
 /* Quantizes BF16 keys and values (same addressing as the queries, one row_stride for both) into
  * the run `kv8` of `tokens` keys. `mean_from` NULL: the run is smoothed with its own K mean;
  * else with the mean stored in the run `mean_from` of `mean_from_tokens` keys (the prefix's, for
- * the target), which is copied into this run. */
+ * the target), which is copied into this run. mean_from_tokens must be that run's exact token
+ * count: it locates the mean in the run's layout, and a wrong count silently reads another region
+ * (spec image-model/04's prefix handle carries the count). */
 int32_t ignis_image_attn_store_kv(const void *k, const void *v, uint32_t tokens, uint32_t row_stride,
                                   const void *mean_from, uint32_t mean_from_tokens, void *kv8, void *stream);
 
 /* O = attention of the q8 buffer's `q_tokens` queries over the first `a_keys` keys of run A
  * (`a_tokens` keys, 1 <= a_keys <= a_tokens) followed by all `b_tokens` keys of run B (NULL and
- * 0 for none; it must share A's mean). `causal`: query i sees keys 0 .. i + (keys - q_tokens),
- * keys = a_keys + b_tokens >= q_tokens. `scale` multiplies q . k (1 / sqrt(128) for the DiT).
+ * 0 for none). Run B must have been stored with mean_from = run A: the kernel never reads the
+ * means, so a run B with another mean gives silently wrong scores. `causal`: query i sees keys
+ * 0 .. i + (keys - q_tokens), keys = a_keys + b_tokens >= q_tokens. `scale` (finite, > 0)
+ * multiplies q . k (1 / sqrt(128) for the DiT).
  * O: token t's head h at o + t * o_row_stride + h * 128, BF16, or fp32 when `o_f32`;
  * o_row_stride >= 4096 and a multiple of 8, `o` 16-byte aligned. */
 int32_t ignis_image_attn(const void *q8, uint32_t q_tokens, const void *kv_a, uint32_t a_tokens, uint32_t a_keys,

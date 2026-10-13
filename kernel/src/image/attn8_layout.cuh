@@ -4,6 +4,8 @@
 #ifndef IGNIS_IMAGE_ATTN8_LAYOUT_CUH
 #define IGNIS_IMAGE_ATTN8_LAYOUT_CUH
 
+#include "fp8_quant.cuh"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -16,8 +18,8 @@ constexpr int kAttnQBlock = 128;  // q8 rows are padded to the attention's query
 constexpr int kAttnQScaleRows = 32;  // one Q scale per warp's 32 rows
 constexpr int kAttnKBlock = 64;  // one K scale per key tile
 
-// E4M3 / INT8 floors: the smallest amax whose scale (amax / 448, amax / 127) is a normal fp32.
-constexpr float kAttnE4m3MinAmax = 0x1.cp-118f;  // 448 * 2^-126
+// The INT8 floor: the smallest amax whose scale amax / 127 is a normal fp32. V's E4M3 floor and
+// scale are the GEMM activations' (fp8_quant.cuh: kE4m3MinAmax, e4m3_token_scale).
 constexpr float kAttnInt8MinAmax = 0x1.fcp-120f;  // 127 * 2^-126
 
 struct Q8Layout {
