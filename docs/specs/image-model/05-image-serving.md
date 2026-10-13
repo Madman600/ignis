@@ -305,3 +305,79 @@ enhancement and the Playground are the agents after it.
 - **Tests.** `crates/server/tests/model_kind.rs` (AC 1, 2, 8 and the
   loader on the converter's synthetic artifact), `config/tests.rs` and
   `tests/config_http.rs` (AC 10), `core::image` and `server::images` units.
+
+## As built (322b, 2026-10-14, branch `image-serving-322`: AC 3-7, 13's OpenAPI)
+
+Against `FakeImageRunner`; prompt enhancement, the catalog, Make, the user
+docs and the Playground are the agents after it.
+
+- **The routes** (`crates/server/src/images/routes.rs`): `create_image`
+  (JSON) and `create_image_edit` (multipart: `image[]`, or `image` for one;
+  the other parts are the JSON fields as text). A request is checked whole
+  before it costs anything — the field table against `image.*`, an edit's
+  images decoded (`media::decode_condition_image`: PNG and WebP keep their
+  alpha, JPEG is opaque, GIF is refused) — and only then
+  `switch_to_named_model`, the pin and `check_served_kind`: a 400 never
+  loads or switches a model. Unknown fields are ignored; OpenAI's `quality`,
+  `style`, `moderation`, `output_compression`, `partial_images` and `user`
+  are named inert in the operation. `auto` is the size in `image.sizes`
+  whose ratio is nearest on the log scale (1 for a generation, the last
+  condition image's for an edit), the larger on a tie. The response adds
+  OpenAI's `size` (`auto` resolved), `background` and `output_format` to the
+  spec's fields. The edit route has the media body limit (384 MiB) on every
+  load.
+- **Images and seeds.** RGBA 8-bit PNG (`png`). `opaque` is
+  `(c·a + 255·(255 − a) + 127) / 255`, alpha 255. Image `i` starts from
+  `TargetLatents::noise(size, seed + i)` (core: splitmix64's stream,
+  Box–Muller). A request without a seed takes `server.seedless_seed`, else a
+  drawn one, and it is returned.
+- **The condition budget** (`images/budget.rs`). `condition_size` is
+  diffusers' `calculate_dimensions` (halves to even; a side is never 0).
+  A prefix holds `ImageRunner::prompt_tokens(prompt, images)` plus
+  `(W / 16) · (H / 16)` per image. Over the budget
+  (`min(plan, image.condition_budget_tokens)`), every image gets the same
+  area s², s the largest in [floor, 1024] that fits (bisected: the tokens
+  only grow with s); below the floor `400 condition_budget_exceeded`
+  (`param` `image`, or `prompt` for a generation). The resize is
+  `media::resize_rgba`, Pillow's Lanczos on `RGBa` in Pillow's fixed point,
+  byte-equal to Pillow 12.3 on three committed fixtures.
+- **A new runner call:** `ImageRunner::prompt_tokens`. The runner holds the
+  image model's tokenizer, so the server asks it for the prompt's tokens
+  around the images. #321 implements it with the template's count without
+  the image pads, the same count `encode_condition` refuses by.
+- **The queue** (`images/mod.rs`). `ImageJobs` is a ticket queue under a
+  lock. `admit(depth)` admits while waiting + running ≤ `image.queue_depth`;
+  past it the answer is `503 engine_full` with `Retry-After: 1`, and on a
+  closed queue `503 model_stopped`. `Waiting::turn()` runs the jobs in the
+  order they were admitted, not the order they ask, and gives `None` once the
+  queue is closed. `wait()` / `start()` keep 322a's counting meaning.
+- **The job** (`images/job.rs`). `spawn` waits for the turn and also
+  watches the request: a waiting job whose request went away leaves the
+  queue at once. `run` (blocking) encodes once, then for each image: noise,
+  steps, decode, PNG. It holds `with_runner` for one call at a time. Between
+  calls a closed queue ends it `Stopped`, and a channel with no reader ends
+  it `Cancelled`. `Held` releases the prefix on every path. The job leaves
+  the count before its request hears that it ended.
+- **Answers.**
+  - Not streaming: `200` with the JSON body; `503 model_stopped` with
+    `Retry-After`; `500 engine_error` when the runner refuses a call.
+  - Streaming: `event: <type>` and a `data:` object. Generations send
+    `image_generation.progress` and `.completed`; edits send
+    `image_edit.progress` and `.completed`, OpenAI's names for the edit
+    route (the spec says `image_generation.*` for both).
+  - A progress event announces a unit as it starts: encoding 1/1, then for
+    each image denoising k/total and decoding 1/1. A job that ends early
+    sends one `error` event (`{type, error}`). No `[DONE]`.
+- **OpenAPI.** An `images` tag and both routes, the edit as a multipart
+  `EditForm`. `ImageStreamEvent` is oneOf progress / completed / error, and
+  `Phase` lists all six phases.
+- **Not applied.** `server.request_timeout` (a text knob, 30 s by default)
+  does not bound an image request. `prompt_enhancement` is parsed and has no
+  effect until 322c.
+- **Tests.**
+  - `crates/server/tests/images_http.rs`: AC 3-7, the `409` with a text
+    model loaded, and the edit's body limit.
+  - Unit tests in `images::{budget, job, routes}`, the queue's in `images`,
+    `media` (the Pillow fixtures), `vision::decode` (RGBA), and `core::image`
+    (the noise and `prompt_tokens`).
+  - `tests/openapi_http.rs`: AC 13's OpenAPI part.
