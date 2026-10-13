@@ -772,3 +772,13 @@ target_compile_definitions(ignis_kernel_flash_next_sparse_attention_hq_test PRIV
 add_executable(ignis_mma_peak_bench bench_mma_peak.cu)
 target_include_directories(ignis_mma_peak_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_mma_peak_bench PRIVATE CUDA::cudart)
+# The FP8 W8A8 GEMM and the per-token activation quantization (acceptance 2 and 3,
+# kernel/include/ignis_image_gemm.h) against our own fp64 references at the DiT's and the text
+# encoder's linear shapes. GPU (ADR 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_image_gemm_test test_image_gemm.cu)
+target_link_libraries(ignis_kernel_image_gemm_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_image_gemm_test COMMAND ignis_kernel_image_gemm_test)
+# Its speed at the DiT's shapes (acceptance 2 "Speed") and the standalone quantization's cost
+# (acceptance 3). A timing is a finding: a tool, NOT registered with CTest.
+add_executable(ignis_image_gemm_bench bench_image_gemm.cu)
+target_link_libraries(ignis_image_gemm_bench PRIVATE ignis_kernel ignis_vendor CUDA::nvml)
