@@ -14,8 +14,8 @@
  * taps (ky, kx) in order and, within a tap, the input channels in order, in k16 MMA steps: that
  * fixed order per output makes every call deterministic, and an output does not depend on which
  * call or band computed it. The epilogue adds the bias and the residual in fp32, one rounding
- * each, and rounds once to the output type. (diffusers rounds the convolution to BF16 before it
- * adds the residual in BF16: the fused add is one rounding fewer.) The kinds are the VAE's:
+ * each, and rounds once to the output type. (diffusers' BF16 path rounds between the convolution,
+ * the bias and the residual add; the fused epilogue skips those roundings.) The kinds are the VAE's:
  *   IGNIS_IMAGE_VAE_CONV_3X3     3 x 3, stride 1, zero padding 1 (resnets, conv_in, conv_out,
  *                                and with `upsample` the decoder's resample: nearest-exact 2x of
  *                                the input first, read in place, never materialized);

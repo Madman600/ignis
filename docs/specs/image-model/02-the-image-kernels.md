@@ -1013,9 +1013,10 @@ temporal is left.
 - **Epilogue:** the bias and then the residual are added in fp32, one
   rounding each, then one rounding to the output type (BF16 for the leaf,
   fp32 for the test).
-  - **This differs from diffusers.** diffusers rounds the convolution to
-    BF16 before it adds the residual (`x + h`) in BF16; the fused add skips
-    that rounding.
+  - **This differs from diffusers.** diffusers' BF16 path rounds the
+    convolution (and, unless cuDNN fuses it, the bias add) to BF16 before
+    it adds the residual (`x + h`) in BF16; the fused epilogue skips those
+    intermediate roundings.
   - So spec 04's PSNR comparison sees this op's rounding, not diffusers'.
 - **Weights** are packed once at load, from PyTorch's [out][in][ky][kx] (the
   artifact's BF16 tensors as they are) to [out][ky][kx][in]
