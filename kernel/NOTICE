@@ -52,7 +52,9 @@ The image model's 8-bit DiT attention kernel (`ignis_image_attn`).
   cp_async,mma}.cuh`, "Copyright (c) 2023 by FlashInfer team", Apache-2.0):
   the shared-memory swizzles, cp.async and ldmatrix. They now live in
   `kernel/src/image/attn_smem.cuh`, whose header gives the same chain, and
-  the encoder attention below uses them too.
+  the encoder attention below uses them too, as does the VAE convolution
+  (`kernel/src/image/vae_conv.cu`, otherwise our own: spec image-model/02
+  acceptance 6).
 - Changed here: torch removed, one geometry (D = 128, 32 heads), FP32
   accumulation on `kind::mxf8f6f4`, the row sum of the E4M3 P, two K/V runs
   with a per-channel rescale, causal aligned bottom-right. The file header

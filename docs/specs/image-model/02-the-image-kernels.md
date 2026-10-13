@@ -22,10 +22,10 @@ each with a reference test at the image model's real geometry.
 | linears | FP8 W8A8 GEMM: activations quantized per token to E4M3, weights per output row, FP32 accumulate, row × column scale epilogue | extends `ignis_fp8_linear`'s `mma.sync` path. CUTLASS 2.x sm80 multistage and vLLM's `scaled_mm_sm120` as reading | our own |
 | DiT attention | SageAttention2++: Q/K INT8 with K smoothing, V FP8 per channel, PV FP8 with FP16 accumulate folded into FP32, D=128, 32 heads | `thu-ml/SageAttention`, `csrc/qattn` sm89/sm120 path, torch removed (Apache-2.0) | adapted |
 | encoder attention | FlashAttention-2 forward, bf16, causal, GQA 32/8, D=128 | `Dao-AILab/flash-attention` `csrc/flash_attn/src`: structure and softmax forms, raw PTX (BSD-3) | adapted |
-| VAE convolution | implicit-GEMM conv2d, bf16, the shapes in spec 01's `conversion.json` (3×3 stride 1 pad 1, 3×3 stride 2 after a (0,1,0,1) pad, 1×1) | CUTLASS 2.x Ampere implicit-GEMM fprop and ggml `conv2d_implicit_gemm` as reading or source (BSD-3 / MIT) | ours or adapted |
+| VAE convolution | implicit-GEMM conv2d, bf16, the shapes in spec 01's `conversion.json` (3×3 stride 1 pad 1, 3×3 stride 2 after a (0,1,0,1) pad, 1×1) | written from our FP8 GEMM; CUTLASS 2.x's implicit-GEMM fprop and ggml's `conv2d_implicit_gemm` (BSD-3 / MIT) were allowed, neither was used | our own |
 | VAE mid-block attention | one head, D = 768 (encoder) / 1152 (decoder), over the latent grid: row-tiled QKᵀ, softmax, PV on the bf16 GEMM, with a fixed workspace | — | our own |
 | DiT elementwise | LayerNorm without affine × (1 + scale), with the per-token choice of the t row or the t=0 row; `x + tanh(gate) · y`; QK RMSNorm + 3-axis RoPE (complex form, adjacent pairs); SwiGLU; GELU-tanh; zero-centred RMSNorm (w + 1) | our existing norm/RoPE ops extended. FlashInfer `fused_dit_layernorm.cuh` and `fused_qk_rmsnorm_rope.cuh` as reading or source (Apache-2.0) | ours or adapted |
-| VAE elementwise | channel RMS norm, SiLU, nearest-exact 2× upsample, the AvgDown / DupUp shortcuts | — | our own |
+| VAE elementwise | channel RMS norm, SiLU (AC 7); the nearest-exact 2× upsample (fused into the convolution's gather) and the AvgDown / DupUp shortcuts (AC 6) | — | our own |
 | sampler | Euler update `x += (σ_next − σ) · v` on the device | — | our own |
 
 **The GEMM's inner instruction is measured, not assumed.** One single source
@@ -639,23 +639,27 @@ Per head, against fp64 on the unquantized inputs:
 
 | calls | heads | cosine min / p1 / median | centred min / p1 / median | rel. RMS median / max |
 |---|---|---|---|---|
-| target over [prefix ; target], the split | 384 | 0.99877 / 0.99908 / 0.99984 | 0.98524 / 0.99106 / 0.99975 | 1.8% / 5.4% |
-| the same, one run | 384 | 0.99878 / 0.99908 / 0.99983 | 0.98269 / 0.99208 / 0.99974 | 1.9% / 5.3% |
-| prefix segments (step 0) | 384 | 0.99796 / 0.99888 / 0.99967 | −0.148 / 0.540 / 0.99943 | 2.6% / 8.9% |
+| target over [prefix ; target], the split | 384 | 0.99878 / 0.99911 / 0.99984 | 0.98515 / 0.99105 / 0.99975 | 1.8% / 5.4% |
+| the same, one run | 384 | 0.99879 / 0.99908 / 0.99983 | 0.98284 / 0.99199 / 0.99974 | 1.9% / 5.3% |
+| prefix segments (step 0) | 384 | 0.99796 / 0.99888 / 0.99967 | −0.147 / 0.000 / 0.99953 | 2.6% / 8.9% |
+
+Re-measured 2026-10-14, after the review fix that adds each call's last row
+to the rows checked: the cosines moved in the fourth decimal, and the
+low-spread heads below (whose centred cosine is noise) from 11 to 15.
 
 - Mechanics: 0 outputs over the bound in all 36 calls (worst 0.998 of
   it). The BF16 output equals the fp32 output rounded in every call. Every
   run and q8 buffer matches its definition bit for bit.
 - **No head is below 0.99.** The worst is 0.99796, an 8-token text segment
-  (edit, block 15, head 13). On the target calls it is 0.99877 (t2i,
+  (edit, block 15, head 13). On the target calls it is 0.99878 (t2i,
   step 4, block 0, head 28).
 - **The centred cosine falls below 0.99 only where the output barely varies
   from one query to the next.** The test reports that share as *spread*:
   the reference's norm with each channel's mean over the rows removed,
   over its whole norm.
-  - 11 heads of the edit image block at block 0 have a spread of 0.01-1.6%
+  - 15 heads of the edit image block at block 0 have a spread of 0.00-2.2%
     of |O|, and their centred cosine falls as low as −0.15.
-  - In 7 of them the spread is ≤ 0.15%, below one BF16 rounding of O (2^-9
+  - In 11 of them the spread is ≤ 0.15%, below one BF16 rounding of O (2^-9
     ≈ 0.2%), so the bf16 pipeline cannot hold that part either. Their
     error is the usual 2-3.4% of |O|.
   - Three heads with a spread of 7-13% sit at 0.985-0.989: head 7 of that
@@ -954,5 +958,289 @@ test drives the bindings, each call against fp64 computed in Rust:
 - fp32 and BF16 output, into a strided O;
 - Q, K and V from the fused row and from separate buffers;
 - a refusal, which comes back with the leaf's message.
+
+The bench is a tool.
+
+### The VAE ops (AC 6)
+
+**Where.**
+- ABI: `kernel/include/ignis_image_vae.h`: `ignis_image_vae_pack_conv_weight`,
+  `ignis_image_vae_conv`, `ignis_image_vae_shortcut`,
+  `ignis_image_vae_attn_workspace_bytes`, `ignis_image_vae_attn`,
+  `ignis_image_vae_last_error`.
+- Code: `kernel/src/image/vae_conv.cu` (with `vae_conv.cuh`, the GEMM the
+  attention shares), `vae_shortcut.cu`, `vae_attn.cu`. All our own (ADR 0051
+  tier 1). The convolution is written from the FP8 GEMM above; no
+  convolution source (CUTLASS 2.x's fprop, ggml's `conv2d_implicit_gemm`)
+  was read or copied. It includes `attn_smem.cuh`'s shared-memory helpers
+  (FlashInfer through SageAttention, Apache-2.0), and `kernel/NOTICE`'s
+  entry for them now names it.
+- Tests: the CTest `ignis_kernel_image_vae_test`
+  (`kernel/tests/test_image_vae.cu`, about 13 s) with the fixture
+  `kernel/tests/fixtures/image_vae/` (`record.py`, `shortcuts.bin`,
+  `provenance.json`), and the Rust `--ignored` test
+  `crates/core/tests/image_vae_gpu.rs` (bindings in
+  `crates/core/src/image_vae.rs`). Speed: `ignis_image_vae_bench`
+  (`kernel/tests/bench_image_vae.cu`, a tool).
+
+**Layout.** Activations are one image, BF16, NHWC. A band of whole rows is
+one contiguous range, which is what spec 04's banded 2048² decode needs, and
+the per-pixel channel norm (AC 7) reads one contiguous row. In diffusers'
+`AutoencoderKLQwenImage21` every causal 3D convolution of a single frame is
+already a 2D one (`QwenImage21CausalConv3d` is an `nn.Conv2d`), so nothing
+temporal is left.
+
+**The convolution.**
+- **An implicit GEMM:** rows are output pixels, columns output channels. The
+  reduction runs over the taps (ky, kx) in order and, within a tap, over the
+  input channels in order, in k16 MMA steps (BF16 `mma.sync` m16n8k16, fp32
+  accumulation).
+- **Tile:** 128 pixels × 96 channels, 8 warps of 32 × 48, 32 BF16 of the
+  reduction per stage, 3 cp.async stages. That is 42 KiB, so no prepare call
+  and two CTAs an SM, at 99-102 registers. 96 divides every VAE channel count
+  but 4, 64, 128 and 144.
+- **The gather:** each thread keeps its pixels' receptive-field corners and
+  walks its (tap, channel) position one stage at a time, loading 16-byte
+  pieces of 8 channels. The RGBA input of the encoder's `conv_in` (4
+  channels) takes 8-byte pieces. Pieces in the padding, past the image or
+  past the reduction are zero-filled and never read.
+- **The kinds:** 3 × 3 stride 1 pad 1; 3 × 3 stride 2 after the (0, 1, 0, 1)
+  pad, which is the right column and the bottom row; and 1 × 1.
+- **The upsample is fused.** With `upsample` the gather reads pixel
+  (iy >> 1, ix >> 1) for position (iy, ix) of the 2× grid: PyTorch's
+  nearest-exact 2×, never materialized. At 2048² the up3 resample's
+  upsampled input would be 2048² × 288 BF16, 2.4 GB.
+- **Epilogue:** the bias and then the residual are added in fp32, one
+  rounding each, then one rounding to the output type (BF16 for the leaf,
+  fp32 for the test).
+  - **This differs from diffusers.** diffusers rounds the convolution to
+    BF16 before it adds the residual (`x + h`) in BF16; the fused add skips
+    that rounding.
+  - So spec 04's PSNR comparison sees this op's rounding, not diffusers'.
+- **Weights** are packed once at load, from PyTorch's [out][in][ky][kx] (the
+  artifact's BF16 tensors as they are) to [out][ky][kx][in]
+  (`ignis_image_vae_pack_conv_weight`).
+- **Row windows for bands:**
+  - x holds input rows [x_row0, x_row0 + x_rows) and the call writes output
+    rows [y_row0, y_row0 + y_rows).
+  - Padding is decided by the global row, so a band whose x holds its halo
+    computes exactly what the whole image does.
+  - A window missing a row the outputs read is refused, naming both ranges.
+- **Deterministic:** each output's reduction order does not depend on the
+  tile, the call or the band.
+
+**Mechanics.** The reference is our own fp64 conv2d of the BF16 operands,
+walked in the kernel's reduction order. The bound is the GEMM's, per k16 step
+(the instruction bench's BF16 probes, P4 = 25):
+`E_i = E_{i−1} + 19 · 2^-25 · (|S_{i−1}| + E_{i−1} + Σ_step |x w|)`, then one
+fp32 rounding for the bias add and one for the residual add.
+- **Shapes:** spec 01's `conversion.json` lists 88 VAE convolutions. Grouped
+  by kind, upsample, channels and stage, they are 46 distinct calls, each run
+  at a 1024² and a 2048² image.
+- **The preset:** five calls also run at the 2752 × 1536 preset, in both
+  orientations, so a swapped height and width shows. They are `conv_in`,
+  the up0 resample, a stride-2 downsample, a 1 × 1 shortcut and `conv_out`
+  at 2752 × 1536.
+- **The `time_conv`s:** the eight 1 × 1 `time_conv` weights never run for
+  one frame (diffusers' resample skips them on the first chunk). They are
+  covered as shapes all the same.
+- **Pixels checked:** each call compares the corners, the edge midpoints and
+  128 pixels at an odd stride coprime with the pixel count, with every output
+  channel. The 128 cover every position of a 128-pixel tile. The weights go
+  through the pack op, checked against the packing restated in the test, bit
+  for bit.
+- **Guards:**
+  - x sits between rows of NaN, the packed weight has a NaN row after it,
+    and the outputs start as NaN;
+  - NaN outputs are counted over the whole output on the device, as are
+    BF16 outputs that differ from the fp32 ones rounded.
+
+Results, over all 102 calls:
+- **0 outputs over the bound.** The worst error is 0.05-0.08 of the bound.
+  The bound over |y| has a median of 4.6e-6 to 3.1e-4, growing with the
+  reduction length.
+- **BF16 == RN(fp32)** over every output, bit for bit, and **0 NaN**.
+- **Why 0.05-0.08 and not near 1.** The bound is a worst case per step,
+  while the real errors random-walk, as in the GEMM's test (3-14%).
+  - With `--bound-factor 0.05`, every one of the 46 shapes at 1024² has
+    outputs over it, so the bound is within 20× of the worst error.
+  - One wrong term (one channel of one tap) is about 1/√K of |y|, 1% at
+    K = 10,368, which is 30-2000× the bound.
+
+**Bands and the upsample.**
+- **Bands:** three calls are computed as three uneven bands of output rows,
+  each from a copy of only the input rows it reads (between NaN rows):
+  - the 144-channel resnet with its residual;
+  - the 576-channel upsampling resample;
+  - the 384-channel stride-2 downsample.
+
+  At a 1024² image and at the preset, the banded output equals the
+  whole-image call bit for bit. In each, the two bands with a top halo are
+  refused when x lacks one halo row.
+- **The fused upsample** (the 288-channel resample at 1024²) equals the
+  same convolution over the input upsampled by the restated nearest-exact
+  2×, bit for bit. That restatement is PyTorch's (the fixture below).
+
+**The shortcuts** (`QwenImage21AvgDown3D` and `QwenImage21DupUp3D` for one
+frame; the header has the index formulas).
+- **One frame:**
+  - With factor_t = 2 the frame is the last slot: AvgDown's front padding
+    puts a zero frame first, and DupUp's `first_chunk` slice keeps the last.
+  - So for AvgDown(96 → 192), output channel 2c is the mean of zeros and
+    2c + 1 the 2 × 2 mean of channel c.
+  - DupUp copies one source channel per sub-pixel.
+- **The arithmetic:** AvgDown's mean is an fp32 sum from 0 in group order,
+  then one division by the group. In BF16 the shortcut is rounded once.
+  With `accumulate` the op adds it into y as diffusers' BF16 add does:
+  RN(y + RN(s)).
+- **The fixture is PyTorch's own outputs.** `record.py` runs diffusers'
+  modules (torch 2.13.0+cu130, diffusers 0.41.0, CPU, one thread) at every
+  channel configuration the VAE uses:
+  - AvgDown 96 → 96, 96 → 192, 192 → 384, 384 → 768 and the identity
+    768 → 768;
+  - DupUp 1152 → 1152, 1152 → 576 and 576 → 288;
+  - the upsample.
+
+  The configurations are on small spatial sizes. Inputs span a wide range,
+  with signed zeros and subnormals, so a different summation order would
+  show.
+  - The test's restatement equals PyTorch's fp32 outputs, and its BF16
+    rounding equals PyTorch's BF16 outputs, bit for bit.
+  - The op does too: fp32 bit for bit, and BF16 bit for bit (the gate is one
+    BF16 rounding).
+- **At the real stage sizes** (the 9 configurations at 1024² and 2048², two
+  at the preset), the op equals the restatement bit for bit on six whole
+  output rows per call. The accumulating form equals RN(y + RN(s)) bit for
+  bit.
+
+**The mid-block attention.**
+- **Three passes per tile** of `row_tile` query rows, on a fixed workspace:
+  - S = Q Kᵀ in fp32: the convolution's GEMM as a 1 × 1 convolution over
+    the q rows, with the k rows as weight rows, both at stride 3·dim;
+  - a softmax kernel, one CTA per row:
+    - P = BF16(2^(S · c − fl(max S · c))), with c = fl32(scale · log2 e),
+      one FMA and ex2.approx;
+    - zeros past the tokens;
+    - 1 / D, where D is the fp32 sum of the BF16 P in a fixed order: each
+      thread's columns in order, a warp butterfly, then the 8 warps in
+      order;
+  - O = (P V) · (1 / D): the GEMM again, against Vᵀ (transposed once per
+    call, zero-padded to n8 = tokens rounded up to 8), with 1 / D as a row
+    scale in the epilogue.
+- **Determinism:** a row's output does not depend on the tile it falls in.
+- **Workspace:** Vᵀ [dim][n8] BF16, S [row_tile][n8] fp32, P [row_tile][n8]
+  BF16 and 1 / D, each 256-byte aligned. The leaf picks `row_tile`; the
+  bench below gives the trade.
+- **Mechanics:** the replay of the encoder attention's test, without the
+  online max:
+  - S per k16 step as above;
+  - the kernel's max within em of the replay's;
+  - P's BF16 interval from ex2's 2^-20, its width counted where it holds two
+    values;
+  - PV per k16 step;
+  - the row sum with (n8 / 256 + 12) fp32 roundings;
+  - 1 / D and the product, one rounding each.
+- **Guards:** qkv sits before rows of NaN, and the workspace and the outputs
+  start as NaN, so the zero padding the kernels must write is checked.
+
+| D | latent (tokens) | row tiles | worst / bound | bound / \|O\| | rel. RMS vs fp64 |
+|---|---|---|---|---|---|
+| 768 | 1 × 1, 1 × 7 | 1024 / 1000, 4 / 3 | ≤ 0.14 | 1.5e-6-2.9e-6 | ≤ 3.3e-4 |
+| 768 | 63 × 65 (4095), 64 × 64 | 1024 / 1000 | 0.46 / 0.35 | 6.5e-4 / 8.0e-4 | ≤ 2.9e-4 |
+| 768 | 128 × 128 (16,384) | 2048 / 1000 | 0.42 | 1.1e-3 | 3.0e-4 |
+| 1152 | 1 × 1, 1 × 7 | 1024 / 1000, 4 / 3 | ≤ 0.15 | 1.5e-6-1.7e-6 | ≤ 4.2e-4 |
+| 1152 | 63 × 65 (4095), 64 × 64 | 1024 / 1000 | 0.27 / 0.25 | 1.4e-3 | ≤ 3.2e-4 |
+| 1152 | 128 × 128 (16,384) | 2048 / 1000 | 0.40 | 1.8e-3 | 3.4e-4 |
+| 1152 | 96 × 172 (16,512, the preset) | 2048 / 1000 | 0.41 | 1.5e-3 | 3.2e-4 |
+
+- **0 outputs over the bound**, the BF16 output equals the fp32 output
+  rounded, and the two row tiles (one leaving a partial last tile) give the
+  same output, bit for bit, in every call. 0 NaN.
+- With `--bound-factor 0.5` the worst reaches 0.92 of the halved bound.
+- Relative RMS error against plain fp64 is ≤ 4.2e-4 (gate `--max-rel-rms`,
+  default 2^-8).
+
+**Speed** (2026-10-14, `ignis_image_vae_bench`, GPU lock in timing mode, card
+power limit 575 W; SM clock and board power are NVML's means over the second
+half of a window of at least 1 s). TFLOPS = 2 · output pixels · out · k² · in
+/ time, BF16 out.
+
+| call (decoder, 2048²) | at | in → out | ms | TFLOPS | SM clock | board |
+|---|---|---|---|---|---|---|
+| mid / up0 resnet | 128² | 1152 → 1152 | 2.435 | 161 | 2705 MHz | 571 W |
+| up1 resnet | 256² | 1152 → 1152 | 8.618 | 182 | 2636 MHz | 575 W |
+| up1 resample (upsample) | 256² → 512² | 1152 → 1152 | 33.81 | 185 | 2629 MHz | 576 W |
+| up2 resnet | 512² | 576 → 576 | 8.607 | 182 | 2607 MHz | 575 W |
+| up2 resample (upsample) | 512² → 1024² | 576 → 576 | 34.04 | 184 | 2617 MHz | 575 W |
+| up3 resnet | 1024² | 288 → 288 | 9.359 | 167 | 2670 MHz | 571 W |
+| up3 resample (upsample) | 1024² → 2048² | 288 → 288 | 35.98 | 174 | 2644 MHz | 577 W |
+| up4 conv1 | 2048² | 288 → 144 | 21.83 | 143 | 2599 MHz | 578 W |
+| up4 resnet | 2048² | 144 → 144 | 11.29 | 139 | 2580 MHz | 575 W |
+| up4 conv_shortcut (1 × 1) | 2048² | 288 → 144 | 3.102 | 112 | 2235 MHz | 575 W |
+| conv_out | 2048² | 144 → 4 | 5.144 | 8.5 | 2797 MHz | 575 W |
+
+Each shape's time, times the number of times one pass runs it (the
+`time_conv`s out):
+
+| pass | image | convolutions | TFLOP | TFLOPS |
+|---|---|---|---|---|
+| decode | 1024² | 104.2 ms | 16.95 | 163 |
+| decode | 2048² | 405.8 ms | 67.82 | 167 |
+| encode | 1024² | 18.8 ms | 3.11 | 166 |
+| encode | 2048² | 70.2 ms | 12.43 | 177 |
+
+The mid-block attention, with each row tile's workspace:
+
+| D | tokens | row tile 1024 | 2048 | 4096 |
+|---|---|---|---|---|
+| 768 (encode) | 4096 | 0.791 ms, 30 MiB | 0.464 ms, 54 MiB | 0.387 ms, 102 MiB |
+| 768 (encode) | 16,384 | 10.38 ms, 120 MiB | 7.373 ms, 216 MiB | 6.761 ms, 408 MiB |
+| 1152 (decode) | 4096 | 0.835 ms, 33 MiB | 0.670 ms, 57 MiB | 0.558 ms, 105 MiB |
+| 1152 (decode) | 16,384 | 11.58 ms, 132 MiB | 10.63 ms, 228 MiB | 9.309 ms, 420 MiB |
+
+That is 122-139 TFLOPS (4 · tokens² · dim / time) with a 4096-row tile. A
+decode's attention is under 3% of its convolutions.
+
+The shortcuts are memory-bound at 550-860 GB/s. The largest, up3's DupUp into
+2048² × 288 with the accumulating add, takes 7.0 ms.
+
+**Against the bar (BF16 on the 5090, ~210-240 TFLOPS): 167-186 TFLOPS on
+the 3 × 3 calls of 192 channels and more at 256² and larger, 70-89% of
+it.**
+- **Per clock.** The card runs at its 575 W limit and 2.6 GHz. That is ~70
+  TFLOPS/GHz, 81% of the BF16 MMA's 86.5 per clock (the instruction table
+  above).
+- **A whole decode's convolutions** run at 163-167 TFLOPS: 104 ms at 1024²
+  and 406 ms at 2048².
+- **What would close the rest**, largest first:
+  1. **The 144-channel stage** (up4: 20% of a 2048² decode's convolution
+     time) runs at 132-143 TFLOPS. The 96-wide tile pads 144
+     channels to 192; a 144-wide (or 48-wide) tile configuration would
+     recover about 25% there.
+  2. **`conv_out`'s 4 channels** fill 4 of 96 columns: 5.1 ms at 2048²
+     (1.3%). A narrow tile, or SIMT, is the fix.
+  3. **The 1 × 1 convolutions** (K = in channels, a short reduction) run at
+     93-168 TFLOPS where they are large enough to measure (the latent-sized
+     ones are launch-bound), and the RGBA `conv_in` (K = 36 in a 64-wide
+     reduction) at 46.
+- Tuning stopped at the first version: one tile configuration, measured once.
+
+**Memory.** The convolution and the shortcuts allocate nothing and need no
+workspace. The attention's workspace is the table above: 132-420 MiB at
+2048² for D = 1152, and 33-105 MiB at 1024². The widest decoder activations
+at 2048² are 2048² × 288 BF16, 2.4 GB: up3's resample output and up4's
+input. 2048² × 144 is 1.2 GB. The banded decode (spec 04) bounds them.
+
+**AC 8.** Nothing is adapted in the VAE ops beyond `attn_smem.cuh`'s helpers,
+already listed. `kernel/NOTICE`'s entry for those helpers now names the
+convolution. Nothing comes from CUTLASS 3.x or FlashInfer's `csrc/fmha_v2`.
+
+**AC 9.** The CTest runs in the profile's kernel stage. The Rust `--ignored`
+test drives every binding:
+- the pack and the three convolution kinds, with the upsample, RGBA input,
+  bias, residual, fp32 and BF16 output, and a band, against fp64;
+- AvgDown in fp32 and DupUp accumulating in BF16, bit for bit;
+- the attention in fp32 and BF16, against fp64;
+- refusals that come back with the leaf's message.
 
 The bench is a tool.

@@ -817,3 +817,20 @@ add_test(NAME ignis_kernel_image_encoder_attn_test COMMAND ignis_kernel_image_en
 add_executable(ignis_image_encoder_attn_bench bench_image_encoder_attn.cu)
 target_include_directories(ignis_image_encoder_attn_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_image_encoder_attn_bench PRIVATE ignis_kernel ignis_vendor CUDA::nvml)
+# The VAE ops (acceptance 6, kernel/include/ignis_image_vae.h): every convolution shape of the VAE
+# at a 1024² and a 2048² image (and the 2752 x 1536 preset) against an fp64 conv2d, banded calls
+# against the whole image bit for bit, the shortcuts against PyTorch's own outputs (the fixture,
+# recorded by fixtures/image_vae/record.py), and the mid-block attention against fp64 that
+# replays its softmax. GPU (ADR 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_image_vae_test test_image_vae.cu)
+target_include_directories(ignis_kernel_image_vae_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_image_vae_test PRIVATE ignis_kernel ignis_vendor)
+target_compile_definitions(ignis_kernel_image_vae_test PRIVATE
+  IGNIS_IMAGE_VAE_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/image_vae/shortcuts.bin")
+add_test(NAME ignis_kernel_image_vae_test COMMAND ignis_kernel_image_vae_test)
+# Its speed (acceptance 6 "Speed"): the convolution's TFLOPS at the decoder's heavy shapes and a
+# whole decode's convolutions, the attention's time, with the SM clock and board power. A timing is
+# a finding: a tool, NOT registered with CTest.
+add_executable(ignis_image_vae_bench bench_image_vae.cu)
+target_include_directories(ignis_image_vae_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_image_vae_bench PRIVATE ignis_kernel ignis_vendor CUDA::nvml)
