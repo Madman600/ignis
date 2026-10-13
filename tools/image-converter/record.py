@@ -584,17 +584,18 @@ def encode(pipe, case):
 def encoder_rows(image_pad_mask):
     """The row sets of prompt_embeds, (1, L - drop_idx, D), the encoder is measured over, as
     boolean masks:
-    - `encoder`: the text rows, those the DiT reads as text (image_pad_mask 0; every row for
-      text-to-image). The DiT puts the condition latents in place of the image-pad rows, so their
-      values never reach it;
+    - `encoder`: the text rows from row 1 on, those the DiT reads as text (image_pad_mask 0). The
+      DiT puts the condition latents in place of the image-pad rows, so their values never reach it;
     - `encoder_after_vision`, with a condition image: the text rows after the first image pad, the
       only ones the vision features (DeepStack among them) can reach;
-    - `encoder_row0`: the first row after drop_idx (`<|im_start|>`), information only: it carries
-      most of the bf16 error, so it is never bounded alone."""
+    - `encoder_row0`: the first row after drop_idx (the user turn's `<|im_start|>`), information
+      only. Its error is an ill-conditioned template row's, not a sink's (bf16 alone is 54% off on
+      it, and it varies with the sequence length), so it bounds nothing."""
     pad = np.asarray(image_pad_mask)[0].astype(bool)
-    rows = {"encoder": ~pad, "encoder_row0": np.arange(pad.size) == 0}
+    index = np.arange(pad.size)
+    rows = {"encoder": ~pad & (index > 0), "encoder_row0": index == 0}
     if pad.any():
-        rows["encoder_after_vision"] = ~pad & (np.arange(pad.size) > np.flatnonzero(pad)[0])
+        rows["encoder_after_vision"] = ~pad & (index > np.flatnonzero(pad)[0])
     return rows
 
 
@@ -602,9 +603,13 @@ def row_rel_l2(x, ref):
     """The encoder metric: per row r, ||x_r - ref_r||_2 / ||ref_r||_2, and their RMS,
     sqrt(mean_r ||x_r - ref_r||^2 / ||ref_r||^2), in float64. Per row because the DiT reads each
     row through an RMSNorm (`txt_in`, transformer_qwenimage21.py:197): a row's scale does not
-    weigh in, and one large row cannot stand for the others."""
+    weigh in, and one large row cannot stand for the others. Refuses an empty row set and a zero
+    reference row (a nan bound would pass silently)."""
     x, ref = np.asarray(x, dtype=np.float64), np.asarray(ref, dtype=np.float64)
-    per_row = np.linalg.norm(x - ref, axis=-1) / np.linalg.norm(ref, axis=-1)
+    norm = np.linalg.norm(ref, axis=-1)
+    if not norm.size or not (norm > 0).all():
+        raise ValueError(f"the encoder metric needs rows with a nonzero reference norm ({norm.size} rows)")
+    per_row = np.linalg.norm(x - ref, axis=-1) / norm
     return float(np.sqrt(np.mean(per_row ** 2)))
 
 
@@ -815,7 +820,7 @@ def encoder_breakdown(embeds, recorded, top=TOP_ROWS):
     """Where an encoder error lies, against the recording's prompt_embeds: the share of the squared
     error and of the squared reference norm, and the relative L2 (`rel_l2` pooled over the rows),
     of the text rows and of the image-pad rows; each text row's own relative L2, as [row, error]
-    (`row_rel_l2` is their RMS); and the `top` rows by reference norm and by error norm."""
+    (`row_rel_l2` is the RMS of those from row 1 on, the `encoder` quantity); and the `top` rows by reference norm and by error norm."""
     ref = np.load(os.path.join(recorded, "prompt_embeds.npy"))[0].astype(np.float64)
     pad = np.load(os.path.join(recorded, "image_pad_mask.npy"))[0].astype(bool)
     err = np.linalg.norm(np.asarray(embeds, dtype=np.float64)[0] - ref, axis=-1) ** 2
@@ -831,8 +836,9 @@ def encoder_breakdown(embeds, recorded, top=TOP_ROWS):
                  "error_norm": float(np.sqrt(err[i])), "error_share": float(err[i] / err.sum())}
                 for i in order[:top]]
     text = np.flatnonzero(~pad)
+    bounded = np.flatnonzero(encoder_rows(pad[None])["encoder"])
     return {"whole": float(np.sqrt(err.sum() / norm.sum())), "text_rows": part(~pad), "image_pad_rows": part(pad),
-            "row_rel_l2": float(np.sqrt(np.mean(err[text] / norm[text]))),
+            "row_rel_l2": float(np.sqrt(np.mean(err[bounded] / norm[bounded]))),
             "text_row_rel_l2": [[int(i), float(np.sqrt(err[i] / norm[i]))] for i in text],
             "top_rows_by_ref_norm": rows(np.argsort(-norm)), "top_rows_by_error": rows(np.argsort(-err))}
 
@@ -843,13 +849,15 @@ METRICS = {
                 "tensor in float64, teacher-forced (step i's recorded fp32 input latents in); each yardstick's DiT "
                 "reads that pipeline's own encoder output and condition latents, never the recorded fp32 ones",
     "encoder": "prompt_embeds, (1, L - drop_idx, 4096), the encoder's last hidden state before the final norm, over "
-               "its text rows, the rows whose recorded image_pad_mask is 0 (every row for text-to-image; the DiT "
-               "replaces the image-pad rows with the condition latents): per row r, ||x_r - fp32_r||_2 / "
+               "its text rows from row 1 on, the rows whose recorded image_pad_mask is 0 (the DiT replaces the "
+               "image-pad rows with the condition latents; row 0 is encoder_row0): per row r, ||x_r - fp32_r||_2 / "
                "||fp32_r||_2, and their RMS sqrt(mean_r ||x_r - fp32_r||^2 / ||fp32_r||^2), float64 (txt_in "
                "RMS-normalizes each row)",
     "encoder_after_vision": "with a condition image: the encoder metric over the text rows after the first image "
                             "pad only, the rows the vision features (DeepStack among them) can reach",
-    "encoder_row0": "the encoder metric over the first row after drop_idx alone: information, never bounded",
+    "encoder_row0": "the encoder metric over the first row after drop_idx alone (the user turn's <|im_start|>, an "
+                    "ill-conditioned template row: bf16 alone is 54% off on it, varying with the sequence length): "
+                    "information, never bounded",
     "condition_latents": "the edit case's condition latents, (1, Nc, 64), packed and normalized: relative L2 over "
                          "the whole tensor",
 }
@@ -868,9 +876,9 @@ BOUNDED = ("encoder", "encoder_after_vision", "condition_latents")
 
 
 def write_bounds(path, sim, bf16, sim_factor, bf16_factor, oracle_session, session, artifact):
-    """thresholds.json, schema v3 (spec 01, AC 6): per case, each step's velocity, the encoder
-    (its text rows; with a condition image, also after the vision span), the condition latents and,
-    unbounded, the encoder's first row: the error of both yardsticks (`sim`, `bf16`: yardstick's
+    """thresholds.json, schema v4 (spec 01, AC 6): per case, each step's velocity, the encoder
+    (its text rows from row 1; with a condition image, also after the first image pad), the
+    condition latents and, unbounded, the encoder's first row: the error of both yardsticks (`sim`, `bf16`: yardstick's
     errors per case) and the bound ignis is held to, max(sim_factor x sim, bf16_factor x bf16); each
     quantity's metric; the factors; the oracle's session and this one's; the artifact measured.
     Refuses an existing file."""
@@ -889,9 +897,10 @@ def write_bounds(path, sim, bf16, sim_factor, bf16_factor, oracle_session, sessi
                                          "bound": bound(s[quantity], b[quantity])}
         cases[name]["encoder_row0"] = {"sim_error": s["encoder_row0"], "bf16_error": b["encoder_row0"]}
     value = {
-        "schema": "ignis-image-thresholds-v3",
+        "schema": "ignis-image-thresholds-v4",
         "bound": "max(factors.sim x sim_error, factors.bf16 x bf16_error), per quantity: each step's velocity, the "
-                 "encoder, the encoder after the vision span, the condition latents (encoder_row0 has none)",
+                 "encoder (text rows from row 1), the encoder after the first image pad, the condition latents "
+                 "(encoder_row0 has none)",
         "factors": {"sim": sim_factor, "bf16": bf16_factor},
         "metrics": METRICS,
         "yardsticks": YARDSTICKS,
@@ -1038,7 +1047,7 @@ def _versions():
     for lib in ("accelerate", "torchvision", "tokenizers", "pillow", "psutil"):
         v[lib] = md.version(lib)
     v["cuda"] = torch.version.cuda
-    v["cudnn"] = torch.backends.cudnn.version()
+    v["cudnn"] = torch.backends.cudnn.version() if torch.cuda.device_count() > 0 else None
     return v
 
 
@@ -1180,7 +1189,9 @@ def run_yardstick(checkpoint, oracle, artifact, device, cases, sim_factor=SIM_FA
                   min_free_vram_gb=MIN_FREE_VRAM_GB, max_vram_gib=MAX_VRAM_GIB, log=print):
     """One session of both yardsticks against an existing oracle, which it never records again (the
     fp32 oracle does not depend on the artifact), then thresholds.json (`write_bounds`) and the
-    report (default ORACLE/yardstick-report.json). In order: the bf16 encoder on every case; the
+    report (default ORACLE/yardstick-report.<session id>.json, written always; once the new file
+    is in place, ORACLE/yardstick-report.json is that report, the earlier one archived under its
+    own session). In order: the bf16 encoder on every case; the
     fp32 encoder replayed (its error against the oracle is the session's wiring check) and, for a
     case with an image, with DeepStack off (spec 03 AC 4's premise); the encoder made sim
     (`simquant`), the sim encoder; the encoder dropped, the bf16 DiT; the DiT and the VAE made sim,
@@ -1188,9 +1199,10 @@ def run_yardstick(checkpoint, oracle, artifact, device, cases, sim_factor=SIM_FA
 
     An existing thresholds.json is superseded only before any ignis result exists: with `replace`
     if its schema is in REPLACEABLE, with `replace` and `supersede` otherwise. It is kept as
-    thresholds.<its session id>.json; the new file is written under a temporary name first. A
-    supersede is refused, after the report is written, if the velocity errors moved: the bf16's on
-    the same oracle, the sim's on the same artifact too."""
+    thresholds.<its session id>.json (copied, then the new file replaces it in one step). A
+    supersede is refused, after the report is written, if the velocity errors moved, or the errors
+    after the vision span the replaced file also holds: the bf16's on the same oracle, the sim's
+    on the same artifact (its sha256) too."""
     import hashlib
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1306,13 +1318,23 @@ def run_yardstick(checkpoint, oracle, artifact, device, cases, sim_factor=SIM_FA
             c["deepstack_off"]["encoder_row0"] = {"error": off["encoder_row0"]}
         if old is not None and case.name in old["cases"]:
             was = old["cases"][case.name]["velocity"]
-            same_artifact = old.get("artifact", {}).get("conversion_sha256") == conversion_sha256
+            was_artifact = old.get("artifact", {})
+            same_artifact = (was_artifact["sha256"] == value["artifact"]["sha256"] if "sha256" in was_artifact
+                             else was_artifact.get("conversion_sha256") == conversion_sha256)
             c["velocity_vs_replaced"] = {
                 name: max(abs(x - y) for x, y in zip(errors[case.name]["velocity"], was[f"{name}_error"]))
                 for name, errors in (("bf16", bf16), ("sim", sim))
                 if f"{name}_error" in was and (name == "bf16" or same_artifact)}
             if any(c["velocity_vs_replaced"].values()):
                 moved[case.name] = c["velocity_vs_replaced"]
+            # a quantity the replaced file also measured, over the same rows, must not move either
+            kept_rows = old["cases"][case.name].get("encoder_after_vision")
+            if kept_rows is not None:
+                c["after_vision_vs_replaced"] = {
+                    name: abs(errors[case.name]["encoder_after_vision"] - kept_rows[f"{name}_error"])
+                    for name, errors in (("bf16", bf16), ("sim", sim)) if name == "bf16" or same_artifact}
+                if any(c["after_vision_vs_replaced"].values()):
+                    moved[case.name] = dict(moved.get(case.name, {}), after_vision=c["after_vision_vs_replaced"])
     breakdown = {}
     for case in cases:
         breakdown[case.name] = {name: encoder_breakdown(_numpy(prompts[case.name].embeds), dirs[case.name], top)
@@ -1329,14 +1351,23 @@ def run_yardstick(checkpoint, oracle, artifact, device, cases, sim_factor=SIM_FA
         "wall_s": dict(wall, total=round(time.time() - started, 1)),
         "peak_vram_gib": peaks,
     }
-    _write_json(report or os.path.join(oracle, "yardstick-report.json"), result)
+    archive = report or os.path.join(oracle, f"yardstick-report.{session['id'].replace(':', '')}.json")
+    _write_json(archive, result)
     if moved:
         os.remove(pending)
-        raise AssertionError(f"the velocity errors moved against the superseded {old['schema']} (max abs difference "
-                             f"per yardstick): {moved}; {thresholds} is kept")
+        raise AssertionError(f"the errors moved against the superseded {old['schema']} (max abs difference "
+                             f"per yardstick): {moved}; {thresholds} is kept, the report is {archive}")
     if kept is not None:
-        os.replace(thresholds, kept)
+        shutil.copyfile(thresholds, kept)
     os.replace(pending, thresholds)
+    if report is None:
+        latest = os.path.join(oracle, "yardstick-report.json")
+        if os.path.exists(latest):
+            with open(latest, encoding="utf-8") as f:
+                earlier = os.path.join(oracle, f"yardstick-report.{json.load(f)['session']['id'].replace(':', '')}.json")
+            if not os.path.exists(earlier):
+                shutil.copyfile(latest, earlier)
+        shutil.copyfile(archive, latest)
     log(f"done: thresholds.json and the report in {oracle}, {result['wall_s']['total']} s")
     return value, result
 
@@ -1377,7 +1408,7 @@ def main(argv=None):
                         "id>.json; only before any ignis result exists")
     y.add_argument("--supersede-bound", action="store_true",
                    help="with --replace-thresholds: supersede a bound of any later schema too")
-    y.add_argument("--report", help="the encoder breakdown and the checks (default ORACLE/yardstick-report.json)")
+    y.add_argument("--report", help="the encoder breakdown and the checks (default ORACLE/yardstick-report.<session>.json)")
     y.add_argument("--top-rows", type=int, default=TOP_ROWS, help="rows listed by reference norm and by error in the report")
     y.add_argument("--min-free-ram-gb", type=float, default=YARDSTICK_MIN_FREE_RAM_GB)
     y.add_argument("--min-free-vram-gb", type=float, default=MIN_FREE_VRAM_GB)

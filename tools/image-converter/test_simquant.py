@@ -176,7 +176,7 @@ def test_the_bound_is_the_larger_of_both_factors_per_quantity(tmp_path):
     record.write_bounds(path, sim, bf16, 2.0, 5.0, {"id": "oracle"}, {"id": "yardstick"}, artifact)
     with open(path, encoding="utf-8") as f:
         t = json.load(f)
-    assert t["schema"] == "ignis-image-thresholds-v3" and t["factors"] == {"sim": 2.0, "bf16": 5.0}
+    assert t["schema"] == "ignis-image-thresholds-v4" and t["factors"] == {"sim": 2.0, "bf16": 5.0}
     assert t["oracle_session"] == {"id": "oracle"} and t["session"] == {"id": "yardstick"}
     assert t["artifact"] == artifact and set(t["metrics"]) == {"velocity", "encoder", "encoder_after_vision",
                                                                "encoder_row0", "condition_latents"}

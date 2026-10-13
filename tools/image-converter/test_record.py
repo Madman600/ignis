@@ -395,6 +395,11 @@ def test_without_a_visible_gpu_the_cudnn_precisions_are_not_read(monkeypatch):
     assert flags["cudnn.conv.fp32_precision"] is None and flags["cudnn.rnn.fp32_precision"] is None
     assert flags["cudnn.allow_tf32"] is False
 
+    def unreadable():
+        raise AssertionError("cuDNN version read without a GPU")
+    monkeypatch.setattr(torch.backends.cudnn, "version", unreadable)
+    assert record._versions()["cudnn"] is None
+
 
 def test_the_dit_guard_changes_nothing(tiny, recorded, tmp_path):
     """The attention guard around the DiT's forward (on the GPU, memory-efficient SDPA only), with
@@ -545,13 +550,36 @@ def test_the_encoder_metric_is_the_rms_of_each_text_rows_relative_error(recorded
     embeds = _npy(directory, "prompt_embeds")
     assert not _npy(directory, "image_pad_mask").any()
     n = embeds.shape[1]
-    # one row off by half its norm, out of n: 0.5 / sqrt(n), whatever that row's norm
-    for row in (0, n - 1):
+    # one row off by half its norm, out of the n - 1 rows from row 1 on: 0.5 / sqrt(n - 1), whatever
+    # that row's norm; row 0 is information only and moves no bounded quantity
+    for row in (1, n - 1):
         errors = record.encoder_errors(_scaled(embeds, [row]), directory)
-        assert errors["encoder"] == pytest.approx(0.5 / np.sqrt(n), rel=1e-12)
-        assert errors["encoder_row0"] == pytest.approx(0.5 if row == 0 else 0, abs=1e-15)
+        assert errors["encoder"] == pytest.approx(0.5 / np.sqrt(n - 1), rel=1e-12)
+        assert errors["encoder_row0"] == 0
         assert "encoder_after_vision" not in errors
-    assert record.rel_l2(_scaled(embeds, [0]), embeds) != pytest.approx(0.5 / np.sqrt(n))
+    errors = record.encoder_errors(_scaled(embeds, [0]), directory)
+    assert errors["encoder"] == 0 and errors["encoder_row0"] == pytest.approx(0.5, abs=1e-15)
+    assert record.rel_l2(_scaled(embeds, [1]), embeds) != pytest.approx(0.5 / np.sqrt(n - 1))
+
+
+def test_the_encoder_metric_refuses_an_empty_row_set_and_a_zero_reference_row():
+    ref = np.ones((3, 4))
+    with pytest.raises(ValueError, match="nonzero reference norm"):
+        record.row_rel_l2(ref[:0], ref[:0])
+    ref[1] = 0
+    with pytest.raises(ValueError, match="nonzero reference norm"):
+        record.row_rel_l2(ref + 1, ref)
+
+
+def test_the_rows_after_the_first_image_pad_include_the_text_between_images():
+    # <im_start> text <pad> <pad> text <pad> text text: two images, the text between them is reached
+    # by the first image's vision features
+    pad = np.array([[0, 0, 1, 1, 0, 1, 0, 0]])
+    rows = record.encoder_rows(pad)
+    assert np.flatnonzero(rows["encoder"]).tolist() == [1, 4, 6, 7]
+    assert np.flatnonzero(rows["encoder_row0"]).tolist() == [0]
+    assert np.flatnonzero(rows["encoder_after_vision"]).tolist() == [4, 6, 7]
+    assert "encoder_after_vision" not in record.encoder_rows(np.zeros((1, 5)))
 
 
 def test_the_rows_after_the_vision_span_are_the_ones_the_image_reaches(recorded):
@@ -563,10 +591,10 @@ def test_the_rows_after_the_vision_span_are_the_ones_the_image_reaches(recorded)
     assert record.encoder_errors(_scaled(embeds, np.flatnonzero(pad)), directory) == {
         "encoder": 0, "encoder_row0": 0, "encoder_after_vision": 0}
     errors = record.encoder_errors(_scaled(embeds, [before[-1]]), directory)
-    assert errors["encoder"] == pytest.approx(0.5 / np.sqrt(text.size), rel=1e-12)
+    assert errors["encoder"] == pytest.approx(0.5 / np.sqrt(text.size - 1), rel=1e-12)
     assert errors["encoder_after_vision"] == 0 and errors["encoder_row0"] == 0
     errors = record.encoder_errors(_scaled(embeds, [after[0]]), directory)
-    assert errors["encoder"] == pytest.approx(0.5 / np.sqrt(text.size), rel=1e-12)
+    assert errors["encoder"] == pytest.approx(0.5 / np.sqrt(text.size - 1), rel=1e-12)
     assert errors["encoder_after_vision"] == pytest.approx(0.5 / np.sqrt(after.size), rel=1e-12)
 
 
@@ -672,12 +700,14 @@ def test_a_yardstick_session_supersedes_the_thresholds_with_the_bound(tiny, edit
         assert json.load(f) == bf16_only
     with open(thresholds, encoding="utf-8") as f:
         assert json.load(f) == value
-    with open(os.path.join(out, "yardstick-report.json"), encoding="utf-8") as f:
-        assert json.load(f) == json.loads(json.dumps(report))
-    # the new file was written under a temporary name, then renamed
+    archived = f"yardstick-report.{value['session']['id'].replace(':', '')}.json"
+    for name in ("yardstick-report.json", archived):
+        with open(os.path.join(out, name), encoding="utf-8") as f:
+            assert json.load(f) == json.loads(json.dumps(report))
+    # the new file was written under a temporary name, then renamed; the superseded one was copied
     assert sorted(os.listdir(out)) == sorted(["edit", "t2i", "manifest.json", "thresholds.json", os.path.basename(kept),
-                                              "yardstick-report.json"])
-    assert value["schema"] == "ignis-image-thresholds-v3" and report["replaced"] == bf16_only["schema"]
+                                              "yardstick-report.json", archived])
+    assert value["schema"] == "ignis-image-thresholds-v4" and report["replaced"] == bf16_only["schema"]
     assert value["oracle_session"] == manifest["session"] and value["session"]["id"]
     assert value["factors"] == {"sim": 2.0, "bf16": 5.0} and value["artifact"]["tensors_checked"] == len(records)
     assert value["artifact"]["sha256"] == pin.sha256_file(artifact)
@@ -714,10 +744,20 @@ def test_a_yardstick_session_supersedes_the_thresholds_with_the_bound(tiny, edit
     moved["cases"]["t2i"]["velocity"]["sim_error"][0] += 1e-3
     with open(thresholds, "w", encoding="utf-8") as f:
         json.dump(moved, f)
-    with pytest.raises(AssertionError, match="velocity errors moved"):
+    with pytest.raises(AssertionError, match="errors moved"):
         session(True, supersede=True)
     with open(thresholds, encoding="utf-8") as f:
         assert json.load(f) == moved
     with open(os.path.join(out, "yardstick-report.json"), encoding="utf-8") as f:
+        assert json.load(f) == json.loads(json.dumps(report))   # the report of a refused session is not "the" report
+    refused = max(name for name in os.listdir(out) if name.startswith("yardstick-report.2"))
+    with open(os.path.join(out, refused), encoding="utf-8") as f:
         assert json.load(f)["checks"]["t2i"]["velocity_vs_replaced"]["sim"] == pytest.approx(1e-3)
+    # the errors after the vision span the replaced file holds must not move either
+    moved["cases"]["t2i"]["velocity"]["sim_error"][0] -= 1e-3
+    moved["cases"]["edit"]["encoder_after_vision"]["bf16_error"] += 1e-3
+    with open(thresholds, "w", encoding="utf-8") as f:
+        json.dump(moved, f)
+    with pytest.raises(AssertionError, match="after_vision"):
+        session(True, supersede=True)
     assert not [name for name in os.listdir(out) if name.endswith(".new.json")]
