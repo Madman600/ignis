@@ -330,3 +330,80 @@ launches per engine (ADR 0021 stands). Per ticket, the check is the smallest
 instrument that catches a large error: the op test, and for the speculative
 substrate the greedy equivalence spec-on == spec-off on the existing
 canaries. No gate cell, no extra launch, no sub-1% comparison inside a phase.
+
+---
+
+## From the Qwen-Image grilling session (2026-10-13)
+
+Source conversation: the design session that produced ADRs 0050-0051 and
+`docs/specs/image-model/`. The decision log is in the owner's clone at
+`.scratch/qwen-image-grill-2026-10-13/decisions.md`. Seven items below.
+
+### 1. The condition prefix spilled to host RAM
+
+**Deferred to:** built only if users need more condition images at full size
+than the VRAM condition budget holds, and only where the copy fits inside the
+computation.
+
+The condition prefix is ~256 KiB per token at 8 bits, about 1 GiB per 1024²
+condition image. Past the condition budget the server scales the images down
+(floor 512²) instead of keeping part of the prefix in RAM. Over this host's
+PCIe Gen 3 (~12 GB/s), reading 1 GiB back for every denoising step costs about
+what a 1024² denoising step computes. The copy would sit on the critical path
+the owner wanted kept clear. The condition to re-open: the per-step transfer
+of the spilled part ≤ the step's compute, measured.
+
+### 2. The 2.1 base model, steps, negative prompt and CFG
+
+**Deferred to:** only if the owner wants the base model's quality at 5× the
+steps.
+
+Only the Turbo checkpoint is served. It has a fixed 8-step schedule and no
+classifier-free guidance, so the API has no `steps`, no `negative_prompt` and
+no `true_cfg_scale`. The base model has the same architecture: the leaf would
+serve it with a second catalog entry, a scheduler with dynamic shift, and a
+second forward per step for CFG.
+
+### 3. WebP and JPEG output
+
+**Deferred to:** a client that needs them.
+
+PNG only, because PNG keeps the alpha channel the model generates. WebP would
+keep it too, at a size win; JPEG would drop it.
+
+### 4. Partial images while streaming
+
+**Deferred to:** a client that shows them.
+
+Streaming sends progress per denoising step and the final images. A partial
+image needs a VAE decode per step, or a cheap latent preview decoder this
+checkpoint does not ship.
+
+### 5. bf16 attention in the DiT
+
+**Deferred to:** only if the 8-bit attention fails spec image-model/04's
+end-to-end check and the error is traced to it.
+
+The DiT's attention is 8-bit from the first version (ADR 0050). An
+FA2-derived bf16 path exists for the encoder (spec image-model/02), so a bf16
+DiT fallback would reuse it at head size 128 without a mask. It would be about
+3× slower at 2048².
+
+### 6. One attention kernel for the encoder too
+
+**Deferred to:** after spec image-model/02, if the SageAttention port's causal
+GQA mode passes the encoder's checks.
+
+The encoder keeps the FlashAttention-2 port (bf16), the owner's Q30 choice.
+The alternative is the SageAttention port in causal GQA mode: one port fewer,
+but an 8-bit encoder. The encoder runs once per job, so the speed difference
+is small. The choice is how much code to carry.
+
+### 7. FP4: SageAttention3 and NVFP4 linears
+
+**Deferred to:** after the 8-bit version's timing run, if it misses the
+literature bar and a 4-bit quality check is affordable.
+
+SageAttention3 (NVFP4, 1022-1038 TOPS) and Nunchaku's W4A4 GEMM run on
+sm_120. SageAttention3's own README recommends 8-bit at the first and last
+timesteps, and Turbo has only 8. 4-bit quality on this model is unproven.

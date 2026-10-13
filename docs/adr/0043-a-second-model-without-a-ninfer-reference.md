@@ -9,6 +9,10 @@ acceptance verifies it; its numbers are written here when it holds.
 **Extends ADR 0010**: ops with no ninfer provenance are our own
 implementation. **Replaces ADR 0014's oracle and ADR 0015's gate for this model
 only**; both stand unchanged for Qwen3.8-27B.
+**Amended by ADR 0051** (2026-10-13): "ExLlamaV3 code is read, never copied
+into the engine. Our kernels are original." gives way to three tiers (our
+own, adapted op, vendored op) under MIT, BSD or Apache-2.0. QTIP-derived code
+stays unread.
 
 Sources: the compression study in
 `.scratch/flash-next-compression-2026-10-03/` (`RISULTATI_3.md`, runs 1-8;

@@ -5,9 +5,10 @@ When output names a domain concept, use the term as defined here.
 
 ## Engine & process
 
-- **ignis** — the Rust inference engine for Qwen 3.8-27B on a single RTX 5090 (SM120a).
-  Deliberately specialized: one model family, one GPU class. ADR 0043
-  adds a second model, **Flash-Next**, one loaded at a time.
+- **ignis** — the Rust inference engine for Qwen models on a single RTX 5090
+  (SM120a): text models and an image model, one loaded at a time.
+  Deliberately specialized: few model families, one GPU class. ADR 0043 added
+  a second text model, **Flash-Next**; ADR 0050 adds the image model.
 - **Kernel leaf** — the C++/CUDA compute library linked into ignis behind a C ABI.
   The forward pass and all GPU compute live here; Rust owns everything above the
   **step** — scheduling, KV accounting, serving (ADR 0009).
@@ -17,7 +18,8 @@ When output names a domain concept, use the term as defined here.
   activation pointer crosses it (ADR 0009).
 - **Program** — the leaf-side layer that owns the forward pass and the
   sequence state, on top of the vendored ops. Ours, not vendored (ADR 0009).
-- **Vendored op** — an operator copied *verbatim* from the reference and
+- **Vendored op** — an operator copied *verbatim* from a named upstream (the
+  reference, or a third party under MIT, BSD or Apache-2.0: ADR 0051) and
   tracked by a manifest (pinned commit, content hashes, recorded patches).
   Anything hand-written is not one, and carries no port claim (ADR 0010).
   A vendored op that a measurement identifies as the bottleneck may carry a
@@ -25,6 +27,11 @@ When output names a domain concept, use the term as defined here.
   a vendored op and makes no port claim (ADR 0031). One with a demonstrated
   correctness bug may carry a recorded patch too, with a test that fails
   without it (ADR 0037).
+- **Adapted op** — our own operator that contains parts copied from a named
+  upstream under MIT, BSD or Apache-2.0, with its repo, commit, path and
+  licence in the file header and in `kernel/NOTICE`. Ours to change; no parity
+  claim (ADR 0051).
+  _Avoid_: port, vendored (for an adapted op).
 - **Reference parity** — a behaviour ignis computes exactly as the
   **reference** does. The default for every vendored op, and not a claim of
   correctness: the reference can be wrong (ADR 0037).
@@ -213,6 +220,39 @@ When output names a domain concept, use the term as defined here.
   to (`model_id`, `weights_id`, content hash), checked at load; a mismatched
   pair is refused by name.
 
+## Image model (specs `image-model/01-05`, ADRs 0050-0051)
+
+- **Image model** — Qwen-Image-2.1-Turbo, served from its own artifact: a
+  Qwen3-VL text encoder, a 7B diffusion transformer (the **DiT**) and a VAE.
+  Reached by a switch, never loaded beside a text model.
+- **Image job** — one image request from admission to the delivery of its
+  last image.
+- **Target image** — the image an image job is generating.
+- **Condition image** — an input image an image job is conditioned on (an
+  edit's source or one of its references).
+  _Avoid_: reference image (**Reference** is the ninfer stack).
+- **Condition prefix** — the prompt and the condition images as the DiT sees
+  them before the target image; computed once per image job and reused by
+  every denoising step of every image the job makes.
+  _Avoid_: prefix, shared prefix (those are a text model's).
+- **Condition budget** — how many condition-prefix tokens the image model can
+  hold, set at load from the VRAM the rest of the plan leaves. Condition
+  images beyond it are scaled down, never refused.
+- **Denoising step** — one evaluation of the DiT over the target image at one
+  noise level, and the sampler update after it. Always qualified.
+  _Avoid_: step (bare: that is the Step ABI's unit).
+- **Prompt enhancement** — an image job's optional rewrite of its prompt by a
+  text model before the image model sees it.
+  _Avoid_: polish, rewrite.
+- **Revised prompt** — the prompt that prompt enhancement produced, returned to
+  the client beside the image.
+- **Enhancer model** — the text model that performs prompt enhancement, named
+  by its served id in the config.
+- **Enhancement visit** — a switch to the enhancer model and back inside an
+  image job, made when the image model is loaded. It is not a switch for
+  **Last switch**.
+  _Avoid_: borrow.
+
 ## Weights & artifact
 
 - **Artifact** — the `.ninfer` container: the native NInfer model artifact
@@ -256,11 +296,16 @@ When output names a domain concept, use the term as defined here.
 ## Models, catalog & download (ADR 0033, ADR 0047)
 
 - **Model family** — the architecture an artifact runs as (`Qwen3.8-27B`,
-  `Qwen3.8-Flash-Next`), read from the artifact's own header, never declared
-  beside it. It decides the forward program, the drafter and the family
-  scope. Several artifacts share one family: the 27B and its abliterated
+  `Qwen3.8-Flash-Next`, `Qwen-Image-2.1`), read from the artifact's own
+  header, never declared beside it. It decides the forward program, the
+  drafter and the family scope. Several artifacts share one family: the 27B and its abliterated
   variant are two artifacts of the same family.
   _Avoid_: model (for the architecture)
+- **Model kind** — what a model produces: a **text model** produces tokens
+  (the 27B, Flash-Next), an **image model** produces pixels (the image model,
+  ADR 0050). Above the model family: every family is of one kind. Engine,
+  lane, sequence, KV and generation cap are text-model terms.
+  _Avoid_: modality (the 27B already takes images in), pipeline
 - **Served id** — the name a client puts in a request's `model` and
   `GET /v1/models` reports: the operator's `model.id`, or the family's default
   id when none is named. It tells artifacts of one family apart; the family
