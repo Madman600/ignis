@@ -5,12 +5,12 @@ The oracle is diffusers' `QwenImage21Pipeline` computing in fp32. The checkpoint
 is a compute precision, not a weight precision: the weights stay bf16 at rest (exactly the
 checkpoint's values) and are upcast where they are used, which gives the arithmetic of
 `from_pretrained(torch_dtype=torch.float32)` bit for bit (test_record.py) in about half the memory.
-- The 36 text decoder layers, the 32 DiT blocks and `lm_head` hold bf16 at rest and are upcast
-  to fp32 inside their own forward only (`set_precision`). The hooks sit on whole layers, not on
-  leaves, because the models read a weight's dtype ahead of using it (the vision patch embedding,
-  `get_image_features`, diffusers' RMSNorm).
-- Everything else (embeddings, the vision tower and its mergers, the DiT's input projections,
-  modulation and output, the VAE) is fp32 for the whole run.
+- The token embedding, the 36 text decoder layers, `lm_head` and the 32 DiT blocks hold bf16 at
+  rest and are upcast to fp32 inside their own forward only (`set_precision`). The hooks sit on
+  whole layers, not on leaves, because the models read a weight's dtype ahead of using it (the
+  vision patch embedding, `get_image_features`, diffusers' RMSNorm).
+- Everything else (the vision tower and its mergers, the DiT's input projections, modulation and
+  output, the VAE) is fp32 for the whole run.
 - Each pipeline call is split at `encode_prompt`, the only thing the rest of `__call__` reads from
   the text encoder: an encoder phase runs every case's prompt (fp32 then bf16) with the encoder on
   the GPU and the DiT in host RAM; the encoder is then dropped and a DiT phase replays those
@@ -96,26 +96,31 @@ def condition_image(case):
 
 
 class _Fp32Forward:
-    """Forward hooks for one layer whose parameters are bf16 at rest: fp32 inside its forward."""
+    """Forward hooks for layers whose parameters are bf16 at rest: fp32 inside their forward. The
+    bf16 tensors are kept aside and put back after, so the way back allocates nothing."""
 
     def __init__(self):
         self.on = False
+        self.stash = {}
 
     def pre(self, module, args):
         if self.on:
-            for p in module.parameters():
+            params = list(module.parameters())
+            self.stash[module] = [p.data for p in params]
+            for p in params:
                 p.data = p.data.to(torch.float32)
 
     def post(self, module, args, output):
         if self.on:
-            for p in module.parameters():
-                p.data = p.data.to(torch.bfloat16)
+            for p, bf16 in zip(module.parameters(), self.stash.pop(module)):
+                p.data = bf16
 
 
 def _upcast_layers(pipe):
-    """The layers that hold bf16 at rest: the bulk of the two big models."""
-    return [*pipe.text_encoder.model.language_model.layers, pipe.text_encoder.lm_head,
-            *pipe.transformer.transformer_blocks]
+    """The layers that hold bf16 at rest: the bulk of the two big models (the token embedding and
+    `lm_head` are 2.5 GB each in fp32)."""
+    return [pipe.text_encoder.model.language_model.embed_tokens, *pipe.text_encoder.model.language_model.layers,
+            pipe.text_encoder.lm_head, *pipe.transformer.transformer_blocks]
 
 
 def set_precision(pipe, mode):
@@ -164,12 +169,15 @@ def _no_retain(vae):
 def _stage_dit(pipe, device):
     """On a GPU, while the DiT runs: the DiT on the device for its forward and in host RAM for each
     VAE decode, which at 2048^2 in fp32 needs the room."""
-    pipe.transformer.register_forward_pre_hook(lambda module, args: module.to(device))
+    def on_device(module, args):
+        module.to(device)  # a pre-hook's return value would replace the forward's arguments
+    pipe.transformer.register_forward_pre_hook(on_device)
     decode = pipe.vae.decode
 
     def staged(*args, **kwargs):
         pipe.transformer.to("cpu")
-        torch.cuda.empty_cache()
+        if torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
         return decode(*args, **kwargs)
     pipe.vae.decode = staged
 
@@ -613,13 +621,13 @@ def efficient_attention_only():
     return sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION])
 
 
-def _guard_dit(pipe, on):
-    """The DiT's forward under `efficient_attention_only` (on), or its own forward again (off)."""
+def _guard_dit(pipe, on, guard=efficient_attention_only):
+    """The DiT's forward under `guard` (on), or its own forward again (off)."""
     if on:
         forward = pipe.transformer.forward
 
         def guarded(*args, **kwargs):
-            with efficient_attention_only():
+            with guard():
                 return forward(*args, **kwargs)
         pipe.transformer.forward = guarded
     elif "forward" in pipe.transformer.__dict__:
@@ -712,20 +720,22 @@ def _versions():
 
 def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), factor=5.0,
         min_free_disk_gb=12.0, disk_budget_gb=10.0, min_free_ram_gb=24.0, min_free_vram_gb=27.0,
-        max_vram_gb=25.5, log=print):
+        max_vram_gib=24.0, log=print):
     """One session: every case recorded in fp32, then the bf16 yardstick on the same weights, then
     thresholds.json and manifest.json (written last: its presence means the run completed)."""
     import convert
     device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     started = time.time()
     resources = _preflight(out, device, min_free_disk_gb, disk_budget_gb, min_free_ram_gb, min_free_vram_gb)
     tf32 = fp32_ieee()
     attention = {"dit_fp32": "memory-efficient SDPA only (sdpa_kernel), asserted by construction",
                  "selfcheck_max_abs_diff": None}
     if device.type == "cuda":
-        if max_vram_gb:
+        if max_vram_gib:
             total = torch.cuda.get_device_properties(device).total_memory
-            torch.cuda.set_per_process_memory_fraction(min(1.0, max_vram_gb * GB / total), device)
+            torch.cuda.set_per_process_memory_fraction(min(1.0, max_vram_gib * 2**30 / total), device)
         attention["selfcheck_max_abs_diff"] = _attention_selfcheck(device)
     session = {"id": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **convert.tool_commit()}
     log(f"session {session['id']}: free disk {resources['free_disk_gb']:.1f} GB, RAM {resources['free_ram_gb']:.1f} GB, "
@@ -739,7 +749,7 @@ def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), 
     def peak():
         if device.type != "cuda":
             return None
-        value = torch.cuda.max_memory_allocated(device) / GB
+        value = torch.cuda.max_memory_allocated(device) / 2**30
         torch.cuda.reset_peak_memory_stats(device)
         return round(value, 2)
 
@@ -748,7 +758,7 @@ def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), 
         t = time.time()
         result = work()
         entry[key + "_wall_s"] = round(time.time() - t, 1)
-        entry[key + "_peak_vram_gb"] = peak()
+        entry[key + "_peak_vram_gib"] = peak()
         return result
 
     entries = {case.name: {"prompt": case.prompt, "size": case.size, "seed": case.seed,
@@ -778,7 +788,7 @@ def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), 
         timed(entries[case.name], "fp32_dit_vae", lambda: record_denoise(
             pipe, case, os.path.join(out, case.name), prompts32[case.name], blocks, block_steps))
         log(f"fp32 dit+vae {case.name}: {entries[case.name]['fp32_dit_vae_wall_s']} s, "
-            f"peak {entries[case.name]['fp32_dit_vae_peak_vram_gb']} GB")
+            f"peak {entries[case.name]['fp32_dit_vae_peak_vram_gib']} GiB")
     _guard_dit(pipe, False)
     set_precision(pipe, "bf16")
     errors = {}
@@ -839,13 +849,13 @@ def main(argv=None):
     r.add_argument("--disk-budget-gb", type=float, default=10.0, help="room the recordings may take")
     r.add_argument("--min-free-ram-gb", type=float, default=24.0)
     r.add_argument("--min-free-vram-gb", type=float, default=27.0)
-    r.add_argument("--max-vram-gb", type=float, default=25.5, help="this process's VRAM cap (0: none)")
+    r.add_argument("--max-vram-gib", type=float, default=24.0, help="this process's VRAM cap in GiB, desktop excluded (0: none)")
     a = ap.parse_args(argv)
     ints = lambda text: tuple(int(x) for x in text.split(",") if x)
     try:
         run(a.checkpoint, a.out, a.device, [CASES[n] for n in a.cases.split(",")], ints(a.blocks),
             ints(a.block_steps), a.factor, a.min_free_disk_gb, a.disk_budget_gb, a.min_free_ram_gb,
-            a.min_free_vram_gb, a.max_vram_gb, log=lambda *x: print(*x, flush=True))
+            a.min_free_vram_gb, a.max_vram_gib, log=lambda *x: print(*x, flush=True))
     except BaseException as e:
         print(f"RECORD FAILED: {type(e).__name__}: {e}", flush=True)
         raise

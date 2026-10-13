@@ -369,6 +369,27 @@ def test_fp32_ieee_turns_tf32_off_for_matmul_and_cudnn():
     assert flags["matmul.allow_tf32"] is False and flags["cudnn.allow_tf32"] is False
 
 
+def test_the_gpu_staging_and_the_dit_guard_change_nothing(tiny, recorded, tmp_path):
+    """The GPU run's DiT staging (device for the forward, host for each decode) and the attention
+    guard around the DiT's forward, with the device and the guard the CPU allows."""
+    import contextlib
+    pipe = record.load_pipeline(tiny, "cpu")
+    record.set_precision(pipe, "fp32")
+    record._stage_dit(pipe, torch.device("cpu"))
+    entered = []
+
+    def guard():
+        entered.append(1)
+        return contextlib.nullcontext()
+    record._guard_dit(pipe, True, guard)
+    case, directory, info = recorded["t2i"]
+    assert record.record_case(pipe, case, str(tmp_path), blocks=BLOCKS) == info
+    assert np.array_equal(_npy(str(tmp_path), "step7/latents_out"), _npy(directory, "step7/latents_out"))
+    assert len(entered) == 8
+    record._guard_dit(pipe, False)
+    assert "forward" not in pipe.transformer.__dict__
+
+
 def test_the_attention_guard_refuses_a_fallback_to_math():
     q = torch.randn(1, 2, 8, 16)
     with record.efficient_attention_only():
@@ -399,7 +420,7 @@ def test_the_checked_in_condition_image_is_the_procedural_one():
 
 def _run(tiny, edit, out):
     return record.run(tiny, out, "cpu", [T2I, edit], blocks=BLOCKS, factor=5.0, min_free_disk_gb=0,
-                      disk_budget_gb=0, min_free_ram_gb=0, min_free_vram_gb=0, max_vram_gb=0)
+                      disk_budget_gb=0, min_free_ram_gb=0, min_free_vram_gb=0, max_vram_gib=0)
 
 
 def test_a_run_records_every_case_then_the_yardstick_in_one_session(tiny, edit, recorded, tmp_path):
