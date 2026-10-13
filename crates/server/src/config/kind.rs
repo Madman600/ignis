@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
+use ignis_core::image::ImageSize;
 use ignis_core::ngram_cache::CacheLocation;
 use ignis_core::ngram_table::HotBudget;
 use ignis_core::{KvFormat, KvPoolSize, ProposalHead, RopeScaling, SpeculativeBackend};
@@ -180,6 +181,18 @@ count_kind!(
 count_kind!(
     /// A count of mebibytes.
     Mib: u64, "MiB", "MiB count"
+);
+count_kind!(
+    /// A count of image jobs.
+    Jobs: u32, "jobs", "job count"
+);
+count_kind!(
+    /// A count of images.
+    Images: u32, "images", "image count"
+);
+count_kind!(
+    /// A length in pixels.
+    Pixels: u32, "pixels", "pixel count"
 );
 
 /// A byte count with the size suffixes an operator actually types: a bare
@@ -667,6 +680,54 @@ impl FieldKind for KnownModels {
     }
 }
 
+/// The image sizes a request may ask for (spec image-model/05 §Sizes):
+/// `<width>x<height>` entries, `;`- or `,`-separated — a flag names one or
+/// more per occurrence, a file may give a list. Each side is a nonzero
+/// multiple of 32, the VAE's 16 pixels a latent cell times the DiT's 2 × 2
+/// patch; at least one size, and none twice.
+pub struct Sizes;
+
+impl FieldKind for Sizes {
+    type Value = Vec<ImageSize>;
+    const TAG: &'static str = "WxH;...";
+    const REPEATABLE: bool = true;
+
+    fn parse(raw: &str) -> Result<Self::Value, String> {
+        let mut sizes: Vec<ImageSize> = Vec::new();
+        for entry in raw.split([';', ',']).map(str::trim).filter(|entry| !entry.is_empty()) {
+            let size = ImageSize::parse(entry)?;
+            if size.width % 32 != 0 || size.height % 32 != 0 {
+                return Err(format!("takes sizes whose sides are multiples of 32, got `{entry}`"));
+            }
+            if sizes.contains(&size) {
+                return Err(format!("names `{entry}` twice"));
+            }
+            sizes.push(size);
+        }
+        if sizes.is_empty() {
+            return Err(format!("expects at least one <width>x<height>, got `{raw}`"));
+        }
+        Ok(sizes)
+    }
+
+    fn render(value: &Self::Value) -> Value {
+        Value::Array(value.iter().map(|size| Value::String(size.to_string())).collect())
+    }
+
+    fn file_text(value: &Value) -> Result<Option<String>, String> {
+        match value {
+            Value::Array(items) => Ok(Some(
+                items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_owned).ok_or_else(|| "lists something that is not a `<width>x<height>`".to_owned()))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(";"),
+            )),
+            other => scalar_text(other),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -829,5 +890,20 @@ mod tests {
         assert_eq!(KnownModels::file_text(&list), Ok(Some("a=F:/a.ninfer".into())));
         assert!(KnownModels::file_text(&serde_json::json!({"a": 1})).is_err());
         round_trips::<KnownModels>(known);
+    }
+
+    #[test]
+    fn sizes_are_multiples_of_32_named_once_each() {
+        let sizes = Sizes::parse("2048x2048; 2752x1536,1024x1024").unwrap();
+        assert_eq!(sizes, [ImageSize::new(2048, 2048), ImageSize::new(2752, 1536), ImageSize::new(1024, 1024)]);
+        for (raw, says) in [("1000x1024", "multiples of 32"), ("1024x1024;1024x1024", "twice"), ("1024", "<width>x<height>"), (";", "at least one"), ("0x32", "<width>x<height>")] {
+            assert!(Sizes::parse(raw).unwrap_err().contains(says), "{raw}");
+        }
+        // A file may give a list as well as the joined string.
+        let list = serde_json::json!(["2048x2048", "1024x1024"]);
+        assert_eq!(Sizes::file_text(&list), Ok(Some("2048x2048;1024x1024".into())));
+        assert!(Sizes::file_text(&serde_json::json!([2048])).is_err());
+        assert_eq!(Sizes::render(&sizes), serde_json::json!(["2048x2048", "2752x1536", "1024x1024"]));
+        round_trips::<Sizes>(sizes);
     }
 }

@@ -166,6 +166,11 @@ pub struct Live {
     /// it (`--model-idle-unload`, spec model-switch/02); zero never unloads.
     /// Read by the clock at every tick, so a live change needs no restart.
     pub idle_unload: Duration,
+    /// The image model's serving (`image.*`, spec image-model/05): its
+    /// queue, what one request may ask for, the condition budget, prompt
+    /// enhancement — each read per request, so a live change needs no
+    /// reload.
+    pub image: config::schema::ImageGroup,
 }
 
 impl Default for Live {
@@ -182,6 +187,7 @@ impl Default for Live {
             default_thinking_budget: None,
             instruction_policy: instruction::InstructionPolicy::default(),
             idle_unload: Duration::ZERO,
+            image: config::schema::ImageGroup::default(),
         }
     }
 }
@@ -196,6 +202,7 @@ impl Live {
             default_thinking_budget: config.thinking_budget,
             instruction_policy: config.instruction_policy,
             idle_unload: Duration::from_secs(u64::from(config.idle_unload_secs)),
+            image: config.settings().image.clone(),
         }
     }
 }
