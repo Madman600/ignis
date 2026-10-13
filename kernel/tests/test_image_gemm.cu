@@ -3,14 +3,16 @@
 //
 //   quantize   ignis_image_quantize_tokens against its definition restated on the host (codes and
 //              scales bit for bit), and every dequantized value within E4M3's half ulp of x; an
-//              all-zero row, a row with one outlier, magnitudes from 2^-10 to 2^9; the refusals.
+//              all-zero row, a row with one outlier, magnitudes from 2^-10 to 2^9; the edge rows
+//              (NaN, +-Inf, amax below / at / above 448 * 2^-126); the refusals.
 //   mechanics  ignis_image_gemm_w8a8 against an fp64 GEMM of the *dequantized* operands (the
 //              quantizer's own codes and scales, the payload's codes and BF16 row scales), at
 //              every linear shape of the DiT and the text encoder (rows x cols below) and tokens
 //              from 1 to a 10-image condition prefix (41,000). Outputs are poisoned first; each
 //              call runs twice and must agree bit for bit. Every other tile configuration the
-//              bench's sweep times (kernel/src/image/fp8_gemm_internal.h) is held to the same
-//              check at the edge shapes: one token, partial token and output-row tiles, K = 128.
+//              bench's sweep times (kernel/tests/image_gemm_sweep.h, built into this test and the
+//              bench only) is held to the same check at the edge shapes: one token, partial token
+//              and output-row tiles, K = 128.
 //   quant      the W8A8 product's error against the unquantized one (fp64 of BF16 x and BF16 W,
 //              W quantized per row as the converter does), reported with the weight-only error
 //              beside it; gated only by a loose sanity flag.
@@ -29,18 +31,20 @@
 //
 // Mechanics bound (from bench_mma_peak's probes: one mxf8f6f4 instruction keeps fp32's bits and
 // drops addends more than 2^25 below its largest): per instruction, 32 products and the
-// accumulator each lose at most 2^-25 of the largest, and its result one fp32 rounding, so
-//   |y - ref| <= F * ceil(cols / 32) * 35 * 2^-25 * sum|terms| + |ref| * (2^-23 + BF16's 2^-8)
-// with sum|terms| = |scales[t] * wscale[r]| * sum_c |e4m3(a) e4m3(w)|, and F = --bound-factor
-// (default 1). The rows sampled at large token counts cover every residue mod 128, the columns
-// every residue mod 256, so every warp, fragment and lane position of a tile is checked.
+// accumulator each lose at most 2^-25 of the largest, and its result one fp32 rounding. Walking
+// each output's k32 steps in the kernel's order, with S_i the exact prefix sum after step i,
+//   E_i = E_{i-1} + F * 35 * 2^-25 * (|S_{i-1}| + E_{i-1} + sum_{step i} |e4m3(a) e4m3(w)|)
+//   |y - ref| <= E_last * |scales[t] * wscale[r]| + |ref| * (2^-23 + BF16's 2^-8)
+// with F = --bound-factor (default 1). The rows sampled at large token counts span the whole
+// range with an odd stride, covering every residue mod 128, the columns every residue mod 256, so
+// every warp, fragment and lane position of a tile is checked.
 //
 //   ignis_kernel_image_gemm_test [--bound-factor F] [--max-quant-rel-rms R]
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
 #include "ignis_image_gemm.h"
-#include "image/fp8_gemm_internal.h"
+#include "image_gemm_sweep.h"
 #include "moe_fixture.h"
 
 #include <algorithm>
@@ -48,6 +52,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -87,13 +92,15 @@ uint8_t e4m3_rn_satfinite(float v) {
   return static_cast<uint8_t>(sign | code);
 }
 
-// The header's definition of the quantization, one fp32 operation per step.
+// The header's definition of the quantization, one fp32 operation per step. std::max(a, NaN) is
+// a, as the kernel's fmaxf: a NaN element does not raise amax.
 void quantize_row_host(const uint16_t *x, int cols, uint8_t *codes, float *scale) {
   float amax = 0.0f;
   for (int c = 0; c < cols; ++c) amax = std::max(amax, std::fabs(bf16_to_f32(x[c])));
   const volatile float k448 = 448.0f;
-  const float s = amax > 0.0f ? amax / k448 : 1.0f;
-  const float inv = amax > 0.0f ? k448 / amax : 0.0f;
+  const float min_amax = std::ldexp(7.0f, -120);  // 448 * 2^-126: the scale is a normal fp32
+  const float s = amax >= min_amax ? amax / k448 : 1.0f;
+  const float inv = amax >= min_amax ? k448 / amax : 0.0f;
   for (int c = 0; c < cols; ++c) codes[c] = e4m3_rn_satfinite(bf16_to_f32(x[c]) * inv);
   *scale = s;
 }
@@ -141,8 +148,8 @@ void quantize_arm(int tokens, int cols) {
       const double xv = bf16_to_f32(x[i]);
       const double err = std::fabs(static_cast<double>(scales[t]) * e4m3_to_f32(codes[i]) - xv);
       const double tol = std::fabs(xv) * 0x1p-4 + static_cast<double>(scales[t]) * 0x1p-10;
-      worst = std::max(worst, err / tol);
-      if (err > tol) ++over;
+      worst = std::isnan(err) ? 1e300 : std::max(worst, err / tol);
+      if (!(err <= tol)) ++over;
     }
   }
   std::printf("  quantize %5d tokens x %5d: %d codes and %d scales off the definition, round trip worst %.2f of "
@@ -157,6 +164,73 @@ void quantize_arm(int tokens, int cols) {
     for (int c = 0; c < cols; ++c) zeros = zeros && (codes[zero_row + c] & 0x7F) == 0;
     check(zeros, "quantize: an all-zero row has scale 1 and zero codes");
   }
+}
+
+// The header's edge rows, each against the restatement (codes and scales bit for bit):
+//   0  ordinary (a control in the same launch)
+//   1  one NaN            -> a NaN code; amax, and so the row's scale, from the other elements
+//   2  one +Inf, 3 -Inf   -> scale Inf: the row never dequantizes to finite values
+//   4  amax ~ 1e-37       -> below 448 * 2^-126: scale 1 and zero codes (no 0 * Inf = NaN code)
+//   5  amax ~ 1e-35       -> above it: a normal scale, codes over E4M3's whole range
+//   6  amax = 7 * 2^-120  -> exactly the floor: scale 2^-126, the largest code 448
+//   7  all zero           -> scale 1, zero codes
+// Every non-finite x must dequantize to a non-finite value; the finite rows keep the round trip.
+void quantize_edge_rows() {
+  constexpr int kRows = 8, kCols = 256;
+  const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
+  std::vector<uint16_t> x(kRows * kCols);
+  const float mags[kRows] = {1.0f, 1.0f, 1.0f, 1.0f, 1e-37f, 1e-35f, std::ldexp(7.0f, -120), 0.0f};
+  for (int t = 0; t < kRows; ++t) {
+    for (int c = 0; c < kCols; ++c) x[t * kCols + c] = f32_to_bf16(hash_uniform(800 + t, c, mags[t]));
+  }
+  auto put = [&](int t, int c, float v) {  // bf16 of v, NaN and Inf included
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    x[t * kCols + c] = static_cast<uint16_t>(u >> 16);
+  };
+  put(1, 17, nan);
+  put(2, 100, inf);
+  put(3, 3, -inf);
+  put(6, 200, std::ldexp(7.0f, -120));
+  for (int c = 0; c < kCols; ++c) x[7 * kCols + c] = 0;
+  DeviceBytes dx(x.size() * 2), dc(x.size()), ds(kRows * 4);
+  upload(dx, x);
+  IMG_RC(ignis_image_quantize_tokens(dx.p, kRows, kCols, dc.p, ds.as<float>(), nullptr));
+  MOE_CUDA(cudaDeviceSynchronize());
+  const auto codes = download<uint8_t>(dc.p, x.size());
+  const auto scales = download<float>(ds.p, kRows);
+  std::vector<uint8_t> want(kCols);
+  for (int t = 0; t < kRows; ++t) {
+    float s = 0.0f;
+    quantize_row_host(&x[t * kCols], kCols, want.data(), &s);
+    const bool same = std::memcmp(&s, &scales[t], 4) == 0 && std::memcmp(want.data(), &codes[t * kCols], kCols) == 0;
+    int non_finite_kept = 0, non_finite = 0, over = 0;
+    for (int c = 0; c < kCols; ++c) {
+      const double xv = bf16_to_f32(x[t * kCols + c]);
+      const double back = static_cast<double>(scales[t]) * e4m3_to_f32(codes[t * kCols + c]);
+      if (!std::isfinite(xv)) {
+        ++non_finite;
+        if (!std::isfinite(back)) ++non_finite_kept;
+      } else if (t != 2 && t != 3) {
+        const double tol = std::fabs(xv) * 0x1p-4 + static_cast<double>(scales[t]) * 0x1p-10;
+        if (!(std::fabs(back - xv) <= tol)) ++over;
+      }
+    }
+    std::printf("  quantize edge row %d: scale %g, %s the definition, %d/%d non-finite x kept non-finite, %d over\n", t,
+                scales[t], same ? "bit for bit" : "OFF", non_finite_kept, non_finite, over);
+    const std::string what = "quantize edge row " + std::to_string(t);
+    check(same, what + ": codes and scale are the definition's, bit for bit");
+    check(non_finite_kept == non_finite, what + ": a non-finite x never dequantizes to a finite value");
+    check(over == 0, what + ": the finite elements keep the round trip");
+  }
+  check(std::isinf(scales[2]) && std::isinf(scales[3]), "quantize: an infinite element makes the scale Inf");
+  check(scales[4] == 1.0f && scales[7] == 1.0f, "quantize: a row below 448 * 2^-126 has scale 1");
+  check(scales[6] == std::ldexp(1.0f, -126), "quantize: a row at 448 * 2^-126 has scale 2^-126");
+  bool zero_codes = true;
+  for (int t : {4, 7}) {
+    for (int c = 0; c < kCols; ++c) zero_codes = zero_codes && (codes[t * kCols + c] & 0x7F) == 0;
+  }
+  check(zero_codes, "quantize: a row below 448 * 2^-126 has zero codes");
 }
 
 void quantize_refusals() {
@@ -210,16 +284,20 @@ double weight_scale(const std::vector<uint8_t> &payload, int rows, int cols, int
   return bf16_to_f32(s);
 }
 
-// `want` distinct indices in [0, count): all of them when few, else i * stride mod count (stride
-// odd and prime, so the sample covers every residue mod a power of two up to `want`) plus the last.
-std::vector<int> sample(int count, int want, int stride) {
+// `want` distinct indices in [0, count): all of them when few, else i * stride for i < want, plus
+// the last. The stride is the largest odd number with (want - 1) * stride < count, so the sample
+// spans the whole range and -- an odd stride being invertible mod any power of two -- covers every
+// residue mod a power of two up to `want`.
+std::vector<int> sample(int count, int want) {
   std::vector<int> s;
   if (count <= want) {
     for (int i = 0; i < count; ++i) s.push_back(i);
     return s;
   }
-  for (int i = 0; i < want; ++i) s.push_back(static_cast<int>((static_cast<long long>(i) * stride) % count));
-  if (std::find(s.begin(), s.end(), count - 1) == s.end()) s.push_back(count - 1);
+  int stride = (count - 1) / (want - 1);
+  if (stride % 2 == 0) --stride;
+  for (int i = 0; i < want; ++i) s.push_back(i * stride);
+  if (s.back() != count - 1) s.push_back(count - 1);
   return s;
 }
 
@@ -242,7 +320,7 @@ std::vector<uint8_t> y_row_bytes(const DeviceBytes &dy, int t, int rows, bool f3
   return download<uint8_t>(static_cast<const uint8_t *>(dy.p) + static_cast<std::size_t>(t) * rows * width, rows * width);
 }
 
-// `config` < 0: the public entry point; else that tile configuration (fp8_gemm_internal.h).
+// `config` < 0: the public entry point; else that tile configuration (image_gemm_sweep.h).
 void mechanics_arm(const Options &o, int tokens, int rows, int cols, bool f32_out, int config = -1) {
   const std::vector<uint8_t> w = make_weight(static_cast<uint32_t>(7000 + rows + cols), rows, cols, 0.004f);
   const std::vector<uint16_t> x = make_activations(static_cast<uint32_t>(600 + cols), tokens, cols, {});
@@ -254,13 +332,13 @@ void mechanics_arm(const Options &o, int tokens, int rows, int cols, bool f32_ou
   MOE_CUDA(cudaMemset(dy.p, 0xFF, dy.bytes));  // poison: an unwritten output is a NaN
   auto gemm = [&] {
     return config < 0 ? ignis_image_gemm_w8a8(dw.p, rows, cols, dc.p, ds.as<float>(), tokens, dy.p, f32_out ? 1 : 0, nullptr)
-                      : ignis_image::gemm_w8a8_config(config, dw.p, rows, cols, dc.p, ds.as<float>(), tokens, dy.p,
+                      : image_gemm_sweep::gemm_w8a8(config, dw.p, rows, cols, dc.p, ds.as<float>(), tokens, dy.p,
                                                       f32_out ? 1 : 0, nullptr);
   };
   IMG_RC(ignis_image_quantize_tokens(dx.p, tokens, cols, dc.p, ds.as<float>(), nullptr));
   IMG_RC(gemm());
   MOE_CUDA(cudaDeviceSynchronize());
-  const std::vector<int> ts = sample(tokens, 160, 131), rs = sample(rows, 384, 263);
+  const std::vector<int> ts = sample(tokens, 160), rs = sample(rows, 384);
   std::vector<std::vector<uint8_t>> first;
   for (int t : ts) first.push_back(y_row_bytes(dy, t, rows, f32_out));
   IMG_RC(gemm());
@@ -268,10 +346,16 @@ void mechanics_arm(const Options &o, int tokens, int rows, int cols, bool f32_ou
   bool same = true;
   for (std::size_t i = 0; i < ts.size(); ++i) same = same && y_row_bytes(dy, ts[i], rows, f32_out) == first[i];
 
-  const double per_instr = std::ldexp(35.0 * ((cols + 31) / 32), -25) * o.bound_factor;
+  // The bound walks each output's k32 steps in the kernel's order (k ascending, one instruction
+  // per step): step i's 32 products and its accumulator input lose at most 2^-25 of its largest
+  // addend each and its result one rounding, so it adds at most 35 * 2^-25 * (|S_{i-1}| + E_{i-1}
+  // + sum_i |p|), S the exact fp64 prefix sum and E the bound so far (the accumulator the
+  // instruction actually reads is within E of S).
+  const double per_step = 0x1p-25 * 35.0 * o.bound_factor;
   const double out_rel = 0x1p-23 + (f32_out ? 0.0 : 0x1p-8);
   int bad = 0;
   double worst = 0.0;
+  std::vector<double> acc_rel;  // the accumulation part of the bound over |ref|
   for (int t : ts) {
     const auto codes = download<uint8_t>(dc.as<uint8_t>() + static_cast<std::size_t>(t) * cols, cols);
     const double sx = download<float>(ds.as<float>() + t, 1)[0];
@@ -280,23 +364,35 @@ void mechanics_arm(const Options &o, int tokens, int rows, int cols, bool f32_ou
     for (int c = 0; c < cols; ++c) a[c] = g_e4m3.v[codes[c]];
     for (int r : rs) {
       const uint8_t *wr = &w[static_cast<std::size_t>(r) * cols];
-      double s = 0.0, mag = 0.0;
-      for (int c = 0; c < cols; ++c) {
-        const double p = a[c] * g_e4m3.v[wr[c]];
-        s += p;
-        mag += std::fabs(p);
+      double s = 0.0, e = 0.0;
+      for (int k0 = 0; k0 < cols; k0 += 32) {
+        double step = 0.0, step_mag = 0.0;
+        for (int c = k0; c < k0 + 32; ++c) {
+          const double p = a[c] * g_e4m3.v[wr[c]];
+          step += p;
+          step_mag += std::fabs(p);
+        }
+        e += per_step * (std::fabs(s) + e + step_mag);
+        s += step;
       }
       const double scale = sx * weight_scale(w, rows, cols, r);
       const double ref = s * scale;
-      const double tol = per_instr * mag * std::fabs(scale) + std::fabs(ref) * out_rel + 1e-30;
+      const double tol = e * std::fabs(scale) + std::fabs(ref) * out_rel + 1e-30;
       const double err = std::fabs(y[r] - ref);
       if (!(err <= tol)) ++bad;
       if (err / tol > worst || std::isnan(err)) worst = std::isnan(err) ? 1e300 : err / tol;
+      if (ref != 0.0) acc_rel.push_back(e * std::fabs(scale) / std::fabs(ref));
     }
   }
+  double median = 0.0;
+  if (!acc_rel.empty()) {
+    std::nth_element(acc_rel.begin(), acc_rel.begin() + acc_rel.size() / 2, acc_rel.end());
+    median = acc_rel[acc_rel.size() / 2];
+  }
   const std::string tile = config < 0 ? "" : ", configuration " + std::to_string(config);
-  std::printf("  gemm %5d x %5d x %5d tokens, %s out%s: worst error %.3f of bound, %d over (%zu x %zu sampled)%s\n", rows,
-              cols, tokens, f32_out ? "fp32" : "bf16", tile.c_str(), worst, bad, ts.size(), rs.size(),
+  std::printf("  gemm %5d x %5d x %5d tokens, %s out%s: worst error %.3f of bound, %d over (%zu x %zu sampled), "
+              "accumulation bound / |ref| median %.2e%s\n",
+              rows, cols, tokens, f32_out ? "fp32" : "bf16", tile.c_str(), worst, bad, ts.size(), rs.size(), median,
               same ? "" : ", NOT deterministic");
   const std::string what =
       "gemm [" + std::to_string(rows) + "][" + std::to_string(cols) + "] x " + std::to_string(tokens) + tile;
@@ -310,8 +406,9 @@ float gaussian(uint32_t stream, uint64_t i) {
 }
 
 void quant_error_arm(const Options &o, int tokens, int rows, int cols, bool outliers) {
-  // W: BF16, ~N(0, 0.02^2); quantized per row as the converter does: scale = BF16(amax / 448),
-  // codes E4M3(w / scale).
+  // W: BF16, ~N(0, 0.02^2); quantized per row as the converter does (layout.md §6.1,
+  // tools/flash-next-converter/fp8.py): scale = the smallest BF16 >= fp32(amax / 448), so no code
+  // saturates, or 1 for an all-zero row; codes E4M3(w / scale).
   std::vector<float> wf(static_cast<std::size_t>(rows) * cols);
   for (std::size_t i = 0; i < wf.size(); ++i) wf[i] = bf16_to_f32(f32_to_bf16(0.02f * gaussian(901, i)));
   const std::size_t scale_at = (wf.size() + 255) / 256 * 256;
@@ -320,7 +417,10 @@ void quant_error_arm(const Options &o, int tokens, int rows, int cols, bool outl
   for (int r = 0; r < rows; ++r) {
     float amax = 0.0f;
     for (int c = 0; c < cols; ++c) amax = std::max(amax, std::fabs(wf[static_cast<std::size_t>(r) * cols + c]));
-    const uint16_t sb = f32_to_bf16(amax / 448.0f);
+    const float want = amax / 448.0f;
+    uint16_t sb = f32_to_bf16(want);
+    if (bf16_to_f32(sb) < want) ++sb;  // round up: the next BF16 (positive, so the next bit pattern)
+    if (amax == 0.0f) sb = f32_to_bf16(1.0f);
     const float s = bf16_to_f32(sb);
     std::memcpy(&w[scale_at + 2 * static_cast<std::size_t>(r)], &sb, 2);
     for (int c = 0; c < cols; ++c) {
@@ -344,11 +444,11 @@ void quant_error_arm(const Options &o, int tokens, int rows, int cols, bool outl
   IMG_RC(ignis_image_gemm_w8a8(dw.p, rows, cols, dc.p, ds.as<float>(), tokens, dy.p, 0, nullptr));
   MOE_CUDA(cudaDeviceSynchronize());
   double e8 = 0.0, e16 = 0.0, ref2 = 0.0, dot = 0.0, y2 = 0.0;
-  for (int t : sample(tokens, 64, 131)) {
+  for (int t : sample(tokens, 64)) {
     const std::vector<double> y = y_row(dy, t, rows, false);
     std::vector<double> xr(cols);
     for (int c = 0; c < cols; ++c) xr[c] = bf16_to_f32(x[static_cast<std::size_t>(t) * cols + c]);
-    for (int r : sample(rows, 256, 263)) {
+    for (int r : sample(rows, 256)) {
       double full = 0.0, wonly = 0.0;
       for (int c = 0; c < cols; ++c) {
         const std::size_t i = static_cast<std::size_t>(r) * cols + c;
@@ -400,26 +500,30 @@ int main(int argc, char **argv) {
   int devices = 0;
   MOE_CUDA(cudaGetDeviceCount(&devices));
   IMG_RC(ignis_image_gemm_prepare());
+  IMG_RC(image_gemm_sweep::prepare());
   std::printf("per-token E4M3 activation quantization\n");
   for (int cols : {16, 64, 4096, 12288}) quantize_arm(3, cols);
   for (int cols : {4096, 6144}) quantize_arm(300, cols);
   quantize_arm(1, 4096);
+  quantize_edge_rows();
   quantize_refusals();
 
   std::printf("FP8 W8A8 GEMM against fp64 of the dequantized operands (bound factor %.2f)\n", o.bound_factor);
   struct Shape {
     int rows, cols;
-    bool dit;
   };
-  const Shape shapes[] = {{4096, 64, true},    {64, 4096, true},     {4096, 4096, true},    {1024, 4096, false},
-                          {6144, 4096, false}, {12288, 4096, true}, {24576, 4096, true}, {4096, 12288, true}};
+  // The encoder's shapes run to 41,000 tokens too: its sequence (text plus up to 10 x 1024 vision
+  // slots) is never longer than the DiT prefix it becomes (each slot is 4 prefix tokens), and the
+  // prompt text has no cap of its own (spec image-model/02 "As built").
+  const Shape shapes[] = {{4096, 64},   {64, 4096},    {4096, 4096},  {1024, 4096},
+                          {6144, 4096}, {12288, 4096}, {24576, 4096}, {4096, 12288}};
   for (const Shape &s : shapes) {
     int i = 0;
     for (int tokens : {1, 2, 17, 129, 4096, 16512}) mechanics_arm(o, tokens, s.rows, s.cols, (i++ + s.rows / 64) % 2 == 1);
-    if (s.dit) mechanics_arm(o, 41000, s.rows, s.cols, false);
+    mechanics_arm(o, 41000, s.rows, s.cols, false);
   }
   std::printf("every tile configuration (the bench's sweep) at the edge shapes\n");
-  for (int config = 0; config < ignis_image::gemm_config_count(); ++config) {
+  for (int config = 0; config < image_gemm_sweep::config_count(); ++config) {
     mechanics_arm(o, 1, 64, 4096, true, config);
     mechanics_arm(o, 129, 4096, 128, false, config);
     mechanics_arm(o, 300, 1040, 4096, true, config);

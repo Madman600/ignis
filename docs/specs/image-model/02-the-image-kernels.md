@@ -166,10 +166,13 @@ and per-row scales are applied in the epilogue.
 - ABI: `kernel/include/ignis_image_gemm.h`: `ignis_image_gemm_prepare`,
   `ignis_image_quantize_tokens`, `ignis_image_gemm_w8a8`,
   `ignis_image_gemm_last_error`.
-- Code: `kernel/src/image/` (`fp8_gemm.cu`, `fp8_gemm_internal.h`,
+- Code: `kernel/src/image/` (`fp8_gemm.cu`, `fp8_gemm_kernel.cuh`,
   `fp8_quant.cu`, `fp8_quant.cuh`, `image_mma.cuh`, `image_common.*`). All our
   own (ADR 0051 tier 1); CUTLASS 2.x sm80 and vLLM's `scaled_mm_sm120` were
   read, nothing was copied, so `kernel/NOTICE` has nothing to add.
+- The leaf instantiates the default tile configuration only. The sweep's
+  configurations are built into the test and the bench alone
+  (`kernel/tests/image_gemm_sweep.{h,cu}`, from the same kernel template).
 - Tests: the CTest `ignis_kernel_image_gemm_test`
   (`kernel/tests/test_image_gemm.cu`) and the Rust `--ignored` test
   `crates/core/tests/image_gemm_gpu.rs` (bindings in
@@ -178,9 +181,16 @@ and per-row scales are applied in the epilogue.
 
 **The activation contract (AC 3).** Activations reach the GEMM as E4M3FN
 codes `[tokens][cols]` plus fp32 `scales[tokens]`:
-- `scales[t] = amax_t / 448`, or 1 for an all-zero row;
+- `scales[t] = amax_t / 448`;
 - `codes[t][c] = E4M3(x[t][c] · (448 / amax_t))`, rounded to nearest even
-  and saturated, each step one fp32 operation.
+  and saturated, each step one fp32 operation;
+- a row whose amax is below 448 · 2^-126 = 7 · 2^-120 gets scale 1 and zero
+  codes. That floor is the smallest amax whose scale is a normal fp32;
+  below it 448 / amax can overflow, and 0 · Inf would make NaN codes. An
+  all-zero row is one such row;
+- a NaN element gets a NaN code, and an infinite one makes the scale Inf:
+  a non-finite x never dequantizes to a finite value (tested, with rows
+  at, below and above the floor).
 
 `ignis_image_quantize_tokens` is the standalone producer.
 `fp8_quant.cuh` holds the device steps, so a norm, modulation, SwiGLU or
@@ -212,33 +222,51 @@ row scales. Shapes are the real linears (spec.md's model table), rows × cols:
 - 24576 × 4096: gate and up fused;
 - 4096 × 12288: down.
 
-Every shape runs at 1, 2, 17, 129, 4096 and 16,512 tokens, and the DiT's
-shapes also at 41,000 (a 10-image prefix). At large token counts the check
-samples 161 rows covering every residue mod 128 and 385 columns covering
-every residue mod 256.
+Every shape runs at 1, 2, 17, 129, 4096, 16,512 and 41,000 tokens (a
+10-image prefix). At large token counts the check samples 161 rows and 385
+columns, each at an odd stride over the whole range plus the last one, so
+they cover every residue mod 128 and mod 256.
+
+**The encoder's longest prompt.** It is 10 × 1024 vision slots plus the
+template and the prompt text: about 12,400 tokens with spec 03's longest
+tested prompt (2,000 tokens), inside 16,512. The prompt text has no cap of
+its own, though. So the encoder-only shapes (1024 × 4096, 6144 × 4096) also
+run at 41,000 tokens: the encoder's sequence is never longer than the DiT
+prefix it becomes, since each slot becomes 4 prefix tokens.
 
 The bound comes from the M1 probes. Per instruction, its 32 products and its
 accumulator input each lose at most 2^-25 of the largest addend, and its
-result one fp32 rounding:
+result one fp32 rounding. The test walks each output's k32 steps in the
+kernel's order. With `S_i` the exact fp64 prefix sum after step `i`:
 
-`|y − ref| ≤ F · ⌈cols/32⌉ · 35 · 2^-25 · Σ|terms| + |ref| · (2^-23 + 2^-8 for BF16)`
+`E_i = E_{i−1} + F · 35 · 2^-25 · (|S_{i−1}| + E_{i−1} + Σ_{step i}|p|)`
 
-`F` is `--bound-factor`, default 1.
+`|y − ref| ≤ E_last · |scales[t] · wscale[r]| + |ref| · (2^-23 + 2^-8 for BF16)`
+
+`F` is `--bound-factor`, default 1. The accumulation part of the bound over
+|ref| has these medians:
+
+| K | per-k32 bound (now) | whole-row Σ\|terms\| bound (before, review's simulation) |
+|---|---|---|
+| 64 | 4.9e-6 | 1.1e-5 |
+| 4096 | 1.26e-4 | 4.9e-3 |
+| 12288 | 3.4e-4 | 1.9e-2 |
 
 **Result:** 0 outputs over the bound, at every shape and token count.
-- fp32 outputs use 0.1-10% of the bound.
-- BF16 outputs use 27-99%; that is BF16's own half ulp.
+- fp32 outputs use 3-13% of the bound.
+- BF16 outputs use 85-99%; that is BF16's own half ulp.
 - The six other tile configurations pass the same check at the edge shapes.
 - Run time: about 2 minutes.
 
 **Quantization error**, against the unquantized product. The reference is
-fp64 of BF16 x times BF16 W, with W quantized per row as a converter would.
-Shapes are 4096 tokens × (4096 × 4096) and (4096 × 12288):
+fp64 of BF16 x times BF16 W, with W quantized per row as the converter does
+(layout.md §6.1: the row scale is amax / 448 rounded **up** to the next
+BF16). Shapes are 4096 tokens × (4096 × 4096) and (4096 × 12288):
 
 | x | W8A8 relative RMS | cosine | weights only |
 |---|---|---|---|
-| Gaussian | 3.75-3.81% | 0.99927-0.99930 | 2.66-2.67% |
-| Gaussian, 8 channels at 20× | 3.64-3.67% | 0.99933-0.99934 | 2.65-2.70% |
+| Gaussian | 3.77-3.78% | 0.99929 | 2.64-2.66% |
+| Gaussian, 8 channels at 20× | 3.61-3.66% | 0.99933-0.99935 | 2.65-2.67% |
 
 The inputs are synthetic. The error on real DiT activations comes with spec
 01's recordings and spec 04's end-to-end test. The CTest gates only on

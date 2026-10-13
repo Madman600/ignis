@@ -8,8 +8,10 @@
  *   scales [tokens] fp32, x[t][c] ~ scales[t] * e4m3(codes[t][c]).
  * ignis_image_quantize_tokens is the standalone producer: per token, amax = max |x[t][c]|,
  * scales[t] = amax / 448 and codes[t][c] = E4M3(x[t][c] * (448 / amax)), rounded to nearest even
- * and saturated to +-448, each step one fp32 operation; an all-zero row gets scale 1 and zero
- * codes. A non-finite x gives a non-finite scale or code: it is never clamped into a finite one.
+ * and saturated to +-448, each step one fp32 operation. A row whose amax is below 448 * 2^-126
+ * (= 7 * 2^-120, the smallest amax whose scale is a normal fp32), an all-zero row among them, gets
+ * scale 1 and zero codes. A non-finite x gives a non-finite scale or code: it is never clamped
+ * into a finite one.
  *
  * Weights are the FP8_E4M3FN_ROW_BF16S / row-scale-v1 payload (docs/specs/flash-next/layout.md
  * §6.1): E4M3FN codes [rows][cols] row-major, zero padding to a multiple of 256 bytes, then BF16

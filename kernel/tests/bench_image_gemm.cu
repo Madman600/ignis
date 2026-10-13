@@ -16,11 +16,11 @@
 //
 //   ignis_image_gemm_bench [--tokens N] [--reps N] [--warmup-ms N] [--sweep]
 //
-// --sweep times every tile configuration (kernel/src/image/fp8_gemm_internal.h) instead of the
+// --sweep times every tile configuration (image_gemm_sweep.h) instead of the
 // default one alone.
 
 #include "ignis_image_gemm.h"
-#include "image/fp8_gemm_internal.h"
+#include "image_gemm_sweep.h"
 
 #include <cuda_runtime.h>
 #include <nvml.h>
@@ -154,6 +154,7 @@ int main(int argc, char **argv) {
   BENCH_CUDA(cudaGetDeviceProperties(&prop, 0));
   if (nvmlInit_v2() == NVML_SUCCESS) nvmlDeviceGetHandleByIndex_v2(0, &g_nvml);
   BENCH_RC(ignis_image_gemm_prepare());
+  BENCH_RC(image_gemm_sweep::prepare());
   std::printf("%s, %d SMs; %d target tokens, %d timed launches per case\n", prop.name, prop.multiProcessorCount, tokens,
               reps);
 
@@ -202,18 +203,18 @@ int main(int argc, char **argv) {
     quant_ms[qi++] = t.ms;
   }
 
-  const int first = sweep ? 0 : ignis_image::gemm_default_config();
-  const int last = sweep ? ignis_image::gemm_config_count() - 1 : first;
+  const int first = sweep ? 0 : image_gemm_sweep::default_config();
+  const int last = sweep ? image_gemm_sweep::config_count() - 1 : first;
   for (int config = first; config <= last; ++config) {
-    std::printf("configuration %d: %s%s\n", config, ignis_image::gemm_config_name(config),
-                config == ignis_image::gemm_default_config() ? " (the default)" : "");
+    std::printf("configuration %d: %s%s\n", config, image_gemm_sweep::config_name(config),
+                config == image_gemm_sweep::default_config() ? " (the default)" : "");
     auto gemm = [&](const Weight &w) {
-      BENCH_RC(ignis_image::gemm_w8a8_config(config, w.p, w.rows, w.cols, codes, scales, tokens, y, 0, nullptr));
+      BENCH_RC(image_gemm_sweep::gemm_w8a8(config, w.p, w.rows, w.cols, codes, scales, tokens, y, 0, nullptr));
     };
     std::printf("  GEMM alone (BF16 out)                        rows x  cols      ms   TFLOPS   SM MHz  board W\n");
     for (std::size_t i = 0; i < weights.size(); ++i) {
       const Weight &w = weights[i];
-      if (ignis_image::gemm_w8a8_config(config, w.p, w.rows, w.cols, codes, scales, tokens, y, 0, nullptr) != 0) {
+      if (image_gemm_sweep::gemm_w8a8(config, w.p, w.rows, w.cols, codes, scales, tokens, y, 0, nullptr) != 0) {
         std::printf("    %-42s %5d x %5d   (not taken: %s)\n", cases[i].what, w.rows, w.cols, ignis_image_gemm_last_error());
         continue;
       }
