@@ -11,8 +11,16 @@ checkpoint's values) and are upcast where they are used, which gives the arithme
   `get_image_features`, diffusers' RMSNorm).
 - Everything else (embeddings, the vision tower and its mergers, the DiT's input projections,
   modulation and output, the VAE) is fp32 for the whole run.
-- `Stager` keeps one of the text encoder and the DiT on the GPU and the other in host RAM; the
-  VAE stays on the GPU.
+- Each pipeline call is split at `encode_prompt`, the only thing the rest of `__call__` reads from
+  the text encoder: an encoder phase runs every case's prompt (fp32 then bf16) with the encoder on
+  the GPU and the DiT in host RAM; the encoder is then dropped and a DiT phase replays those
+  outputs with the DiT and the VAE on the GPU (the DiT steps out to host RAM for each VAE decode).
+- The VAE's causal feature cache keeps nothing for a single frame (`_NoRetain`).
+
+    python record.py run --checkpoint SNAPSHOT_DIR [--out F:/ai/models/ignis-image-2.1-turbo/oracle]
+
+`run` writes one directory per case (`FIELDS`), thresholds.json and, last, manifest.json; it
+prints RECORD DONE or RECORD FAILED at the end.
 """
 import argparse
 import json
@@ -132,47 +140,65 @@ def set_precision(pipe, mode):
     hooks.on = mode == "fp32"
 
 
-class Stager:
-    """One of the text encoder and the DiT on the device, the other in host RAM; the VAE stays on
-    the device (so `pipe.device` is the device). A component moves when its forward starts; VAE
-    encode and decode run with both away."""
+class _NoRetain(list):
+    """The VAE's causal feature cache, for one frame: tensor stores are dropped. For a single frame
+    every read sees None (fresh from `clear_cache`) and the image convolution refuses a cache, so
+    dropping them changes no value; keeping them holds a copy of every convolution's input until
+    the decode ends (tens of GB at 2048^2 in fp32)."""
 
-    def __init__(self, pipe, device):
-        self.pipe, self.device = pipe, torch.device(device)
-        pipe.vae.to(self.device)
-        pipe.text_encoder.register_forward_pre_hook(lambda module, args: self.stage("text_encoder"))
-        pipe.transformer.register_forward_pre_hook(lambda module, args: self.stage("transformer"))
-        for name in ("encode", "decode"):
-            original = getattr(pipe.vae, name)
+    def __setitem__(self, index, value):
+        super().__setitem__(index, None if isinstance(value, torch.Tensor) else value)
 
-            def staged(*args, _original=original, **kwargs):
-                self.stage(None)
-                return _original(*args, **kwargs)
-            setattr(pipe.vae, name, staged)
 
-    def stage(self, name):
-        if self.device.type == "cpu":
-            return
-        for other in ("text_encoder", "transformer"):
-            if other != name:
-                getattr(self.pipe, other).to("cpu")
+def _no_retain(vae):
+    clear = vae.clear_cache
+
+    def clear_cache():
+        clear()
+        vae._feat_map = _NoRetain(vae._feat_map)
+        vae._enc_feat_map = _NoRetain(vae._enc_feat_map)
+    vae.clear_cache = clear_cache
+    clear_cache()
+
+
+def _stage_dit(pipe, device):
+    """On a GPU, while the DiT runs: the DiT on the device for its forward and in host RAM for each
+    VAE decode, which at 2048^2 in fp32 needs the room."""
+    pipe.transformer.register_forward_pre_hook(lambda module, args: module.to(device))
+    decode = pipe.vae.decode
+
+    def staged(*args, **kwargs):
+        pipe.transformer.to("cpu")
         torch.cuda.empty_cache()
-        if name is not None:
-            getattr(self.pipe, name).to(self.device)
+        return decode(*args, **kwargs)
+    pipe.vae.decode = staged
 
 
 def load_pipeline(checkpoint, device):
-    """diffusers' pipeline with bf16 weights, staged for `device`: the text encoder is loaded and
-    moved to the device first, so host RAM never holds more than one big model."""
+    """diffusers' pipeline with bf16 weights, for the encoder phase: the text encoder on `device`,
+    the DiT and the VAE in host RAM until `denoise_phase`. Host RAM never holds both big models."""
     from diffusers import QwenImage21Pipeline
     from transformers import Qwen3VLForConditionalGeneration
 
+    device = torch.device(device)
     text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
         os.path.join(checkpoint, "text_encoder"), dtype=torch.bfloat16)
     text_encoder.to(device)
     pipe = QwenImage21Pipeline.from_pretrained(checkpoint, text_encoder=text_encoder, dtype=torch.bfloat16)
-    pipe._ignis_stager = Stager(pipe, device)
+    _no_retain(pipe.vae)
+    if device.type == "cuda":
+        _stage_dit(pipe, device)
     return pipe
+
+
+def denoise_phase(pipe, device):
+    """After every prompt is encoded: on a GPU the text encoder's weights are dropped (to `meta`;
+    `pipe.device` then resolves to the GPU the DiT is on), and the DiT and the VAE go to `device`."""
+    if torch.device(device).type == "cuda":
+        pipe.text_encoder.to("meta")
+        torch.cuda.empty_cache()
+    pipe.vae.to(device)
+    pipe.transformer.to(device)
 
 
 def _write_json(path, value):
@@ -189,15 +215,32 @@ def _numpy(t):
     return t.numpy()
 
 
+class _PromptDone(Exception):
+    """Ends a pipeline call right after `encode_prompt` (the encoder phase)."""
+
+
+@dataclass
+class Prompt:
+    """What the encoder phase hands the DiT: `encode_prompt`'s output, on the host."""
+    embeds: torch.Tensor
+    pad: torch.Tensor
+    files: dict
+
+
 class _Capture:
     """Hooks on one pipeline call that write the oracle's fields as they appear, as .npy files
     under `out` (a field `a/b` is `out/a/b.npy`), and index them in `files`; with `out` None they
     are kept in `arrays` instead. Every hook is on the instance and comes off when the call ends;
-    the pipeline's code is not touched."""
+    the pipeline's code is not touched.
 
-    def __init__(self, pipe, out, blocks, block_steps, save_blocks=True):
+    The call is split at `encode_prompt`, the only thing the rest of `__call__` reads from the
+    text encoder: `stop_after_prompt` ends it there (the encoder phase), and `prompt` (a Prompt)
+    stands in for it without running the encoder (the DiT phase)."""
+
+    def __init__(self, pipe, out, blocks=(), block_steps=(), prompt=None, stop_after_prompt=False):
         self.pipe, self.out = pipe, out
-        self.blocks, self.block_steps, self.save_blocks = tuple(blocks), tuple(block_steps), save_blocks
+        self.blocks, self.block_steps = tuple(blocks), tuple(block_steps)
+        self.prompt, self.stop_after_prompt = prompt, stop_after_prompt
         self.files, self.arrays, self.kv_modes, self.dit_timesteps = {}, {}, [], []
         self.step = -1
         self.values = {}
@@ -247,12 +290,18 @@ class _Capture:
 
         def encode_prompt(original):
             def wrapped(*args, **kwargs):
+                if self.prompt is not None:
+                    device = pipe._execution_device
+                    return self.prompt.embeds.to(device), None, self.prompt.pad.to(device)
                 embeds, mask, pad = original(*args, **kwargs)
                 if mask is not None:
                     raise AssertionError("batch 1 has no padding, but the prompt mask is not None")
                 self.values["prompt_embeds"] = embeds.detach().clone()
+                self.values["image_pad_mask"] = pad.detach().clone()
                 self.save("prompt_embeds", embeds)
                 self.save("image_pad_mask", pad)
+                if self.stop_after_prompt:
+                    raise _PromptDone
                 return embeds, mask, pad
             return wrapped
         self._wrap(pipe, "encode_prompt", encode_prompt)
@@ -311,7 +360,7 @@ class _Capture:
 
         for b in self.blocks:
             def block_output(module, args, output, b=b):
-                if self.save_blocks and self.step in self.block_steps:
+                if self.step in self.block_steps:
                     self.save(f"step{self.step}/block{b:02d}", output)
             self._hook(pipe.transformer.transformer_blocks[b].register_forward_hook(block_output))
 
@@ -353,8 +402,9 @@ def on_white(rgba):
     return white
 
 
-def _check_traps(pipe, case, cap):
-    """Spec 01's traps, asserted on the run itself (test_record.py pins each on a tiny pipeline)."""
+def _check_prompt_traps(pipe, case, cap):
+    """Spec 01's encoder traps, asserted on the run itself (test_record.py pins each on a tiny
+    pipeline)."""
     import metadata
 
     ids = cap.values["input_ids"]
@@ -362,8 +412,7 @@ def _check_traps(pipe, case, cap):
     prompt = case.prompt or metadata.EMPTY_PROMPT       # trap: an empty prompt becomes " "
     image = None
     if case.image is not None:
-        rgba = pipe.image_processor.resize(condition_image(case), width=case.size, height=case.size)
-        image = on_white(rgba)
+        image = on_white(pipe.image_processor.resize(condition_image(case), width=case.size, height=case.size))
     # trap: the prompt is the raw template string, not apply_chat_template
     template = metadata.TEMPLATE_T2I if image is None else metadata.TEMPLATE_TI2I
     raw = pipe.processor(text=[template.format(prompt)], images=None if image is None else [image],
@@ -375,14 +424,23 @@ def _check_traps(pipe, case, cap):
     if pipe.processor.tokenizer.decode(ids[0, :drop].tolist()) != system:
         raise AssertionError(f"drop_idx {drop} does not end the system message")
     # trap: the encoder output is the final norm's input, not its output
-    hidden, embeds = cap.values["encoder_hidden_states"], cap.values["prompt_embeds"]
-    if not (torch.equal(embeds, hidden[:, drop:]) and torch.equal(cap.values["dit_encoder_hidden_states"], embeds)):
+    if not torch.equal(cap.values["prompt_embeds"], cap.values["encoder_hidden_states"][:, drop:]):
         raise AssertionError("prompt_embeds are not the final norm's input after drop_idx")
+    # trap: the encoder sees the image composited on white
     if image is not None:
-        # trap: the encoder sees the image on white, the VAE reads all four channels
-        want = raw["pixel_values"].to(cap.values["pixel_values"].device)
-        if not torch.equal(cap.values["pixel_values"], want.to(cap.values["pixel_values"].dtype)):
+        got = cap.values["pixel_values"]
+        if not torch.equal(got.cpu(), raw["pixel_values"].to(got.dtype)):
             raise AssertionError("pixel_values are not the image composited on white")
+
+
+def _check_denoise_traps(pipe, case, cap, prompt):
+    """The DiT phase's: it read the encoder phase's output, the VAE read the alpha, and the KV cache
+    ran as use_kv_cache=True lays it out."""
+    if not torch.equal(cap.values["dit_encoder_hidden_states"].cpu(), prompt.embeds):
+        raise AssertionError("the DiT did not read the encoder phase's prompt_embeds")
+    if case.image is not None:
+        # trap: the VAE reads all four channels
+        rgba = pipe.image_processor.resize(condition_image(case), width=case.size, height=case.size)
         read = cap.values["condition_vae_input"][0, 3, 0].cpu()
         alpha = torch.from_numpy(np.asarray(rgba)[..., 3].astype(np.float32)) / 127.5 - 1
         if (read.float() - alpha.to(read.dtype).float()).abs().max() > 1e-6:
@@ -392,38 +450,66 @@ def _check_traps(pipe, case, cap):
         raise AssertionError(f"kv cache modes {cap.kv_modes}: not use_kv_cache=True's layout")
 
 
-def record_case(pipe, case, out, blocks=(0, 15, 31), block_steps=(0, 1)):
-    """Runs the pipeline on `case` and writes every field of spec 01's list under `out` (empty):
-    .npy files indexed in `case.json`, the decoded `image.png`. Returns the case record."""
+def _encode(pipe, case, out):
+    """The encoder phase of one case: the pipeline up to `encode_prompt`, its fields written under
+    `out` (or kept in memory with `out` None). Returns its Prompt."""
+    latents = noise(case, pipe.transformer.config.in_channels)
+    with _Capture(pipe, out, stop_after_prompt=True) as cap:
+        try:
+            _call(pipe, case, _pack(pipe, latents), "latent")
+        except _PromptDone:
+            pass
+        else:
+            raise AssertionError("the pipeline returned without calling encode_prompt")
+    _check_prompt_traps(pipe, case, cap)
+    return Prompt(cap.values["prompt_embeds"].cpu(), cap.values["image_pad_mask"].cpu(), cap.files)
+
+
+def record_prompt(pipe, case, out):
+    """The encoder phase's recording: input_ids, the processor's outputs, the mrope positions, the
+    encoder's last hidden state and prompt_embeds, under `out` (empty). Returns the Prompt the DiT
+    phase replays."""
     os.makedirs(out, exist_ok=True)
     if os.listdir(out):
         raise ValueError(f"{out} is not empty: a recording never mixes two runs")
-    channels = pipe.transformer.config.in_channels
-    latents = noise(case, channels)
-    with _Capture(pipe, out, blocks, block_steps) as cap:
+    return _encode(pipe, case, out)
+
+
+def record_denoise(pipe, case, out, prompt, blocks=(0, 15, 31), block_steps=(0, 1)):
+    """The DiT phase's recording, on `prompt` from `record_prompt`: the noise, the condition
+    latents, the RoPE table and segments, every step, the block outputs, the decoded image.
+    Writes `case.json`, the index of both phases' fields, and returns it."""
+    latents = noise(case, pipe.transformer.config.in_channels)
+    with _Capture(pipe, out, blocks, block_steps, prompt=prompt) as cap:
         cap.save("noise", latents)
         images = _call(pipe, case, _pack(pipe, latents), "pil")
-    _check_traps(pipe, case, cap)
+    _check_denoise_traps(pipe, case, cap, prompt)
     images[0].save(os.path.join(out, "image.png"))
     cap.save("timesteps", pipe.scheduler.timesteps)
     cap.save("sigmas", pipe.scheduler.sigmas)
     cap.save("dit_timesteps", np.array(cap.dit_timesteps, dtype=np.float32))
+    files = {**prompt.files, **cap.files}
     info = {
         "case": {"name": case.name, "prompt": case.prompt, "size": case.size, "seed": case.seed,
                  "image": None if case.image is None else os.path.basename(case.image)},
         "drop_idx": pipe._drop_idx,
-        "sequence": {"text_encoder": cap.files["input_ids"]["shape"][1],
-                     "dit": cap.files["image_ids"]["shape"][0]},
+        "sequence": {"text_encoder": files["input_ids"]["shape"][1], "dit": files["image_ids"]["shape"][0]},
         "img_shapes": cap.img_shapes,
         "segments": cap.segments,
         "kv_cache_modes": cap.kv_modes,
         "sigmas": [float(s) for s in pipe.scheduler.sigmas],
         "blocks": list(blocks),
         "block_steps": list(block_steps),
-        "files": cap.files,
+        "files": files,
     }
     _write_json(os.path.join(out, "case.json"), info)
     return info
+
+
+def record_case(pipe, case, out, blocks=(0, 15, 31), block_steps=(0, 1)):
+    """Both phases of one case on one pipeline: every field of spec 01's list under `out` (empty),
+    .npy files indexed in `case.json`, the decoded `image.png`. Returns the case record."""
+    return record_denoise(pipe, case, out, record_prompt(pipe, case, out), blocks, block_steps)
 
 
 def rel_l2(x, ref):
@@ -432,11 +518,17 @@ def rel_l2(x, ref):
     return float(np.linalg.norm(x - ref) / np.linalg.norm(ref))
 
 
-def yardstick(pipe, case, recorded):
+def encode(pipe, case):
+    """The encoder phase without a recording: the Prompt, in memory (the yardstick's)."""
+    return _encode(pipe, case, None)
+
+
+def yardstick(pipe, case, recorded, prompt=None):
     """The pipeline's per-step error against a recording, teacher-forced: step i's recorded input
     latents go in (in the pipeline's dtype, so rounded to bf16 in bf16), and its velocity is
     compared with step i's recorded velocity. Also the encoder's error (prompt_embeds) and, with a
-    condition image, the condition latents'. Relative L2 (`rel_l2`)."""
+    condition image, the condition latents'. Relative L2 (`rel_l2`). `prompt` is this pipeline's
+    own encoder phase (`encode`), run here when None."""
     with open(os.path.join(recorded, "case.json"), encoding="utf-8") as f:
         info = json.load(f)
     steps = len(info["sigmas"]) - 1
@@ -451,11 +543,12 @@ def yardstick(pipe, case, recorded):
         latents = tensors["latents"]
         return {"latents": torch.from_numpy(inputs[i + 1]).to(latents.device, latents.dtype)}
 
-    with _Capture(pipe, None, (), (), save_blocks=False) as cap:
+    prompt = prompt if prompt is not None else encode(pipe, case)
+    with _Capture(pipe, None, prompt=prompt) as cap:
         _call(pipe, case, torch.from_numpy(inputs[0]), "latent", callback=force)
-    _check_traps(pipe, case, cap)
+    _check_denoise_traps(pipe, case, cap, prompt)
     errors = {"velocity": [rel_l2(cap.arrays[f"step{i}/velocity"], load(f"step{i}/velocity")) for i in range(steps)],
-              "encoder": rel_l2(cap.arrays["prompt_embeds"], load("prompt_embeds"))}
+              "encoder": rel_l2(_numpy(prompt.embeds), load("prompt_embeds"))}
     if case.image is not None:
         errors["condition_latents"] = rel_l2(cap.arrays["condition_latents"], load("condition_latents"))
     return errors
@@ -650,31 +743,50 @@ def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), 
         torch.cuda.reset_peak_memory_stats(device)
         return round(value, 2)
 
-    entries = {}
+    def timed(entry, key, work):
+        peak()
+        t = time.time()
+        result = work()
+        entry[key + "_wall_s"] = round(time.time() - t, 1)
+        entry[key + "_peak_vram_gb"] = peak()
+        return result
+
+    entries = {case.name: {"prompt": case.prompt, "size": case.size, "seed": case.seed,
+                           "image": None if case.image is None else "condition.png"} for case in cases}
+    # the encoder phase: every prompt in fp32 (recorded), then in bf16 (the yardstick's)
+    set_precision(pipe, "fp32")
+    prompts32, prompts16 = {}, {}
+    for case in cases:
+        check_fp32_ieee()
+        directory = os.path.join(out, case.name)
+        prompts32[case.name] = timed(entries[case.name], "fp32_encoder",
+                                     lambda: record_prompt(pipe, case, directory))
+        if case.image is not None:
+            shutil.copyfile(case.image, os.path.join(directory, "condition.png"))
+        log(f"fp32 encoder {case.name}: {entries[case.name]['fp32_encoder_wall_s']} s")
+    set_precision(pipe, "bf16")
+    for case in cases:
+        prompts16[case.name] = timed(entries[case.name], "bf16_encoder", lambda: encode(pipe, case))
+    # the DiT phase: every case in fp32 (recorded), then the teacher-forced bf16 yardstick
+    t = time.time()
+    denoise_phase(pipe, device)
+    switch_s = time.time() - t
     set_precision(pipe, "fp32")
     _guard_dit(pipe, device.type == "cuda")
     for case in cases:
         check_fp32_ieee()
-        peak()
-        t = time.time()
-        directory = os.path.join(out, case.name)
-        record_case(pipe, case, directory, blocks, block_steps)
-        if case.image is not None:
-            shutil.copyfile(case.image, os.path.join(directory, "condition.png"))
-        entries[case.name] = {"prompt": case.prompt, "size": case.size, "seed": case.seed,
-                              "image": None if case.image is None else "condition.png",
-                              "fp32_wall_s": round(time.time() - t, 1), "fp32_peak_vram_gb": peak()}
-        log(f"fp32 {case.name}: {entries[case.name]['fp32_wall_s']} s, peak {entries[case.name]['fp32_peak_vram_gb']} GB")
-
+        timed(entries[case.name], "fp32_dit_vae", lambda: record_denoise(
+            pipe, case, os.path.join(out, case.name), prompts32[case.name], blocks, block_steps))
+        log(f"fp32 dit+vae {case.name}: {entries[case.name]['fp32_dit_vae_wall_s']} s, "
+            f"peak {entries[case.name]['fp32_dit_vae_peak_vram_gb']} GB")
     _guard_dit(pipe, False)
     set_precision(pipe, "bf16")
     errors = {}
     for case in cases:
-        t = time.time()
-        errors[case.name] = yardstick(pipe, case, os.path.join(out, case.name))
-        entries[case.name].update(bf16_wall_s=round(time.time() - t, 1), bf16_peak_vram_gb=peak())
-        log(f"bf16 {case.name}: {entries[case.name]['bf16_wall_s']} s, velocity error "
-            f"{[round(e, 5) for e in errors[case.name]['velocity']]}, encoder {errors[case.name]['encoder']:.5f}")
+        errors[case.name] = timed(entries[case.name], "bf16_dit", lambda: yardstick(
+            pipe, case, os.path.join(out, case.name), prompts16[case.name]))
+        log(f"bf16 {case.name}: velocity error {[round(e, 5) for e in errors[case.name]['velocity']]}, "
+            f"encoder {errors[case.name]['encoder']:.5f}")
     write_thresholds(os.path.join(out, "thresholds.json"), errors, factor, session)
 
     revision = os.path.basename(os.path.normpath(checkpoint))
@@ -690,7 +802,9 @@ def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), 
         "pipeline": "diffusers QwenImage21Pipeline, batch 1, use_kv_cache=True, default attention processor "
                     "(QwenImage21AttnProcessor); fp32 compute: weights bf16 at rest (the checkpoint's), the text "
                     "decoder layers, lm_head and the DiT blocks upcast to fp32 in their own forward, everything else "
-                    "fp32 (bit-identical to from_pretrained(torch_dtype=float32), test_record.py)",
+                    "fp32; each call split at encode_prompt (the encoder phase for every case, then the DiT phase "
+                    "replaying its output); the VAE keeps no single-frame causal cache. All bit-identical to "
+                    "from_pretrained(torch_dtype=float32) (test_record.py)",
         "use_kv_cache": True,
         "tf32": tf32,
         "attention": attention,
@@ -701,7 +815,8 @@ def run(checkpoint, out, device, cases, blocks=(0, 15, 31), block_steps=(0, 1), 
         "block_steps": list(block_steps),
         "thresholds": "thresholds.json",
         "resources": resources,
-        "wall_s": {"load": round(load_s, 1), "total": round(time.time() - started, 1)},
+        "wall_s": {"load": round(load_s, 1), "encoder_to_dit": round(switch_s, 1),
+                   "total": round(time.time() - started, 1)},
         "bytes": size,
     }
     _write_json(os.path.join(out, "manifest.json"), manifest)

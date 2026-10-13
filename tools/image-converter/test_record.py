@@ -104,6 +104,25 @@ def test_fp32_compute_with_bf16_weights_is_diffusers_fp32_bit_for_bit(tiny, case
     assert {p.dtype for p in pipe.text_encoder.model.language_model.layers.parameters()} == {torch.bfloat16}
 
 
+def test_the_vae_keeps_no_single_frame_cache_and_computes_the_same(tiny):
+    from diffusers import AutoencoderKLQwenImage21
+    vae = AutoencoderKLQwenImage21.from_pretrained(os.path.join(tiny, "vae"), dtype=torch.float32)
+    retained = []
+    vae.decoder.up_blocks[-1].register_forward_hook(
+        lambda m, a, o: retained.append(sum(isinstance(x, torch.Tensor) for x in vae._feat_map)))
+    image = torch.rand(1, 4, 1, 64, 64, generator=torch.Generator().manual_seed(0)) * 2 - 1
+
+    def round_trip():
+        with torch.no_grad():
+            z = vae.encode(image).latent_dist.mode()
+            return z, vae.decode(z).sample
+    z, decoded = round_trip()
+    record._no_retain(vae)
+    z2, decoded2 = round_trip()
+    assert torch.equal(z, z2) and torch.equal(decoded, decoded2)
+    assert retained[0] > 0 and retained[1] == 0
+
+
 def test_bf16_mode_is_a_plain_bf16_load_bit_for_bit(tiny, case):
     pipe = record.load_pipeline(tiny, "cpu")
     record.set_precision(pipe, "fp32")
@@ -383,7 +402,7 @@ def _run(tiny, edit, out):
                       disk_budget_gb=0, min_free_ram_gb=0, min_free_vram_gb=0, max_vram_gb=0)
 
 
-def test_a_run_records_every_case_then_the_yardstick_in_one_session(tiny, edit, tmp_path):
+def test_a_run_records_every_case_then_the_yardstick_in_one_session(tiny, edit, recorded, tmp_path):
     out = str(tmp_path / "oracle")
     manifest = _run(tiny, edit, out)
     with open(os.path.join(out, "manifest.json"), encoding="utf-8") as f:
@@ -391,11 +410,25 @@ def test_a_run_records_every_case_then_the_yardstick_in_one_session(tiny, edit, 
     with open(os.path.join(out, "thresholds.json"), encoding="utf-8") as f:
         thresholds = json.load(f)
     assert thresholds["session"] == manifest["session"] and set(thresholds["cases"]) == {"t2i", "edit"}
+    fresh = record.load_pipeline(tiny, "cpu")
+    record.set_precision(fresh, "bf16")
     for name in ("t2i", "edit"):
-        assert len(thresholds["cases"][name]["velocity"]["threshold"]) == 8
         entry = manifest["cases"][name]
-        assert entry["fp32_wall_s"] > 0 and entry["bf16_wall_s"] > 0
-        assert os.path.isfile(os.path.join(out, name, "case.json"))
+        for phase in ("fp32_encoder", "bf16_encoder", "fp32_dit_vae", "bf16_dit"):
+            assert entry[phase + "_wall_s"] >= 0
+        # the phased run (all prompts, the encoder dropped, then all DiT work) records what one
+        # pipeline call per case records, bit for bit
+        case, directory, info = recorded[name]
+        with open(os.path.join(out, name, "case.json"), encoding="utf-8") as f:
+            assert json.load(f) == info
+        for field in info["files"]:
+            assert np.array_equal(_npy(os.path.join(out, name), field), _npy(directory, field)), field
+        with Image.open(os.path.join(out, name, "image.png")) as a, Image.open(os.path.join(directory, "image.png")) as b:
+            assert np.array_equal(np.asarray(a), np.asarray(b))
+        errors = record.yardstick(fresh, case, directory)
+        assert thresholds["cases"][name]["velocity"]["bf16_error"] == errors["velocity"]
+        assert thresholds["cases"][name]["encoder"]["bf16_error"] == errors["encoder"]
+        assert len(thresholds["cases"][name]["velocity"]["threshold"]) == 8
     assert os.path.isfile(os.path.join(out, "edit", "condition.png"))
     assert manifest["use_kv_cache"] is True and manifest["tf32"]["cudnn.allow_tf32"] is False
     for lib in ("torch", "diffusers", "transformers"):
