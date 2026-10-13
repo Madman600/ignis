@@ -137,3 +137,72 @@ The artifact is published on Hugging Face as `gpillon/ignis-image-2.1-turbo`.
    spec 05's catalog entry.
 8. The GPU runs (recordings) took the shared GPU lock. Their wall times are
    written in this spec's "As built".
+
+## As built (2026-10-13, branch `image-artifact-318`: AC 1-4)
+
+Where the implementation chose what the sections above leave open. AC 5, 6
+and 8 (the recorder) and AC 7 (publication) are not done here.
+
+- **Who writes the container.** `tools/image-converter/convert.py run`
+  writes work units (`frontend`, `text_encoder`, `vision`, `transformer`,
+  `vae`: `tensors.json`, one payload file per tensor, `DONE`, as
+  `docs/specs/flash-next/layout.md` §2 and §6), then runs the packer
+  (`ignis-artifact-pack --family qwen-image`, `Family::QwenImage21`), which
+  assembles the container through the crate's writer and merges
+  `converter.json` into `<artifact>.conversion.json`. Python never writes
+  the container, as for Flash-Next.
+- **Identity.** The header names the family through its `model_id`:
+  `ignis-image-2.1-turbo`, which is also the id it is served under by default
+  (ADR 0050: "Qwen" is never its primary name); `weights_id`
+  `fp8rows-bf16-fc13ba1`. `ModelFamily::QwenImage21` (`name()`
+  `Qwen-Image-2.1`) is read from it by `ModelFamily::of_model_id`.
+- **Object names.** `text_encoder/` + the checkpoint name without
+  `model.language_model.`; `transformer/` and `vae/` + the checkpoint name;
+  the vision tower under the 27B artifact's own names (`vision/layers/{b}/...`,
+  `vision/merger/...`) and the DeepStack mergers as `vision/deepstack/{i}/...`.
+  `frontend/` holds the tokenizer, `tokenizer_config.json`, the chat
+  template, the checkpoint's configs (`model_index.json`,
+  `processor_config.json`, `scheduler_config.json`,
+  `text_encoder_config.json`, `text_encoder_generation_config.json`,
+  `transformer_config.json`, `vae_config.json`) and `image_model.json`
+  (sample sigmas, scheduler, image processor, `latents_mean`/`latents_std`,
+  the system prompt and both templates verbatim from diffusers 0.41.0, the
+  source revision).
+- **Encodings the table leaves open.** `norm_out.linear` (`norm_out`'s
+  modulation from the timestep embedding) is bf16. The vision tower takes
+  the 27B's formats: Q6 patch embedding stored `[1152, 1536]`, Q4 qkv/fc1,
+  Q5 output/fc2, W8 merger and DeepStack mergers, all `row-split-k128-v1`,
+  bf16 biases, norms and positions; the encoder is adapted from the
+  reference converter (gpillon/ninfer `a00648c`, Apache-2.0) and bit-exact
+  with it. The token embedding is bound on the host.
+- **The pin.** `tools/image-converter/pin.json`: every file the converter
+  reads with its size and sha256 (all 16 matched the Hub's LFS oids), every
+  tensor's dtype and shape from the safetensors headers. The revision check
+  is the snapshot directory's name plus those hashes and the tensor list.
+- **The FP8 bound.** `--fp8-bound` defaults to 0.03: the 27B's FP8 linears
+  (`unsloth/Qwen3.8-27B-NVFP4@7d6f8d4` against `Qwen/Qwen3.8-27B@1d4bf0f`,
+  ten tensors, `tools/image-converter/fp8_bound.py`) measured 2.659-2.663%
+  relative Frobenius error, rounded up.
+- **The artifact.** `F:/ai/models/ignis-image-2.1-turbo/ignis_image_2_1_turbo-v2.ninfer`,
+  16,523,373,824 bytes, 1,294 objects: 1,283 tensors (480 FP8, 13.96 GB; 686
+  bf16, 2.13 GB; 54 Q4, 54 Q5, 1 Q6, 8 W8, 0.41 GB) and 11 resources.
+  - sha256 `ea5f971917d31db13edeedf84b99699d6903e846f8d877ffef523f0f6215dfd4`;
+  - its `.conversion.json` (618,239 bytes), sha256
+    `a60d7e46a5575977417b6f14ee82317891a53c5388ab6ac2bb9bb3c4b5f1bd0f`;
+  - converted by commit `1e1ef04` (clean), torch 2.13.0+cu130, diffusers
+    0.41.0, transformers 5.17.0.
+- **Numbers.** No NaN or infinity in any source tensor or decoded payload.
+  FP8 round-trip error 2.591-2.649% (mean 2.644%; the worst, text encoder
+  layer 13's `v_proj`), all under the bound. The vision tower's grouped
+  formats: Q4 10.4-16.2% (the worst `vision/layers/0/attention/qkv`), Q5
+  5.0-6.7%, Q6 2.5%, W8 0.54%. `conversion.json` records 88 VAE
+  convolutions.
+- **Wall times (CPU only).** Download 351 s; the pin's hashes 63 s; the
+  conversion 443 s (hashing included, beside a workspace build); the pack
+  79 s; the bind 1.1 s (`crates/artifact/tests/qwen_image.rs`
+  `the_real_artifact_binds`).
+- **For publication (AC 7).** `converter.command` in the sidecar holds local
+  paths, and `frontend/vae_config.json` (verbatim) carries the upstream
+  `_name_or_path` `/cpfs02/user/...`: the privacy scan will flag both. The
+  `.pack.lock`, `.pack-state.json` and `work/` beside the artifact are not
+  for publication.
