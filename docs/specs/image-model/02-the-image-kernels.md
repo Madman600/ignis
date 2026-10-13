@@ -160,6 +160,29 @@ Measured 2026-10-13 on the RTX 5090 (driver 596.36, CUDA 13.1, power limit
 (`kernel/src/image/image_mma.cuh`, `mma_e4m3_mx_unit_f32`). The per-token
 and per-row scales are applied in the epilogue.
 
+**For the 8-bit attention (AC 4)** the bench gained two loops, run again
+with the others on 2026-10-13 under the GPU lock (timing mode):
+
+| loop | SASS | TOPS | SM clock | TOPS/GHz |
+|---|---|---|---|---|
+| BF16 m16n8k16 (again) | `HMMA.16816.F32.BF16` | 249.8 | 2897 MHz | 86.2 |
+| FP8 `kind::f8f6f4`, FP32 accumulate (again) | `QMMA.16832.F32.E4M3.E4M3` | 495.6 | 2865 MHz | 173.0 |
+| FP8 `kind::mxf8f6f4`, unit scales (again) | `QMMA.SF.16832.F32.E4M3.E4M3.E8` | 908.2 | 2674 MHz | 339.6 |
+| FP8 FP16 accumulate (again) | `QMMA.16832.F16.E4M3.E4M3` | 941.2 | 2733 MHz | 344.4 |
+| INT8 m16n8k32, INT32 accumulate | `IMMA.16832.S8.S8` | **977.8** | 2836 MHz | **344.8** |
+| INT8 and `mxf8f6f4` alternating | both | 893.5 | 2768 MHz | 322.8 |
+
+- INT8 runs at the 838 class, the same rate per clock as `mxf8f6f4` with
+  unit scales. One instruction is exact (checked against the integer
+  product, including 32 products of −128 × −128 on top of 2^31 − 1 − 2^19).
+- Alternating the two, as the attention does, keeps 95% of that rate per
+  clock.
+- **So the attention takes INT8 for QK^T and `mxf8f6f4` with FP32
+  accumulation for PV.** SageAttention2++'s FP16-accumulate PV buys nothing
+  here, and it would cost precision: its V scale is capped at 2.25 so that
+  the FP16 accumulator cannot overflow. With FP32 accumulation, V uses
+  E4M3's whole range (448).
+
 ### The FP8 W8A8 GEMM and the activation quantization (AC 2, AC 3)
 
 **Where.**

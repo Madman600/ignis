@@ -1,7 +1,7 @@
 // The tensor-core instruction microbenchmark (spec image-model/02 acceptance 1, GitHub #319) --
 // OURS. It decides the FP8 GEMM's inner instruction.
 //
-// Three loops on register-resident operands, no memory traffic, eight independent accumulator
+// The loops run on register-resident operands, no memory traffic, eight independent accumulator
 // chains per warp so the issue rate is measured rather than the latency:
 //
 //   bf16      mma.m16n8k16 BF16, fp32 accumulate                         (4096 FLOP / instruction)
@@ -9,6 +9,8 @@
 //   fp8-mx    mma.m16n8k32 kind::mxf8f6f4 E4M3, unit UE8M0 block scales,
 //             fp32 accumulate                                            (8192)
 //   fp8-f16   mma.m16n8k32 kind::f8f6f4 E4M3, fp16 accumulate (reference: the 838-class rate)
+//   int8      mma.m16n8k32 s8.s8, int32 accumulate: the 8-bit attention's QK^T (8192 OP)
+//   qk+pv     int8 and fp8-mx alternating, one of each per chain step: the 8-bit attention's mix
 //
 // Each loop warms the card for --warmup-ms first (the boost clock ramps), then times --reps
 // launches with events. Block 0 reads clock64 and %globaltimer around its loop, so every rate is
@@ -48,9 +50,12 @@ using namespace ignis_image;
 
 namespace {
 
-enum Form { kBf16 = 0, kFp8 = 1, kFp8Mx = 2, kFp8F16 = 3 };
-const char *const kFormName[4] = {"bf16", "fp8", "fp8-mx", "fp8-f16"};
-constexpr double kFlopPerMma[4] = {2.0 * 16 * 8 * 16, 2.0 * 16 * 8 * 32, 2.0 * 16 * 8 * 32, 2.0 * 16 * 8 * 32};
+enum Form { kBf16 = 0, kFp8 = 1, kFp8Mx = 2, kFp8F16 = 3, kInt8 = 4, kQkPv = 5 };
+constexpr int kForms = 6;
+const char *const kFormName[kForms] = {"bf16", "fp8", "fp8-mx", "fp8-f16", "int8", "qk+pv"};
+// FLOP (or integer OP) per chain step: one instruction, two for qk+pv.
+constexpr double kFlopPerStep[kForms] = {2.0 * 16 * 8 * 16, 2.0 * 16 * 8 * 32, 2.0 * 16 * 8 * 32,
+                                         2.0 * 16 * 8 * 32, 2.0 * 16 * 8 * 32, 2.0 * 2.0 * 16 * 8 * 32};
 constexpr int kChains = 8;
 constexpr int kThreads = 256;
 
@@ -91,7 +96,21 @@ __device__ __forceinline__ uint32_t random_bf16x2(uint32_t h) {
   return r;
 }
 
+// Four INT8 in [-127, 127], so each one's negation is an INT8 too.
+__device__ __forceinline__ uint32_t random_int8x4(uint32_t h) {
+  uint32_t r = 0;
+  for (int i = 0; i < 4; ++i) r |= static_cast<uint32_t>(static_cast<uint8_t>(static_cast<int>((h >> (8 * i)) & 0xFFu) % 255 - 127)) << (8 * i);
+  return r;
+}
+
+__device__ __forceinline__ uint32_t negate_int8x4(uint32_t v) {
+  uint32_t r = 0;
+  for (int i = 0; i < 4; ++i) r |= static_cast<uint32_t>(static_cast<uint8_t>(-static_cast<int8_t>((v >> (8 * i)) & 0xFFu))) << (8 * i);
+  return r;
+}
+
 // Each chain accumulates +A B then -A B, so the accumulators stay bounded however long it runs.
+// qk+pv reads the E4M3 operands as INT8 too (its INT8 chains wrap, which does not change the rate).
 template <int FORM>
 __global__ void __launch_bounds__(kThreads) peak_kernel(int iters, uint32_t seed, float *sink,
                                                         unsigned long long *clocks) {
@@ -100,15 +119,16 @@ __global__ void __launch_bounds__(kThreads) peak_kernel(int iters, uint32_t seed
   const uint32_t sign = FORM == kBf16 ? 0x80008000u : 0x80808080u;
   for (int i = 0; i < 4; ++i) {
     const uint32_t h = mix(id * 8u + i + seed);
-    a[i] = FORM == kBf16 ? random_bf16x2(h) : random_e4m3x4(h);
+    a[i] = FORM == kBf16 ? random_bf16x2(h) : FORM == kInt8 ? random_int8x4(h) : random_e4m3x4(h);
   }
   for (int i = 0; i < 2; ++i) {
     const uint32_t h = mix(id * 8u + 4 + i + seed);
-    b[i] = FORM == kBf16 ? random_bf16x2(h) : random_e4m3x4(h);
-    bn[i] = b[i] ^ sign;
+    b[i] = FORM == kBf16 ? random_bf16x2(h) : FORM == kInt8 ? random_int8x4(h) : random_e4m3x4(h);
+    bn[i] = FORM == kInt8 ? negate_int8x4(b[i]) : b[i] ^ sign;
   }
   float acc[kChains][4] = {};
   uint32_t hacc[kChains][2] = {};
+  int32_t iacc[kChains][4] = {};
   unsigned long long c0 = 0, g0 = 0;
   if (id == 0) {
     c0 = clock64();
@@ -119,15 +139,17 @@ __global__ void __launch_bounds__(kThreads) peak_kernel(int iters, uint32_t seed
     for (int c = 0; c < kChains; ++c) {
       if (FORM == kBf16) mma_bf16_f32(acc[c], a, b);
       if (FORM == kFp8) mma_e4m3_f32(acc[c], a, b);
-      if (FORM == kFp8Mx) mma_e4m3_mx_unit_f32(acc[c], a, b);
+      if (FORM == kFp8Mx || FORM == kQkPv) mma_e4m3_mx_unit_f32(acc[c], a, b);
       if (FORM == kFp8F16) mma_e4m3_f16(hacc[c], a, b);
+      if (FORM == kInt8 || FORM == kQkPv) mma_s8_s32(iacc[c], a, b);
     }
 #pragma unroll
     for (int c = 0; c < kChains; ++c) {
       if (FORM == kBf16) mma_bf16_f32(acc[c], a, bn);
       if (FORM == kFp8) mma_e4m3_f32(acc[c], a, bn);
-      if (FORM == kFp8Mx) mma_e4m3_mx_unit_f32(acc[c], a, bn);
+      if (FORM == kFp8Mx || FORM == kQkPv) mma_e4m3_mx_unit_f32(acc[c], a, bn);
       if (FORM == kFp8F16) mma_e4m3_f16(hacc[c], a, bn);
+      if (FORM == kInt8 || FORM == kQkPv) mma_s8_s32(iacc[c], a, bn);
     }
   }
   if (id == 0) {
@@ -138,8 +160,26 @@ __global__ void __launch_bounds__(kThreads) peak_kernel(int iters, uint32_t seed
   for (int c = 0; c < kChains; ++c) {
     s += acc[c][0] + acc[c][1] + acc[c][2] + acc[c][3];
     s += __uint_as_float(hacc[c][0]) + __uint_as_float(hacc[c][1]);
+    s += static_cast<float>(iacc[c][0] + iacc[c][1] + iacc[c][2] + iacc[c][3]);
   }
   sink[id] = s;
+}
+
+// One INT8 instruction on known operands: A [16][32], B^T [8][32] (k contiguous), C and D [16][8]
+// int32, fragments read by the PTX ISA's formulas.
+__global__ void one_mma_int8_kernel(const int8_t *A, const int8_t *Bt, const int32_t *C, int32_t *D) {
+  const int lane = threadIdx.x & 31;
+  const int g = lane >> 2, t = lane & 3;
+  auto word = [](const int8_t *p) { return *reinterpret_cast<const uint32_t *>(p); };
+  const uint32_t a[4] = {word(A + g * 32 + 4 * t), word(A + (g + 8) * 32 + 4 * t), word(A + g * 32 + 16 + 4 * t),
+                         word(A + (g + 8) * 32 + 16 + 4 * t)};
+  const uint32_t b[2] = {word(Bt + g * 32 + 4 * t), word(Bt + g * 32 + 16 + 4 * t)};
+  const int rows[4] = {g, g, g + 8, g + 8};
+  const int cols[4] = {2 * t, 2 * t + 1, 2 * t, 2 * t + 1};
+  int32_t d[4];
+  for (int i = 0; i < 4; ++i) d[i] = C[rows[i] * 8 + cols[i]];
+  mma_s8_s32(d, a, b);
+  for (int i = 0; i < 4; ++i) D[rows[i] * 8 + cols[i]] = d[i];
 }
 
 // ---- one instruction on known operands ------------------------------------------------------
@@ -403,6 +443,47 @@ void semantics() {
   }
 }
 
+// INT8 against the exact integer product: random operands over the whole INT8 range, and the
+// extremes (-128 x -128 in every product, on a large C).
+void int8_semantics() {
+  std::vector<int8_t> a(16 * 32), b(8 * 32);
+  std::vector<int32_t> c(128), d(128);
+  int8_t *da, *db;
+  int32_t *dc, *dd;
+  BENCH_CUDA(cudaMalloc(&da, a.size()));
+  BENCH_CUDA(cudaMalloc(&db, b.size()));
+  BENCH_CUDA(cudaMalloc(&dc, 128 * 4));
+  BENCH_CUDA(cudaMalloc(&dd, 128 * 4));
+  bool exact = true;
+  uint32_t seed = 31337u;
+  for (int trial = 0; trial < 9; ++trial) {
+    const bool extreme = trial == 8;
+    for (auto &v : a) v = extreme ? -128 : static_cast<int8_t>(lcg(seed) & 0xFF);
+    for (auto &v : b) v = extreme ? -128 : static_cast<int8_t>(lcg(seed) & 0xFF);
+    for (auto &v : c) v = extreme ? 0x7FFFFFFF - 32 * 16384 : static_cast<int32_t>(lcg(seed)) - (1 << 23);
+    BENCH_CUDA(cudaMemcpy(da, a.data(), a.size(), cudaMemcpyHostToDevice));
+    BENCH_CUDA(cudaMemcpy(db, b.data(), b.size(), cudaMemcpyHostToDevice));
+    BENCH_CUDA(cudaMemcpy(dc, c.data(), 128 * 4, cudaMemcpyHostToDevice));
+    one_mma_int8_kernel<<<1, 32>>>(da, db, dc, dd);
+    BENCH_CUDA(cudaGetLastError());
+    BENCH_CUDA(cudaMemcpy(d.data(), dd, 128 * 4, cudaMemcpyDeviceToHost));
+    for (int r = 0; r < 16; ++r) {
+      for (int n = 0; n < 8; ++n) {
+        int64_t s = c[r * 8 + n];
+        for (int k = 0; k < 32; ++k) s += static_cast<int64_t>(a[r * 32 + k]) * b[n * 32 + k];
+        exact = exact && s == d[r * 8 + n];
+      }
+    }
+  }
+  cudaFree(da);
+  cudaFree(db);
+  cudaFree(dc);
+  cudaFree(dd);
+  std::printf("  %-8s one instruction equals the exact integer product (random, and -128^2 x 32 on 2^31-1 - 2^19): %s\n",
+              "int8", exact ? "yes" : "NO");
+  check(exact, "int8: one instruction is exact");
+}
+
 // ---- timing ---------------------------------------------------------------------------------
 
 template <int FORM> void launch_peak(int blocks, int iters, float *sink, unsigned long long *clocks) {
@@ -414,7 +495,9 @@ void launch_form(int form, int blocks, int iters, float *sink, unsigned long lon
   case kBf16: launch_peak<kBf16>(blocks, iters, sink, clocks); break;
   case kFp8: launch_peak<kFp8>(blocks, iters, sink, clocks); break;
   case kFp8Mx: launch_peak<kFp8Mx>(blocks, iters, sink, clocks); break;
-  default: launch_peak<kFp8F16>(blocks, iters, sink, clocks); break;
+  case kFp8F16: launch_peak<kFp8F16>(blocks, iters, sink, clocks); break;
+  case kInt8: launch_peak<kInt8>(blocks, iters, sink, clocks); break;
+  default: launch_peak<kQkPv>(blocks, iters, sink, clocks); break;
   }
 }
 
@@ -450,7 +533,7 @@ Rate time_form(int form, int blocks, int iters, int reps, int warmup_ms, float *
   cudaEventDestroy(e1);
   const double mmas = static_cast<double>(blocks) * (kThreads / 32) * iters * 2.0 * kChains * reps;
   Rate rate;
-  rate.tflops = mmas * kFlopPerMma[form] / (ms * 1e-3) / 1e12;
+  rate.tflops = mmas * kFlopPerStep[form] / (ms * 1e-3) / 1e12;
   rate.mhz = hc[1] > 0 ? static_cast<double>(hc[0]) / static_cast<double>(hc[1]) * 1e3 : 0.0;
   return rate;
 }
@@ -472,6 +555,7 @@ int main(int argc, char **argv) {
   BENCH_CUDA(cudaGetDeviceProperties(&prop, 0));
   std::printf("%s, %d SMs, sm_%d%d\n", prop.name, prop.multiProcessorCount, prop.major, prop.minor);
   semantics();
+  int8_semantics();
   const int blocks = prop.multiProcessorCount * 4;
   float *sink;
   unsigned long long *clocks;
@@ -479,14 +563,17 @@ int main(int argc, char **argv) {
   BENCH_CUDA(cudaMalloc(&clocks, 2 * sizeof(unsigned long long)));
   std::printf("instruction rate (%d blocks x %d threads, %d chains, %d iterations, %d timed launches)\n", blocks,
               kThreads, kChains, iters, reps);
-  Rate rates[4];
-  for (int form = 0; form < 4; ++form) {
+  Rate rates[kForms];
+  for (int form = 0; form < kForms; ++form) {
     rates[form] = time_form(form, blocks, iters, reps, warmup_ms, sink, clocks);
     std::printf("  %-8s %8.1f TFLOPS at %6.0f MHz  (%.1f TFLOPS/GHz)\n", kFormName[form], rates[form].tflops,
                 rates[form].mhz, rates[form].tflops / (rates[form].mhz * 1e-3));
   }
+  auto per_clock = [&](int form) { return rates[form].tflops / rates[form].mhz; };
   std::printf("  fp8-mx / fp8 = %.2f (clock-adjusted %.2f)\n", rates[kFp8Mx].tflops / rates[kFp8].tflops,
-              (rates[kFp8Mx].tflops / rates[kFp8Mx].mhz) / (rates[kFp8].tflops / rates[kFp8].mhz));
+              per_clock(kFp8Mx) / per_clock(kFp8));
+  std::printf("  int8 / fp8-mx = %.2f, qk+pv / fp8-mx = %.2f (clock-adjusted)\n", per_clock(kInt8) / per_clock(kFp8Mx),
+              per_clock(kQkPv) / per_clock(kFp8Mx));
   cudaFree(sink);
   cudaFree(clocks);
   if (g_failed != 0) {
