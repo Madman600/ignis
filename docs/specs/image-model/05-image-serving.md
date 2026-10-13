@@ -242,3 +242,66 @@ not told to.
 14. With spec 04's leaf: one live run on the 5090 serves a 2048² generation
     and a 2-image edit from the Playground, switching from the 27B and back.
     The times are written in "As built".
+
+## As built (322a, 2026-10-13, branch `image-serving-322`: AC 1, 2, 8, 10)
+
+Against `FakeImageRunner`; the image routes, the queue, the PNG, prompt
+enhancement and the Playground are the agents after it.
+
+- **The kind.** `ModelKind { Text, Image }` and `ModelFamily::kind()` in
+  `crates/core/src/compute.rs`. `ActiveModel.runner` is
+  `Runner::Text(Engine) | Runner::Image(ImageModel)`; `kind()`, `model_id()`
+  and `in_flight()` serve both, `engine()` is `None` on the image model, and
+  `text_engine()` is what a text route reads past the kind check (it panics
+  on the image model). The template, calibrations, labels and acquirer stay
+  on `ActiveModel`: the image model carries the placeholder template and
+  none of the rest.
+- **The runner.** `ignis_core::image::ImageRunner`, in core so the image
+  leaf's crate implements it as the text leaf implements `Compute`:
+  `plan()` (condition budget, sample sigmas), `encode_condition(&ImageCondition)`
+  → `ConditionId`, `denoise_step(id, &mut TargetLatents, σ, σ_next,
+  velocity)`, `vae_decode` → RGBA, `release_condition`. `&mut self`: one job
+  at a time. The prompt goes in as text and the condition images as RGBA at
+  their budgeted size: the runner owns the tokenizer and the preprocessing
+  (spec 03). The latents cross to the host between calls (≤ 4 MiB a step).
+  `vae_encode` is inside `encode_condition`. `FakeImageRunner` is
+  deterministic in the condition and the noise and counts its held prefixes.
+- **The image model in the server** (`crates/server/src/images/mod.rs`):
+  `ImageModel` holds the runner behind a lock (`with_runner`), and its
+  shutdown drops it — the counterpart of joining a text model's thread.
+  `ImageJobs` is the queue-busy hook: `wait()` → `Waiting`, `start()` →
+  `Running`, RAII; `in_flight()` is what the idle clock and a switch's drain
+  read; `close()` is a switch's or an unload's stop.
+- **The kind check** (`crates/server/src/api.rs`):
+  `switch_to_named_model(server, route_kind, model)` refuses
+  `409 model_kind_mismatch` (`param: model`) before any load or switch when
+  the model that would serve the request is of the other kind: the one
+  `model` names when it is another, its kind read by the switcher
+  (`Switcher::kind_of`, `ModelLoader::kind_of`: the artifact's header for a
+  known model, else the id when it is a family's own), or the loaded one —
+  also while unloaded, so a text request never reloads the image model only
+  to be refused. `check_served_kind` runs again on the pinned server and
+  refuses by name (`404 model_not_found`) a model of the route's kind that
+  was not switched to; `/v1/decide` answers that with its own `422`. The
+  tokenize routes never switch: `409` with the image model loaded.
+- **Other consumers.** The warm-up is a text model's only; metrics install
+  into an engine when there is one (`/metrics` serves either way); the
+  decide heads log and the thinking checks (start, `PATCH`) skip the image
+  model. `GET /v1/models` gains `kind`, and `max_model_len` is a text
+  model's only.
+- **The load.** `prepare_model` reads the family first: the image artifact
+  is verified against its sidecar (no text frontend is read) and the
+  options fitted to the family. `load_model` then loads `FakeImageRunner`
+  without `cuda`, and under `cuda` refuses naming #321
+  (`cuda_image_runner`, the stub the leaf fills).
+- **Config** (`config_group! { ImageGroup = "image" }`): the table's fields
+  and defaults, each with flag and env var, `[Visible, Patchable]`, every
+  family taking them (they matter while a text model is loaded too). Bounds:
+  `queue_depth` 0..=64, `max_n` 1..=64, `max_condition_images` 1..=10 (the
+  encoder's), `condition_floor_px` 32..=1024; `sizes` is its own list kind,
+  each side a multiple of 32; `condition_budget_tokens` and the enhancement
+  fields have no bound. The live knobs carry the group
+  (`server.live().image`). No `qwenimage21` family scope.
+- **Tests.** `crates/server/tests/model_kind.rs` (AC 1, 2, 8 and the
+  loader on the converter's synthetic artifact), `config/tests.rs` and
+  `tests/config_http.rs` (AC 10), `core::image` and `server::images` units.
