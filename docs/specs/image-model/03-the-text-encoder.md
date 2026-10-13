@@ -74,11 +74,12 @@ because the text tokens after an image attend to it.
    aspect ratios 1:1, 16:9, 9:16 and a 2-pixel-wide image, and the
    white-composite of an RGBA image whose alpha is 0, 128 and 255.
 3. The **t2i case**: the encoder output against the recorded fp32 output has
-   a relative L2 error ≤ the 5× bound in spec 01's `thresholds.json`. This is
-   the first milestone.
-4. The **edit case**: the same bound holds with the vision tower and
-   DeepStack on. With DeepStack off, the same test fails; that check proves
-   DeepStack matters to the test.
+   a relative L2 error ≤ the bound in spec 01's `thresholds.json`, both
+   measured over the text rows (spec 01's encoder metric: the positions
+   after `drop_idx` that are not image-pad). This is the first milestone.
+4. The **edit case**: the same bound holds on the text rows with the vision
+   tower and DeepStack on. With DeepStack off, the same test fails; that
+   check proves DeepStack matters to the test.
 5. The 27B's vision tests pass unchanged after the tower is parametrised.
 6. mrope positions equal transformers' for a t2i layout and a 3-image layout
    (CPU test against a recorded table).

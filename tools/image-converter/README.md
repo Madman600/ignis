@@ -21,9 +21,9 @@ is `crates/artifact/src/qwen_image.rs`.
 | `metadata.py` | `frontend/image_model.json` (sampler sigmas, scheduler, image processor, latent normalization, the prompt templates verbatim from diffusers 0.41.0) and the VAE's convolution shapes. |
 | `synthetic.py` | The synthetic checkpoint: 2 DiT blocks, 2 text layers, a 3-block vision tower, a small VAE, from diffusers' and transformers' own modules. |
 | `fp8_bound.py` | The measurement behind `--fp8-bound`'s default (below). |
-| `record.py` | The diffusers recordings (spec 01, AC 5-6): the fp32 oracle of three cases, the bf16 yardstick, `thresholds.json` (below). |
+| `record.py` | The diffusers recordings (spec 01, AC 5-6): the fp32 oracle of three cases (`run`); the bf16 and simulated W8A8 yardsticks and `thresholds.json`'s bound (`yardstick`, below). |
 | `fixtures/edit-condition.png` | The edit case's RGBA condition image, procedural (`record.edit_image(1024)`): shapes on an alpha ramp, alpha 0, partial and 255. |
-| `vision_probe.py` | An informational probe: the vision tower's outputs with the artifact's grouped formats and in bf16, against fp32. |
+| `vision_probe.py` | An informational probe: the vision tower's outputs with the artifact's W8 weights and in bf16, against fp32. |
 | `requirements.txt` | The venv `F:/ai/venvs/ignis-image` (torch and torchvision cu130, diffusers 0.41.0, transformers 5.17.0); the recorder uses it too. |
 
 ## What is stored
@@ -81,8 +81,9 @@ One GPU session, under the shared GPU lock, writes `F:/ai/models/ignis-image-2.1
 - a directory per case (`t2i` 1024², `t2i-2k` 2048², `edit` 1024² with the checked-in image): the
   fields of spec 01's list as `.npy`, indexed with shapes and dtypes in `case.json`, the decoded
   `image.png` (`record.FIELDS` describes each);
-- `thresholds.json`: per case and step, the bf16 pipeline's teacher-forced velocity error against
-  fp32 and 5 × it, and the encoder's (`--factor`). Written once: the recorder refuses an existing one;
+- a bf16-only `thresholds.json` (schema v1): per case and step, the bf16 pipeline's teacher-forced
+  velocity error against fp32 and 5 × it, and the encoder's (`--factor`), which the yardstick below
+  supersedes. Written once: the recorder refuses an existing one;
 - `manifest.json`, last: the versions, the TF32 flags, the attention check, wall times, peaks.
 
 The fp32 arithmetic is diffusers' own at about half the memory: the weights stay bf16 at rest (the
@@ -96,6 +97,38 @@ of it bit-identical to `from_pretrained(torch_dtype=float32)` and one call per c
 (asserted) and the DiT's attention is restricted to the memory-efficient SDPA kernel, which raises
 rather than fall back to a dense fp32 score matrix. The session needs ~22 GiB of VRAM and, for the
 host decode, 40 GB of free host RAM (`--min-free-ram-gb`); it took 494 s.
+
+## The yardsticks and the bound
+
+```
+HF_HUB_CACHE=F:/ai/models/hf F:/ai/venvs/ignis-image/Scripts/python.exe tools/image-converter/record.py yardstick \
+    --checkpoint F:/ai/models/hf/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba1986fcb905854dc8de2f52eee395f49b5b \
+    --replace-thresholds
+```
+
+One GPU session against the recorded oracle, which it never records again (the fp32 oracle does not
+depend on the artifact). Both yardsticks are teacher-forced (step i's recorded fp32 input latents in):
+- **bf16**: diffusers in bf16, as the recorder's own;
+- **sim**, simulated W8A8: the pipeline computing in fp32 on the artifact's stored values. Each of
+  the 480 FP8 linears becomes a `_SimQuantLinear` of its payload, read from the container
+  (`--artifact`) and checked against the sidecar's sha256, and fake-quantizes its input per token to
+  E4M3 as #319's kernel does (`fake_quant_e4m3`). The W8 vision tower is decoded, and every bf16
+  tensor is checked against its record. Attention stays fp32.
+
+It writes `thresholds.json` (schema v2). For each case it holds each step's velocity error, the
+encoder's over its text rows (not the image-pad rows the DiT discards), and the condition latents'.
+Each quantity has both errors and the bound max(`--sim-factor` 2 × sim, `--bf16-factor` 5 × bf16).
+The file also holds each metric's definition, the factors, the oracle's session, this session, and
+the artifact's identity and sidecar sha256. An existing `thresholds.json` is replaced only with
+`--replace-thresholds`, and kept as `thresholds.<its session id>.json`.
+
+`yardstick-report.json` beside it holds:
+- both yardsticks' errors, with the encoder's whole-tensor error;
+- the encoder error's breakdown per row: text against image-pad rows, and the top rows by reference
+  norm and by error;
+- the fp32 encoder replayed against the oracle (the session's wiring check, expected 0);
+- the edit encoder's text-row error with DeepStack off (spec 03 AC 4's premise) against its bound;
+- the wall times and the peaks.
 
 ## The conversion
 

@@ -16,16 +16,19 @@ An offline Python tool, `tools/image-converter/`, does three jobs:
    `Qwen-Image-2.1`.
 2. It records diffusers in fp32 on three fixed cases. These recordings are the
    oracle for specs 03 and 04.
-3. It records diffusers in bf16, teacher-forced, as the yardstick for the
-   end-to-end tolerance.
+3. It measures two yardsticks against that oracle, teacher-forced:
+   diffusers in bf16, and the pipeline computing in fp32 on the artifact's
+   own values with ignis's W8A8 quantization simulated. The end-to-end
+   tolerance comes from both.
 
 The artifact is published on Hugging Face as `gpillon/ignis-image-2.1-turbo`.
 
 ## Seams
 
 - **The container.** `.ninfer` v2 as `docs/specs/flash-next/layout.md`
-  defines it. The header family is `Qwen-Image-2.1`, and `crates/artifact`
-  reads it as a new `ModelFamily` variant (`QwenImage21`,
+  defines it. The header names the family `Qwen-Image-2.1` through its
+  `model_id` (`ignis-image-2.1-turbo`; the header has no family field), and
+  `crates/artifact` reads it as a new `ModelFamily` variant (`QwenImage21`,
   `crates/core/src/compute.rs`) with its own object list. The binder requires
   every object the family declares and refuses an artifact that lacks one, by
   name.
@@ -35,9 +38,9 @@ The artifact is published on Hugging Face as `gpillon/ignis-image-2.1-turbo`.
   |---|---|
   | DiT block linears (QKV, out, SwiGLU gate/up, down), `img_in`, `txt_in`'s two linears, `proj_out` | FP8 E4M3, one scale per output row |
   | text encoder decoder-layer linears (36 layers) | FP8 E4M3, one scale per output row |
-  | DiT shared modulation (4096→16384), timestep embedder, all norms | bf16 |
+  | DiT shared modulation (4096→16384), `norm_out.linear` (`norm_out`'s modulation from the timestep embedding), timestep embedder, all norms | bf16 |
   | token embedding (151936 × 4096) | bf16. It is read on the host and only the prompt's rows are uploaded |
-  | vision tower + merger + the three DeepStack mergers | the dtypes the 27B's vision path reads (`kernel/src/vision_encode.cu`) |
+  | vision tower + merger + the three DeepStack mergers | W8 (`W8G32_F16S`, `row-split-k128-v1`) for every matrix, bf16 biases, norms and positions, under the 27B's object names |
   | VAE encoder and decoder, `quant_conv`, `post_quant_conv` | bf16 |
   | `frontend/tokenizer.json` | the checkpoint's Qwen3-VL tokenizer, as the 27B's artifact carries its own |
   | metadata | the processor's image config, `sample_sigmas`, the scheduler config, `latents_mean`/`latents_std`, the system prompt and both templates verbatim, the checkpoint id and revision |
@@ -85,16 +88,38 @@ The artifact is published on Hugging Face as `gpillon/ignis-image-2.1-turbo`.
       state;
     - the encoder sees each condition image composited on white, while the
       VAE reads all four channels.
-- **The bf16 yardstick** (same tool). The same pipeline in bf16,
-  **teacher-forced**:
+- **The yardsticks** (same tool, `record.py yardstick`, against the recorded
+  oracle). Both run the pipeline **teacher-forced**:
   - at each denoising step i, the recorded fp32 input latents go in;
-  - the bf16 velocity is compared with the fp32 velocity of that step.
+  - the step's velocity is compared with the fp32 velocity of that step.
 
-  It writes the per-step relative L2 error and the end-to-end threshold,
-  **5 × that error per step**, to `thresholds.json` before ignis ever runs
-  (spec 04). A free-running comparison would measure the sampler amplifying
-  one ULP, not the error: the pipeline's docstring says even the cache on/off
-  switch gives "visibly distinct samples" in reduced precision.
+  The two pipelines:
+  - **bf16**: diffusers in bf16 on the checkpoint's weights. It has no
+    quantization error, so a bound from it alone would fail every step of a
+    correct ignis.
+  - **simulated W8A8 (sim)**: the pipeline computing in fp32 on the
+    artifact's stored values. Each linear the artifact stores as FP8 (480,
+    the text encoder's and the DiT's) uses its payload, E4M3 codes × bf16
+    row scale, and fake-quantizes its input per token to E4M3 with scale
+    amax/448, with the semantics of spec 02's kernel. The vision tower uses
+    its W8 payloads, and every other tensor its bf16. Attention is not
+    simulated.
+
+  The metrics are relative L2 against fp32:
+  - the velocity and the condition latents over the whole tensor;
+  - the encoder over its **text rows** only: the positions after
+    `drop_idx` whose `image_pad_mask` is 0. The DiT replaces the image-pad
+    rows with the condition latents, so their error never reaches it.
+
+  The **bound** ignis is held to is **max(2 × sim error, 5 × bf16 error)**,
+  per step, for the encoder and for the condition latents. Both factors are
+  flags with these defaults. `thresholds.json` carries both errors, the
+  bound, each quantity's metric, the factors, and the oracle's and the
+  yardstick's session ids. It is written before ignis ever runs (spec 04).
+
+  A free-running comparison would measure the sampler amplifying one ULP,
+  not the error: the pipeline's docstring says even the cache on/off switch
+  gives "visibly distinct samples" in reduced precision.
 - **Publication.** The Hugging Face repo `gpillon/ignis-image-2.1-turbo`
   holds:
   - the artifact and `conversion.json`;
@@ -128,10 +153,16 @@ The artifact is published on Hugging Face as `gpillon/ignis-image-2.1-turbo`.
    manifest that pins the versions of torch, diffusers and transformers. It
    asserts TF32 off and `use_kv_cache=True`. Each trap above has a test or an
    assertion.
-6. `thresholds.json` holds the bf16 teacher-forced per-step error, the 5×
-   threshold for each case, and the encoder's bf16 error. It is written in
-   the same session as the fp32 recording and never edited after ignis
-   results exist.
+6. `thresholds.json` holds, for each case:
+   - the teacher-forced per-step velocity error of both yardsticks (bf16
+     and simulated W8A8);
+   - their encoder error over the text rows, and their condition-latent
+     error;
+   - the bound max(2 × sim, 5 × bf16) for each of these.
+
+   It also holds the metrics, the factors and the oracle's session id. It is
+   written against the recorded oracle before any ignis result exists, and
+   never edited after.
 7. The Hugging Face repo exists with the files and card above, passed the
    privacy scan, and is pinned at a revision. Its sha256s are recorded for
    spec 05's catalog entry.
@@ -169,12 +200,33 @@ and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
   the system prompt and both templates verbatim from diffusers 0.41.0, the
   source revision).
 - **Encodings the table leaves open.** `norm_out.linear` (`norm_out`'s
-  modulation from the timestep embedding) is bf16. The vision tower takes
-  the 27B's formats: Q6 patch embedding stored `[1152, 1536]`, Q4 qkv/fc1,
-  Q5 output/fc2, W8 merger and DeepStack mergers, all `row-split-k128-v1`,
-  bf16 biases, norms and positions; the encoder is adapted from the
+  modulation from the timestep embedding) is bf16. The vision tower is W8
+  G32 `row-split-k128-v1` for every matrix (the patch embedding stored
+  `[1152, 1536]`), bf16 biases, norms and positions. The first conversion
+  kept the 27B's formats (Q6 patch embedding, Q4 qkv/fc1, Q5 output/fc2, W8
+  mergers): its Q4 tensors carried 10.4-16.2% weight error and the merger's
+  output 41.8% (the probe below), and the owner made the tower W8
+  throughout (2026-10-13). The row-split encoder is adapted from the
   reference converter (gpillon/ninfer `a00648c`, Apache-2.0) and bit-exact
   with it. The token embedding is bound on the host.
+- **The W8 tower needs a kernel change.** Every tower linear in
+  `kernel/src/vision_encode.cu` goes through ninfer's `ops::linear`. Its W8
+  arm, `select_w8_a16_launch`
+  (`kernel/vendor/src/ops/linear/w8/w8_dispatch.cpp`), is a finite registry
+  of exact (N, K) problems and throws outside it. It registers K 4608 with
+  N 2048, 4608 and 5120 (the mergers' fc1 `[4608, 4608]` among them), but
+  none of these:
+  - the tower's `[3456, 1152]` qkv, `[1152, 1152]` output, `[4304, 1152]`
+    fc1 and `[1152, 4304]` fc2 (stored K 4352);
+  - the `[1152, 1536]` patch embedding;
+  - the image merger's and DeepStack mergers' fc2 `[4096, 4608]`, missing
+    under the old formats too.
+
+  The W8 MMA and SIMT kernels look shape-generic (a non-"Full" path takes a
+  padded K, as Q5 does at K 4304 today). The change is therefore new
+  dispatch arms, plus `linear_workspace_capacity_bytes`, which calls
+  `select_w8_launch`, plus their test cases: a recorded vendored patch, for
+  spec 03 (or 02).
 - **The pin.** `tools/image-converter/pin.json`: every file the converter
   reads with its size and sha256 (all 16 matched the Hub's LFS oids), every
   tensor's dtype and shape from the safetensors headers. The revision check
@@ -183,31 +235,42 @@ and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
   (`unsloth/Qwen3.8-27B-NVFP4@7d6f8d4` against `Qwen/Qwen3.8-27B@1d4bf0f`,
   ten tensors, `tools/image-converter/fp8_bound.py`) measured 2.659-2.663%
   relative Frobenius error, rounded up.
-- **The artifact.** `F:/ai/models/ignis-image-2.1-turbo/ignis_image_2_1_turbo-v2.ninfer`,
-  16,523,373,824 bytes, 1,294 objects: 1,283 tensors (480 FP8, 13.96 GB; 686
-  bf16, 2.13 GB; 54 Q4, 54 Q5, 1 Q6, 8 W8, 0.41 GB) and 11 resources.
-  - sha256 `ea5f971917d31db13edeedf84b99699d6903e846f8d877ffef523f0f6215dfd4`;
-  - its `.conversion.json` (618,239 bytes), sha256
-    `a60d7e46a5575977417b6f14ee82317891a53c5388ab6ac2bb9bb3c4b5f1bd0f`;
-  - converted by commit `1e1ef04` (clean), torch 2.13.0+cu130, diffusers
-    0.41.0, transformers 5.17.0.
-- **Numbers.** No NaN or infinity in any source tensor or decoded payload.
-  FP8 round-trip error 2.591-2.649% (mean 2.644%; the worst, text encoder
-  layer 13's `v_proj`), all under the bound. The vision tower's grouped
-  formats: Q4 10.4-16.2% (the worst `vision/layers/0/attention/qkv`), Q5
-  5.0-6.7%, Q6 2.5%, W8 0.54%. `conversion.json` records 88 VAE
-  convolutions.
-- **Wall times (CPU only).** Download 351 s; the pin's hashes 63 s; the
-  conversion 443 s (hashing included, beside a workspace build); the pack
-  79 s; the bind 1.1 s (`crates/artifact/tests/qwen_image.rs`
-  `the_real_artifact_binds`).
+- **The artifact (the W8 tower).**
+  `F:/ai/models/ignis-image-2.1-turbo/ignis_image_2_1_turbo-v2.ninfer` is
+  16,721,644,544 bytes, 1,294 objects: 1,283 tensors and 11 resources. The
+  tensors are 480 FP8 (13.96 GB), 686 bf16 (2.13 GB) and 117 W8 (0.61 GB).
+  - sha256 `4205dd1932f0801804b0a544fe1340697e4e0a0dea4a276996bcb981006050af`.
+  - Its `.conversion.json` is 618,040 bytes, sha256
+    `b96d32efc29102c8d2fcef139b544b0f24758459a250e2c79fc854f569bc13ce`.
+  - It was converted from `e1f2351`'s tree plus the W8 recipe, later
+    committed as `6500add`. The sidecar records `e1f2351`, dirty, with
+    torch 2.13.0+cu130, diffusers 0.41.0 and transformers 5.17.0.
+  - The 1,174 payloads it shares with the first conversion are
+    byte-identical by sha256. That conversion was commit `1e1ef04`, clean;
+    its artifact was 16,523,373,824 bytes, sha256 `ea5f9719...`, and is
+    deleted.
+  - `vision_probe.py --conversion` re-encoded all 117 W8 payloads from
+    `6500add` to the recorded sha256s.
+- **Numbers.** No source tensor or decoded payload holds a NaN or an
+  infinity. The FP8 round-trip error is 2.591-2.649% (mean 2.644%; the worst
+  is text encoder layer 13's `v_proj`), all under the bound. The W8 tower's
+  is 0.51-0.78%; the worst is `vision/layers/0/attention/qkv`, which was
+  16.2% in Q4. `conversion.json` records 88 VAE convolutions.
+- **Wall times (CPU only).**
+  - Download 351 s; the pin's hashes 63 s.
+  - The first conversion took 443 s, hashing included, beside a workspace
+    build; its pack 79 s.
+  - The W8 reconversion took 345 s, hashing included; its pack 78 s; the
+    sha256 56 s.
+  - The bind took 1.1 s (`crates/artifact/tests/qwen_image.rs`
+    `the_real_artifact_binds`).
 - **For publication (AC 7).** `converter.command` in the sidecar holds local
   paths, and `frontend/vae_config.json` (verbatim) carries the upstream
   `_name_or_path` `/cpfs02/user/...`: the privacy scan will flag both. The
   `.pack.lock`, `.pack-state.json` and `work/` beside the artifact are not
   for publication.
 
-## As built (2026-10-13, branch `image-artifact-318`: AC 5, 6, 8, the recordings)
+## As built (2026-10-13, branch `image-artifact-318`: AC 5, 6, 8, the recordings and the yardsticks)
 
 - **The recordings.** `F:/ai/models/ignis-image-2.1-turbo/oracle/`, 2.89 GB,
   from `tools/image-converter/record.py run` at commit `7075b12` (clean),
@@ -216,7 +279,10 @@ and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
     list above as `.npy` (little-endian, C order, masks as uint8), indexed
     with shapes and dtypes in `case.json`; the decoded `image.png`; for edit,
     the condition image as `condition.png`;
-  - `thresholds.json` (written once: the recorder refuses an existing one);
+  - `thresholds.json`: the recorder's bf16-only file (written once: the
+    recorder refuses an existing one), since replaced by the yardstick
+    session's bound (below);
+  - `yardstick-report.json`: that session's report;
   - `manifest.json`, written last: torch 2.13.0+cu130, diffusers 0.41.0,
     transformers 5.17.0 (and the rest), the TF32 flags, the attention
     check, wall times and peaks, and `record.FIELDS`, which describes each
@@ -277,34 +343,62 @@ and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
   back to the math kernel; a self-check against the math kernel gave a
   1.07e-6 max difference. `use_kv_cache=True` is asserted from the kv modes
   (`extract`, then `cached` ×7).
-- **thresholds.json** (relative L2 over the whole tensor, the bf16 pipeline
-  teacher-forced, threshold = 5 × the error):
+- **thresholds.json** (schema v2) comes from `record.py yardstick`, one
+  session under the GPU lock: session `2026-10-13T20:43:05Z`, commit
+  `eee2433` (dirty: the README's uncommitted text only), on oracle session
+  `2026-10-13T18:08:17Z`. It is the bound max(2 × sim, 5 × bf16), with
+  relative L2, both yardsticks teacher-forced, and the encoder over its
+  text rows. The recorder's bf16-only file is kept as
+  `thresholds.2026-10-13T180817Z.json`.
 
-  | case | bf16 velocity error per step, % | encoder, % |
-  |---|---|---|
-  | t2i | 1.17 4.49 2.36 1.22 0.76 0.73 0.73 0.67 | 8.78 |
-  | t2i-2k | 2.20 4.70 1.91 1.18 0.58 0.63 0.62 0.60 | 8.78 |
-  | edit | 2.08 1.78 1.48 1.16 0.69 0.61 0.64 0.73 | 39.2 |
+  | case | | velocity per step, % | encoder (text rows), % |
+  |---|---|---|---|
+  | t2i | bf16 | 1.17 4.49 2.36 1.22 0.76 0.73 0.73 0.67 | 8.78 |
+  | | sim | 5.51 7.12 4.09 3.52 3.14 3.02 2.88 3.53 | 17.85 |
+  | | **bound** | 11.01 22.47 11.78 7.04 6.28 6.04 5.75 7.06 | 43.88 |
+  | t2i-2k | bf16 | 2.20 4.70 1.91 1.18 0.58 0.63 0.62 0.60 | 8.78 |
+  | | sim | 4.68 5.65 3.19 2.95 2.79 2.70 2.68 3.40 | 17.85 |
+  | | **bound** | 10.99 23.49 9.54 5.90 5.57 5.39 5.36 6.79 | 43.88 |
+  | edit | bf16 | 2.08 1.78 1.48 1.16 0.69 0.61 0.64 0.73 | 6.56 |
+  | | sim | 6.89 6.27 3.09 2.99 2.74 2.65 2.65 3.81 | 15.16 |
+  | | **bound** | 13.78 12.53 7.42 5.97 5.48 5.31 5.29 7.63 | 32.82 |
 
-  The edit case's condition latents: 1.48%. Its encoder error is over every
-  row of `prompt_embeds`, 97% of whose squared norm is the 1024 image-pad
-  rows, which the DiT discards; the vision path alone carries 16% in bf16
-  (below). Its 5× bound, 196%, cannot fail spec 03's edit test, DeepStack
-  off included: a bound over the text rows needs a bf16 baseline the
-  recording does not hold (the owner's call).
+  - **Condition latents (edit):** bf16 1.48%, sim exactly 0 (the VAE is the
+    artifact's bf16, computing in fp32 as the oracle does), bound 7.38%.
+  - **Which factor sets the bound:** 5 × bf16 at the first steps (step 1 of
+    both t2i cases), 2 × sim everywhere else.
+  - **Checks in `oracle/yardstick-report.json`:**
+    - every one of the artifact's 1,283 stored tensors was checked against
+      its sidecar sha256: the 480 FP8 and 117 W8 payloads read from the
+      container, and the 686 bf16 tensors from the loaded models;
+    - the fp32 encoder replayed in the session has error exactly 0 against
+      the oracle;
+    - the bf16 velocity errors are bit-identical to the recorder's.
+  - **Where the encoder error lies.**
+    - t2i: one row, the first after `drop_idx`, carries 95% of the bf16
+      squared error and 70% of the sim one.
+    - edit, whole tensor: the 1024 image-pad rows carry 99.9% (bf16) and
+      99.3% (sim) of it (39.2% and 31.3% whole).
+  - **Spec 03 AC 4's premise does not hold under this bound.** The edit
+    encoder in fp32 with DeepStack off has a text-row error of 20.7%. That
+    is above the sim error (15.2%) but below the bound (32.8%), so "with
+    DeepStack off, the same test fails" cannot discriminate as written (the
+    owner's call).
 - **The vision tower's formats (informational, `vision_probe.py`).** The
-  edit case's 4096 patches through the tower, the merger and the DeepStack
-  mergers on the CPU, against the checkpoint's weights in fp32 (relative L2;
-  all 117 grouped payloads matched the artifact record's sha256s):
+  edit case's 4096 patches go through the tower, the merger and the
+  DeepStack mergers on the CPU. They are compared with the checkpoint's
+  weights in fp32 (relative L2). All 117 grouped payloads matched the
+  artifact record's sha256s.
 
   | weights / compute | merger | DeepStack 8, 16, 24 |
   |---|---|---|
-  | the artifact's Q6/Q4/Q5/W8, fp32 | 41.8% | 12.6%, 21.5%, 35.1% |
+  | the first artifact's Q6/Q4/Q5/W8, fp32 | 41.8% | 12.6%, 21.5%, 35.1% |
+  | **the artifact's W8, fp32** | **4.0%** | **1.1%, 1.7%, 3.3%** |
   | the checkpoint's, bf16 | 15.9% | 1.6%, 4.4%, 5.5% |
 
   The merger's bf16 error is 3× the last DeepStack tap's, so the merger's
-  whole-tensor error is likely outlier-dominated; the formats still cost
-  2.6-8× bf16.
+  whole-tensor error is likely outlier-dominated. The W8 tower in fp32 is
+  closer to fp32 than a bf16 tower is, at every output.
 - **Wall times (AC 8)**, one session under the GPU lock (2026-10-13
   20:08-20:17), 494 s in all: load 30 s; encoder phase 0.3, 0.1, 1.0 s in
   fp32 and 0.2, 0.1, 0.4 s in bf16 (t2i, t2i-2k, edit); encoder to DiT 13 s;
@@ -315,6 +409,19 @@ and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
   shape above: the cap's device index, the encoder's `lm_head` cast-back
   (OOM), a forward pre-hook that returned the module, and the 2048² decode
   (OOM).
+- **Wall times of the yardstick session (AC 8)**, under the GPU lock
+  (2026-10-13 22:43-22:47), 227 s in all:
+  - load 26.5 s;
+  - encoders 0.6, 0.2, 0.7 s in bf16 and 0.2, 0.2, 0.8 s in sim (t2i,
+    t2i-2k, edit);
+  - the sim swaps 24.9 s (encoder) and 20.2 s (DiT), reading and hashing
+    the payloads;
+  - encoder to DiT 13.1 s;
+  - DiT 3.6, 23.6, 5.2 s in bf16 and 12.5, 73.8, 16.8 s in sim.
+
+  Peak VRAM of the process (GiB): encoder 17.6 (bf16) and 14.9 (sim), DiT
+  17.1 (bf16) and 14.9 (sim). The sim holds the FP8 codes at rest and
+  dequantizes one linear at a time.
 - **The venv** gains torchvision 0.28.0+cu130: the checkpoint's processor
   (`Qwen2VLImageProcessorFast`, `Qwen3VLVideoProcessor`) does not build
   without it.
