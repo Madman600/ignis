@@ -52,6 +52,7 @@ pub mod gqa_layer;
 pub mod gpu_profile;
 pub mod host;
 pub mod hq_ring;
+pub mod image;
 pub mod identity;
 pub mod kv;
 pub mod kv_format;
