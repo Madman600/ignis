@@ -353,3 +353,219 @@ would close the gap, largest first:
    600 W. The wide GEMMs reach 575-580 W and drop to 2.0-2.6 GHz.
 4. **Fusing the quantization** into the producers: 3.4% at 1024² and about
    5% at 16,512 tokens.
+
+### The 8-bit DiT attention (AC 4)
+
+**Where.**
+- ABI: `kernel/include/ignis_image_attn.h`: `ignis_image_attn_q8_bytes`,
+  `ignis_image_attn_kv8_bytes`, `ignis_image_attn_quantize_q`,
+  `ignis_image_attn_store_kv`, `ignis_image_attn`,
+  `ignis_image_attn_last_error`.
+- Code: `kernel/src/image/attn8.cu`, an adapted op (ADR 0051 tier 2). It
+  adapts `thu-ml/SageAttention` d1a57a5 `csrc/qattn` (the sm89/sm120 path),
+  whose smem, cp.async and mma helpers are themselves adapted from FlashInfer
+  v0.1.5; all Apache-2.0. The file header and `kernel/NOTICE` give the
+  chain. The quantizers (`attn8_quant.cu`) and the layout
+  (`attn8_layout.cuh`) are our own.
+- The upstream was fetched as data into this worktree's
+  `.scratch/upstream/sageattention`, pinned at d1a57a5. Nothing of it was
+  built or run.
+- Tests: the CTest `ignis_kernel_image_attn_test`
+  (`kernel/tests/test_image_attn.cu`) and the Rust `--ignored` test
+  `crates/core/tests/image_attn_gpu.rs` (bindings in
+  `crates/core/src/image_attn.rs`). Speed: `ignis_image_attn_bench`
+  (`kernel/tests/bench_image_attn.cu`, a tool).
+
+**The instructions** (the bench table above): INT8 m16n8k32 for QK^T
+(exact in int32) and `kind::mxf8f6f4` with unit scales and FP32
+accumulation for PV. Both run at the 838 class.
+
+**The scheme.** SageAttention2's, with four changes:
+- Q is INT8 per 32-row block (per warp), K is INT8 per 64-key block after
+  subtracting a K mean, and V is E4M3 per channel.
+- **PV accumulates in FP32**, at the same rate as SA2++'s FP16
+  accumulation. So V's scale is amax / 448, not SA2++'s amax / 2.25, and
+  there is no FP16 overflow to guard.
+- **The denominator is the row sum of the same E4M3 P that multiplies V**,
+  as an MMA against ones; SA2 sums the fp32 P before rounding. So O is a
+  convex combination of V's rows whatever P's rounding, and V's channel
+  offset adds no error. The MMA count rises by 3%.
+- **Two K/V runs per call.** When the key loop crosses from run A (the
+  stored prefix) to run B (the target), the fp32 accumulator is rescaled
+  per channel by vscale_A / vscale_B.
+- **Causal is aligned bottom-right** (query i sees keys 0 .. i + keys −
+  queries), masked on every block the diagonal crosses at any offset. So
+  the text segments need no plain path.
+
+**The ABI for spec 04's leaf.** A K/V *run* is one byte buffer whose layout
+the header documents: K codes, V codes (transposed and permuted), K block
+scales, V channel scales, the K mean. Per layer it costs 8 KiB per token
+(plus 2 bytes of K scales), padded to 64 tokens, and a fixed 32 KiB. That is
+about 1 GiB per 1024² condition image over 32 layers, as spec'd.
+- **Step 1** (`encode_condition`), per layer:
+  - `store_kv` of the prefix's K and V with its own mean: the stored prefix,
+    kept for the job;
+  - then per segment, `quantize_q` of the segment's rows and one
+    `ignis_image_attn` over run A = the prefix truncated at the segment's
+    end: causal for text, not for images.
+- **Every denoising step**, per layer:
+  - `store_kv` of the target's K and V with `mean_from` = the prefix run, so
+    every key is smoothed with the same mean;
+  - `quantize_q` of the target;
+  - one call over A = the whole prefix and B = the target's run.
+- Every call takes a stream, allocates nothing, is graph-capturable and is
+  deterministic. Q, K, V and O are addressed with a row stride, so the
+  fused QKV GEMM's output can be read as it is.
+
+**Mechanics.** The reference is our own fp64 code on the same quantized,
+smoothed operands (the q8 buffer and the runs, read back). It replays the
+kernel's softmax in the kernel's block order with the same fp32 operations:
+- the score scale `(qscale · kscale) · fl(scale · log2 e)`;
+- the running max `max(m, fma(max S, c, −8.807))`;
+- the exponent argument `fma(S, c, −m)`.
+
+S is exact in int32. What it cannot replay it bounds:
+- **P's E4M3 code.** ex2.approx is within 2 ulp of the correctly rounded
+  2^x (PTX ISA); the test takes 2^-20. A key whose 2^x · (1 ± 2^-20)
+  straddles a rounding midpoint adds that ulp · |v| to the numerator's
+  error and that ulp to the denominator's.
+- **The rescales** when the max rises: ex2 again, plus one rounding.
+- **PV and the row sum:** per k32 step, 35 · 2^-25 · (|acc| + the error so
+  far + Σ|P v|), as in the GEMM.
+- **The run boundary** (two roundings) and **the end** (three).
+- **The quotient:** |ΔO| ≤ (|ΔN| + |O| · |ΔD|) / (D − |ΔD|).
+
+`--bound-factor` multiplies the whole bound (default 1). The output is fp32
+for this check. The same call with BF16 output must equal the fp32 output
+rounded to BF16, bit for bit, which also shows the call is deterministic.
+
+**Quantization error**, against fp64 attention on the unquantized BF16
+inputs. The gate is cosine per head ≥ `--min-cosine` (default 0.99); the
+centred cosine and the relative RMS error are reported beside it. The
+inputs are synthetic but DiT-shaped:
+- K has a per-channel mean of ±3, shifted per token kind (text, image,
+  target);
+- V has per-channel scales of 0.25-4 and offsets of ±2, and the target's
+  spread is 2.5× the prefix's;
+- Q runs at a per-head temperature from flat to peaked.
+
+The error on real activations comes with spec 01's recordings and spec 04's
+end-to-end test.
+
+**The cases** (`ignis_kernel_image_attn_test`, about 30 s with the fp64
+references on 16 threads). Each check covers 64 query rows per head (all
+rows of a smaller call), at an odd stride shifted by head, so the 32 heads
+together cover every residue mod 128. The prefix layouts are:
+- 0 images: text 200;
+- 1 image: text 20, image 4096, text 160;
+- 10 images: text 20, then image 4096 and text 7 ten times, the last text
+  160 (41,203 tokens).
+
+The target is 4096 tokens (1024²). The table gives the worst error over
+the bound, the bound's median over |O|, and the worst head's cosine
+(centred) and relative RMS error:
+
+| call | queries × keys | worst / bound | bound / \|O\| | cosine (centred) | rel. RMS |
+|---|---|---|---|---|---|
+| target over [prefix ; target], 0 images | 4096 × 4296 | 0.81 | 1.5e-4 | 0.99950 (0.99831) | 3.2% |
+| target over [prefix ; target], 1 image | 4096 × 8372 | 0.70 | 2.9e-4 | 0.99973 (0.99803) | 2.3% |
+| target over [prefix ; target], 10 images | 4096 × 45,299 | 0.53 | 1.5e-3 | 0.99990 (0.99811) | 1.4% |
+| image block 1 of 1 (truncated keys) | 4096 × 4116 | 0.94 | 1.4e-4 | 0.99985 (0.99802) | 1.7% |
+| image blocks 1 and 10 of 10 | 4096 × 4116 / 41,043 | 0.85 / 0.42 | 1.4e-4 / 1.4e-3 | ≥ 0.99978 (0.99799) | ≤ 2.1% |
+| text segments, causal bottom-right | 7-200 × 20-41,203 | ≤ 0.98 | 4.5e-6-1.4e-3 | ≥ 0.99954 (0.99786) | ≤ 3.0% |
+| small odd sizes (partial blocks, both runs, causal over two runs) | 1-100 × 1-207 | ≤ 0.05 | ≤ 1.8e-5 | ≥ 0.99948 (0.99830) | ≤ 3.2% |
+
+- **0 outputs over the bound**, in every call.
+- The BF16 output equals the fp32 output rounded, bit for bit, in every call.
+- The quantizers equal their restated definitions bit for bit, padding
+  included. The prefix's K mean is within the fp32-sum error of fp64; the
+  target's run carries the prefix's mean, byte for byte.
+- A worst near 1 is one E4M3 rounding flip of P, which the bound adds in
+  full. The median shows how tight the bound is: from 5e-6 to 1.5e-3 of
+  |O|, growing with the number of k32 steps. That is 10-1000× below the
+  quantization error.
+
+**Prefix handling.** "The prefix stored in step 1 and read in step 2 gives
+the same result as quantizing [prefix ; target] at once within the
+mechanics bound" cannot hold literally. Quantizing the concatenation at once
+gives other operands: one K mean over both, V scales over both, and K blocks
+that straddle the boundary. So the two results differ at the quantization
+level, not the mechanics level. As built:
+- **The two-run call is checked against fp64 of the operands the split path
+  stores**: the prefix's run (its own mean and V scales) and the target's
+  run (the prefix's mean, its own V scales), concatenated. That is the
+  target rows above. A lost boundary rescale or a second mean would be an
+  O(1) error there.
+- **Negative control:** the same bound computed without the rescale fails
+  32,767 of 32,768 outputs (1 image, where the target's V spread is 2.5× the
+  prefix's).
+- **The shared mean:** the target run's mean is the prefix's byte for byte,
+  and its K codes restate from that mean bit for bit.
+- **Against one run of [prefix ; target]** (its own mean and scales), the
+  split result differs by a relative RMS of 1.2%. Both reach cosine 0.9997
+  against the unquantized fp64.
+
+**Speed** (2026-10-13, `ignis_image_attn_bench`, GPU lock in timing mode,
+card power limit 575 W). The SM clock and board power are NVML's means over
+the second half of a window of at least 1 s. TOPS = 4 · queries · keys · 128
+· 32 / time:
+
+| call | queries × keys | ms | TOPS | SM clock | board |
+|---|---|---|---|---|---|
+| target, 1024², 0 images | 4096 × 4296 | 0.589 | 489 | 2650 MHz | 397 W |
+| target, 1024², 1 image | 4096 × 8372 | 1.115 | 504 | 2606 MHz | 576 W |
+| target, 1024², 10 images | 4096 × 45,299 | 5.813 | 523 | 2604 MHz | 574 W |
+| target, 2048², 0 images | 16,384 × 16,584 | 7.952 | 560 | 2464 MHz | 579 W |
+| target, 2048², 1 image | 16,384 × 20,660 | 9.866 | 562 | 2450 MHz | 576 W |
+| target, 2048², 10 images | 16,384 × 57,587 | 27.13 | 570 | 2444 MHz | 575 W |
+| self, N = 4096 | 4096 × 4096 | 0.549 | 500 | 2616 MHz | 570 W |
+| self, N = 8192 | 8192 × 8192 | 2.048 | 537 | 2501 MHz | 578 W |
+| self, N = 16,384 | 16,384 × 16,384 | 7.866 | 559 | 2422 MHz | 576 W |
+| self, N = 32,768 | 32,768 × 32,768 | 30.71 | 573 | 2412 MHz | 576 W |
+| self, N = 16,384, causal (half the work) | 16,384 × 16,384 | 4.135 | 532 | 2445 MHz | 580 W |
+| image block 10 of 10, truncated keys | 4096 × 41,043 | 5.311 | 519 | 2576 MHz | 571 W |
+| last text segment, causal | 160 × 41,203 | 0.879 | 123 | 2908 MHz | 470 W |
+
+The quantizers at 1024²:
+- `quantize_q`, 4096 tokens: 0.013 ms;
+- the target's run: 0.080 ms;
+- a 10-image prefix's run: 1.91 ms, once per job and layer.
+
+A denoising step's 32 attention layers at 1024² take 21.8 ms with 0
+condition images, 38.7 ms with 1 and 189 ms with 10. The quantizers are
+13.5%, 7.6% and 1.6% of that.
+
+**Against the bar (SA2++ on the 5090: 583-643 TOPS from 1K to 32K): 500-573
+TOPS on the bar's own geometry (86-89% of it at 8K-32K), 560-570 at 2048²
+and 489-523 at 1024².**
+- **Per clock.** Nsight Compute (clocks locked at 2.01 GHz, N = 16,384)
+  puts the tensor pipe 72% busy: 233 TOPS/GHz against the 322.8 the bench
+  measures for alternating INT8 and FP8 instructions. The stalls are the
+  saturated math pipe and fixed-latency waits (28% each), then barriers
+  (9%). The card sits at the 575 W limit and 2.4-2.6 GHz.
+- **What tuning bought.** The first version ran at 458-472 TOPS. Taking a
+  per-element branch out of the plain block's score conversion moved
+  `branch_resolving` from 11% of the stall samples to 0.4%, worth +23%.
+  The two-stage K/V ring and skipping the rescale by 1 measured neutral;
+  they stay, being exact.
+- **What would close the rest**, largest first:
+  1. **1024² wave quantization.** 4096 queries × 32 heads are 1024 CTAs on
+     340 slots, 3.01 waves. A split-KV tail or a persistent scheduler
+     would recover about 10% there. 2048² is 12.05 waves.
+  2. **Short causal segments** (160 × 41K: 64 CTAs) run at 123 TOPS. They
+     are step 1 only, 28 ms per job at 10 images. Split-KV is the fix.
+  3. **The prefix store** (1.9 ms for 41K tokens) reads K and V twice
+     (stats, then codes) with 16-byte rows. It is once per job per layer.
+  4. **Fusing the target's quantization** into the QKV GEMM's epilogue
+     (spec 04): 7.6-13.5% of a step at 1024² with 0-1 images.
+
+Tuning stopped here: speed is a target, not a gate.
+
+**AC 8.** `attn8.cu`'s header and `kernel/NOTICE` (a new "Adapted ops (ADR
+0051)" section) name SageAttention d1a57a5's files and FlashInfer v0.1.5,
+under Apache-2.0. Nothing comes from CUTLASS 3.x or FlashInfer's
+`csrc/fmha_v2`.
+
+**AC 9.** The CTest runs in the profile's kernel stage. The Rust `--ignored`
+test drives the bindings: quantize, store two runs, three calls checked
+against fp64 of the unquantized inputs, and a refusal. The bench is a tool.
