@@ -34,6 +34,7 @@ pub mod download;
 pub mod engine;
 pub mod expose;
 pub mod idle;
+pub mod images;
 pub mod instruction;
 pub mod load;
 pub mod locate;
@@ -61,7 +62,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use axum::Router;
 
-pub use crate::active::{ActiveModel, ModelSource, ModelStatus, StatusCell};
+pub use crate::active::{ActiveModel, InFlight, ModelSource, ModelStatus, Runner, StatusCell};
 use crate::engine::Engine;
 use crate::template::TemplateProvider;
 use crate::thinking::ReasoningEffort;
@@ -246,6 +247,16 @@ pub async fn warm_up_engine(engine: &Engine) -> Result<Duration, String> {
     Ok(started.elapsed())
 }
 
+/// The first traversal of `model` before it serves: a text model's
+/// [`warm_up_engine`]. The image model has no decode graphs to capture and
+/// none is run (spec image-model/05): it serves once loaded.
+pub async fn warm_up_model(model: &ActiveModel) -> Result<Duration, String> {
+    match model.engine() {
+        Some(engine) => warm_up_engine(engine).await,
+        None => Ok(Duration::ZERO),
+    }
+}
+
 impl Server {
     /// A server over `engine`'s scheduler with the given template provider.
     pub fn new(engine: Engine, template: Box<dyn TemplateProvider>) -> Self {
@@ -371,13 +382,13 @@ impl Server {
     }
 
     /// The first traversal (GitHub #129): one two-token request through the
-    /// scheduler ([`warm_up_engine`]), so the prefill and decode kernels
+    /// scheduler ([`warm_up_model`]), so the prefill and decode kernels
     /// have run and the decode graphs are captured before a client's request
     /// needs them, then the API is marked ready and `ignis.process.ready`
     /// says how long it took. A warm-up that does not complete is an error
     /// and leaves the server not ready: better refused than silently cold.
     pub async fn warm_up(&self) -> Result<Duration, String> {
-        let took = warm_up_engine(&self.active().engine).await?;
+        let took = warm_up_model(&self.active()).await?;
         self.status.store(std::sync::Arc::new(ModelStatus::Serving));
         tracing::info!(
             name: "ignis.process.ready",
@@ -490,10 +501,13 @@ impl Server {
     /// set): installs the projection into the engine's telemetry consumer,
     /// which alone keeps it up to date from the facts it already receives.
     /// It is served by [`Server::metrics_app`] and, with the Playground, at
-    /// `/ui/metrics`.
+    /// `/ui/metrics`. The image model has no engine to feed it: the
+    /// projection is served as the last text model left it.
     pub fn with_metrics(mut self) -> Self {
         let metrics = std::sync::Arc::new(metrics::Metrics::new());
-        self.active().engine.install_metrics(std::sync::Arc::clone(&metrics));
+        if let Some(engine) = self.active().engine() {
+            engine.install_metrics(std::sync::Arc::clone(&metrics));
+        }
         self.responses.install_metrics(std::sync::Arc::clone(&metrics));
         self.metrics = Some(metrics);
         self
@@ -517,7 +531,9 @@ impl Server {
         let Some(metrics) = &self.metrics else {
             return;
         };
-        model.engine.install_metrics(std::sync::Arc::clone(metrics));
+        if let Some(engine) = model.engine() {
+            engine.install_metrics(std::sync::Arc::clone(metrics));
+        }
         if let Some(reserved) = reserved {
             self.install_reservations(model, reserved);
         }
@@ -555,7 +571,9 @@ impl Server {
     /// reads it at every tick (GitHub #301, #302) — goes to `model`'s engine.
     fn install_reservations(&self, model: &ActiveModel, mut reserved: metrics::LoadReservations) {
         if let Some(metrics) = &self.metrics {
-            model.engine.install_counter_source(reserved.flash_next.take());
+            if let Some(engine) = model.engine() {
+                engine.install_counter_source(reserved.flash_next.take());
+            }
             metrics.set_load_reservations(reserved);
         }
     }

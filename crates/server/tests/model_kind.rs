@@ -1,0 +1,410 @@
+//! The model kind (spec image-model/05, ADR 0050, GitHub #322) over the
+//! mock-backed router: with the image model loaded the text routes refuse a
+//! request no text model would serve `409 model_kind_mismatch`, and one naming
+//! a known text model switches to it, or is refused by name with implicit
+//! switching off (AC 1); `/metrics`, the tokenize routes and `GET /v1/models`
+//! answer without an engine (AC 2); an image job keeps the image model
+//! loaded and an unused one unloads like a text model (AC 8); and the
+//! production loader verifies the image artifact and loads it on the fake
+//! runner. The image model is `support/switch.rs`'s mock loader's, over
+//! `FakeImageRunner`; the text models run on `MockCompute`.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::body::Body;
+use axum::http::{header, Method, Request, StatusCode};
+use http_body_util::BodyExt;
+use ignis_core::compute::ModelKind;
+use ignis_server::model_switch::{ArtifactLoader, ModelLoader, Switcher};
+use ignis_server::{ModelSource, Server};
+use serde_json::{json, Value};
+use tower::ServiceExt;
+
+#[path = "support/switch.rs"]
+mod switch_support;
+use switch_support::{source, MockLoader};
+
+/// The image model's served id: its family's own, so its kind is known by
+/// the id alone.
+const IMAGE: &str = "ignis-image-2.1-turbo";
+
+const PATIENT: Duration = Duration::from_secs(30);
+
+/// The tests' idle clock and `model.idle_unload`, as `idle_unload.rs` runs
+/// them.
+const TICK: Duration = Duration::from_millis(50);
+const IDLE: Duration = Duration::from_secs(1);
+
+/// The known-models table naming each of `ids` at the artifact [`source`]
+/// gives it.
+fn known(ids: &[&str]) -> BTreeMap<String, PathBuf> {
+    ids.iter().map(|id| (id.to_string(), source(id).artifact)).collect()
+}
+
+/// A server on `start` whose requests may switch to any of `ids` by naming
+/// it (`switch.allow_implicit` on).
+fn implicit_on(loader: &Arc<MockLoader>, start: &str, ids: &[&str]) -> Server {
+    Server::from_active(loader.model(start))
+        .with_switcher(Switcher::new(Arc::clone(loader) as _, PATIENT).with_known_models(known(ids)))
+}
+
+/// The same server with `switch.allow_implicit` off: `ids` may be switched
+/// to by id, never by a request naming them — what `main` builds.
+fn implicit_off(loader: &Arc<MockLoader>, start: &str, ids: &[&str]) -> Server {
+    Server::from_active(loader.model(start))
+        .with_switcher(Switcher::new(Arc::clone(loader) as _, PATIENT).with_listed_models(known(ids)))
+}
+
+async fn send(app: &axum::Router, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+    let request = Request::builder().method(method).uri(uri).header(header::CONTENT_TYPE, "application/json");
+    let request = request.body(body.map_or_else(Body::empty, |body| Body::from(body.to_string()))).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    (status, body)
+}
+
+/// `body` with `model` set, when one is named.
+fn naming(mut body: Value, model: Option<&str>) -> Value {
+    if let Some(model) = model {
+        body["model"] = json!(model);
+    }
+    body
+}
+
+/// `POST /v1/models/switch`'s body: the mock artifact [`source`] names.
+fn switch_to(model: &str) -> Value {
+    json!({ "artifact": source(model).artifact, "model": model })
+}
+
+fn chat(model: Option<&str>) -> Value {
+    naming(json!({ "messages": [{ "role": "user", "content": "hello there" }], "max_tokens": 3 }), model)
+}
+
+fn response_body(model: Option<&str>) -> Value {
+    naming(json!({ "input": "hello there", "max_output_tokens": 3, "enable_thinking": false }), model)
+}
+
+fn decision(model: Option<&str>) -> Value {
+    naming(json!({ "state": "s", "questions": { "q": { "type": "noul", "instructions": "Urgent?" } } }), model)
+}
+
+/// The text routes, each with the body it takes.
+fn text_routes(model: Option<&str>) -> [(&'static str, Value); 4] {
+    [
+        ("/v1/chat/completions", chat(model)),
+        ("/v1/responses", response_body(model)),
+        ("/v1/decide", decision(model)),
+        ("/v1/systemone", decision(model)),
+    ]
+}
+
+/// Wait (bounded) until the status reads `wanted`.
+async fn until(server: &Server, wanted: &str, within: Duration) {
+    let deadline = Instant::now() + within;
+    while server.status().as_str() != wanted {
+        assert!(Instant::now() < deadline, "the status never read {wanted}: {:?}", server.status());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Wait (bounded) until the idle clock has unloaded the model and its
+/// teardown has let go of the switch's slot.
+async fn unloaded(server: &Server) {
+    until(server, "unloaded", IDLE * 5).await;
+    let switcher = server.switcher.as_ref().expect("a switcher");
+    for _ in 0..1_000 {
+        if switcher.running().is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the unload never let go of the switch's slot");
+}
+
+/// AC 1: with the image model loaded, a text request naming no model is
+/// refused `409 model_kind_mismatch`, naming both kinds and the loaded id —
+/// and nothing is loaded for it.
+#[tokio::test]
+async fn with_the_image_model_loaded_a_text_request_naming_no_model_is_refused_naming_both_kinds() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, IMAGE, &[IMAGE, "mock-a"]);
+    let app = server.app();
+    for (uri, body) in text_routes(None) {
+        let (status, refused) = send(&app, Method::POST, uri, Some(body)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{uri}: {refused}");
+        assert_eq!(refused["error"]["code"], "model_kind_mismatch", "{uri}: {refused}");
+        assert_eq!(refused["error"]["param"], "model", "{uri}: {refused}");
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(message.contains("serves text models") && message.contains(&format!("{IMAGE} is an image model")), "{uri}: {message}");
+    }
+    // Naming the loaded image model itself is the same request.
+    let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(Some(IMAGE)))).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("model_kind_mismatch")), "{refused}");
+    assert!(loader.loads().is_empty());
+    assert_eq!(server.active().kind(), ModelKind::Image);
+}
+
+/// AC 1: naming a known text model switches from the image model to it, on
+/// every text route, and the request is served by it; the image model's
+/// runner is gone before the text model loads.
+#[tokio::test]
+async fn naming_a_known_text_model_switches_from_the_image_model_and_is_served_by_it() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, IMAGE, &[IMAGE, "mock-a", "mock-b"]);
+    let app = server.app();
+    let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(Some("mock-a@agent")))).await;
+    assert_eq!(status, StatusCode::OK, "{completion}");
+    assert_eq!(completion["model"], "mock-a");
+    assert_eq!((server.active().kind(), server.active().model_id()), (ModelKind::Text, "mock-a".to_owned()));
+
+    let back = send(&app, Method::POST, "/v1/models/switch", Some(switch_to(IMAGE))).await;
+    assert_eq!(back.0, StatusCode::ACCEPTED, "{}", back.1);
+    until(&server, "serving", PATIENT).await;
+    let (status, response) = send(&app, Method::POST, "/v1/responses", Some(response_body(Some("mock-b")))).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["model"], "mock-b");
+
+    let back = send(&app, Method::POST, "/v1/models/switch", Some(switch_to(IMAGE))).await;
+    assert_eq!(back.0, StatusCode::ACCEPTED, "{}", back.1);
+    until(&server, "serving", PATIENT).await;
+    let (status, answered) = send(&app, Method::POST, "/v1/decide", Some(decision(Some("mock-a")))).await;
+    // The mock template has no answer labels: past the model checks, the
+    // question itself is refused.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answered}");
+    assert!(!matches!(answered["error"]["code"].as_str(), Some("model_kind_mismatch" | "model_not_found")), "{answered}");
+    assert_eq!(server.active().model_id(), "mock-a");
+
+    assert_eq!(loader.loads(), ["mock-a", IMAGE, "mock-b", IMAGE, "mock-a"]);
+    assert_eq!(loader.resident_at_load(), [0; 5], "each model left the card before the next loaded");
+}
+
+/// AC 1: with `switch.allow_implicit` off, a text request naming a text model
+/// while the image model is loaded is refused by name, as a model the
+/// server does not serve always was — `404`, and `/v1/decide`'s own `422`.
+#[tokio::test]
+async fn with_implicit_switching_off_a_named_text_model_is_refused_by_name() {
+    let loader = MockLoader::new();
+    let server = implicit_off(&loader, IMAGE, &[IMAGE, "mock-a"]);
+    let app = server.app();
+    for (uri, body) in text_routes(Some("mock-a")) {
+        let (status, refused) = send(&app, Method::POST, uri, Some(body)).await;
+        let expected = if uri.starts_with("/v1/chat") || uri == "/v1/responses" { StatusCode::NOT_FOUND } else { StatusCode::UNPROCESSABLE_ENTITY };
+        assert_eq!(status, expected, "{uri}: {refused}");
+        assert_eq!(refused["error"]["code"], "model_not_found", "{uri}: {refused}");
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(message.contains("mock-a") && message.contains(IMAGE), "{uri}: {message}");
+    }
+    assert!(loader.loads().is_empty());
+    assert_eq!(server.active().model_id(), IMAGE);
+}
+
+/// AC 1, the other way round: a text route naming the image model is
+/// refused before any switch — a request never loads the model that would
+/// refuse it — while an explicit switch still goes to it.
+#[tokio::test]
+async fn a_text_route_naming_the_image_model_is_refused_without_switching_to_it() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]);
+    let app = server.app();
+    for (uri, body) in text_routes(Some(IMAGE)) {
+        let (status, refused) = send(&app, Method::POST, uri, Some(body)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{uri}: {refused}");
+        assert_eq!(refused["error"]["code"], "model_kind_mismatch", "{uri}: {refused}");
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(message.contains(&format!("`model` names {IMAGE}, an image model")) && message.contains("loaded: mock-a, a text model"), "{uri}: {message}");
+    }
+    assert!(loader.loads().is_empty());
+
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(switch_to(IMAGE))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    until(&server, "serving", PATIENT).await;
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!(models["data"][0]["id"], IMAGE);
+    assert_eq!(models["data"][0]["kind"], "image");
+    assert!(models["data"][0].get("max_model_len").is_none(), "an image model has no context: {models}");
+    assert_eq!(loader.loads(), [IMAGE]);
+}
+
+/// AC 2: `/metrics`, the tokenize routes and `GET /v1/models` answer with the
+/// image model loaded — the counting routes refuse it, the others report —
+/// and a switch to it and back with metrics on touches no engine that is not
+/// there.
+#[tokio::test]
+async fn metrics_the_tokenize_routes_and_the_models_list_answer_with_the_image_model_loaded() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]).with_metrics();
+    let (app, metrics) = (server.app(), server.metrics_app().expect("metrics are on"));
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!((models["data"][0]["kind"].as_str(), models["data"][0]["max_model_len"].is_u64()), (Some("text"), true), "{models}");
+
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(switch_to(IMAGE))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    until(&server, "serving", PATIENT).await;
+    assert_eq!(server.active().kind(), ModelKind::Image);
+
+    for (uri, body) in [
+        ("/v1/tokenize", json!({ "messages": [{ "role": "user", "content": "count me" }] })),
+        ("/v1/tokenize", json!({ "prompt": "count me" })),
+        ("/v1/detokenize", json!({ "token_ids": [1, 2] })),
+    ] {
+        let (status, refused) = send(&app, Method::POST, uri, Some(body)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{uri}: {refused}");
+        assert_eq!(refused["error"]["code"], "model_kind_mismatch", "{uri}: {refused}");
+    }
+    let (status, scraped) = send(&metrics, Method::GET, "/metrics", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(scraped.as_str().is_some_and(|text| text.contains("# TYPE")), "{scraped}");
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!(models["data"][0]["kind"], "image");
+
+    // Back on a text model, its engine feeds the projection again.
+    let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(Some("mock-a")))).await;
+    assert_eq!(status, StatusCode::OK, "{completion}");
+    let counted = json!({ "messages": [{ "role": "user", "content": "count me" }] });
+    let (status, counted) = send(&app, Method::POST, "/v1/tokenize", Some(counted)).await;
+    assert_eq!(status, StatusCode::OK, "{counted}");
+    assert_eq!(send(&metrics, Method::GET, "/metrics", None).await.0, StatusCode::OK);
+}
+
+/// AC 8: a queued image job, then a running one, is use — the idle clock
+/// leaves the image model loaded past `model.idle_unload` — and once it ends
+/// the model unloads after the idle time, its runner dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_or_running_image_job_keeps_the_image_model_loaded() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, IMAGE, &[IMAGE]).with_idle_unload(IDLE);
+    let _clock = server.spawn_idle_clock(TICK).expect("a switcher, so a clock");
+    let jobs = Arc::clone(&server.active().image_model().expect("the image model").jobs);
+
+    let waiting = jobs.wait();
+    tokio::time::sleep(IDLE + IDLE / 2).await;
+    assert_eq!(server.status().as_str(), "serving", "a queued job is use");
+    let running = waiting.start();
+    tokio::time::sleep(IDLE + IDLE / 2).await;
+    assert_eq!(server.status().as_str(), "serving", "a running job is use");
+    assert_eq!(loader.resident(), 1);
+
+    let ended = Instant::now();
+    drop(running);
+    unloaded(&server).await;
+    assert!(ended.elapsed() >= IDLE, "the idle time counts from the job's end: {:?}", ended.elapsed());
+    assert_eq!(loader.resident(), 0, "the unloaded image model's runner was dropped");
+    assert!(jobs.is_closed(), "the unloaded model's queue admits nothing more");
+    assert!(loader.loads().is_empty());
+}
+
+/// AC 8: an unused image model unloads after `model.idle_unload` like a text
+/// model, keeping its id and kind; a text request naming no model leaves it
+/// unloaded, since loading it would only refuse the request; a switch loads
+/// it again, and a request naming a text model loads that one alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unused_image_model_unloads_and_the_next_request_that_needs_a_model_loads_one() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, IMAGE, &[IMAGE, "mock-a"]).with_idle_unload(IDLE);
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+    let app = server.app();
+    unloaded(&server).await;
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!((models["status"].as_str(), models["data"][0]["id"].as_str(), models["data"][0]["kind"].as_str()), (Some("unloaded"), Some(IMAGE), Some("image")));
+
+    let (status, refused) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(None))).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("model_kind_mismatch")), "{refused}");
+    assert_eq!(server.status().as_str(), "unloaded", "nothing was loaded for a request it would refuse");
+
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(switch_to(IMAGE))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    until(&server, "serving", PATIENT).await;
+    assert_eq!(server.active().kind(), ModelKind::Image);
+    unloaded(&server).await;
+
+    let (status, completion) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(Some("mock-a")))).await;
+    assert_eq!(status, StatusCode::OK, "{completion}");
+    assert_eq!(completion["model"], "mock-a");
+    assert_eq!(loader.loads(), [IMAGE, "mock-a"], "one load each, never the image model before the text one");
+}
+
+// ── the production loader on the image artifact ───────────────────────────
+
+/// A scratch directory removed on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("ignis-model-kind-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch(dir)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The image model's container packed from the converter's synthetic work
+/// tree (the artifact crate's committed fixture), its sidecar beside it.
+fn image_artifact(dir: &Path) -> PathBuf {
+    use ignis_artifact::packer::{pack, PackOptions, PackOutcome};
+    let work = Path::new(env!("CARGO_MANIFEST_DIR")).join("../artifact/tests/fixtures/qwen_image_work");
+    let artifact = dir.join("synthetic-v2.ninfer");
+    let mut options = PackOptions::qwen_image(work, artifact.clone());
+    options.keep_work = true;
+    options.accept_status = vec!["fixture".into()];
+    options.header_bytes = 1 << 20;
+    let outcome = pack(&options, &mut |_| {}).unwrap();
+    assert!(matches!(outcome, PackOutcome::Finished { .. }), "{outcome:?}");
+    artifact
+}
+
+fn start_options() -> ignis_server::config::Config {
+    match ignis_server::config::resolve(&[], |_| None).expect("the defaults resolve") {
+        ignis_server::config::ConfigOutcome::Config(config) => config,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The production loader reads the image artifact's kind off its header,
+/// verifies it against its sidecar, fits the options to the image family
+/// and loads it — on the fake runner in a build without `cuda`, and refused
+/// naming the leaf still to come with it. A sidecar that does not match is
+/// refused before anything loads.
+#[tokio::test]
+async fn the_artifact_loader_verifies_the_image_artifact_and_loads_its_runner() {
+    let scratch = Scratch::new("loader");
+    let artifact = image_artifact(&scratch.0);
+    let loader = ArtifactLoader::new(start_options());
+    let target = ModelSource { artifact: artifact.clone(), model: IMAGE.to_owned() };
+    assert_eq!(loader.kind_of(&target), Some(ModelKind::Image));
+    assert_eq!(loader.kind_of(&ModelSource { artifact: scratch.0.join("absent.ninfer"), model: "x".into() }), None);
+
+    let prepared = loader.prepare(&target, None).expect("a verified image artifact prepares");
+    assert_eq!(prepared.options().expect("the fitted options").model, IMAGE);
+    let loaded = prepared.load();
+    #[cfg(not(feature = "cuda"))]
+    {
+        let model = loaded.expect("the fake runner loads").model;
+        assert_eq!((model.kind(), model.model_id()), (ModelKind::Image, IMAGE.to_owned()));
+        assert_eq!(model.source, Some(target.clone()));
+        assert!(model.engine().is_none());
+        let image = model.image_model().expect("the image model");
+        assert_eq!(image.plan().sample_sigmas.len(), 8);
+        model.shut_down();
+        assert!(image.with_runner(|runner| runner.plan().clone()).is_none(), "shut down, the runner is gone");
+    }
+    #[cfg(feature = "cuda")]
+    assert!(loaded.err().expect("no image leaf yet").contains("#321"));
+
+    let sidecar = ignis_artifact::packer::sidecar_path(&artifact);
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+    record["artifact"]["bytes"] = json!(record["artifact"]["bytes"].as_u64().unwrap() + 1);
+    std::fs::write(&sidecar, record.to_string()).unwrap();
+    let refused = loader.prepare(&target, None).err().expect("a sidecar that does not match is refused");
+    assert!(refused.contains("checksum verification failed"), "{refused}");
+}

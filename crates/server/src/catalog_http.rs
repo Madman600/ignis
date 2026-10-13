@@ -91,7 +91,7 @@ pub(crate) struct CatalogList {
 /// the workers.
 fn rows(server: &Server) -> Vec<CatalogRow> {
     let active = server.active();
-    let loaded_id = active.engine.model_id();
+    let loaded_id = active.model_id();
     let switcher = server.switcher.as_deref();
     // A switch beginning now: serving, failed (the way out of a failure
     // is a switch), or unloaded (a switch loads, spec model-switch/02). Not

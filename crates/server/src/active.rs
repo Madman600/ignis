@@ -12,16 +12,23 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use ignis_core::compute::ModelFamily;
+use ignis_core::compute::{ModelFamily, ModelKind};
 
 use crate::engine::Engine;
+use crate::images::ImageModel;
 use crate::media::MediaAcquirer;
 use crate::template::TemplateProvider;
 
 /// Everything on the server that is a property of the loaded artifact
-/// rather than of the process: the engine over its scheduler, its template,
-/// what its family serves, the heads its content hash was calibrated with,
-/// the `/v1/decide` labels its tokenizer yields, and its vision acquirer.
+/// rather than of the process: what it computes with — the engine over its
+/// scheduler, or the image model's runner — its template, what its family
+/// serves, the heads its content hash was calibrated with, the `/v1/decide`
+/// labels its tokenizer yields, and its vision acquirer.
+///
+/// The template, the calibrations, the labels and the acquirer are a text
+/// model's: the image model carries the placeholder template and none of
+/// the rest, and no route reads them past the kind check
+/// (`crate::api::check_served_kind`, spec image-model/05).
 ///
 /// Read wait-free through [`crate::Server::active`] (an `ArcSwap` load), and
 /// replaced whole by the model switch (`crate::model_switch`). Cloning is
@@ -29,9 +36,8 @@ use crate::template::TemplateProvider;
 /// model, never a second one.
 #[derive(Clone)]
 pub struct ActiveModel {
-    /// The engine: the core scheduler + per-request event routing
-    /// (submit / drive / route — `engine.rs`).
-    pub engine: Engine,
+    /// What the model computes with, by its kind (spec image-model/05).
+    pub runner: Runner,
     /// The chat-template / tokenizer seam (artifact-02 plugs the real
     /// frontend object set in here).
     pub template: Arc<dyn TemplateProvider>,
@@ -76,6 +82,32 @@ pub struct ActiveModel {
     driver: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
+/// What a loaded model computes with: its [`ModelKind`] as a value.
+#[derive(Clone)]
+pub enum Runner {
+    /// A text model's engine: the core scheduler + per-request event
+    /// routing (submit / drive / route — `engine.rs`).
+    Text(Engine),
+    /// The image model's runner and job count (`crate::images`).
+    Image(ImageModel),
+}
+
+/// The work waiting and running on a loaded model
+/// ([`ActiveModel::in_flight`]): a text model's requests not yet on a lane
+/// and on one, the image model's jobs queued and the one running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InFlight {
+    pub waiting: u32,
+    pub running: u32,
+}
+
+impl InFlight {
+    /// Nothing waiting, nothing running.
+    pub fn is_idle(&self) -> bool {
+        self.waiting == 0 && self.running == 0
+    }
+}
+
 /// Where a loaded model came from, as a switch request names it (the
 /// `--model-artifact` / `--model-id` pair a restart would have been given).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,12 +132,95 @@ impl ActiveModel {
             calibration: ignis_core::pointing::calibration(engine.artifact()),
             locate: ignis_core::locate::calibration(engine.artifact()),
             alphabet: Arc::new(template.answer_alphabet()),
-            engine,
+            runner: Runner::Text(engine),
             template,
             family: ModelFamily::Qwen38_27b,
             media: None,
             source: None,
             driver: Arc::default(),
+        }
+    }
+
+    /// The image model `image` (ADR 0050): its family, the placeholder
+    /// template, no calibration, labels nor acquirer, and no source until
+    /// [`ActiveModel::with_source`].
+    pub fn image(image: ImageModel) -> Self {
+        let template: Arc<dyn TemplateProvider> = Arc::new(crate::template::SimpleTemplateProvider);
+        Self {
+            calibration: None,
+            locate: None,
+            alphabet: Arc::new(template.answer_alphabet()),
+            runner: Runner::Image(image),
+            template,
+            family: ModelFamily::QwenImage21,
+            media: None,
+            source: None,
+            driver: Arc::default(),
+        }
+    }
+
+    /// What the model produces: what its runner is.
+    pub fn kind(&self) -> ModelKind {
+        match self.runner {
+            Runner::Text(_) => ModelKind::Text,
+            Runner::Image(_) => ModelKind::Image,
+        }
+    }
+
+    /// The id it is served under.
+    pub fn model_id(&self) -> String {
+        match &self.runner {
+            Runner::Text(engine) => engine.model_id(),
+            Runner::Image(image) => image.model_id(),
+        }
+    }
+
+    /// A text model's engine; `None` on the image model, which has none.
+    pub fn engine(&self) -> Option<&Engine> {
+        match &self.runner {
+            Runner::Text(engine) => Some(engine),
+            Runner::Image(_) => None,
+        }
+    }
+
+    /// The engine of a model a text route has checked the kind of
+    /// (`crate::api::check_served_kind`): every route that reads it refuses
+    /// the image model first, so the image model here is a route that skipped
+    /// the check, and that panics naming it rather than serving it.
+    pub fn text_engine(&self) -> &Engine {
+        self.engine().unwrap_or_else(|| panic!("{} is an image model and has no engine: a text route skipped the kind check", self.model_id()))
+    }
+
+    /// The image model's runner and jobs; `None` on a text model.
+    pub fn image_model(&self) -> Option<&ImageModel> {
+        match &self.runner {
+            Runner::Text(_) => None,
+            Runner::Image(image) => Some(image),
+        }
+    }
+
+    /// The work waiting and running on it now: what the idle clock reads to
+    /// tell it is in use, and a switch's drain to tell it is done. A text
+    /// model's from its engine's wait-free counters, the image model's from
+    /// its job count.
+    pub fn in_flight(&self) -> InFlight {
+        match &self.runner {
+            Runner::Text(engine) => {
+                let counters = engine.interval_counters();
+                InFlight { waiting: counters.waiting, running: counters.running }
+            }
+            Runner::Image(image) => image.jobs.in_flight(),
+        }
+    }
+
+    /// Tell the model to stop now, not waiting for it: a text model's thread
+    /// ends every request still on it with an error ([`Engine::shutdown`]);
+    /// the image model's queue admits nothing more and cancels its jobs
+    /// between denoising steps.
+    pub fn stop(&self) {
+        match &self.runner {
+            Runner::Text(engine) => engine.shutdown(),
+            Runner::Image(image) => image.jobs.close(),
         }
     }
 
@@ -135,21 +250,26 @@ impl ActiveModel {
     }
 
     /// Stop this model for good and wait until it is gone: the model thread
-    /// is told to shut down ([`Engine::shutdown`] — every request still on it
+    /// is told to shut down ([`ActiveModel::stop`] — every request still on it
     /// ends with an error), and its handle is joined, which returns only once
     /// the thread has dropped the scheduler and everything the scheduler
-    /// owned. Blocking: an async caller runs it on `spawn_blocking`.
+    /// owned. The image model's runner is dropped once the job holding it lets
+    /// go ([`ImageModel::shut_down`]). Blocking: an async caller runs it on
+    /// `spawn_blocking`.
     ///
     /// A model with no driver handle is told to shut down and not waited
     /// for — nothing was kept to wait on. Calling this twice is harmless.
     pub fn shut_down(&self) {
-        self.engine.shutdown();
+        self.stop();
+        if let Runner::Image(image) = &self.runner {
+            image.shut_down();
+        }
         let driver = self.driver.lock().expect("driver lock").take();
         if let Some(driver) = driver {
             if driver.join().is_err() {
                 tracing::error!(
                     name: "ignis.model.thread_panicked",
-                    model = %self.engine.model_id(),
+                    model = %self.model_id(),
                     "the model thread panicked before it shut down"
                 );
             }

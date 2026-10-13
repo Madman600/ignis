@@ -244,7 +244,7 @@ async fn a_failed_reload_leaves_the_model_the_config_and_the_file_as_they_were()
     let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{applied}");
     until_serving(&app).await;
-    assert_eq!(server.active().engine.model_id(), "mock-a");
+    assert_eq!(server.active().model_id(), "mock-a");
     assert_eq!(server.live().request_timeout, Duration::from_secs(30));
     let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
     assert_eq!(document["model"]["max_context"], ignis_server::config::DEFAULT_MAX_CONTEXT);

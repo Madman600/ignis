@@ -9,18 +9,25 @@
 //! compute is alive exactly as long as the scheduler that owns it, so the
 //! count of live ones when a load begins is how many models were still
 //! resident then — the mock's proof that the old model was gone first.
+//!
+//! An id of the image family (`ignis-image-2.1-turbo`, spec image-model/05)
+//! builds the image model over a `FakeImageRunner` instead, resident until
+//! its runner is dropped.
 
 #![allow(dead_code)]
 
 use std::collections::HashSet;
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
 
 use ignis_core::compute::ModelFamily;
+use ignis_core::image::FakeImageRunner;
 use ignis_core::mock::{GateController, GatedCompute, MockCompute};
 use ignis_core::{Compute, ConcreteScheduler, SchedulerConfig};
 use ignis_server::config_http::ConfigState;
 use ignis_server::engine::Engine;
+use ignis_server::images::ImageModel;
 use ignis_server::model_switch::{load_options, ModelLoader, PreparedLoad};
 use ignis_server::load::LoadedModel;
 use ignis_server::telemetry::SystemClock;
@@ -32,6 +39,8 @@ use ignis_server::{ActiveModel, ModelSource};
 struct State {
     /// Every compute built, weakly.
     built: Mutex<Vec<Weak<dyn Compute>>>,
+    /// Every image runner built, by a handle only the runner keeps alive.
+    built_images: Mutex<Vec<Weak<AtomicUsize>>>,
     /// How many built models were still alive as each load began.
     resident_at_load: Mutex<Vec<usize>>,
     /// The ids loaded, in order.
@@ -174,10 +183,16 @@ impl MockLoader {
 }
 
 fn resident(state: &State) -> usize {
-    state.built.lock().unwrap().iter().filter(|built| built.strong_count() > 0).count()
+    let images = state.built_images.lock().unwrap().iter().filter(|built| built.strong_count() > 0).count();
+    images + state.built.lock().unwrap().iter().filter(|built| built.strong_count() > 0).count()
 }
 
 fn build(state: &State, id: &str, compute: Arc<dyn Compute>) -> ActiveModel {
+    if ModelFamily::of_model_id(id) == Some(ModelFamily::QwenImage21) {
+        let runner = FakeImageRunner::default();
+        state.built_images.lock().unwrap().push(Arc::downgrade(&runner.held_conditions()));
+        return ActiveModel::image(ImageModel::new(id, Box::new(runner))).with_source(source(id));
+    }
     state.built.lock().unwrap().push(Arc::downgrade(&compute));
     let scheduler =
         ConcreteScheduler::with_config(SchedulerConfig { model: id.into(), ..SchedulerConfig::default() }, compute);

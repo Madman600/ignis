@@ -347,7 +347,7 @@ async fn open_text(
     }
     let segments = whole.keys.len();
     let around = (whole.ready.prompt_tokens as usize).saturating_sub(whole.span.len());
-    let window = (calibration.window_keys as usize).min((server.active().engine.max_model_len() as usize).saturating_sub(around));
+    let window = (calibration.window_keys as usize).min((server.active().text_engine().max_model_len() as usize).saturating_sub(around));
     if whole.span.len() <= window {
         within_context(server, id, &whole)?;
         let LocatePrompt { ready, span, keys, .. } = whole;

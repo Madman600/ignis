@@ -605,10 +605,15 @@ pub fn needs_reload(running: &Config, next: &Config) -> bool {
 /// no forced close for, is refused rather than silently inert. Only for what
 /// `patch` changes — a value the load already accepted is not judged again —
 /// and the budget's check only on a model loaded from an artifact, as at
-/// start: the placeholder has no tokenizer to close with.
+/// start: the placeholder has no tokenizer to close with. Not on the image
+/// model, which thinks nothing: the next text model's load judges them
+/// (spec image-model/05).
 fn check_thinking(server: &Server, next: &Config, patch: &Layer) -> Result<(), String> {
     let named = |name: &str| patch.named().any(|(meta, _)| meta.group == "model" && meta.name == name);
     let active = server.active();
+    if active.engine().is_none() {
+        return Ok(());
+    }
     if named("enable_thinking") || named("reasoning_effort") {
         let defaults = crate::thinking::ThinkingDefaults {
             enable_thinking: next.enable_thinking,

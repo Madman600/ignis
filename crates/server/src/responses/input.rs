@@ -9,6 +9,7 @@ use serde_json::{json, Value as JsonValue};
 use utoipa::ToSchema;
 
 use axum::response::Response;
+use ignis_core::compute::ModelKind;
 use ignis_core::{RequestClass, RequestInput};
 
 use crate::api::{self, SamplingRequestFields};
@@ -171,18 +172,22 @@ pub(crate) fn previous_response_not_found(id: &JsonValue) -> Response {
 /// alike. On the server every handler shares, ahead of the pin [`prepare`]'s
 /// callers take.
 pub(crate) async fn switch_to_named_model(server: &Server, req: &CreateResponse) -> Result<(), Response> {
-    api::switch_to_named_model(server, req.model.as_deref()).await
+    api::switch_to_named_model(server, ModelKind::Text, req.model.as_deref()).await
 }
 
 /// Validate `req`, map its items (after `history`, a continued response's
 /// conversation) onto chat messages, and render and prepare the request as
 /// chat completions would. `warm_up` submits it as a warm-up request.
+///
+/// `server` is pinned, and its model a text model first of all (spec
+/// image-model/05, [`api::check_served_kind`]).
 pub(crate) async fn prepare(
     server: &Server,
     req: CreateResponse,
     history: Vec<JsonValue>,
     warm_up: bool,
 ) -> Result<Prepared, Response> {
+    api::check_served_kind(server, ModelKind::Text, api::split_model_lane(req.model.clone()).0.as_deref())?;
     crate::openai_fields::check(&req.other, crate::openai_fields::Surface::Responses)
         .map_err(api::refused_field)?;
     if let Some(text) = &req.text {

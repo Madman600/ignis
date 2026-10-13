@@ -589,7 +589,7 @@ async fn after_a_failed_load_a_switch_loads_a_model() {
     let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(switch)).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
     until(&server, "serving", PATIENT).await;
-    assert_eq!(server.active().engine.model_id(), "mock-b");
+    assert_eq!(server.active().model_id(), "mock-b");
     assert_eq!(loader.loads(), ["mock-a", "mock-b"]);
 }
 
@@ -726,7 +726,7 @@ async fn a_request_admitted_but_not_yet_submitted_is_not_unloaded_under() {
     let _clock = server.spawn_idle_clock(TICK).expect("a clock");
 
     tokio::time::sleep(IDLE * 2).await;
-    let counters = server.active().engine.interval_counters();
+    let counters = server.active().text_engine().interval_counters();
     assert_eq!(counters.waiting + counters.running, 0, "the engine has nothing yet: only the count holds the model");
     assert_eq!(*server.status(), ModelStatus::Serving, "an admitted request is use");
     let released = Instant::now();
@@ -757,7 +757,7 @@ async fn a_switch_while_unloaded_loads_the_named_model_the_same_id_included() {
         assert_eq!(models["status"], "loading", "{target}: {models}");
         release.send(()).expect("the held load is waiting");
         until(&server, "serving", PATIENT).await;
-        assert_eq!(server.active().engine.model_id(), target);
+        assert_eq!(server.active().model_id(), target);
         assert_eq!(loader.loads(), [target], "{target}");
         assert_eq!(loader.resident_at_load(), [0], "{target}");
         let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
@@ -808,7 +808,7 @@ async fn an_unload_due_while_a_switch_runs_waits_for_it() {
     until(&server, "serving", PATIENT).await;
     let at = until(&server, "unloaded", IDLE * 5).await - released;
     assert!(at >= IDLE, "unloaded {at:?} after the switch's load was let go");
-    assert_eq!(server.active().engine.model_id(), "mock-b", "the switch's model was the one unloaded");
+    assert_eq!(server.active().model_id(), "mock-b", "the switch's model was the one unloaded");
     assert_eq!(loader.loads(), ["mock-b"]);
 }
 

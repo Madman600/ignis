@@ -584,7 +584,7 @@ async fn serve(
     let queue = &server.responses.queue;
     // The engine the request is submitted to is the one its cancel guard
     // must reach, whatever a model switch does meanwhile.
-    let engine = server.active().engine.clone();
+    let engine = server.active().text_engine().clone();
     let (mut events, request, mut scheduled) = match queue.submit(&engine, &input, class, notes).await {
         Admission::Refused(refused) => {
             emit(refusal_event(api::submit_error(server, refused)).await);

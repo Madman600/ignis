@@ -70,7 +70,7 @@ async fn until_in_flight(engine: &Engine, in_flight: u32) {
 
 /// A request completes on `server`'s loaded model.
 async fn serves(server: &Server) {
-    let engine = server.active().engine.clone();
+    let engine = server.active().text_engine().clone();
     let mut events = ask(&engine, 3).await;
     let completion = collect_completion(&mut events, Duration::from_secs(5)).await.expect("completes");
     assert_eq!(completion.tokens.len(), 3);
@@ -83,7 +83,7 @@ async fn a_switch_closes_the_gate_waits_for_the_running_request_then_serves_the_
     gated.arm();
     drop(gated);
     let server = server_on(&loader, model, PATIENT);
-    let old = server.active().engine.clone();
+    let old = server.active().text_engine().clone();
     let mut held = ask(&old, 4).await;
     gate.wait_entered();
     until_in_flight(&old, 1).await;
@@ -102,7 +102,7 @@ async fn a_switch_closes_the_gate_waits_for_the_running_request_then_serves_the_
     assert_eq!(completion.tokens.len(), 4);
 
     assert_eq!(task.await.expect("the switch task"), SwitchOutcome::Switched);
-    assert_eq!(server.active().engine.model_id(), "mock-b");
+    assert_eq!(server.active().model_id(), "mock-b");
     assert_eq!(*server.status(), ModelStatus::Serving);
     assert_eq!(server.status().refusal(), None);
     assert_eq!(loader.resident_at_load(), [0], "the old model was gone before the new one loaded");
@@ -119,7 +119,7 @@ async fn a_request_past_the_drain_window_is_cut_with_an_error_and_the_switch_com
     gated.arm();
     drop(gated);
     let server = server_on(&loader, model, Duration::from_millis(50));
-    let old = server.active().engine.clone();
+    let old = server.active().text_engine().clone();
     let mut straggler = ask(&old, 64).await;
     gate.wait_entered();
     until_in_flight(&old, 1).await;
@@ -146,7 +146,7 @@ async fn a_request_past_the_drain_window_is_cut_with_an_error_and_the_switch_com
     assert_eq!(cut.reason, FinishReason::Error, "a request cut by a switch ends with an error, not silently");
     assert!(cut.tokens.len() < 64);
     assert_eq!(task.await.expect("the switch task"), SwitchOutcome::Switched);
-    assert_eq!(server.active().engine.model_id(), "mock-b");
+    assert_eq!(server.active().model_id(), "mock-b");
     assert_eq!(*server.status(), ModelStatus::Serving);
     assert_eq!(loader.resident_at_load(), [0]);
     // The old engine refuses what reaches it after the switch: "not now",
@@ -191,13 +191,13 @@ async fn a_load_that_fails_after_the_teardown_reloads_the_previous_model() {
     let loader = MockLoader::new();
     loader.break_load("mock-broken");
     let server = server_on(&loader, loader.model("mock-a"), PATIENT);
-    let old = server.active().engine.clone();
+    let old = server.active().text_engine().clone();
 
     let (_, task) = begin(&server, source("mock-broken")).expect("begins");
     let outcome = task.await.expect("the switch task");
     let SwitchOutcome::Restored { reason } = outcome else { panic!("restored, got {outcome:?}") };
     assert!(reason.contains("simulated kernel load error"), "{reason}");
-    assert_eq!(server.active().engine.model_id(), "mock-a");
+    assert_eq!(server.active().model_id(), "mock-a");
     assert_eq!(*server.status(), ModelStatus::Serving);
     assert_eq!(loader.loads(), ["mock-broken", "mock-a"]);
     assert_eq!(loader.resident_at_load(), [0, 0], "each load found the card empty");
@@ -232,7 +232,7 @@ async fn with_nothing_to_reload_a_failed_switch_stays_failed_until_a_switch_succ
     assert_eq!(started.from, "mock-a", "the dead model is still the one named");
     assert_eq!(task.await.expect("the switch task"), SwitchOutcome::Switched);
     assert_eq!(*server.status(), ModelStatus::Serving);
-    assert_eq!(server.active().engine.model_id(), "mock-b");
+    assert_eq!(server.active().model_id(), "mock-b");
     serves(&server).await;
 }
 
@@ -254,7 +254,7 @@ async fn a_second_switch_is_refused_naming_the_first_and_switches_are_not_queued
     let (started, second) = begin(&server, source("mock-c")).expect("the next switch begins once the first ended");
     assert_eq!(started.from, "mock-b");
     assert_eq!(second.await.expect("the switch task"), SwitchOutcome::Switched);
-    assert_eq!(server.active().engine.model_id(), "mock-c");
+    assert_eq!(server.active().model_id(), "mock-c");
     assert_eq!(loader.loads(), ["mock-b", "mock-c"], "mock-c was loaded once, when asked again");
 }
 
@@ -294,9 +294,9 @@ async fn a_pinned_request_keeps_the_model_it_began_on_across_a_switch() {
 
     let (_, task) = begin(&server, source("mock-b")).expect("begins");
     assert_eq!(task.await.expect("the switch task"), SwitchOutcome::Switched);
-    assert_eq!(server.active().engine.model_id(), "mock-b");
-    assert_eq!(pinned.active().engine.model_id(), "mock-a", "the pinned request still sees its own model");
-    let refused = pinned.active().engine.submit(input("mock-a", 3), RequestClass::Interactive).await;
+    assert_eq!(server.active().model_id(), "mock-b");
+    assert_eq!(pinned.active().model_id(), "mock-a", "the pinned request still sees its own model");
+    let refused = pinned.active().text_engine().submit(input("mock-a", 3), RequestClass::Interactive).await;
     assert!(matches!(refused, Err(ignis_core::SubmitError::Full)), "{refused:?}");
     assert_eq!(*pinned.status(), ModelStatus::Serving, "the status is the server's, shared");
 }
@@ -334,14 +334,14 @@ async fn naming_a_known_model_switches_to_it_and_returns_once_it_serves() {
     let server = implicit_server_on(&loader, loader.model("mock-a"), &["mock-a", "mock-b"]);
 
     assert_eq!(implicit_switch(&server, Some("mock-b")).await, Ok(()));
-    assert_eq!(server.active().engine.model_id(), "mock-b");
+    assert_eq!(server.active().model_id(), "mock-b");
     assert_eq!(*server.status(), ModelStatus::Serving);
     assert_eq!(loader.loads(), ["mock-b"]);
     assert_eq!(loader.resident_at_load(), [0], "the same teardown-then-load as an explicit switch");
     serves(&server).await;
 
     assert_eq!(implicit_switch(&server, Some("mock-a")).await, Ok(()), "and back");
-    assert_eq!(server.active().engine.model_id(), "mock-a");
+    assert_eq!(server.active().model_id(), "mock-a");
     assert_eq!(loader.loads(), ["mock-b", "mock-a"]);
 }
 
@@ -379,7 +379,7 @@ async fn the_gate_closes_at_once_the_drain_runs_first_and_a_second_request_is_to
     gated.arm();
     drop(gated);
     let server = implicit_server_on(&loader, model, &["mock-a", "mock-b", "mock-c"]);
-    let old = server.active().engine.clone();
+    let old = server.active().text_engine().clone();
     let mut held = ask(&old, 4).await;
     gate.wait_entered();
     until_in_flight(&old, 1).await;
@@ -405,7 +405,7 @@ async fn the_gate_closes_at_once_the_drain_runs_first_and_a_second_request_is_to
     let completion = collect_completion(&mut held, Duration::from_secs(5)).await.expect("the held request completes");
     assert_eq!(completion.reason, FinishReason::Length, "drained, not cut");
     assert_eq!(trigger.await.expect("the trigger task"), Ok(()));
-    assert_eq!(server.active().engine.model_id(), "mock-b");
+    assert_eq!(server.active().model_id(), "mock-b");
     assert_eq!(loader.loads(), ["mock-b"], "one switch, not one per request that named a model");
 }
 
@@ -425,14 +425,14 @@ async fn a_switch_that_does_not_land_refuses_the_request_with_its_reason() {
     };
     assert_eq!(to, "mock-refused");
     assert!(reason.contains("refused at prepare"), "{reason}");
-    assert_eq!(server.active().engine.model_id(), "mock-a");
+    assert_eq!(server.active().model_id(), "mock-a");
 
     let Err(ImplicitRefusal::Failed { to, reason }) = implicit_switch(&server, Some("mock-broken")).await else {
         panic!("failed on the load");
     };
     assert_eq!(to, "mock-broken");
     assert!(reason.contains("simulated kernel load error"), "{reason}");
-    assert_eq!(server.active().engine.model_id(), "mock-a", "the previous model was reloaded");
+    assert_eq!(server.active().model_id(), "mock-a", "the previous model was reloaded");
     assert_eq!(*server.status(), ModelStatus::Serving);
     serves(&server).await;
 }
@@ -472,11 +472,11 @@ async fn a_catalog_entry_whose_artifact_is_on_disk_when_named_is_switchable() {
 
     assert_eq!(implicit_switch(&server, Some("mock-cat")).await, Ok(()));
     assert!(loader.loads().is_empty(), "not on disk: nothing switches, the request's own check refuses it");
-    assert_eq!(server.active().engine.model_id(), "mock-a");
+    assert_eq!(server.active().model_id(), "mock-a");
 
     std::fs::write(&artifact, b"fetched").unwrap();
     assert_eq!(implicit_switch(&server, Some("mock-cat")).await, Ok(()));
-    assert_eq!(server.active().engine.model_id(), "mock-cat");
+    assert_eq!(server.active().model_id(), "mock-cat");
     assert_eq!(loader.prepared_artifacts(), [artifact.clone()], "loaded from the download directory");
     assert!(!server.switcher.as_ref().unwrap().known_models().contains_key("mock-cat"), "derived, not added to the list");
     let _ = std::fs::remove_dir_all(artifact.parent().unwrap());

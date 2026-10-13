@@ -51,10 +51,26 @@ pub fn load_artifact(artifact: &Path, sidecar: &Path) -> Result<FrontendSet> {
 /// mock [`ChecksumReport`]): extract the frontend set when `report` is
 /// clean, refuse the load with a descriptive error otherwise.
 pub fn load_artifact_with_report(reader: &Reader, report: &ChecksumReport) -> Result<FrontendSet> {
-    if !report.is_clean() {
-        return Err(ArtifactError::new(describe_report(report)));
-    }
+    check_report(report)?;
     FrontendSet::from_reader(reader)
+}
+
+/// [`load_artifact`]'s verification alone, for a container with no text
+/// frontend to extract — the image model's (spec image-model/05): its own
+/// runner reads its tokenizer and templates.
+pub fn verify_artifact(artifact: &Path, sidecar: &Path) -> Result<()> {
+    let reader = Reader::open(artifact)?;
+    let sidecar = Sidecar::load(sidecar)?;
+    check_report(&verify(&reader, &sidecar)?)
+}
+
+/// A clean `report`, or the load refused naming what it flagged.
+fn check_report(report: &ChecksumReport) -> Result<()> {
+    if report.is_clean() {
+        Ok(())
+    } else {
+        Err(ArtifactError::new(describe_report(report)))
+    }
 }
 
 /// The model `artifact` holds (ADR 0043): the family its container

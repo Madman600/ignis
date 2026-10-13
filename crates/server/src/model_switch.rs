@@ -65,9 +65,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::engine::Engine;
+use ignis_core::compute::{ModelFamily, ModelKind};
+
 use crate::load::LoadedModel;
-use crate::{ActiveModel, ModelSource, ModelStatus, Server, StatusCell};
+use crate::{ActiveModel, InFlight, ModelSource, ModelStatus, Server, StatusCell};
 
 /// How often the drain reads the old engine's in-flight counts. A switch is
 /// an operator's action, seconds long; 10 ms of latency on noticing the last
@@ -87,6 +88,15 @@ pub trait ModelLoader: Send + Sync {
     /// fitted to the family it reloads); `None` is the running one, fitted
     /// to `target`'s family as a switch fits it.
     fn prepare(&self, target: &ModelSource, options: Option<&crate::config::Config>) -> Result<Box<dyn PreparedLoad>, String>;
+
+    /// The kind of model `target` is, when that can be told without loading
+    /// it (spec image-model/05): what keeps a request of one kind from
+    /// switching the server to a model of the other, only to be refused. By
+    /// default the kind of the family whose own id `target` is served under;
+    /// `None` when that says nothing.
+    fn kind_of(&self, target: &ModelSource) -> Option<ModelKind> {
+        ModelFamily::of_model_id(&target.model).map(ModelFamily::kind)
+    }
 }
 
 /// A target [`ModelLoader::prepare`] accepted: what is left is the load
@@ -146,6 +156,14 @@ impl ModelLoader for ArtifactLoader {
         let options = load_options(&self.state.current(), target, family, options)?;
         let prepared = crate::load::prepare_model(&options, &target.artifact).map_err(|e| e.to_string())?;
         Ok(Box::new(prepared))
+    }
+
+    /// The kind of the family the artifact's header names — the 27B's for an
+    /// artifact of no family, as a load serves it; `None` for a file that
+    /// cannot be read, which the switch's own prepare refuses.
+    fn kind_of(&self, target: &ModelSource) -> Option<ModelKind> {
+        let family = crate::loader::artifact_family(&target.artifact).ok()?;
+        Some(family.unwrap_or(ModelFamily::Qwen38_27b).kind())
     }
 }
 
@@ -465,6 +483,17 @@ impl Switcher {
             Some(LastSwitch { from: from.to_owned(), to: to.to_owned(), outcome: outcome.clone() });
     }
 
+    /// The kind of the model a request naming `model` would be served by, if
+    /// that can be told before any switch (spec image-model/05): a model it
+    /// would switch to, by what the loader reads of its artifact; any other,
+    /// by its id when that is a family's own.
+    pub fn kind_of(&self, model: &str) -> Option<ModelKind> {
+        match self.known(model) {
+            Some(artifact) => self.loader.kind_of(&ModelSource { artifact, model: model.to_owned() }),
+            None => ModelFamily::of_model_id(model).map(ModelFamily::kind),
+        }
+    }
+
     /// The artifact a request naming `model` would switch to, if it is known:
     /// the known models' entry for it, else a catalog entry on disk.
     fn known(&self, model: &str) -> Option<PathBuf> {
@@ -755,7 +784,7 @@ fn begin_with(
             ModelStatus::Unloaded => Some(ModelStatus::Unloaded),
             _ => None,
         };
-        let started = SwitchStarted { from: server.active().engine.model_id(), to: target.model.clone() };
+        let started = SwitchStarted { from: server.active().model_id(), to: target.model.clone() };
         *running = Some(Slot::Switch(started.clone()));
         // The model being replaced is the start model if nothing else said so.
         switcher.note_start(server.active().source.as_ref());
@@ -851,7 +880,7 @@ pub async fn implicit_switch(server: &Server, requested: Option<&str>) -> Result
     let Some(artifact) = server.switcher.as_ref().and_then(|switcher| switcher.known(requested)) else {
         return Ok(());
     };
-    if server.active().engine.model_id() == requested {
+    if server.active().model_id() == requested {
         return Ok(());
     }
     let target = ModelSource { artifact: artifact.clone(), model: requested.to_owned() };
@@ -991,7 +1020,7 @@ pub(crate) fn claim_unload(server: &Server) -> Option<Unloading> {
     if running.is_some() || !matches!(*server.status(), ModelStatus::Serving) || server.active().source.is_none() {
         return None;
     }
-    *running = Some(Slot::Unload { model: server.active().engine.model_id() });
+    *running = Some(Slot::Unload { model: server.active().model_id() });
     server.status.store(Arc::new(ModelStatus::Unloaded));
     drop(running);
     Some(Unloading { _slot: RunningGuard { switcher, status: Arc::clone(&server.status), records: false } })
@@ -1021,7 +1050,7 @@ pub(crate) async fn unload(server: &Server, unloading: Unloading, idle: Duration
         server.observe_unload();
         tracing::info!(
             name: "ignis.model.unloaded",
-            model = %model.engine.model_id(),
+            model = %model.model_id(),
             idle_secs = idle.as_secs(),
             teardown_ms = teardown_began.elapsed().as_millis() as u64,
             "nobody used the model for model.idle_unload seconds: it is unloaded, and the next request that needs it loads it again"
@@ -1105,11 +1134,11 @@ async fn run(
     } else {
         let drain_began = Instant::now();
         let drain_timeout = switcher.drain_timeout();
-        if let Err(left) = drain(&old.engine, drain_timeout).await {
+        if let Err(left) = drain(&old, drain_timeout).await {
             // The window is over: what is still running is cut now, before
             // the line saying so — whoever reads it can count on the cut
             // being under way. The join below waits for it.
-            old.engine.shutdown();
+            old.stop();
             tracing::warn!(
                 name: "ignis.model.switch_drain_timed_out",
                 from = %from,
@@ -1228,17 +1257,18 @@ async fn prepare(
         .unwrap_or_else(|panicked| Err(format!("preparing the load panicked: {panicked}")))
 }
 
-/// Step 3: wait until `engine` has nothing waiting or running, or `timeout`
-/// passes — then what was still in flight.
-async fn drain(engine: &Engine, timeout: Duration) -> Result<(), crate::telemetry::IntervalCounters> {
+/// Step 3: wait until `model` has nothing waiting or running — a text
+/// model's lanes, the image model's jobs — or `timeout` passes, then what
+/// was still in flight.
+async fn drain(model: &ActiveModel, timeout: Duration) -> Result<(), InFlight> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let counters = engine.interval_counters();
-        if counters.waiting == 0 && counters.running == 0 {
+        let in_flight = model.in_flight();
+        if in_flight.is_idle() {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(counters);
+            return Err(in_flight);
         }
         tokio::time::sleep(DRAIN_POLL).await;
     }
@@ -1261,7 +1291,7 @@ async fn load_and_warm(server: &Server, prepared: Box<dyn PreparedLoad>) -> Resu
     let loaded = tokio::task::spawn_blocking(move || prepared.load())
         .await
         .unwrap_or_else(|panicked| Err(format!("the load panicked: {panicked}")))?;
-    let warm_up = match crate::warm_up_engine(&loaded.model.engine).await {
+    let warm_up = match crate::warm_up_model(&loaded.model).await {
         Ok(took) => took,
         Err(error) => {
             shut_down(&Arc::new(loaded.model)).await;
