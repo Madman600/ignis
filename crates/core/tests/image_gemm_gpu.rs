@@ -16,6 +16,7 @@ use std::os::raw::c_void;
 use ignis_artifact::{CudaDevice, Device, DeviceBuffer};
 use ignis_core::gpu_profile;
 use ignis_core::image_gemm;
+use ignis_core::moe;
 
 /// The device, prepared for the image GEMM, or `None` after the profile's verdict.
 fn device() -> Option<CudaDevice> {
@@ -51,9 +52,11 @@ fn ptr(buf: &DeviceBuffer) -> *mut c_void {
     buf.base_ptr() as *mut c_void
 }
 
-/// Runs a binding and waits for it, under the profile's rule for a kernel error.
-fn ran(dev: &mut CudaDevice, result: Result<(), String>, what: &str) -> bool {
-    match result.and_then(|_| dev.synchronize().map_err(|e| e.to_string())) {
+/// Runs a binding and waits for it, under the profile's rule for a kernel error. The ops run on
+/// the legacy default stream, which `CudaDevice::synchronize` (its own non-blocking stream) does
+/// not wait for: without this, a download could read the output before the kernel wrote it.
+fn ran(result: Result<(), String>, what: &str) -> bool {
+    match result.and_then(|_| moe::stream_sync(std::ptr::null_mut())) {
         Ok(()) => true,
         Err(e) => {
             gpu_profile::skip_or_fail(&format!("{what}: {e}"));
@@ -122,7 +125,7 @@ fn quantized_gemm_through_the_bindings_matches_fp64_of_its_dequantized_operands(
     let dc = dev.allocate((tokens * cols) as u64).expect("device allocation");
     let ds = dev.allocate(tokens as u64 * 4).expect("device allocation");
     let quantize = unsafe { image_gemm::quantize_tokens(ptr(&dx), tokens, cols, ptr(&dc), ptr(&ds) as *mut f32, std::ptr::null_mut()) };
-    if !ran(&mut dev, quantize, "ignis_image_quantize_tokens") {
+    if !ran(quantize, "ignis_image_quantize_tokens") {
         return;
     }
     let codes = download(&mut dev, &dc);
@@ -138,7 +141,7 @@ fn quantized_gemm_through_the_bindings_matches_fp64_of_its_dequantized_operands(
         let gemm = unsafe {
             image_gemm::gemm_w8a8(ptr(&dw), rows, cols, ptr(&dc), ptr(&ds) as *const f32, tokens, ptr(&dy), y_f32, std::ptr::null_mut())
         };
-        if !ran(&mut dev, gemm, "ignis_image_gemm_w8a8") {
+        if !ran(gemm, "ignis_image_gemm_w8a8") {
             return;
         }
         let y: Vec<f64> = download(&mut dev, &dy)
