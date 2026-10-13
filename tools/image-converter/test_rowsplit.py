@@ -9,8 +9,9 @@ import torch
 
 import rowsplit
 
-NINFER = "F:/ai/q38/ninfer"
-ARTIFACT_27B = "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer"
+# the owner's layout; the tests that need them skip without them
+NINFER = os.environ.get("IGNIS_NINFER_SOURCE", "F:/ai/q38/ninfer")
+ARTIFACT_27B = os.environ.get("IGNIS_ARTIFACT_27B", "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer")
 
 
 def test_payload_geometry_is_the_readers():

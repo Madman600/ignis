@@ -153,28 +153,45 @@ def test_simquant_refuses_a_tensor_that_is_not_the_artifacts(packed):
             record.simquant(_models(snap)["text_encoder"], "text_encoder", record.Artifact(artifact), records)
 
 
+def test_simquant_refuses_a_record_whose_encoding_is_not_the_plans(packed):
+    snap, _, artifact, record_ = packed
+    tampered = copy.deepcopy(record_)
+    r = next(r for r in tampered["tensors"] if r["encoding"] == "fp8" and r["source"].startswith("text_encoder/"))
+    r["encoding"] = "w8"
+    records = {t["source"]: t for t in tampered["tensors"]}
+    with pytest.raises(ValueError, match=f"{r['source']}: the artifact records w8, recipe.py plans fp8"):
+        record.simquant(_models(snap)["text_encoder"], "text_encoder", record.Artifact(artifact), records)
+
+
 def test_the_bound_is_the_larger_of_both_factors_per_quantity(tmp_path):
     path = str(tmp_path / "thresholds.json")
     # binary fractions, so the products are exact
-    sim = {"t2i": {"velocity": [0.25, 0.015625], "encoder": 0.03125},
-           "edit": {"velocity": [0.0625, 0.125], "encoder": 0.5, "condition_latents": 0.0}}
-    bf16 = {"t2i": {"velocity": [0.0625, 0.015625], "encoder": 0.0078125},
-            "edit": {"velocity": [0.03125, 0.0078125], "encoder": 0.015625, "condition_latents": 0.015625}}
+    sim = {"t2i": {"velocity": [0.25, 0.015625], "encoder": 0.03125, "encoder_row0": 0.5},
+           "edit": {"velocity": [0.0625, 0.125], "encoder": 0.5, "encoder_after_vision": 0.25, "encoder_row0": 0.5,
+                    "condition_latents": 0.0}}
+    bf16 = {"t2i": {"velocity": [0.0625, 0.015625], "encoder": 0.0078125, "encoder_row0": 0.25},
+            "edit": {"velocity": [0.03125, 0.0078125], "encoder": 0.015625, "encoder_after_vision": 0.0625,
+                     "encoder_row0": 0.25, "condition_latents": 0.015625}}
     artifact = {"file": "a.ninfer", "bytes": 1}
     record.write_bounds(path, sim, bf16, 2.0, 5.0, {"id": "oracle"}, {"id": "yardstick"}, artifact)
     with open(path, encoding="utf-8") as f:
         t = json.load(f)
-    assert t["schema"] == "ignis-image-thresholds-v2" and t["factors"] == {"sim": 2.0, "bf16": 5.0}
+    assert t["schema"] == "ignis-image-thresholds-v3" and t["factors"] == {"sim": 2.0, "bf16": 5.0}
     assert t["oracle_session"] == {"id": "oracle"} and t["session"] == {"id": "yardstick"}
-    assert t["artifact"] == artifact and set(t["metrics"]) == {"velocity", "encoder", "condition_latents"}
+    assert t["artifact"] == artifact and set(t["metrics"]) == {"velocity", "encoder", "encoder_after_vision",
+                                                               "encoder_row0", "condition_latents"}
     assert "text rows" in t["metrics"]["encoder"] and set(t["yardsticks"]) == {"bf16", "sim"}
+    assert "own encoder output" in t["metrics"]["velocity"]
     assert t["cases"]["t2i"]["velocity"] == {"sim_error": [0.25, 0.015625], "bf16_error": [0.0625, 0.015625],
                                              "bound": [0.5, 0.078125]}
     assert t["cases"]["t2i"]["encoder"]["bound"] == 0.0625
     assert t["cases"]["edit"]["velocity"]["bound"] == [0.15625, 0.25]
     assert t["cases"]["edit"]["encoder"] == {"sim_error": 0.5, "bf16_error": 0.015625, "bound": 1.0}
+    assert t["cases"]["edit"]["encoder_after_vision"] == {"sim_error": 0.25, "bf16_error": 0.0625, "bound": 0.5}
     assert t["cases"]["edit"]["condition_latents"]["bound"] == 0.078125
-    assert "condition_latents" not in t["cases"]["t2i"]
+    # the first row is information, never bounded
+    assert t["cases"]["edit"]["encoder_row0"] == {"sim_error": 0.5, "bf16_error": 0.25}
+    assert "condition_latents" not in t["cases"]["t2i"] and "encoder_after_vision" not in t["cases"]["t2i"]
     with pytest.raises(FileExistsError):
         record.write_bounds(path, sim, bf16, 2.0, 5.0, {"id": "oracle"}, {"id": "yardstick"}, artifact)
 

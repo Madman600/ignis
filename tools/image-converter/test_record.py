@@ -2,7 +2,9 @@
 pinned checkpoint's tokenizer, chat template and image config) with tiny diffusers and
 transformers modules, CPU only. The tiny pipeline runs the same code as the real one, so the
 precision scheme, every recorded field and every trap are checked here; only the size, the device
-and the attention backend wait for the GPU run."""
+and the attention backend wait for the GPU run. The tests that need the pinned checkpoint skip
+without it (IGNIS_IMAGE_SNAPSHOT, default the owner's layout)."""
+import inspect
 import json
 import os
 import shutil
@@ -14,8 +16,9 @@ from PIL import Image
 
 import record
 
-SNAPSHOT = "F:/ai/models/hf/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba1986fcb905854dc8de2f52eee395f49b5b"
-pytestmark = pytest.mark.skipif(not os.path.isdir(SNAPSHOT), reason=f"{SNAPSHOT} (the pinned checkpoint) is not here")
+SNAPSHOT = os.environ.get(
+    "IGNIS_IMAGE_SNAPSHOT",
+    "F:/ai/models/hf/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/fc13ba1986fcb905854dc8de2f52eee395f49b5b")
 
 # the real checkpoint's token ids, tiny everything else
 TEXT = dict(hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4,
@@ -46,6 +49,8 @@ def tiny(tmp_path_factory):
     from diffusers import AutoencoderKLQwenImage21, QwenImage21Transformer2DModel
     from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 
+    if not os.path.isdir(SNAPSHOT):
+        pytest.skip(f"{SNAPSHOT} (the pinned checkpoint) is not here")
     out = tmp_path_factory.mktemp("tiny")
     with open(os.path.join(SNAPSHOT, "text_encoder", "config.json"), encoding="utf-8") as f:
         real = json.load(f)
@@ -373,8 +378,22 @@ def test_fp32_ieee_turns_tf32_off_for_matmul_and_cudnn():
         record.check_fp32_ieee()
     flags = record.fp32_ieee()
     assert not torch.backends.cuda.matmul.allow_tf32 and not torch.backends.cudnn.allow_tf32
-    assert "tf32" not in (torch.backends.cudnn.conv.fp32_precision, torch.backends.cuda.matmul.fp32_precision)
+    assert "tf32" not in (flags["cudnn.conv.fp32_precision"], flags["matmul.fp32_precision"])
     assert flags["matmul.allow_tf32"] is False and flags["cudnn.allow_tf32"] is False
+
+
+def test_without_a_visible_gpu_the_cudnn_precisions_are_not_read(monkeypatch):
+    class Unreadable:
+        @property
+        def fp32_precision(self):
+            raise AssertionError("cuDNN read without a GPU")
+    record.fp32_ieee()
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    monkeypatch.setattr(torch.backends.cudnn, "conv", Unreadable())
+    monkeypatch.setattr(torch.backends.cudnn, "rnn", Unreadable())
+    flags = record.check_fp32_ieee()
+    assert flags["cudnn.conv.fp32_precision"] is None and flags["cudnn.rnn.fp32_precision"] is None
+    assert flags["cudnn.allow_tf32"] is False
 
 
 def test_the_dit_guard_changes_nothing(tiny, recorded, tmp_path):
@@ -466,35 +485,104 @@ def test_a_run_records_every_case_then_the_yardstick_in_one_session(tiny, edit, 
         _run(tiny, edit, out)
 
 
+def test_the_preflight_refuses_a_full_disk_low_ram_and_an_old_recording(tmp_path):
+    cpu, out = torch.device("cpu"), str(tmp_path / "oracle")
+    with pytest.raises(RuntimeError, match="GB free on .* disk"):
+        record._preflight(out, cpu, min_free_disk_gb=1e9, disk_budget_gb=0, min_free_ram_gb=0, min_free_vram_gb=0)
+    with pytest.raises(RuntimeError, match="GB of host RAM free, below"):
+        record._preflight(out, cpu, min_free_disk_gb=0, disk_budget_gb=0, min_free_ram_gb=1e9, min_free_vram_gb=0)
+    measured = record._preflight(out, cpu, 0, 0, 0, 0)
+    assert measured["free_disk_gb"] > 0 and measured["free_ram_gb"] > 0 and measured["free_vram_gb"] is None
+    open(os.path.join(out, "run.log"), "w").close()
+    with pytest.raises(FileExistsError, match="recorded once"):
+        record._preflight(out, cpu, 0, 0, 0, 0)
+
+
+def _main(monkeypatch, argv):
+    """record.main(argv) with `run` and `run_yardstick` replaced: (positional args, keyword args)."""
+    calls = []
+    monkeypatch.setattr(record, "run", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(record, "run_yardstick", lambda *a, **k: calls.append((a, k)))
+    assert record.main(argv) == 0
+    (args, kwargs), = calls
+    kwargs.pop("log")
+    return args, kwargs
+
+
+def test_main_hands_every_flag_to_its_function_and_shares_its_defaults(monkeypatch):
+    for fn, argv in ((record.run, ["run"]), (record.run_yardstick, ["yardstick"])):
+        defaults = {k: p.default for k, p in inspect.signature(fn).parameters.items() if k != "log"
+                    and p.default is not inspect.Parameter.empty}
+        args, kwargs = _main(monkeypatch, argv + ["--checkpoint", "C"])
+        assert kwargs == defaults
+    args, kwargs = _main(monkeypatch, [
+        "run", "--checkpoint", "C", "--out", "O", "--device", "cpu", "--cases", "t2i,edit", "--blocks", "1,2",
+        "--block-steps", "0", "--factor", "3", "--min-free-disk-gb", "1", "--disk-budget-gb", "2",
+        "--min-free-ram-gb", "3", "--min-free-vram-gb", "4", "--max-vram-gib", "5", "--host-decode-from", "0"])
+    assert args == ("C", "O", "cpu", [record.CASES["t2i"], record.CASES["edit"]])
+    assert kwargs == dict(blocks=(1, 2), block_steps=(0,), factor=3.0, min_free_disk_gb=1.0, disk_budget_gb=2.0,
+                          min_free_ram_gb=3.0, min_free_vram_gb=4.0, max_vram_gib=5.0, host_decode_from=0)
+    args, kwargs = _main(monkeypatch, [
+        "yardstick", "--checkpoint", "C", "--oracle", "O", "--artifact", "A", "--device", "cpu", "--cases", "edit",
+        "--sim-factor", "3", "--bf16-factor", "4", "--replace-thresholds", "--supersede-bound", "--report", "R",
+        "--top-rows", "2", "--min-free-ram-gb", "1", "--min-free-vram-gb", "2", "--max-vram-gib", "3"])
+    assert args == ("C", "O", "A", "cpu", [record.CASES["edit"]])
+    assert kwargs == dict(sim_factor=3.0, bf16_factor=4.0, replace=True, supersede=True, report="R", top=2,
+                          min_free_ram_gb=1.0, min_free_vram_gb=2.0, max_vram_gib=3.0)
+
+
 # The encoder metric, DeepStack off and the simulated W8A8 yardstick (AC 6).
 
-def test_the_encoder_metric_is_the_text_rows(recorded, tmp_path):
+def _scaled(embeds, rows):
+    """prompt_embeds with `rows` 1.5 times their value: each of them off by half its own norm."""
+    out = embeds.astype(np.float64)
+    out[0, rows] *= 1.5
+    return out
+
+
+def test_the_encoder_metric_is_the_rms_of_each_text_rows_relative_error(recorded):
     case, directory, _ = recorded["t2i"]
     embeds = _npy(directory, "prompt_embeds")
-    noisy = embeds * np.float32(1.5)
     assert not _npy(directory, "image_pad_mask").any()
-    assert record.encoder_error(noisy, directory) == record.rel_l2(noisy, embeds)
+    n = embeds.shape[1]
+    # one row off by half its norm, out of n: 0.5 / sqrt(n), whatever that row's norm
+    for row in (0, n - 1):
+        errors = record.encoder_errors(_scaled(embeds, [row]), directory)
+        assert errors["encoder"] == pytest.approx(0.5 / np.sqrt(n), rel=1e-12)
+        assert errors["encoder_row0"] == pytest.approx(0.5 if row == 0 else 0, abs=1e-15)
+        assert "encoder_after_vision" not in errors
+    assert record.rel_l2(_scaled(embeds, [0]), embeds) != pytest.approx(0.5 / np.sqrt(n))
+
+
+def test_the_rows_after_the_vision_span_are_the_ones_the_image_reaches(recorded):
     case, directory, _ = recorded["edit"]
     embeds, pad = _npy(directory, "prompt_embeds"), _npy(directory, "image_pad_mask")[0].astype(bool)
-    assert pad.any() and (~pad).any()
-    on_pads = embeds.copy()
-    on_pads[0, pad] += 1
-    assert record.encoder_error(on_pads, directory) == 0
-    on_text = embeds.copy()
-    on_text[0, np.flatnonzero(~pad)[-1]] += 1
-    assert record.encoder_error(on_text, directory) > 0
+    text = np.flatnonzero(~pad)
+    before, after = text[text < np.flatnonzero(pad)[0]], text[text > np.flatnonzero(pad)[0]]
+    assert before[0] == 0 and before.size > 1 and after.size
+    assert record.encoder_errors(_scaled(embeds, np.flatnonzero(pad)), directory) == {
+        "encoder": 0, "encoder_row0": 0, "encoder_after_vision": 0}
+    errors = record.encoder_errors(_scaled(embeds, [before[-1]]), directory)
+    assert errors["encoder"] == pytest.approx(0.5 / np.sqrt(text.size), rel=1e-12)
+    assert errors["encoder_after_vision"] == 0 and errors["encoder_row0"] == 0
+    errors = record.encoder_errors(_scaled(embeds, [after[0]]), directory)
+    assert errors["encoder"] == pytest.approx(0.5 / np.sqrt(text.size), rel=1e-12)
+    assert errors["encoder_after_vision"] == pytest.approx(0.5 / np.sqrt(after.size), rel=1e-12)
 
 
-def test_deepstack_off_moves_the_edit_cases_text_rows_only_while_on(tiny, recorded):
+def test_deepstack_off_moves_the_edit_cases_rows_after_the_image_only_while_on(tiny, recorded):
     pipe = record.load_pipeline(tiny, "cpu")
     record.set_precision(pipe, "fp32")
     case, directory, _ = recorded["edit"]
     with record.deepstack_off(pipe):
         off = record.encode(pipe, case)
         t2i, t2i_directory, _ = recorded["t2i"]
-        assert record.encoder_error(record._numpy(record.encode(pipe, t2i).embeds), t2i_directory) == 0
-    assert record.encoder_error(record._numpy(off.embeds), directory) > 0
-    assert record.encoder_error(record._numpy(record.encode(pipe, case).embeds), directory) == 0
+        assert record.encoder_errors(record._numpy(record.encode(pipe, t2i).embeds), t2i_directory)["encoder"] == 0
+    errors = record.encoder_errors(record._numpy(off.embeds), directory)
+    assert errors["encoder_after_vision"] > 0
+    # it cannot reach the rows before the image
+    assert errors["encoder_row0"] == 0 and errors["encoder"] < errors["encoder_after_vision"]
+    assert record.encoder_errors(record._numpy(record.encode(pipe, case).embeds), directory)["encoder"] == 0
 
 
 @pytest.fixture(scope="module")
@@ -564,40 +652,72 @@ def test_the_sim_yardstick_measures_the_quantization(tiny, recorded, tiny_artifa
         assert errors.get("condition_latents", 0) == 0
 
 
-def test_a_yardstick_session_replaces_the_thresholds_with_the_bound(tiny, edit, recorded, tiny_artifact, tmp_path):
+def test_a_yardstick_session_supersedes_the_thresholds_with_the_bound(tiny, edit, recorded, tiny_artifact, tmp_path):
+    import pin
     artifact, records = tiny_artifact
     out = str(tmp_path / "oracle")
     manifest = _run(tiny, edit, out)
-    with open(os.path.join(out, "thresholds.json"), encoding="utf-8") as f:
+    thresholds = os.path.join(out, "thresholds.json")
+    with open(thresholds, encoding="utf-8") as f:
         bf16_only = json.load(f)
 
-    def session(replace):
-        return record.run_yardstick(tiny, out, artifact, "cpu", [T2I, edit], replace=replace, top=3,
-                                    min_free_ram_gb=0, min_free_vram_gb=0, max_vram_gib=0, log=lambda *a: None)
+    def session(replace, supersede=False):
+        return record.run_yardstick(tiny, out, artifact, "cpu", [T2I, edit], replace=replace, supersede=supersede,
+                                    top=3, min_free_ram_gb=0, min_free_vram_gb=0, max_vram_gib=0, log=lambda *a: None)
     with pytest.raises(FileExistsError, match="--replace-thresholds"):
         session(False)
     value, report = session(True)
     kept = os.path.join(out, f"thresholds.{bf16_only['session']['id'].replace(':', '')}.json")
     with open(kept, encoding="utf-8") as f:
         assert json.load(f) == bf16_only
-    with open(os.path.join(out, "thresholds.json"), encoding="utf-8") as f:
+    with open(thresholds, encoding="utf-8") as f:
         assert json.load(f) == value
     with open(os.path.join(out, "yardstick-report.json"), encoding="utf-8") as f:
         assert json.load(f) == json.loads(json.dumps(report))
+    # the new file was written under a temporary name, then renamed
+    assert sorted(os.listdir(out)) == sorted(["edit", "t2i", "manifest.json", "thresholds.json", os.path.basename(kept),
+                                              "yardstick-report.json"])
+    assert value["schema"] == "ignis-image-thresholds-v3" and report["replaced"] == bf16_only["schema"]
     assert value["oracle_session"] == manifest["session"] and value["session"]["id"]
     assert value["factors"] == {"sim": 2.0, "bf16": 5.0} and value["artifact"]["tensors_checked"] == len(records)
+    assert value["artifact"]["sha256"] == pin.sha256_file(artifact)
     sim = _sim(tiny, tiny_artifact)
     for case, directory, _ in recorded.values():
         t = value["cases"][case.name]
         assert t["velocity"]["bf16_error"] == bf16_only["cases"][case.name]["velocity"]["bf16_error"]
         assert t["velocity"]["sim_error"] == record.yardstick(sim, case, directory)["velocity"]
-        for quantity in ("velocity", "encoder"):
-            s, b = np.atleast_1d(t[quantity]["sim_error"]), np.atleast_1d(t[quantity]["bf16_error"])
-            assert np.array_equal(np.atleast_1d(t[quantity]["bound"]), np.maximum(2 * s, 5 * b))
+        assert ("encoder_after_vision" in t) == ("condition_latents" in t) == (case.image is not None)
+        for quantity in ("velocity", *record.BOUNDED):
+            if quantity in t:
+                s, b = np.atleast_1d(t[quantity]["sim_error"]), np.atleast_1d(t[quantity]["bf16_error"])
+                assert np.array_equal(np.atleast_1d(t[quantity]["bound"]), np.maximum(2 * s, 5 * b))
+        assert set(t["encoder_row0"]) == {"sim_error", "bf16_error"}
         checks = report["checks"][case.name]
-        assert checks["fp32_replay_encoder"] == 0 and checks["bf16_velocity_vs_replaced"] == 0
+        assert checks["fp32_replay_encoder"] == 0 and checks["velocity_vs_replaced"] == {"bf16": 0}
         breakdown = report["encoder_breakdown"][case.name]["sim"]
-        assert breakdown["text_rows"]["rel_l2"] == pytest.approx(t["encoder"]["sim_error"], rel=1e-12)
+        assert breakdown["row_rel_l2"] == pytest.approx(t["encoder"]["sim_error"], rel=1e-12)
+        assert breakdown["text_row_rel_l2"][0] == [0, pytest.approx(t["encoder_row0"]["sim_error"], rel=1e-12)]
         assert len(breakdown["top_rows_by_ref_norm"]) == 3
-    assert report["checks"]["edit"]["deepstack_off_encoder"] > 0
+    off = report["checks"]["edit"]["deepstack_off"]
+    assert off["encoder_after_vision"]["error"] > 0 and off["encoder_row0"]["error"] == 0
+    for quantity in ("encoder", "encoder_after_vision"):
+        assert off[quantity]["bound"] == value["cases"]["edit"][quantity]["bound"]
+        assert off[quantity]["fails_the_bound"] == (off[quantity]["error"] > off[quantity]["bound"])
+    assert set(report["encoder_breakdown"]["edit"]) == {"sim", "bf16", "deepstack_off"}
+    assert set(report["encoder_breakdown"]["t2i"]) == {"sim", "bf16"}
     assert report["encoder_breakdown"]["edit"]["bf16"]["image_pad_rows"]["rows"] > 0
+
+    # a bound is superseded only with --supersede-bound as well, and never with other velocity errors
+    with pytest.raises(FileExistsError, match="--supersede-bound"):
+        session(True)
+    moved = json.loads(json.dumps(value))
+    moved["cases"]["t2i"]["velocity"]["sim_error"][0] += 1e-3
+    with open(thresholds, "w", encoding="utf-8") as f:
+        json.dump(moved, f)
+    with pytest.raises(AssertionError, match="velocity errors moved"):
+        session(True, supersede=True)
+    with open(thresholds, encoding="utf-8") as f:
+        assert json.load(f) == moved
+    with open(os.path.join(out, "yardstick-report.json"), encoding="utf-8") as f:
+        assert json.load(f)["checks"]["t2i"]["velocity_vs_replaced"]["sim"] == pytest.approx(1e-3)
+    assert not [name for name in os.listdir(out) if name.endswith(".new.json")]
