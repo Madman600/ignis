@@ -5,9 +5,10 @@ reads with its size and sha256 (a safetensors file's sha256 is its LFS oid), and
 every safetensors file with its dtype and shape, read from the file headers. `check` refuses a
 checkpoint directory that differs from a pin in any of these, naming the difference.
 
-A checkpoint directory is a diffusers tree (`model_index.json`, `transformer/`, ...). When it
-is a Hugging Face cache snapshot (`.../snapshots/<revision>/`) its revision is read from the path
-as well; the file hashes decide either way.
+A checkpoint directory is a diffusers tree (`model_index.json`, `transformer/`, ...). Its revision
+is read from the path for a Hugging Face cache snapshot (`.../snapshots/<revision>/`) and from the
+`.cache/huggingface/download/*.metadata` files of an `hf download --local-dir` copy; any other
+directory has none, and a refusal says so. The file hashes decide either way.
 """
 import hashlib
 import json
@@ -78,6 +79,21 @@ def snapshot_revision(directory):
     return name if os.path.basename(parent) == "snapshots" else None
 
 
+def revisions(directory, paths):
+    """The revisions a checkpoint directory names: a snapshot's, or the commits an
+    `hf download --local-dir` copy records for `paths` (each file's `.metadata`, commit first)."""
+    snapshot = snapshot_revision(directory)
+    if snapshot is not None:
+        return {snapshot}
+    found = set()
+    for path in paths:
+        meta = os.path.join(directory, ".cache", "huggingface", "download", path + ".metadata")
+        if os.path.isfile(meta):
+            with open(meta, encoding="utf-8") as f:
+                found.add(f.readline().strip())
+    return found
+
+
 def _named(kind, names, limit=8):
     names = sorted(names)
     more = f" and {len(names) - limit} more" if len(names) > limit else ""
@@ -90,8 +106,8 @@ def check(directory, pin, hashes=True):
     `hashes=False` skips the sha256 of the files (sizes and tensors are still checked); the
     converter always hashes, the flag is for tests that only exercise the tensor list."""
     problems = []
-    revision = snapshot_revision(directory)
-    if revision is not None and revision != pin["revision"]:
+    named = revisions(directory, pin["files"])
+    for revision in sorted(named - {pin["revision"]}):
         problems.append(f"revision {revision} is not the pinned {pin['revision']}")
     for path, want in pin["files"].items():
         full = os.path.join(directory, path)
@@ -121,6 +137,9 @@ def check(directory, pin, hashes=True):
             problems.append(f"{comp}: " + _named("tensors not in the pin", extra))
         if changed:
             problems.append(f"{comp}: " + _named("tensors with another dtype or shape", changed))
+    if problems and not named:
+        problems.append("its revision is unknown (neither a Hugging Face cache snapshot nor an "
+                        "`hf download --local-dir` copy): the differences above stand for it")
     if problems:
         raise Refused(f"{directory} is not {pin['repo']}@{pin['revision']}:\n  " + "\n  ".join(problems))
 

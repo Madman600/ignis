@@ -114,3 +114,51 @@ def test_a_nan_an_fp8_error_above_the_bound_and_an_old_work_tree_are_refused(con
         convert.convert(snap, p, str(tmp_path / "w2"), fp8_bound=0.001)
     with pytest.raises(pin.Refused, match="is not empty"):
         convert.convert(snap, p, work)
+
+
+def test_a_local_dir_download_names_its_revision_and_a_bare_directory_says_it_has_none(converted, tmp_path):
+    import shutil
+    snap, p, _, _ = converted
+    local = str(tmp_path / "local")
+    shutil.copytree(snap, local)
+    pin.check(local, p)  # the same files: a bare directory is accepted by its hashes
+    # `hf download --local-dir` writes each file's commit beside it
+    meta = os.path.join(local, ".cache", "huggingface", "download", "model_index.json.metadata")
+    os.makedirs(os.path.dirname(meta))
+    with open(meta, "w", encoding="utf-8") as f:
+        f.write("e" * 40 + "\n\"etag\"\n0\n")
+    with pytest.raises(pin.Refused, match=f"revision {'e' * 40} is not the pinned {synthetic.REVISION}"):
+        pin.check(local, p)
+    os.remove(meta)
+    with open(os.path.join(local, "model_index.json"), "a", encoding="utf-8") as f:
+        f.write(" ")
+    with pytest.raises(pin.Refused, match="its revision is unknown"):
+        pin.check(local, p)
+
+
+def test_the_cli_takes_the_fp8_bound_and_exits_2_on_a_refusal(converted, tmp_path, capsys):
+    snap, p, _, _ = converted
+    pinned = str(tmp_path / "pin.json")
+    with open(pinned, "w", encoding="utf-8") as f:
+        json.dump(p, f)
+    code = convert.main(["run", "--checkpoint", snap, "--out", str(tmp_path / "out"), "--pin", pinned,
+                         "--fp8-bound", "0.001", "--no-pack"])
+    assert code == convert.EXIT_REFUSED == 2
+    assert "above the bound 0.001 (--fp8-bound)" in capsys.readouterr().err
+    assert convert.main(["run", "--checkpoint", snap, "--out", str(tmp_path / "out2"), "--pin", pinned,
+                         "--no-pack"]) == 0
+
+
+def test_fp8_is_flash_nexts_encoder():
+    """fp8.py is a copy of tools/flash-next-converter/fp8.py (one FP8 encoder for both converters):
+    the functions they share have the same source."""
+    import importlib.util
+    import inspect
+    import fp8
+    path = os.path.join(convert.REPO, "tools", "flash-next-converter", "fp8.py")
+    spec = importlib.util.spec_from_file_location("flash_next_fp8", path)
+    theirs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(theirs)
+    assert (fp8.ALIGN, fp8.E4M3_MAX) == (theirs.ALIGN, theirs.E4M3_MAX)
+    for name in ("_bf16_round_up", "scales", "encode", "decode", "payload_bytes"):
+        assert inspect.getsource(getattr(fp8, name)) == inspect.getsource(getattr(theirs, name)), name
