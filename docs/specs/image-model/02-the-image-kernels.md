@@ -394,7 +394,9 @@ would close the gap, largest first:
 - Tests: the CTest `ignis_kernel_image_attn_test`
   (`kernel/tests/test_image_attn.cu`) and the Rust `--ignored` test
   `crates/core/tests/image_attn_gpu.rs` (bindings in
-  `crates/core/src/image_attn.rs`). Speed: `ignis_image_attn_bench`
+  `crates/core/src/image_attn.rs`). Real Q, K and V: the CTest
+  `ignis_kernel_image_attn_qkv_probe_test` (the same file, `--cases
+  qkv-probe`; "Real Q, K and V" below). Speed: `ignis_image_attn_bench`
   (`kernel/tests/bench_image_attn.cu`, a tool).
 
 **The instructions** (the bench table above): INT8 m16n8k32 for QK^T
@@ -491,8 +493,8 @@ inputs are synthetic but DiT-shaped:
 - Q runs at a per-head temperature from flat to peaked.
 
 Three harder profiles follow below the main table: a heavy tail, outlier
-channels, and prefix and target K means far apart. The error on real
-activations comes with spec 01's recordings and spec 04's end-to-end test.
+channels, and prefix and target K means far apart. Real activations follow
+them ("Real Q, K and V"); spec 04's end-to-end test has the last word.
 
 **The cases** (`ignis_kernel_image_attn_test`, about 75 s with the fp64
 references on 16 threads). Each check covers 64 query rows per head (all
@@ -598,11 +600,85 @@ at ±3.45σ. Two profiles add what stretches a block's amax, each at 0, 1 and
     INT8 amax. The other 127 channels keep ~2 levels per σ, so the scores
     carry noise of ~0.1 × the head's temperature. K's mean smoothing does
     not help.
-  - Status: the arm is reported, not gated, and is flagged to the
-    coordinator. An exact per-channel Q/K migration scale (q_d / s_d,
-    k_d · s_d, fixed per layer and head) is the known remedy; whether real
-    DiT activations need it is for spec 01's recordings and spec 04's
-    end-to-end check.
+  - Status: the arm is reported, not gated. An exact per-channel Q/K
+    migration scale (q_d / s_d, k_d · s_d, fixed per layer and head) is the
+    known remedy. The DiT's own Q, K and V do not need it (below), so the
+    arm stays report-only.
+
+**Real Q, K and V (the probe, 2026-10-13).** Inputs:
+- Q, K and V as the DiT computes them, after QK-norm and RoPE, from a plain
+  bf16 diffusers run of spec 01's t2i and edit cases at 1024²: the oracle's
+  prompts, noise and condition image, snapshot fc13ba1.
+- Steps 0 and 4 (step 4 reads step 0's cached prefix) and blocks 0, 15 and
+  31. The prefix is text 31 for t2i, and text 8, image 4096, text 18 for
+  edit; the target is 4096 tokens.
+
+They go through spec 04's calls: the prefix run stored alone, the target run
+with the prefix's mean, the target over both, and step 0's segment calls.
+Beside them runs the target over [prefix ; target] stored as one run. That
+is 36 calls.
+
+Where it lives:
+- The dump is `F:/ai/models/ignis-image-2.1-turbo/qkv-probe` (1.5 GB).
+  `dump_qkv.py`, `provenance.json` and the statistics (`stats.json`, from
+  `qkv_stats.py`) sit beside it.
+- The test is `ignis_kernel_image_attn_qkv_probe_test`, 31 s. It reads the
+  directory from `--qkv-probe`, else `$IGNIS_IMAGE_QKV_PROBE`, else that
+  path.
+- Without the dump it prints SKIP and passes. That goes against ADR 0006,
+  by the coordinator's call: the data is outside the repo.
+
+Per head, against fp64 on the unquantized inputs:
+
+| calls | heads | cosine min / p1 / median | centred min / p1 / median | rel. RMS median / max |
+|---|---|---|---|---|
+| target over [prefix ; target], the split | 384 | 0.99877 / 0.99908 / 0.99984 | 0.98524 / 0.99106 / 0.99975 | 1.8% / 5.4% |
+| the same, one run | 384 | 0.99878 / 0.99908 / 0.99983 | 0.98269 / 0.99208 / 0.99974 | 1.9% / 5.3% |
+| prefix segments (step 0) | 384 | 0.99796 / 0.99888 / 0.99967 | −0.148 / 0.540 / 0.99943 | 2.6% / 8.9% |
+
+- Mechanics: 0 outputs over the bound in all 36 calls (worst 0.998 of
+  it). The BF16 output equals the fp32 output rounded in every call. Every
+  run and q8 buffer matches its definition bit for bit.
+- **No head is below 0.99.** The worst is 0.99796, an 8-token text segment
+  (edit, block 15, head 13). On the target calls it is 0.99877 (t2i,
+  step 4, block 0, head 28).
+- **The centred cosine falls below 0.99 only where the output barely varies
+  from one query to the next.** The test reports that share as *spread*:
+  the reference's norm with each channel's mean over the rows removed,
+  over its whole norm.
+  - 11 heads of the edit image block at block 0 have a spread of 0.01-1.6%
+    of |O|, and their centred cosine falls as low as −0.15.
+  - In 7 of them the spread is ≤ 0.15%, below one BF16 rounding of O (2^-9
+    ≈ 0.2%), so the bf16 pipeline cannot hold that part either. Their
+    error is the usual 2-3.4% of |O|.
+  - Three heads with a spread of 7-13% sit at 0.985-0.989: head 7 of that
+    block, head 30 of the image block at block 31, and head 3 of block 0
+    on the target calls.
+  - Which of these matter is for spec 04's end-to-end check.
+- **The split costs nothing measurable.** The target's K mean sits up to
+  27σ from the prefix's in single channels (block 31; ≤ 6.8σ RMS over
+  channels), including t2i's 31-token prefix. In every call the split's
+  worst head is within 0.0003 of one run's. Spec 04's K-mean fallback is
+  not needed here.
+- **Real Q has strong outlier channels; K's are milder.** Q is taken over
+  the target rows, K over both runs after the prefix's mean.
+  - Q's top channel RMS is up to 23.6× the head's median, and 23-32 heads
+    of 32 are above 4×.
+  - A 32-row Q block's amax is a median 24× the median channel RMS at
+    block 0, about 5 INT8 levels per σ. Head 3 sits at 53-57× (blocks up
+    to 68×). There channels 0 and 1, one RoPE pair at 0.7-0.85 of each
+    other's RMS, set 66-86% of the blocks' amax.
+  - At blocks 15 and 31 the median is 6.4-7.3×, and the worst heads are at
+    14-19×. There one channel (104/105, 70) sets every block, and its
+    partner carries only 0.08-0.18 of its RMS.
+  - K stays ≤ 12× in channel RMS, with a block amax of 6-10× the median.
+    The worst head is at 24× (blocks up to 31×: edit, block 0, head 7, the
+    pair 72/73 equally).
+- **Verdict: no migration.** Even with these outliers every head clears
+  0.99 with margin. The synthetic arm, with 20× outliers in unrelated Q and
+  K channels of flat Gaussian heads, is harsher than the DiT's own
+  activations, so it stays report-only. If a fix were ever needed, Q's
+  pattern points to exact scales per RoPE pair.
 
 **Speed** (2026-10-13, `ignis_image_attn_bench`, GPU lock in timing mode,
 card power limit 575 W). The SM clock and board power are NVML's means over

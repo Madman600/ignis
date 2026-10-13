@@ -45,6 +45,12 @@
 //
 //   ignis_kernel_image_attn_test [--bound-factor F] [--min-cosine C]
 //                                [--cases edges,small,0,1,10,16k,shift,tail,outliers,refusals]
+//   ignis_kernel_image_attn_test --cases qkv-probe [--qkv-probe DIR]
+//
+// qkv-probe runs the same checks on real Q, K and V (case_qkv_probe below), read from DIR, else
+// $IGNIS_IMAGE_QKV_PROBE, else F:/ai/models/ignis-image-2.1-turbo/qkv-probe. The data lives
+// outside the repo: with no dump there it prints SKIP and passes (the coordinator's call for #319,
+// against the no-skip rule below: a machine without the dump cannot run it at all).
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
@@ -56,7 +62,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <string>
@@ -623,6 +631,9 @@ struct Verdict {
   double min_cos = 1.0, min_centred = 1.0, max_rel_rms = 0.0;
   double median_bound = 0.0;  // the bound over |reference|, median over the checked outputs
   int worst_head = 0;         // the head with the lowest cosine
+  // Per head, when the quantization error is checked; spread is the reference's norm with each
+  // channel's mean over the rows removed, over its whole norm (the share the centred cosine sees).
+  std::vector<double> head_cos, head_centred, head_rel, head_spread;
 };
 
 Verdict run_call(const Options &o, const Sequence &s, const Call &call, DeviceBytes &d_q8, const DeviceBytes &d_a,
@@ -648,7 +659,7 @@ Verdict run_call(const Options &o, const Sequence &s, const Call &call, DeviceBy
 
   std::vector<int> over(kHeads, 0);
   std::vector<std::vector<double>> tight(kHeads);
-  std::vector<double> worst(kHeads, 0.0), cosv(kHeads, 1.0), centred(kHeads, 1.0), rel(kHeads, 0.0);
+  std::vector<double> worst(kHeads, 0.0), cosv(kHeads, 1.0), centred(kHeads, 1.0), rel(kHeads, 0.0), spread(kHeads, 1.0);
   parallel_for(kHeads, [&](int h) {
     const std::vector<int> rows = rows_for(call.q_tokens, h, rows_per_head);
     const HeadOperands op = head_operands(s, call, h, quant_check);
@@ -690,6 +701,7 @@ Verdict run_call(const Options &o, const Sequence &s, const Call &call, DeviceBy
         mean_g[k % kDim] += got[k] / nrows;
         mean_w[k % kDim] += want[k] / nrows;
       }
+      const double ww_raw = ww;
       dot = gg = ww = 0;
       for (std::size_t k = 0; k < got.size(); ++k) {
         const double a = got[k] - mean_g[k % kDim], b = want[k] - mean_w[k % kDim];
@@ -698,9 +710,14 @@ Verdict run_call(const Options &o, const Sequence &s, const Call &call, DeviceBy
         ww += b * b;
       }
       centred[h] = dot / std::sqrt(gg * ww);
+      spread[h] = std::sqrt(ww / ww_raw);
     }
   });
   Verdict v;
+  v.head_cos = cosv;
+  v.head_centred = centred;
+  v.head_rel = rel;
+  v.head_spread = spread;
   for (int h = 0; h < kHeads; ++h) {
     v.over += over[h];
     v.worst = std::max(v.worst, worst[h]);
@@ -1048,6 +1065,192 @@ void refusals() {
   check(ignis_image_attn_store_kv(x.p, nullptr, 16, kHD, nullptr, 0, kv.p, nullptr) != 0, "store_kv: NULL v refused");
 }
 
+// ---- real Q, K and V (--cases qkv-probe) ------------------------------------------------------
+//
+// Q, K and V the DiT computed, taken after QK-norm and RoPE in a bf16 diffusers run (dump_qkv.py,
+// kept beside the dump): the t2i case (a 31-token text prefix) and the edit case (text 8, one
+// condition image of 4096, text 18), each with a 4096-token target, at steps 0 and 4 and blocks 0,
+// 15 and 31. Step 0's files hold [prefix ; target]; step 4's hold the target's rows only, read
+// after step 0's prefix (the cached K and V, which the dump checked bit for bit). Each goes through
+// the calls spec 04 makes: the prefix run stored alone, the target run with the prefix's mean, the
+// target over both, and at step 0 the prefix's own segment calls. Beside them runs the target over
+// [prefix ; target] stored as one run (the split's cost). The quantizers, the mechanics bound and
+// BF16 = RN(fp32) are checked as above. The cosine against fp64 on the unquantized inputs is
+// reported, not gated: per call, then min, p1 and median over every call's 32 heads, and every
+// head below --min-cosine by name.
+
+// A 2-D uint16 .npy (little-endian '<u2', C order): BF16 bits.
+std::vector<uint16_t> load_npy_u16(const std::string &path, std::size_t &rows, std::size_t &cols) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    std::fprintf(stderr, "FATAL: cannot open %s\n", path.c_str());
+    std::exit(EXIT_FAILURE);
+  }
+  char magic[8];
+  f.read(magic, 8);
+  uint32_t header_len = 0;
+  if (magic[6] == 1) {
+    uint16_t n = 0;
+    f.read(reinterpret_cast<char *>(&n), 2);
+    header_len = n;
+  } else {
+    f.read(reinterpret_cast<char *>(&header_len), 4);
+  }
+  std::string header(header_len, '\0');
+  f.read(&header[0], header_len);
+  const std::size_t at = header.find('(');
+  if (!f || std::memcmp(magic, "\x93NUMPY", 6) != 0 || header.find("'<u2'") == std::string::npos ||
+      header.find("'fortran_order': False") == std::string::npos || at == std::string::npos ||
+      std::sscanf(header.c_str() + at, "(%zu, %zu)", &rows, &cols) != 2) {
+    std::fprintf(stderr, "FATAL: %s is not a 2-D '<u2' C-order .npy\n", path.c_str());
+    std::exit(EXIT_FAILURE);
+  }
+  std::vector<uint16_t> v(rows * cols);
+  f.read(reinterpret_cast<char *>(v.data()), static_cast<std::streamsize>(v.size() * 2));
+  if (!f) {
+    std::fprintf(stderr, "FATAL: %s is short\n", path.c_str());
+    std::exit(EXIT_FAILURE);
+  }
+  return v;
+}
+
+struct ProbeHead {
+  std::string where;  // case, step, block, call
+  int head;
+  double cos, centred, rel, spread;
+};
+
+// Min, p1 and median of the cosines (raw and centred), the median and max relative RMS error, and
+// the heads below `min_cosine`: by the cosine, then by the centred cosine with the share of the
+// reference it sees (Verdict::head_spread).
+void probe_summary(const std::string &what, const std::vector<ProbeHead> &heads, double min_cosine) {
+  if (heads.empty()) return;
+  auto sorted = [&](double ProbeHead::*field) {
+    std::vector<double> x;
+    for (const ProbeHead &p : heads) x.push_back(p.*field);
+    std::sort(x.begin(), x.end());
+    return x;
+  };
+  const auto c = sorted(&ProbeHead::cos), cc = sorted(&ProbeHead::centred), r = sorted(&ProbeHead::rel);
+  const std::size_t n = heads.size(), p1 = (n - 1) / 100, mid = n / 2;
+  std::size_t below = 0;
+  for (const ProbeHead &p : heads) below += p.cos < min_cosine;
+  std::printf("  %s, %zu heads: cosine min %.5f, p1 %.5f, median %.5f; centred min %.5f, p1 %.5f, median %.5f; "
+              "rel RMS median %.4f, max %.4f; %zu below %.2f\n",
+              what.c_str(), n, c[0], c[p1], c[mid], cc[0], cc[p1], cc[mid], r[mid], r[n - 1], below, min_cosine);
+  for (const ProbeHead &p : heads) {
+    if (p.cos < min_cosine) {
+      std::printf("    below: %s, head %d: cosine %.5f (centred %.5f), rel RMS %.4f\n", p.where.c_str(), p.head, p.cos,
+                  p.centred, p.rel);
+    }
+  }
+  for (const ProbeHead &p : heads) {
+    if (p.centred < min_cosine) {
+      std::printf("    centred below: %s, head %d: centred %.5f (cosine %.5f), rel RMS %.4f, spread %.4f\n", p.where.c_str(),
+                  p.head, p.centred, p.cos, p.rel, p.spread);
+    }
+  }
+}
+
+void case_qkv_probe(const Options &o, const std::string &dir) {
+  std::vector<ProbeHead> split, one, segment;  // every head of every call, by the call's kind
+  for (const char *name : {"t2i", "edit"}) {
+    const std::string base = dir + "/" + name;
+    std::vector<Segment> segs;
+    {
+      std::ifstream f(base + "/segments.txt");
+      int start = 0, end = 0, text = 0;
+      while (f >> start >> end >> text) segs.push_back({start, end, text != 0});
+    }
+    const int prefix = segs.empty() ? 0 : segs.back().end;
+    check(prefix > 0, std::string(name) + ": a prefix in segments.txt");
+    if (prefix == 0) continue;
+    for (int step : {0, 4}) {
+      for (int block : {0, 15, 31}) {
+        Sequence s;
+        auto load = [&](int st, const char *t) {
+          std::size_t rows = 0, cols = 0;
+          auto v = load_npy_u16(base + "/step" + std::to_string(st) + "/block" + std::to_string(block) + "_" + t + ".npy",
+                                rows, cols);
+          check(cols == static_cast<std::size_t>(kHD), std::string(name) + ": 4096 columns");
+          return v;
+        };
+        s.q = load(0, "q");
+        s.k = load(0, "k");
+        s.v = load(0, "v");
+        if (step != 0) {  // step 0's prefix rows, then this step's target rows
+          const std::size_t keep = static_cast<std::size_t>(prefix) * kHD;
+          for (auto *x : {&s.q, &s.k, &s.v}) {
+            const auto t = load(step, x == &s.q ? "q" : x == &s.k ? "k" : "v");
+            x->resize(keep);
+            x->insert(x->end(), t.begin(), t.end());
+          }
+        }
+        s.prefix = prefix;
+        s.target = static_cast<int>(s.q.size() / kHD) - prefix;
+        check(s.k.size() == s.q.size() && s.v.size() == s.q.size() && s.target > 0,
+              std::string(name) + ": q, k and v of [prefix ; target]");
+        const std::string where = std::string(name) + ", step " + std::to_string(step) + ", block " + std::to_string(block);
+        std::printf("%s: prefix %d, target %d\n", where.c_str(), s.prefix, s.target);
+        DeviceBytes dq(s.q.size() * 2), dk(s.k.size() * 2), dv(s.v.size() * 2);
+        upload(dq, s.q);
+        upload(dk, s.k);
+        upload(dv, s.v);
+        auto at = [](const DeviceBytes &d, int row) { return static_cast<const uint16_t *>(d.p) + static_cast<std::size_t>(row) * kHD; };
+        DeviceRun pre(s.prefix), tgt(s.target), joint(s.tokens());
+        ATT_RC(ignis_image_attn_store_kv(at(dk, 0), at(dv, 0), s.prefix, kHD, nullptr, 0, pre.bytes.p, nullptr));
+        ATT_RC(ignis_image_attn_store_kv(at(dk, s.prefix), at(dv, s.prefix), s.target, kHD, pre.bytes.p, s.prefix,
+                                         tgt.bytes.p, nullptr));
+        ATT_RC(ignis_image_attn_store_kv(at(dk, 0), at(dv, 0), s.tokens(), kHD, nullptr, 0, joint.bytes.p, nullptr));
+        MOE_CUDA(cudaDeviceSynchronize());
+        const Run rp = download_run(pre.bytes, s.prefix), rt = download_run(tgt.bytes, s.target),
+                  rj = download_run(joint.bytes, s.tokens());
+        check_run(s, 0, rp, nullptr, "prefix");
+        check_run(s, s.prefix, rt, &rp, "target (the prefix's mean)");
+        DeviceBytes q8(ignis_image_attn_q8_bytes(std::max(s.target, s.prefix)));
+        auto collect = [&](std::vector<ProbeHead> &into, const Call &c, const Verdict &v) {
+          for (int h = 0; h < kHeads; ++h) {
+            into.push_back({where + ", " + c.what, h, v.head_cos[h], v.head_centred[h], v.head_rel[h], v.head_spread[h]});
+          }
+        };
+        Call t;
+        t.what = "target over [prefix ; target]";
+        t.q_first = s.prefix;
+        t.q_tokens = s.target;
+        t.a = &rp;
+        t.a_keys = s.prefix;
+        t.b = &rt;
+        t.b_first = s.prefix;
+        t.cosine_gated = false;
+        collect(split, t, run_call(o, s, t, q8, pre.bytes, &tgt.bytes, dq));
+        check_q8(s, s.prefix, download_q8(q8, s.target), "target");
+        Call j = t;
+        j.what = "target over [prefix ; target] stored as one run";
+        j.a = &rj;
+        j.a_keys = s.tokens();
+        j.b = nullptr;
+        collect(one, j, run_call(o, s, j, q8, joint.bytes, nullptr, dq));
+        for (const Segment &g : step == 0 ? segs : std::vector<Segment>{}) {
+          Call c;
+          c.what = std::string(g.text ? "text" : "image") + " segment [" + std::to_string(g.start) + ", " +
+                   std::to_string(g.end) + ")";
+          c.q_first = g.start;
+          c.q_tokens = g.end - g.start;
+          c.a = &rp;
+          c.a_keys = g.end;
+          c.causal = g.text;
+          c.cosine_gated = false;
+          collect(segment, c, run_call(o, s, c, q8, pre.bytes, nullptr, dq));
+        }
+      }
+    }
+  }
+  std::printf("real Q/K/V, per head against fp64 on the unquantized inputs (reported, not gated):\n");
+  probe_summary("target over [prefix ; target], the split (spec 04's layout)", split, o.min_cosine);
+  probe_summary("target over [prefix ; target], one run", one, o.min_cosine);
+  probe_summary("prefix segments (step 0)", segment, o.min_cosine);
+}
+
 double arg_double(int argc, char **argv, const char *name, double fallback) {
   for (int i = 1; i + 1 < argc; ++i) {
     if (std::strcmp(argv[i], name) == 0) return std::atof(argv[i + 1]);
@@ -1063,9 +1266,14 @@ int main(int argc, char **argv) {
   o.min_cosine = arg_double(argc, argv, "--min-cosine", o.min_cosine);
   int devices = 0;
   MOE_CUDA(cudaGetDeviceCount(&devices));
-  std::string cases = "edges,small,0,1,10,16k,shift,tail,outliers,refusals";
+  std::string cases = "edges,small,0,1,10,16k,shift,tail,outliers,refusals", probe;
   for (int i = 1; i + 1 < argc; ++i) {
     if (std::strcmp(argv[i], "--cases") == 0) cases = argv[i + 1];
+    if (std::strcmp(argv[i], "--qkv-probe") == 0) probe = argv[i + 1];
+  }
+  if (probe.empty()) {
+    const char *env = std::getenv("IGNIS_IMAGE_QKV_PROBE");
+    probe = env != nullptr && *env != '\0' ? env : "F:/ai/models/ignis-image-2.1-turbo/qkv-probe";
   }
   auto want = [&](const char *name) { return ("," + cases + ",").find("," + std::string(name) + ",") != std::string::npos; };
   std::printf("8-bit DiT attention (bound factor %.2f, min cosine %.4f; cases %s)\n", o.bound_factor, o.min_cosine,
@@ -1085,6 +1293,13 @@ int main(int argc, char **argv) {
   }
   for (int images : {0, 1, 10}) {
     if (want("outliers")) case_images(o, images, 4096, Segments::kNone, Profile::kOutliers);
+  }
+  if (want("qkv-probe")) {
+    if (std::ifstream(probe + "/t2i/segments.txt").good()) {
+      case_qkv_probe(o, probe);
+    } else {
+      std::printf("SKIP: qkv-probe: no Q/K/V dump at %s (--qkv-probe DIR or IGNIS_IMAGE_QKV_PROBE)\n", probe.c_str());
+    }
   }
   if (want("refusals")) refusals();
   if (g_failed != 0) {

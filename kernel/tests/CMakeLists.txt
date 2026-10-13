@@ -794,6 +794,11 @@ add_executable(ignis_kernel_image_attn_test test_image_attn.cu)
 target_include_directories(ignis_kernel_image_attn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_image_attn_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_image_attn_test COMMAND ignis_kernel_image_attn_test)
+# The same checks on real Q, K and V from a diffusers run (the cosine reported, not gated). The dump
+# lives outside the repo (--qkv-probe DIR, $IGNIS_IMAGE_QKV_PROBE, or the default under
+# F:/ai/models): without it the case prints SKIP and passes. That breaks the no-skip rule above on
+# purpose (the coordinator's call for #319): a machine without the dump cannot run it at all.
+add_test(NAME ignis_kernel_image_attn_qkv_probe_test COMMAND ignis_kernel_image_attn_test --cases qkv-probe)
 # Its speed (acceptance 4 "Speed") as TOPS with the SM clock and board power, and the quantizers'
 # cost. A timing is a finding: a tool, NOT registered with CTest.
 add_executable(ignis_image_attn_bench bench_image_attn.cu)
