@@ -593,7 +593,7 @@ The baseline on 96db56b (322d never recorded one): `cargo test --workspace`
   chunk, decode share, speculation, rope scaling, vision and KV-RAM knobs
   defaulting to empty, so no text flag reaches the server. `make config`
   prints a PLAN and MODEL line for it. `mk/flags-selftest.sh` asserts both the
-  flags that arrive and the thirteen that do not.
+  flags that arrive and the eleven that do not.
 - **User docs (AC 13).** `docs/user/README.md`: the catalog table, the two
   routes in the API table, an "Image generation" section (licence, routes,
   streaming, sizes, condition images, queue, the `image.*` table with
