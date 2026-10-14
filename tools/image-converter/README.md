@@ -25,6 +25,8 @@ is `crates/artifact/src/qwen_image.rs`.
 | `record_encoder_input.py` | Spec 03's CPU fixture (`crates/server/tests/fixtures/image_encoder_input.json`): the pipeline's tokens, `drop_idx`, mrope positions and `pixel_values` on the pinned processor, with a tiny text encoder. |
 | `fixtures/edit-condition.png` | The edit case's RGBA condition image, procedural (`record.edit_image(1024)`): shapes on an alpha ramp, alpha 0, partial and 255. |
 | `vision_probe.py` | An informational probe: the vision tower's outputs with the artifact's W8 weights and in bf16, against fp32. |
+| `ref_layers.py` | Spec 03's per-layer reference: transformers' text model in fp32 on the CPU, layer by layer, on a recorded case (`layer00.npy` .. `layer35.npy`); `IGNIS_IMAGE_ENCODER_LAYERS` names its output for the GPU test's teacher-forced diagnosis. |
+| `ref_vision.py` | Spec 03's per-stage reference: transformers' vision tower in fp32 on the edit case, with the checkpoint's weights and with the artifact's W8 weights decoded (through `vision_probe`); `IGNIS_IMAGE_VISION_REF` names its output. |
 | `requirements.txt` | The venv `F:/ai/venvs/ignis-image` (torch and torchvision cu130, diffusers 0.41.0, transformers 5.17.0); the recorder uses it too. |
 
 ## What is stored
