@@ -261,3 +261,46 @@ ignis_kv_disk_spills_total{from="kv_ram"} 7
 ignis_kv_disk_failures_total{op="write"} 1
 ignis_kv_disk_failures_total{op="read"} 0
 `;
+
+// A server that ran image jobs (GitHub #324, ADR 0017): the 27B-shaped
+// exposition plus the image families, which the server renders from the first
+// admitted job (zeros included) and only then. Twelve jobs ended: ten
+// completed (twenty images, 2 s median), one cancelled, one failed.
+export const IMAGE_EXPOSITION = `${IGNIS_EXPOSITION}# HELP ignis_image_jobs_total Image jobs ended, by outcome.
+# TYPE ignis_image_jobs_total counter
+ignis_image_jobs_total{outcome="completed"} 10
+ignis_image_jobs_total{outcome="cancelled"} 1
+ignis_image_jobs_total{outcome="stopped"} 0
+ignis_image_jobs_total{outcome="refused"} 0
+ignis_image_jobs_total{outcome="failed"} 1
+# HELP ignis_image_images_total Images the image jobs made.
+# TYPE ignis_image_images_total counter
+ignis_image_images_total 21
+# HELP ignis_image_job_duration_seconds Image job duration from its turn to its last image, completed jobs only.
+# TYPE ignis_image_job_duration_seconds histogram
+ignis_image_job_duration_seconds_bucket{le="0.1"} 0
+ignis_image_job_duration_seconds_bucket{le="0.25"} 0
+ignis_image_job_duration_seconds_bucket{le="0.5"} 0
+ignis_image_job_duration_seconds_bucket{le="1"} 0
+ignis_image_job_duration_seconds_bucket{le="2.5"} 10
+ignis_image_job_duration_seconds_bucket{le="5"} 10
+ignis_image_job_duration_seconds_bucket{le="10"} 10
+ignis_image_job_duration_seconds_bucket{le="30"} 10
+ignis_image_job_duration_seconds_bucket{le="60"} 10
+ignis_image_job_duration_seconds_bucket{le="120"} 10
+ignis_image_job_duration_seconds_bucket{le="300"} 10
+ignis_image_job_duration_seconds_bucket{le="600"} 10
+ignis_image_job_duration_seconds_bucket{le="+Inf"} 10
+ignis_image_job_duration_seconds_sum 20
+ignis_image_job_duration_seconds_count 10
+# HELP ignis_image_job_phase_seconds_total Seconds the image jobs spent in each phase: waiting for their turn, encoding the condition, denoising, decoding.
+# TYPE ignis_image_job_phase_seconds_total counter
+ignis_image_job_phase_seconds_total{phase="queued"} 5
+ignis_image_job_phase_seconds_total{phase="encoding"} 3
+ignis_image_job_phase_seconds_total{phase="denoising"} 14
+ignis_image_job_phase_seconds_total{phase="decoding"} 3
+# HELP ignis_image_queue_jobs Image jobs waiting for their turn and running (at most one).
+# TYPE ignis_image_queue_jobs gauge
+ignis_image_queue_jobs{state="waiting"} 2
+ignis_image_queue_jobs{state="running"} 1
+`;

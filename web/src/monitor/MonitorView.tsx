@@ -15,6 +15,7 @@ import {
   type Memory,
   type Meter,
   type Ngram,
+  type Images,
   type Speculation,
   RATE_SPAN_MS,
   TOKENS_PER_KV_PAGE,
@@ -24,6 +25,7 @@ import { formatAgo, formatBound, formatBytes, formatCount, formatMs, formatNumbe
 import { bucketCounts } from "./quantile.ts";
 import type { MonitorState } from "./scrape.ts";
 import {
+  IMAGE_OUTCOMES,
   REJECT_REASONS,
   type RejectReason,
   RETAINED_FAMILY_KEYS,
@@ -256,6 +258,9 @@ function Board({ dash, state }: { dash: Dashboard; state: MonitorState }) {
 
       {/* GitHub #307: only once a verify round ran -- a load without speculation shows nothing of it. */}
       {dash.speculation && <SpeculationCard speculation={dash.speculation} win={win} />}
+
+      {/* GitHub #324: only once the image model admitted a job -- a text-only server shows nothing of it. */}
+      {dash.images && <ImagesCard images={dash.images} win={win} />}
 
       {/* GitHub #301, #302: only a Flash-Next load has an expert cache and an n-gram table. */}
       {(dash.experts || dash.ngram) && (
@@ -1095,6 +1100,30 @@ function SpeculationCard({ speculation, win }: { speculation: Speculation; win: 
         ]}
       />
       {positions.length > 0 && <Figures items={positions} />}
+    </Card>
+  );
+}
+
+/** The image jobs (GitHub #324): what ended and how, how long the completed ones took, the queue, and where the time went. */
+function ImagesCard({ images, win }: { images: Images; win: string }) {
+  const phases = images.phases.filter((p) => p.share !== null);
+  const refused = IMAGE_OUTCOMES.filter((outcome) => outcome !== "completed" && images.jobs.byOutcome[outcome].window).map(
+    (outcome) => `${formatCount(images.jobs.byOutcome[outcome].window)} ${outcome}`,
+  );
+  return (
+    <Card title="Image jobs" subtitle={`Jobs the image model ran · last ${win}`}>
+      <Figures
+        items={[
+          ["Jobs ended", formatCount(images.jobs.window)],
+          ["Images made", formatCount(images.images.window)],
+          ["Median duration", images.duration.p50 === null ? "-" : formatSeconds(images.duration.p50)],
+          ["Running", formatCount(images.running)],
+          ["Waiting", formatCount(images.waiting)],
+          ["Since start", formatCount(images.jobs.total)],
+        ]}
+      />
+      {refused.length > 0 && <p className="mt-2 text-[11px] text-ash">Not completed: {refused.join(" · ")}</p>}
+      {phases.length > 0 && <Figures items={phases.map((p) => [`Time ${p.phase}`, asShare(p.share)] as [string, string])} />}
     </Card>
   );
 }

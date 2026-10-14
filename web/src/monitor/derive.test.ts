@@ -408,3 +408,31 @@ describe("deriveSpeculation", () => {
     expect(deriveDashboard([at(0, {})], 60_000)!.speculation).toBeNull();
   });
 });
+
+// GitHub #324: the image jobs are read over the window, with the time's shares.
+describe("deriveDashboard images", () => {
+  const images = (completed: number, failed: number, made: number, denoising: number, decoding: number) => ({
+    jobs: { completed, cancelled: 0, stopped: 0, refused: 0, failed },
+    images: made,
+    phaseSeconds: { queued: 0, encoding: 0, denoising, decoding },
+    duration: null,
+    waiting: 1,
+    running: 0,
+  });
+
+  it("gains the jobs by outcome, the images and each phase's share of the window's image time", () => {
+    const points = [at(0, { images: images(10, 0, 20, 100, 20) }), at(60_000, { images: images(13, 1, 27, 130, 30) })];
+    const dash = deriveDashboard(points, 60_000)!;
+    expect(dash.images?.jobs).toMatchObject({ total: 14, window: 4 });
+    expect(dash.images?.jobs.byOutcome.failed).toEqual({ total: 1, window: 1 });
+    expect(dash.images?.images).toMatchObject({ total: 27, window: 7 });
+    expect([dash.images?.waiting, dash.images?.running]).toEqual([1, 0]);
+    const share = Object.fromEntries(dash.images!.phases.map((p) => [p.phase, p.share]));
+    expect(share.denoising).toBeCloseTo(0.75);
+    expect(share.decoding).toBeCloseTo(0.25);
+  });
+
+  it("is absent from the dashboard on a text-only server", () => {
+    expect(deriveDashboard([at(0, {})], 60_000)!.images).toBeNull();
+  });
+});
