@@ -610,7 +610,7 @@ The baseline on 96db56b (322d never recorded one): `cargo test --workspace`
   8. Done (322a).
   9. Done (322d).
   10. Done (322a).
-  11. Done (322e), but for the pinned revision above.
+  11. Done (322e); the revision is pinned to d6912417 (c81e8c6).
   12. Done (322f): the image view, its switch button and gallery; see "As built (322f)".
   13. Done: OpenAPI (322b) and the user docs (322e).
   14. Remains: the live run needs spec 04's real leaf and runner adapter (#321).
