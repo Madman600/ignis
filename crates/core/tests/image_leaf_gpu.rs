@@ -412,9 +412,18 @@ fn the_edit_condition_image_encodes_within_the_oracle_bound() {
     let Some(cropped) = ran(leaf.vae_encode(width, rows, crop), "vae_encode of a 1024 x 768 crop") else { return };
     assert_eq!(cropped.len(), (width / 16 * rows / 16) as usize * 64, "a 64 x 48 latent grid");
     assert!(cropped.iter().all(|v| v.is_finite()), "a non-finite latent of the 1024 x 768 crop");
-    let top = (width / 16 * rows / 32) as usize * 64;
+    let row = (width / 16) as usize * 64;
+    let top = (rows / 32) as usize * row;
     let near = rel_l2(&cropped[..top], &got[..top]);
-    println!("edit: vae_encode of its top {width} x {rows}: the top 24 latent rows {:.3}% from the square's", near * 100.0);
+    // A control: the same rows against the square's one latent row lower, what a crop laid out a
+    // row off would match.
+    let shifted = rel_l2(&cropped[..top], &got[row..row + top]);
+    println!(
+        "edit: vae_encode of its top {width} x {rows}: the top 24 latent rows {:.3}% from the square's (a row lower: {:.3}%)",
+        near * 100.0,
+        shifted * 100.0
+    );
+    assert!(near < shifted, "the 1024 x 768 crop's latents are no nearer the square's own rows than the rows below them");
 }
 
 #[test]
@@ -794,8 +803,11 @@ fn the_widest_preset_runs_free_and_decodes_within_the_arena() {
     assert_eq!(free_after, free, "{size}: vae_decode allocates nothing (it runs in the arena)");
     assert_eq!(rgba.len(), (size.width * size.height * 4) as usize);
     // Not a blank or saturated frame: the RGB channels spread.
-    let mean = |c: usize| rgba.iter().skip(c).step_by(4).map(|&v| v as f64).sum::<f64>() / (size.width * size.height) as f64;
-    let spread = |c: usize| (rgba.iter().skip(c).step_by(4).map(|&v| (v as f64 - mean(c)).powi(2)).sum::<f64>() / (size.width * size.height) as f64).sqrt();
+    let pixels = (size.width * size.height) as f64;
+    let spread = |c: usize| {
+        let mean = rgba.iter().skip(c).step_by(4).map(|&v| v as f64).sum::<f64>() / pixels;
+        (rgba.iter().skip(c).step_by(4).map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / pixels).sqrt()
+    };
     assert!((0..3).all(|c| spread(c) > 10.0), "{size}: a flat image (RGB spread {:.1} {:.1} {:.1})", spread(0), spread(1), spread(2));
     let out = machine_local("IGNIS_IMAGE_FREERUN", "F:/ai/models/ignis-image-2.1-turbo/freerun").join("t2i-2752x1536").join("ignis.png");
     write_png(&out, size.width, size.height, &rgba);
