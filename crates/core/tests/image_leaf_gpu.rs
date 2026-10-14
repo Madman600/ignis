@@ -1,5 +1,5 @@
 //! The image leaf on the real artifact against spec 01's recordings (spec image-model/04, GitHub
-//! #321): acceptance 1, 2, 3 at 1024² and 5.
+//! #321): acceptance 1, 2, 3 at 1024² and 2048², and 5.
 //!
 //! - **Load and plan (AC 1).** The family loads from the artifact (`ImageLeaf::load`: the full
 //!   bind, the text encoder, the vision tower and the DiT's descriptors, the arena) and prints its
@@ -9,7 +9,7 @@
 //!   `timesteps.npy` bit for bit; the Euler update of each step's recorded input latents by the
 //!   recorded velocity is the recorded output, bit for bit; and in every step below, the leaf's own
 //!   update on the device equals the host's on the leaf's velocity, bit for bit.
-//! - **t2i, step by step, at 1024² (AC 3).** `encode_condition` runs ignis's own text encoder on the
+//! - **t2i, step by step, at 1024² and 2048² (AC 3; the cases `t2i` and `t2i-2k`, one test each).** `encode_condition` runs ignis's own text encoder on the
 //!   recorded `input_ids` and `mrope_position_ids` (never the recorded `prompt_embeds`), txt_in and
 //!   the DiT's prefix pass; then each of the 8 steps is fed the recorded input latents
 //!   (teacher-forced), and its velocity's relative L2 against the recorded velocity must be within
@@ -134,8 +134,6 @@ fn ran<T>(result: Result<T, ImageLeafError>, what: &str) -> Option<T> {
 #[ignore = "GPU: run under scripts/gpu-profile.ps1"]
 fn the_t2i_steps_at_1024_are_within_the_oracle_bound() {
     let Some((reader, oracle, thresholds)) = fixtures() else { return };
-    let dir = oracle.join("t2i");
-    let case: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("case.json")).unwrap()).unwrap();
 
     // AC 1: a budget below the weights and the arena is refused before anything is placed.
     let Some(dev) = device() else { return };
@@ -150,14 +148,31 @@ fn the_t2i_steps_at_1024_are_within_the_oracle_bound() {
         Ok(_) => panic!("an 8 GiB budget: the load fits"),
     }
 
-    // AC 1: the load and its plan line.
-    let Some(dev) = device() else { return };
-    let start = Instant::now();
-    let Some(mut leaf) = ran(ImageLeaf::load(&reader, dev, &ImageLeafOptions::new(VramMode::Derived { headroom_bytes: HEADROOM })), "the load") else {
-        return;
-    };
-    println!("{} (loaded in {:.1} s)", leaf.plan().line(), start.elapsed().as_secs_f64());
+    let Some(mut leaf) = load(&reader) else { return };
+    t2i_case(&mut leaf, &oracle, &thresholds, "t2i");
+}
 
+#[test]
+#[ignore = "GPU: run under scripts/gpu-profile.ps1"]
+fn the_t2i_steps_at_2048_are_within_the_oracle_bound() {
+    let Some((reader, oracle, thresholds)) = fixtures() else { return };
+    let Some(mut leaf) = load(&reader) else { return };
+    t2i_case(&mut leaf, &oracle, &thresholds, "t2i-2k");
+}
+
+/// AC 1: the load and its plan line, under the server's default headroom.
+fn load(reader: &Reader) -> Option<ImageLeaf> {
+    let dev = device()?;
+    let start = Instant::now();
+    let leaf = ran(ImageLeaf::load(reader, dev, &ImageLeafOptions::new(VramMode::Derived { headroom_bytes: HEADROOM })), "the load")?;
+    println!("{} (loaded in {:.1} s)", leaf.plan().line(), start.elapsed().as_secs_f64());
+    Some(leaf)
+}
+
+/// ACs 2, 3 and 5 on one of the oracle's text-to-image cases (`t2i` at 1024², `t2i-2k` at 2048²).
+fn t2i_case(leaf: &mut ImageLeaf, oracle: &Path, thresholds: &serde_json::Value, name: &str) {
+    let dir = oracle.join(name);
+    let case: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("case.json")).unwrap()).unwrap();
     // AC 2: the schedule.
     let sigmas = npy_f32(&dir.join("sigmas.npy"), &[9]);
     let timesteps = npy_f32(&dir.join("timesteps.npy"), &[8]);
@@ -201,8 +216,8 @@ fn the_t2i_steps_at_1024_are_within_the_oracle_bound() {
     // AC 3: the 8 steps, teacher-forced.
     let noise = npy_f32(&dir.join("noise.npy"), &[1, 64, h as usize, w as usize]);
     let packed: Vec<f32> = (0..target * 64).map(|i| noise[(i % 64) * target + i / 64]).collect();
-    let bound = thresholds["cases"]["t2i"]["velocity"]["bound"].as_array().expect("the velocity bound").iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>();
-    let yard = &thresholds["cases"]["t2i"]["velocity"];
+    let bound = thresholds["cases"][name]["velocity"]["bound"].as_array().expect("the velocity bound").iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>();
+    let yard = &thresholds["cases"][name]["velocity"];
     if ran(leaf.start_image(&condition, h, w, &packed), "start_image").is_none() {
         return;
     }
@@ -235,7 +250,7 @@ fn the_t2i_steps_at_1024_are_within_the_oracle_bound() {
         assert_eq!(bits(&stepped), bits(&want_stepped), "step {step}: the device's update is the host's, bit for bit");
         let err = rel_l2(&velocity, &velocity_want);
         println!(
-            "step {step} (sigma {sigma:.6}): velocity {:.3}% (bound {:.3}%; bf16 {:.3}%, sim {:.3}%)",
+            "{name} step {step} (sigma {sigma:.6}): velocity {:.3}% (bound {:.3}%; bf16 {:.3}%, sim {:.3}%)",
             err * 100.0,
             bound[step] * 100.0,
             yard["bf16_error"][step].as_f64().unwrap() * 100.0,
@@ -250,15 +265,15 @@ fn the_t2i_steps_at_1024_are_within_the_oracle_bound() {
             report.push(format!("step {step} target block {b:2}: {:.3}%", rel_l2(&tapped[i], want) * 100.0));
         }
     }
-    println!("AC 5, the residual stream against the recorded block outputs (relative L2, no threshold):");
+    println!("{name}: AC 5, the residual stream against the recorded block outputs (relative L2, no threshold):");
     for line in &report {
         println!("  {line}");
     }
     println!(
-        "encode_condition {:.0} ms (with 3 taps); denoise steps {:?} ms (steps 0 and 1 with 3 taps each)",
+        "{name}: encode_condition {:.0} ms (with 3 taps); denoise steps {:?} ms (steps 0 and 1 with 3 taps each)",
         encode_s * 1e3,
         step_ms.iter().map(|m| m.round() as i64).collect::<Vec<_>>()
     );
     ran(leaf.release_condition(condition), "release_condition");
-    assert!(over.is_empty(), "steps {over:?} are over their velocity bound");
+    assert!(over.is_empty(), "{name}: steps {over:?} are over their velocity bound");
 }
