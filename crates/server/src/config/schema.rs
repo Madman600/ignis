@@ -483,8 +483,15 @@ config_group! {
         /// (1,048,576 pixels, a 1024x1024 image, each); a larger one is
         /// refused. A condition image is encoded at 1024x1024 of area at
         /// most, so 16 — a 16-megapixel photo, 64 MiB decoded — takes any
-        /// phone camera's own output and bounds what one edit decodes.
+        /// phone camera's own output and bounds what one condition image
+        /// decodes to.
         max_condition_mipx: Mipx = 16, between(1, 64), ALL, [Visible, Patchable];
+        /// The most edits that decode their condition images at once; the
+        /// others wait their turn. Each holds up to `max_condition_images`
+        /// frames of up to `max_condition_mipx` while it decodes, and the
+        /// queue runs one job at a time, so more side by side buy memory,
+        /// not throughput.
+        max_condition_decodes: Jobs = 1, between(1, 16), ALL, [Visible, Patchable];
         /// The sizes a request may ask for, `<width>x<height>` with each side
         /// a multiple of 32: by default the checkpoint's presets and
         /// 1024x1024, the size OpenAI clients often send. `auto` picks among

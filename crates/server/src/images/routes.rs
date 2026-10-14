@@ -4,10 +4,11 @@
 //! behind them ([`super::job`]).
 //!
 //! A request's fields are checked against `image.*`, and an edit's condition
-//! images decoded, before anything loads or switches — then the kind check
+//! images decoded and resized to their unscaled size ([`Conditions`]),
+//! before anything loads or switches — then the kind check
 //! and the implicit switch ([`crate::api::switch_to_named_model`]), the
 //! queue's admission, the condition budget ([`super::budget`]) and the
-//! resize, and the job. Two 400s come after the switch, since they need the
+//! resize of the images it scales, and the job. Two 400s come after the switch, since they need the
 //! loaded image model: a size past what its load makes (and `auto` with none
 //! of `image.sizes` made), and a prefix over the condition budget, which the
 //! runner's tokenizer counts. Its answer is one JSON body, or with `stream` its events as
@@ -413,7 +414,7 @@ pub(crate) async fn create_image(State(server): State<Arc<Server>>, Json(fields)
         Ok(request) => request,
         Err(refused) => return refused,
     };
-    serve(server, request, Vec::new(), Route::Generations).await
+    serve(server, request, Conditions::default(), Route::Generations).await
 }
 
 #[utoipa::path(
@@ -465,21 +466,46 @@ pub(crate) async fn create_image_edit(State(server): State<Arc<Server>>, multipa
         );
     }
     let max_pixels = u64::from(limits.max_condition_mipx) << 20;
-    let decoding = server.image_decodes.acquire().await.expect("the decode permits are never closed");
+    let decoding = server.image_decodes.enter(limits.max_condition_decodes).await;
     let decoded = tokio::task::spawn_blocking(move || {
-        form.images
-            .iter()
-            .enumerate()
-            .map(|(i, bytes)| crate::media::decode_condition_image(bytes, max_pixels).map_err(|why| format!("condition image {i}: {why}")))
-            .collect::<Result<Vec<_>, _>>()
+        // Held by the decode itself, so a request that goes away mid-decode
+        // does not let another begin beside it.
+        let _decoding = decoding;
+        decode_conditions(&form.images, max_pixels)
     })
     .await
     .expect("decoding condition images does not panic");
-    drop(decoding);
     match decoded {
-        Ok(images) => serve(server, request, images, Route::Edits).await,
+        Ok(conditions) => serve(server, request, conditions, Route::Edits).await,
         Err(why) => bad_request_param(&why, "image"),
     }
+}
+
+/// An edit's condition images, decoded: each resized as soon as it is to the
+/// size it is encoded at unless the condition budget scales it (diffusers'
+/// size at 1024² of area, [`budget::condition_size`]), so that no full frame
+/// outlives its own decode — not through a load, a switch or a visit; and
+/// each one's size as sent, which the budget and `auto` read.
+#[derive(Debug, Default)]
+struct Conditions {
+    /// Each image's size as sent, in order.
+    sources: Vec<ImageSize>,
+    /// Each image at its unscaled encoded size, in order.
+    images: Vec<RgbaImage>,
+}
+
+/// Decode an edit's condition images in order ([`Conditions`]), each at most
+/// `max_pixels`; `Err` names the first that is not one. Blocking.
+fn decode_conditions(images: &[Vec<u8>], max_pixels: u64) -> Result<Conditions, String> {
+    let area = f64::from(budget::CONDITION_SIDE) * f64::from(budget::CONDITION_SIDE);
+    let mut conditions = Conditions::default();
+    for (i, bytes) in images.iter().enumerate() {
+        let image = crate::media::decode_condition_image(bytes, max_pixels).map_err(|why| format!("condition image {i}: {why}"))?;
+        let ratio = f64::from(image.size.width) / f64::from(image.size.height);
+        conditions.images.push(crate::media::resize_rgba(&image, budget::condition_size(area, ratio)));
+        conditions.sources.push(image.size);
+    }
+    Ok(conditions)
 }
 
 /// An edit's form: the image parts in order, the mask's presence, and the
@@ -575,7 +601,7 @@ fn switch_steps(events: mpsc::UnboundedSender<Streamed>, legs: u32) -> Steps {
 /// prompt is rewritten first. One the loaded image model takes as it is
 /// starts streaming once admitted, so every refusal before its job is still
 /// a status.
-async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage>, route: Route) -> Response {
+async fn serve(server: Arc<Server>, request: ImageRequest, conditions: Conditions, route: Route) -> Response {
     let named = split_model_lane(request.model.clone()).0;
     if let Err(refused) = check_kind(&server, ModelKind::Image, named.as_deref()) {
         return refused;
@@ -588,7 +614,7 @@ async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage
     if stream && (request.enhance || waits_before_the_job(&server, named.as_deref())) {
         tokio::spawn(async move {
             let refused = tokio::select! {
-                admitted = admit(server, request, images, route, &events) => admitted.err(),
+                admitted = admit(server, request, conditions, route, &events) => admitted.err(),
                 // The client went away: nobody is left to admit it for.
                 () = events.closed() => None,
             };
@@ -598,7 +624,7 @@ async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage
         });
         return Sse::new(ImageSse::new(receiver, route)).into_response();
     }
-    let admitted = admit(server, request, images, route, &events).await;
+    let admitted = admit(server, request, conditions, route, &events).await;
     // The job holds a sender of its own: the channel closes once it ends.
     drop(events);
     if let Err(refused) = admitted {
@@ -638,7 +664,7 @@ async fn error_of(refused: Response) -> ApiError {
 async fn admit(
     server: Arc<Server>,
     request: ImageRequest,
-    images: Vec<RgbaImage>,
+    conditions: Conditions,
     route: Route,
     events: &mpsc::UnboundedSender<Streamed>,
 ) -> Result<(), Response> {
@@ -650,7 +676,7 @@ async fn admit(
     // Drawn now, so that the rewrite is seeded with it too.
     let seed = request.seed.or(server.seedless_seed).unwrap_or_else(crate::api::fresh_seed);
     let enhanced = match request.enhance {
-        true => enhance(&server, request.prompt.clone(), &images, named.as_deref(), seed, events).await?,
+        true => enhance(&server, request.prompt.clone(), &conditions.images, named.as_deref(), seed, events).await?,
         false => Enhanced::sent(request.prompt.clone()),
     };
     crate::model_switch::implicit_switch_telling(&server, named.as_deref(), Some(switch_steps(events.clone(), 1)))
@@ -664,7 +690,7 @@ async fn admit(
     let limits = server.live().image.clone();
     // `image.sizes` less what this load cannot make: what `auto` picks from.
     let sizes = super::served_sizes(&limits.sizes, model.plan());
-    let ratio = images.last().map_or(1.0, |image| f64::from(image.size.width) / f64::from(image.size.height));
+    let ratio = conditions.sources.last().map_or(1.0, |size| f64::from(size.width) / f64::from(size.height));
     let size = match request.size {
         Some(size) if !model.plan().takes(size) => {
             let served: Vec<String> = sizes.iter().map(ToString::to_string).collect();
@@ -698,7 +724,7 @@ async fn admit(
     let Enhanced { prompt, revised, warnings } = enhanced;
     let prepared = {
         let model = model.clone();
-        tokio::task::spawn_blocking(move || prepare(model, &limits, prompt, images, size, n, seed, background, route))
+        tokio::task::spawn_blocking(move || prepare(model, &limits, prompt, conditions, size, n, seed, background, route))
             .await
             .expect("fitting condition images does not panic")
     };
@@ -833,7 +859,7 @@ fn prepare(
     model: ImageModel,
     limits: &ImageGroup,
     prompt: String,
-    images: Vec<RgbaImage>,
+    conditions: Conditions,
     size: ImageSize,
     n: u32,
     seed: u64,
@@ -841,9 +867,8 @@ fn prepare(
     route: Route,
 ) -> Result<Prepared, Response> {
     let budget = budget::budget(model.plan(), limits.condition_budget_tokens);
-    let sources: Vec<ImageSize> = images.iter().map(|image| image.size).collect();
     let fitted = model.with_runner(|runner| {
-        budget::fit(|sizes| runner.condition_tokens(&prompt, sizes), &sources, budget, limits.condition_floor_px)
+        budget::fit(|sizes| runner.condition_tokens(&prompt, sizes), &conditions.sources, budget, limits.condition_floor_px)
     });
     let Some(fitted) = fitted else {
         return Err(model_stopped());
@@ -857,7 +882,14 @@ fn prepare(
             Some(route.condition_param()),
         )
     })?;
-    let images = images.iter().zip(&fitted.sizes).map(|(image, &size)| crate::media::resize_rgba(image, size)).collect();
+    // Each image was decoded at its unscaled size: only one the budget scaled
+    // is resized again, from that.
+    let images = conditions
+        .images
+        .into_iter()
+        .zip(&fitted.sizes)
+        .map(|(image, &size)| if image.size == size { image } else { crate::media::resize_rgba(&image, size) })
+        .collect();
     let job = ImageJob { condition: ImageCondition { prompt, images }, size, n, seed, background };
     Ok(Prepared { model, job, fitted })
 }
@@ -1058,6 +1090,22 @@ mod tests {
         assert_eq!(auto_size(&sizes, 1.0 / 1.4), Some(ImageSize::new(1792, 2400)));
         assert_eq!(auto_size(&[ImageSize::new(1024, 1024)], 3.0), Some(ImageSize::new(1024, 1024)));
         assert_eq!(auto_size(&[], 1.0), None);
+    }
+
+    /// Review-322cf L1: each condition image is resized as it is decoded, to
+    /// the size it is encoded at unless the budget scales it, and keeps its
+    /// size as sent; one that is not an image is named by its place.
+    #[test]
+    fn condition_images_are_resized_as_they_are_decoded() {
+        let image = |width: u32, height: u32| RgbaImage { size: ImageSize::new(width, height), pixels: vec![120; (width * height * 4) as usize] };
+        let pngs = [job::encode_png(&image(64, 32)), job::encode_png(&image(1024, 1024))];
+        let decoded = decode_conditions(&pngs, 1 << 20).unwrap();
+        assert_eq!(decoded.sources, [ImageSize::new(64, 32), ImageSize::new(1024, 1024)]);
+        let sizes: Vec<ImageSize> = decoded.images.iter().map(|image| image.size).collect();
+        assert_eq!(sizes, [ImageSize::new(1440, 736), ImageSize::new(1024, 1024)], "diffusers' size at 1024² of area");
+        assert_eq!(decoded.images[1], image(1024, 1024), "an image at its size already is kept as it is");
+        let refused = decode_conditions(&[pngs[0].clone(), b"not an image".to_vec()], 1 << 20).unwrap_err();
+        assert!(refused.starts_with("condition image 1: "), "{refused}");
     }
 
     /// An edit's text parts parse as the JSON fields do, and a malformed

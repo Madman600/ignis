@@ -1210,7 +1210,7 @@ async fn the_image_fields_are_listed_and_change_live_within_their_bounds() {
     assert_eq!(
         names,
         [
-            "queue_depth", "max_n", "max_condition_images", "max_condition_mipx", "sizes", "condition_budget_tokens", "condition_floor_px",
+            "queue_depth", "max_n", "max_condition_images", "max_condition_mipx", "max_condition_decodes", "sizes", "condition_budget_tokens", "condition_floor_px",
             "prompt_enhancement", "prompt_enhancer", "prompt_enhancer_max_tokens",
         ]
     );

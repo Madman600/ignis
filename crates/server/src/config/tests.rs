@@ -2061,6 +2061,7 @@ fn every_image_field_resolves_from_flag_env_and_file_by_precedence() {
         ("max_n", "4", "5", "6"),
         ("max_condition_images", "7", "8", "9"),
         ("max_condition_mipx", "4", "8", "32"),
+        ("max_condition_decodes", "2", "3", "4"),
         ("sizes", "1024x1024", "2048x2048;1024x1024", "2752x1536"),
         ("condition_budget_tokens", "8192", "16384", "4096"),
         ("condition_floor_px", "256", "384", "640"),
@@ -2102,6 +2103,7 @@ fn an_image_field_past_its_bounds_is_refused_naming_it() {
         ("max_n", 1, 64),
         ("max_condition_images", 1, 10),
         ("max_condition_mipx", 1, 64),
+        ("max_condition_decodes", 1, 16),
         ("condition_floor_px", 32, 1024),
         ("prompt_enhancer_max_tokens", 16, 8192),
     ] {

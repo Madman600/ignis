@@ -480,8 +480,9 @@ async fn an_edit_below_the_floor_is_refused_naming_the_budget() {
 
 /// Review-322b F2: a condition image past `image.max_condition_mipx` is
 /// refused before its frame is decoded, naming the field; at the cap it is
-/// taken. One edit decodes at a time: while the server's decode permit is
-/// held, an edit waits for it and reaches nothing.
+/// taken. `image.max_condition_decodes` edits decode at a time (review-322cf
+/// L1): while that many decodes are held, an edit waits for its turn and
+/// reaches nothing; with the limit raised, one more decodes beside them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn condition_images_decode_one_edit_at_a_time_up_to_the_cap() {
     let harness = Harness::new(Gate::opened());
@@ -496,14 +497,21 @@ async fn condition_images_decode_one_edit_at_a_time_up_to_the_cap() {
     let (status, body) = send(&harness.app, form_request(&[("prompt", Part::Text("x")), ("image[]", Part::File(&at))])).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let permit = Arc::clone(&harness.server.image_decodes).acquire_owned().await.unwrap();
+    let held = harness.server.image_decodes.enter(1).await;
     let app = harness.app.clone();
     let waiting = tokio::spawn(async move { send(&app, form_request(&[("prompt", Part::Text("held")), ("image[]", Part::File(JPEG))])).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(!harness.encodes().contains(&"held".to_owned()) && !waiting.is_finished(), "the edit waits for the decode permit");
-    drop(permit);
+    assert!(!harness.encodes().contains(&"held".to_owned()) && !waiting.is_finished(), "the edit waits for its turn to decode");
+    drop(held);
     assert_eq!(waiting.await.unwrap().0, StatusCode::OK);
     assert_eq!(harness.encodes().last().map(String::as_str), Some("held"));
+
+    harness.server.update_live(|live| live.image.max_condition_decodes = 2);
+    let held = harness.server.image_decodes.enter(2).await;
+    let (status, body) = send(&harness.app, form_request(&[("prompt", Part::Text("beside")), ("image[]", Part::File(JPEG))])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(harness.server.image_decodes.running(), 1, "its decode ended; the held one runs on");
+    drop(held);
 }
 
 /// The edit route's body limit is the media one on every load: a form past

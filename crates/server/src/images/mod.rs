@@ -227,6 +227,60 @@ impl Drop for Running {
     }
 }
 
+/// The edits decoding their condition images now: at most
+/// `image.max_condition_decodes` at once (review-322b F2), since each may
+/// decode `image.max_condition_images` frames of up to
+/// `image.max_condition_mipx` before the queue sees it, and the queue behind
+/// runs one job at a time anyway — decodes side by side buy memory, not
+/// throughput.
+#[derive(Debug, Default)]
+pub struct Decodes {
+    running: Mutex<u32>,
+    /// Told whenever a decode ends.
+    ended: tokio::sync::Notify,
+}
+
+impl Decodes {
+    /// A decode's turn, once fewer than `limit` run — the limit as the caller
+    /// reads it now, so a live change applies from the next decode that
+    /// begins or ends. Counted until the guard is dropped: moved into the
+    /// blocking task that decodes, a request that goes away mid-decode does
+    /// not free it before the decode ends.
+    pub async fn enter(self: &Arc<Self>, limit: u32) -> Decoding {
+        loop {
+            // Asked before the count is read, so no end between the two goes
+            // unseen.
+            let ended = self.ended.notified();
+            tokio::pin!(ended);
+            ended.as_mut().enable();
+            {
+                let mut running = self.running.lock().expect("decodes lock");
+                if *running < limit.max(1) {
+                    *running += 1;
+                    return Decoding(Arc::clone(self));
+                }
+            }
+            ended.await;
+        }
+    }
+
+    /// The decodes running now.
+    pub fn running(&self) -> u32 {
+        *self.running.lock().expect("decodes lock")
+    }
+}
+
+/// A decode counted as running ([`Decodes::enter`]), until dropped.
+#[derive(Debug)]
+pub struct Decoding(Arc<Decodes>);
+
+impl Drop for Decoding {
+    fn drop(&mut self) {
+        *self.0.running.lock().expect("decodes lock") -= 1;
+        self.0.ended.notify_waiters();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +367,29 @@ mod tests {
         assert!(closed.await.unwrap(), "a waiting job gets no turn once closed");
         drop(running);
         assert!(jobs.in_flight().is_idle());
+    }
+
+    /// Review-322cf L1: at most `limit` decodes run, read as each one asks,
+    /// and one waiting gets its turn when one ends.
+    #[tokio::test]
+    async fn decodes_run_up_to_the_limit_each_one_reads() {
+        let decodes = Arc::new(Decodes::default());
+        let (first, second) = (decodes.enter(2).await, decodes.enter(2).await);
+        assert_eq!(decodes.running(), 2);
+        let third = tokio::spawn({
+            let decodes = Arc::clone(&decodes);
+            async move { decodes.enter(2).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!third.is_finished(), "a third waits at a limit of 2");
+        drop(first);
+        let third = third.await.unwrap();
+        assert_eq!(decodes.running(), 2);
+        let fourth = tokio::time::timeout(std::time::Duration::from_secs(5), decodes.enter(3)).await.expect("room at a limit of 3");
+        drop((second, third, fourth));
+        assert_eq!(decodes.running(), 0);
+        let _one = decodes.enter(0).await;
+        assert_eq!(decodes.running(), 1, "a limit of 0 still lets one run");
     }
 
     /// Spec image-model/05 §Sizes: the fake's plan makes every default size,
