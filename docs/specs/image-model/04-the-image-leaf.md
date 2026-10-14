@@ -851,3 +851,20 @@ branch merged `image-serving-322` first (d7447b4; the conflicts were additive:
     16380x100 panoramas at the default 512 floor round to 6560x32, past
     200:1, and the request is refused `400 condition_budget_exceeded`,
     though 12800x64 would serve (the GPU test fits from 640).
+- **Gates.**
+  - The CTest under the profile (`kernel/build.ps1 -Test`,
+    `IGNIS_GPU_PROFILE=1`): 124/124.
+  - `CARGO_INCREMENTAL=0 cargo test --workspace`: 2964 passed, 0 failed,
+    6 ignored.
+  - `cargo check -p ignis-server --features cuda --tests` and `-p
+    ignis-core --features cuda --tests`: ok, with only the old warnings.
+  - Under the profile, the image GPU tests 19/19: core's `image_attn_gpu`,
+    `image_elementwise_gpu`, `image_encoder_attn_gpu`, `image_encoder_gpu`
+    (2), `image_gemm_gpu`, `image_vae_gpu`, `image_leaf_gpu` (7); the
+    server's `image_encoder_edit_gpu` (2), `image_leaf_ten_images_gpu`,
+    `image_runner_gpu` (2).
+  - The 27B's vision tests 7/7 under the profile (`vision_load_gpu`,
+    `vision_canary_gpu`, `vision_dflash2_gpu`, `vision_mixed_load_gpu`,
+    `vision_prefix_reuse_gpu`, `classify_vision_readout_gpu`,
+    `classify_pointing_gpu`).
+  - `npm test` in `web/`: 855 passed.
