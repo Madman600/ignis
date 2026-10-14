@@ -8,6 +8,8 @@
 //!                       [--accept-status STATUS] [--keep-work] [--weights-id ID]
 //!                       [--geometry qwen3.8-flash-next|fixture]
 //!                       [--family main|mtp --pair-main <main.ninfer>]
+//!   ignis-artifact-pack --family qwen-image --work <work dir> [--out <artifact.ninfer>]
+//!                       [--header-mib N] [--accept-status STATUS] [--keep-work]
 //!
 //! Run it after the converter ends (`work/converter.json` with status
 //! `complete`; until then it waits and deletes nothing). It appends every
@@ -28,16 +30,24 @@
 //! main container `--pair-main`; `--out` then defaults to
 //! `<work>/../qwen3_8_flash_next_mtp_3p0-v2.ninfer`, the identity and the
 //! 1 MiB header are the companion's.
+//!
+//! `--family qwen-image` packs the image model's container (spec
+//! image-model/01) from `tools/image-converter`'s work tree: `frontend/` and
+//! its four tensor units, no Flash-Next geometry (`--layers`, `--experts` and
+//! `--geometry` are refused); `--out` defaults to
+//! `<work>/../ignis_image_2_1_turbo-v2.ninfer`.
 
 use std::path::PathBuf;
 
 use ignis_artifact::flash_next::FlashNextGeometry;
-use ignis_artifact::packer::{pack, Family, PackOptions, PackOutcome, ARTIFACT_FILE_NAME, MTP_ARTIFACT_FILE_NAME};
+use ignis_artifact::packer::{
+    pack, Family, PackOptions, PackOutcome, ARTIFACT_FILE_NAME, MTP_ARTIFACT_FILE_NAME, QWEN_IMAGE_ARTIFACT_FILE_NAME,
+};
 
 const USAGE: &str = "usage: ignis-artifact-pack --work <dir> [--out <artifact.ninfer>] [--layers N] \
                      [--experts N] [--header-mib N] [--accept-status STATUS] [--keep-work] \
                      [--weights-id ID] [--geometry qwen3.8-flash-next|fixture] \
-                     [--family main|mtp --pair-main <main.ninfer>]";
+                     [--family main|mtp|qwen-image --pair-main <main.ninfer>]";
 
 fn main() {
     let mut work = None;
@@ -49,6 +59,7 @@ fn main() {
     let mut keep_work = false;
     let mut weights_id = None;
     let mut geometry = FlashNextGeometry::qwen38_flash_next();
+    let mut geometry_named = false;
     let mut family = None;
     let mut pair_main = None;
     let mut args = std::env::args().skip(1);
@@ -66,6 +77,7 @@ fn main() {
             "--keep-work" => keep_work = true,
             "--weights-id" => weights_id = args.next(),
             "--geometry" => {
+                geometry_named = true;
                 geometry = match args.next().as_deref() {
                     Some("qwen3.8-flash-next") => FlashNextGeometry::qwen38_flash_next(),
                     Some("fixture") => FlashNextGeometry::fixture(),
@@ -84,15 +96,20 @@ fn main() {
         (None | Some("main"), None) => Family::Main,
         (Some("mtp"), Some(pair_main)) => Family::Mtp { pair_main },
         (Some("mtp"), None) => usage_error("--family mtp needs --pair-main"),
-        (None | Some("main"), Some(_)) => usage_error("--pair-main is for --family mtp"),
-        _ => usage_error("--family takes main or mtp"),
+        (Some("qwen-image"), None) => Family::QwenImage21,
+        (None | Some("main") | Some("qwen-image"), Some(_)) => usage_error("--pair-main is for --family mtp"),
+        _ => usage_error("--family takes main, mtp or qwen-image"),
     };
+    if family == Family::QwenImage21 && (layers.is_some() || experts.is_some() || geometry_named) {
+        usage_error("--layers, --experts and --geometry are Flash-Next's, not --family qwen-image's");
+    }
     let artifact = match out {
         Some(out) => out,
         None => match work_dir.parent() {
             Some(model_dir) => model_dir.join(match family {
                 Family::Main => ARTIFACT_FILE_NAME,
                 Family::Mtp { .. } => MTP_ARTIFACT_FILE_NAME,
+                Family::QwenImage21 => QWEN_IMAGE_ARTIFACT_FILE_NAME,
             }),
             None => usage_error("--work has no parent directory: pass --out"),
         },
@@ -107,6 +124,7 @@ fn main() {
     let mut options = match family {
         Family::Mtp { pair_main } => PackOptions::mtp(work_dir, artifact, geometry, pair_main),
         Family::Main => PackOptions::new(work_dir, artifact, geometry),
+        Family::QwenImage21 => PackOptions::qwen_image(work_dir, artifact),
     };
     if let Some(mib) = header_mib {
         options.header_bytes = match mib.checked_mul(1 << 20) {

@@ -361,6 +361,9 @@ fn cuda_scheduler_for(
             thinking_close,
             &config.kv_disk_location,
         ),
+        // The image model has no token scheduler: its leaf and its serving
+        // are specs image-model/04 and 05.
+        ModelFamily::QwenImage21 => Err(format!("{} is not served yet (spec image-model/05)", family.name())),
     };
     let (scheduler, reserved) = loaded.map_err(LoadError::LoadFailed)?;
     tracing::info!(

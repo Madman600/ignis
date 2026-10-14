@@ -1346,6 +1346,15 @@ fn flash_next_refuses_speculation_and_vision_at_start_naming_itself() {
     assert!(err.contains("--vision-enabled") && err.contains("Qwen3.8-Flash-Next"), "{err}");
 }
 
+/// The image model (ADR 0050) decodes no tokens: any speculative backend is
+/// refused at start, saying it has no drafter.
+#[test]
+fn the_image_model_refuses_speculation_saying_it_has_no_drafter() {
+    let spec = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7"]);
+    let err = served_model_for(&spec, ModelFamily::QwenImage21).expect_err("no drafter").0;
+    assert!(err.contains("--spec-backend dflash2") && err.contains("Qwen-Image-2.1 has no drafter"), "{err}");
+}
+
 /// GitHub #228: the 27B's GQA envelope bounds `--model-max-context` per KV
 /// format; Flash-Next's QSA is not bound by it.
 #[test]

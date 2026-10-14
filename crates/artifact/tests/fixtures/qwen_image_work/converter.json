@@ -1,0 +1,7305 @@
+{
+ "schema": "image-converter-v1",
+ "status": "fixture",
+ "verdict": "PASS",
+ "source": {
+  "repo": "synthetic/qwen-image-2.1-turbo",
+  "revision": "0000000000000000000000000000000000f1c7e5",
+  "files": {
+   "LICENSE": {
+    "bytes": 33,
+    "sha256": "e3bc0702a7f9d0d647755e73c0998c06cd005b336ed272bdc42a01c7a4e84d65"
+   },
+   "model_index.json": {
+    "bytes": 96,
+    "sha256": "6310ef83486b191362e0120f89ef967b7c28e69af0f1d0382f136265c6cc67e4"
+   },
+   "processor/chat_template.jinja": {
+    "bytes": 16,
+    "sha256": "520367796df4d9d8f074b3ed71936e423d0d6d32a7fc0981fab1d0b0b6148336"
+   },
+   "processor/processor_config.json": {
+    "bytes": 219,
+    "sha256": "e6edb6e38f338060d616b320d8f70a50848d809882bd9187980dbf46ec713871"
+   },
+   "processor/tokenizer.json": {
+    "bytes": 3,
+    "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+   },
+   "processor/tokenizer_config.json": {
+    "bytes": 3,
+    "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+   },
+   "scheduler/scheduler_config.json": {
+    "bytes": 104,
+    "sha256": "78758ff1b949cd0ebdc9f7669fb4518b11c9945853a41cd80993a1eadaeb8fe1"
+   },
+   "text_encoder/config.json": {
+    "bytes": 1562,
+    "sha256": "49ee9ba199506a038524fe8a09f8b046b4f6d0dc6b5cceb6edcbc05c1cb8b638"
+   },
+   "text_encoder/generation_config.json": {
+    "bytes": 3,
+    "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+   },
+   "text_encoder/model.safetensors": {
+    "bytes": 481680,
+    "sha256": "fd61c46f546d8e1ed8a79626619f9cd7f6ef5115a64519bafc2db66404d9f810"
+   },
+   "transformer/config.json": {
+    "bytes": 376,
+    "sha256": "5ca1a31a0b0ee9f36b119ad8c002f77ae4d71ac01a4bb4069581bc4a95b9a69a"
+   },
+   "transformer/diffusion_pytorch_model-00001-of-00003.safetensors": {
+    "bytes": 151120,
+    "sha256": "47e4edaa9b05dfd70d111d417ccd4b7b9fd96249c09d715699c58e620f68b9b0"
+   },
+   "transformer/diffusion_pytorch_model-00002-of-00003.safetensors": {
+    "bytes": 132224,
+    "sha256": "0decef187c4471d3b44fced78148de23551a8293566a3ba5c0921e07768d012f"
+   },
+   "transformer/diffusion_pytorch_model-00003-of-00003.safetensors": {
+    "bytes": 35136,
+    "sha256": "ca4ba2909062af08247c0f7d000c5972bb86fc14c983309eb7fe1a4bdbf9eae1"
+   },
+   "transformer/diffusion_pytorch_model.safetensors.index.json": {
+    "bytes": 2724,
+    "sha256": "50566f2547425f79c0fa48e1845a5cbc4464f5ef9d978e3a70826083b336af8f"
+   },
+   "vae/config.json": {
+    "bytes": 980,
+    "sha256": "186b4c052d76a80be51c9126f51517451698cf21ff8e930b0b4a181172bbee56"
+   },
+   "vae/diffusion_pytorch_model.safetensors": {
+    "bytes": 340940,
+    "sha256": "43875ad892898cba22573b702f98d14340c67276b594f55bd315001256d628ef"
+   }
+  }
+ },
+ "converter": {
+  "commit": "e1f2351c36988ad33165fbe158d1781ec9613831",
+  "dirty": true,
+  "command": "convert.py fixture"
+ },
+ "versions": {
+  "torch": "2.13.0+cu130",
+  "diffusers": "0.41.0",
+  "transformers": "5.17.0",
+  "safetensors": "0.8.0",
+  "numpy": "2.5.3",
+  "python": "3.12.6"
+ },
+ "fp8_bound": 0.03,
+ "objects": {
+  "tensors": 351,
+  "resources": 11,
+  "not_stored": [
+   "text_encoder/lm_head.weight",
+   "text_encoder/model.language_model.norm.weight"
+  ]
+ },
+ "all_finite": true,
+ "summary": {
+  "bf16": {
+   "count": 298,
+   "bytes": 437044,
+   "max_rel_error": null
+  },
+  "fp8": {
+   "count": 32,
+   "bytes": 195744,
+   "max_rel_error": 0.02594304666599635
+  },
+  "w8": {
+   "count": 21,
+   "bytes": 200192,
+   "max_rel_error": 0.005434493317350978
+  }
+ },
+ "vae_convs": [
+  {
+   "object": "vae/encoder.conv_in.weight",
+   "in_channels": 4,
+   "out_channels": 2,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.0.resnets.0.conv1.weight",
+   "in_channels": 2,
+   "out_channels": 2,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.0.resnets.0.conv2.weight",
+   "in_channels": 2,
+   "out_channels": 2,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.0.resnets.1.conv1.weight",
+   "in_channels": 2,
+   "out_channels": 2,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.0.resnets.1.conv2.weight",
+   "in_channels": 2,
+   "out_channels": 2,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.0.downsampler.resample.1.weight",
+   "in_channels": 2,
+   "out_channels": 2,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    2,
+    2
+   ],
+   "padding": [
+    0,
+    1,
+    0,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.1.resnets.0.conv1.weight",
+   "in_channels": 2,
+   "out_channels": 4,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.1.resnets.0.conv2.weight",
+   "in_channels": 4,
+   "out_channels": 4,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.1.resnets.0.conv_shortcut.weight",
+   "in_channels": 2,
+   "out_channels": 4,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.1.resnets.1.conv1.weight",
+   "in_channels": 4,
+   "out_channels": 4,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.1.resnets.1.conv2.weight",
+   "in_channels": 4,
+   "out_channels": 4,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.1.downsampler.resample.1.weight",
+   "in_channels": 4,
+   "out_channels": 4,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    2,
+    2
+   ],
+   "padding": [
+    0,
+    1,
+    0,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.1.downsampler.time_conv.weight",
+   "in_channels": 4,
+   "out_channels": 4,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.2.resnets.0.conv1.weight",
+   "in_channels": 4,
+   "out_channels": 8,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.2.resnets.0.conv2.weight",
+   "in_channels": 8,
+   "out_channels": 8,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.2.resnets.0.conv_shortcut.weight",
+   "in_channels": 4,
+   "out_channels": 8,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.2.resnets.1.conv1.weight",
+   "in_channels": 8,
+   "out_channels": 8,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.2.resnets.1.conv2.weight",
+   "in_channels": 8,
+   "out_channels": 8,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.2.downsampler.resample.1.weight",
+   "in_channels": 8,
+   "out_channels": 8,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    2,
+    2
+   ],
+   "padding": [
+    0,
+    1,
+    0,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.2.downsampler.time_conv.weight",
+   "in_channels": 8,
+   "out_channels": 8,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.3.resnets.0.conv1.weight",
+   "in_channels": 8,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.3.resnets.0.conv2.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.3.resnets.0.conv_shortcut.weight",
+   "in_channels": 8,
+   "out_channels": 16,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.3.resnets.1.conv1.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.3.resnets.1.conv2.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.3.downsampler.resample.1.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    2,
+    2
+   ],
+   "padding": [
+    0,
+    1,
+    0,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.3.downsampler.time_conv.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.4.resnets.0.conv1.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.4.resnets.0.conv2.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.4.resnets.1.conv1.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.down_blocks.4.resnets.1.conv2.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.mid_block.attentions.0.to_qkv.weight",
+   "in_channels": 16,
+   "out_channels": 48,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.mid_block.attentions.0.proj.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.mid_block.resnets.0.conv1.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.mid_block.resnets.0.conv2.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.mid_block.resnets.1.conv1.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.mid_block.resnets.1.conv2.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/encoder.conv_out.weight",
+   "in_channels": 16,
+   "out_channels": 32,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/quant_conv.weight",
+   "in_channels": 32,
+   "out_channels": 32,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/post_quant_conv.weight",
+   "in_channels": 16,
+   "out_channels": 16,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.conv_in.weight",
+   "in_channels": 16,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.mid_block.attentions.0.to_qkv.weight",
+   "in_channels": 24,
+   "out_channels": 72,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.mid_block.attentions.0.proj.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.mid_block.resnets.0.conv1.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.mid_block.resnets.0.conv2.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.mid_block.resnets.1.conv1.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.mid_block.resnets.1.conv2.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.0.resnets.0.conv1.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.0.resnets.0.conv2.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.0.resnets.1.conv1.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.0.resnets.1.conv2.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.0.resnets.2.conv1.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.0.resnets.2.conv2.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.0.upsampler.resample.1.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": "nearest-exact x2"
+  },
+  {
+   "object": "vae/decoder.up_blocks.0.upsampler.time_conv.weight",
+   "in_channels": 24,
+   "out_channels": 48,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.1.resnets.0.conv1.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.1.resnets.0.conv2.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.1.resnets.1.conv1.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.1.resnets.1.conv2.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.1.resnets.2.conv1.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.1.resnets.2.conv2.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.1.upsampler.resample.1.weight",
+   "in_channels": 24,
+   "out_channels": 24,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": "nearest-exact x2"
+  },
+  {
+   "object": "vae/decoder.up_blocks.1.upsampler.time_conv.weight",
+   "in_channels": 24,
+   "out_channels": 48,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.2.resnets.0.conv1.weight",
+   "in_channels": 24,
+   "out_channels": 12,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.2.resnets.0.conv2.weight",
+   "in_channels": 12,
+   "out_channels": 12,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.2.resnets.0.conv_shortcut.weight",
+   "in_channels": 24,
+   "out_channels": 12,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.2.resnets.1.conv1.weight",
+   "in_channels": 12,
+   "out_channels": 12,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.2.resnets.1.conv2.weight",
+   "in_channels": 12,
+   "out_channels": 12,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.2.resnets.2.conv1.weight",
+   "in_channels": 12,
+   "out_channels": 12,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.2.resnets.2.conv2.weight",
+   "in_channels": 12,
+   "out_channels": 12,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.2.upsampler.resample.1.weight",
+   "in_channels": 12,
+   "out_channels": 12,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": "nearest-exact x2"
+  },
+  {
+   "object": "vae/decoder.up_blocks.2.upsampler.time_conv.weight",
+   "in_channels": 12,
+   "out_channels": 24,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.3.resnets.0.conv1.weight",
+   "in_channels": 12,
+   "out_channels": 6,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.3.resnets.0.conv2.weight",
+   "in_channels": 6,
+   "out_channels": 6,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.3.resnets.0.conv_shortcut.weight",
+   "in_channels": 12,
+   "out_channels": 6,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.3.resnets.1.conv1.weight",
+   "in_channels": 6,
+   "out_channels": 6,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.3.resnets.1.conv2.weight",
+   "in_channels": 6,
+   "out_channels": 6,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.3.resnets.2.conv1.weight",
+   "in_channels": 6,
+   "out_channels": 6,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.3.resnets.2.conv2.weight",
+   "in_channels": 6,
+   "out_channels": 6,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.3.upsampler.resample.1.weight",
+   "in_channels": 6,
+   "out_channels": 6,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": "nearest-exact x2"
+  },
+  {
+   "object": "vae/decoder.up_blocks.4.resnets.0.conv1.weight",
+   "in_channels": 6,
+   "out_channels": 3,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.4.resnets.0.conv2.weight",
+   "in_channels": 3,
+   "out_channels": 3,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.4.resnets.0.conv_shortcut.weight",
+   "in_channels": 6,
+   "out_channels": 3,
+   "kernel": [
+    1,
+    1
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.4.resnets.1.conv1.weight",
+   "in_channels": 3,
+   "out_channels": 3,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.4.resnets.1.conv2.weight",
+   "in_channels": 3,
+   "out_channels": 3,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.4.resnets.2.conv1.weight",
+   "in_channels": 3,
+   "out_channels": 3,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.up_blocks.4.resnets.2.conv2.weight",
+   "in_channels": 3,
+   "out_channels": 3,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  },
+  {
+   "object": "vae/decoder.conv_out.weight",
+   "in_channels": 3,
+   "out_channels": 4,
+   "kernel": [
+    3,
+    3
+   ],
+   "stride": [
+    1,
+    1
+   ],
+   "padding": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "upsample_before": null
+  }
+ ],
+ "tensors": [
+  {
+   "source": "text_encoder/model.language_model.embed_tokens.weight",
+   "object": "text_encoder/embed_tokens.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    256,
+    64
+   ],
+   "bytes": 32768,
+   "sha256": "a544b87b756e0f218ce8f23c3510d5ea430855d4e6af2fe7944fee29dbad578f",
+   "max_abs": 0.2021484375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.0.input_layernorm.weight",
+   "object": "text_encoder/layers.0.input_layernorm.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64
+   ],
+   "bytes": 128,
+   "sha256": "025c47e0e99d6c4b39a8e4e60eb4df419d4d12fef18770866dfbc00d9bf6c7e4",
+   "max_abs": 0.1572265625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.0.mlp.down_proj.weight",
+   "object": "text_encoder/layers.0.mlp.down_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    128
+   ],
+   "bytes": 8320,
+   "sha256": "52549056ae2a2df690df8d0e1af3ab88981fe729203306be2ba15b3eff7c136a",
+   "max_abs": 0.1884765625,
+   "rel_error": 0.02543885086278848
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.0.mlp.gate_proj.weight",
+   "object": "text_encoder/layers.0.mlp.gate_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    128,
+    64
+   ],
+   "bytes": 8448,
+   "sha256": "50a522ca5deffae2c63b3d1d84c66bd1de524ca324fe633245297d9027c665a2",
+   "max_abs": 0.1796875,
+   "rel_error": 0.025716788253606945
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.0.mlp.up_proj.weight",
+   "object": "text_encoder/layers.0.mlp.up_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    128,
+    64
+   ],
+   "bytes": 8448,
+   "sha256": "8b5a2773a72e9d057a40f55a56fab2210a7ac01f52af6cbcd030be8dfe0f668b",
+   "max_abs": 0.212890625,
+   "rel_error": 0.025290561515271294
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.0.post_attention_layernorm.weight",
+   "object": "text_encoder/layers.0.post_attention_layernorm.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64
+   ],
+   "bytes": 128,
+   "sha256": "bc508ef6d9cb193c50d8453e09bd78c6a30860a94a9f02eec420a194ce98a5bf",
+   "max_abs": 0.1708984375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.0.self_attn.k_norm.weight",
+   "object": "text_encoder/layers.0.self_attn.k_norm.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "15490f7d2f82e45515267ae8df0a912764baafef5b2e06f81f9151b6f4594ef7",
+   "max_abs": 0.15625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.0.self_attn.k_proj.weight",
+   "object": "text_encoder/layers.0.self_attn.k_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    32,
+    64
+   ],
+   "bytes": 2112,
+   "sha256": "5817b907a3270c59a3a8660c523c0339f5dc46f7e0390888ef36f4d525edf819",
+   "max_abs": 0.166015625,
+   "rel_error": 0.024551769912650616
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.0.self_attn.o_proj.weight",
+   "object": "text_encoder/layers.0.self_attn.o_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "2a957059625468c6ec080be898140d3a5a410cdfb7ff96318a5aa2a2f2c6e800",
+   "max_abs": 0.20703125,
+   "rel_error": 0.025089438442393888
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.0.self_attn.q_norm.weight",
+   "object": "text_encoder/layers.0.self_attn.q_norm.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "707eddfef16217c76e848c04e8cca441f16bd0de7e4efece2d357026a11b7576",
+   "max_abs": 0.130859375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.0.self_attn.q_proj.weight",
+   "object": "text_encoder/layers.0.self_attn.q_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "3a28defac5d6f14b553a1921c59e2ea9780f0d6493e86b204a6baeae03b17664",
+   "max_abs": 0.1943359375,
+   "rel_error": 0.025640408890054988
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.0.self_attn.v_proj.weight",
+   "object": "text_encoder/layers.0.self_attn.v_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    32,
+    64
+   ],
+   "bytes": 2112,
+   "sha256": "cf0b427fd893368321171301c625aa4e585a1c29eb58bcb6841ba928ec773988",
+   "max_abs": 0.1669921875,
+   "rel_error": 0.02471526296812625
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.1.input_layernorm.weight",
+   "object": "text_encoder/layers.1.input_layernorm.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64
+   ],
+   "bytes": 128,
+   "sha256": "ddfe1c493d967f3e21b1fef4c435160cb75719e1548117e6fbe3fdc75bc52b00",
+   "max_abs": 0.150390625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.1.mlp.down_proj.weight",
+   "object": "text_encoder/layers.1.mlp.down_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    128
+   ],
+   "bytes": 8320,
+   "sha256": "07c2a53177eabd095a6e53e1c1af54017421fc91aa3e25d010334e9e604b4e38",
+   "max_abs": 0.189453125,
+   "rel_error": 0.025766865135464865
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.1.mlp.gate_proj.weight",
+   "object": "text_encoder/layers.1.mlp.gate_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    128,
+    64
+   ],
+   "bytes": 8448,
+   "sha256": "7e8a7bf4e35d9e1206bc6e6b398854f472e929a43289d58ab784e6b102009059",
+   "max_abs": 0.19140625,
+   "rel_error": 0.025008288336612054
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.1.mlp.up_proj.weight",
+   "object": "text_encoder/layers.1.mlp.up_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    128,
+    64
+   ],
+   "bytes": 8448,
+   "sha256": "fa832deb1868e0ddbebedd9a3bf384fbca5ad0e4bea8cb883348cdc6cdcda35e",
+   "max_abs": 0.1875,
+   "rel_error": 0.024931893742239187
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.1.post_attention_layernorm.weight",
+   "object": "text_encoder/layers.1.post_attention_layernorm.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64
+   ],
+   "bytes": 128,
+   "sha256": "3fdf53b9e6b846ee45192382c927c11c854c2b7f22985c9c56749981ad7481d3",
+   "max_abs": 0.140625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.1.self_attn.k_norm.weight",
+   "object": "text_encoder/layers.1.self_attn.k_norm.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "8eeef68b920284a9e83ee4f0f1f65f8bd960594ba44ba21ce18193373cf43eb2",
+   "max_abs": 0.06982421875,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.1.self_attn.k_proj.weight",
+   "object": "text_encoder/layers.1.self_attn.k_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    32,
+    64
+   ],
+   "bytes": 2112,
+   "sha256": "456ca4f43a7c46c41cb4b71db99068addb4d6c1f4c7fd4e812699e40a1d4bfce",
+   "max_abs": 0.1904296875,
+   "rel_error": 0.025142841923174328
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.1.self_attn.o_proj.weight",
+   "object": "text_encoder/layers.1.self_attn.o_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "c3f09730f934d33f54ffcff261d26a1a71a6243249972ad70f96feb2ca5c0cd4",
+   "max_abs": 0.2333984375,
+   "rel_error": 0.02515287092923312
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.1.self_attn.q_norm.weight",
+   "object": "text_encoder/layers.1.self_attn.q_norm.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "b4a39f3be8d17a2e0abac0d106f17cd7f41681c91feff29f1668cc648ad09c9d",
+   "max_abs": 0.1064453125,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.1.self_attn.q_proj.weight",
+   "object": "text_encoder/layers.1.self_attn.q_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "d12446d8d2ce4ce743b6b713531c9532c76007629841bcfbb1d604ad4388ea01",
+   "max_abs": 0.189453125,
+   "rel_error": 0.024955186866641273
+  },
+  {
+   "source": "text_encoder/model.language_model.layers.1.self_attn.v_proj.weight",
+   "object": "text_encoder/layers.1.self_attn.v_proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    32,
+    64
+   ],
+   "bytes": 2112,
+   "sha256": "820635c7d6eaf41da0990b45d9c5ec476cbe26cccb90a801b84cfd4dc706d90e",
+   "max_abs": 0.1845703125,
+   "rel_error": 0.024442363588722163
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.0.attn.proj.bias",
+   "object": "vision/layers/0/attention/output_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "4f29b97420047d242772fb8ef2a874908e142c21a2d3a42aa5592969ce8730a1",
+   "max_abs": 0.1298828125,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.0.attn.proj.weight",
+   "object": "vision/layers/0/attention/output",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    32,
+    32
+   ],
+   "bytes": 4352,
+   "sha256": "a5830f6f84e5deb29d6823689dc0ab3a225e8d25a57a9ffe567d8557adcebcc4",
+   "max_abs": 0.1591796875,
+   "rel_error": 0.005403564218295039
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.0.attn.qkv.bias",
+   "object": "vision/layers/0/attention/qkv_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    96
+   ],
+   "bytes": 192,
+   "sha256": "0eb3d32d9e22941337771f1d76d2d5a8a12acc11415f620cd77f422901629a82",
+   "max_abs": 0.1640625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.0.attn.qkv.weight",
+   "object": "vision/layers/0/attention/qkv",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    96,
+    32
+   ],
+   "bytes": 13056,
+   "sha256": "16571e1b436261d8d99f1bc7ebaad60d33e46dbc965011334cb3438478b6b2cd",
+   "max_abs": 0.1865234375,
+   "rel_error": 0.005349979984217571
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.0.mlp.linear_fc1.bias",
+   "object": "vision/layers/0/mlp/fc1_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64
+   ],
+   "bytes": 128,
+   "sha256": "50f24d9ac88792e821790a9e47c8d5b3b1cd1e67f43788532b6f6055a62e4426",
+   "max_abs": 0.11181640625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.0.mlp.linear_fc1.weight",
+   "object": "vision/layers/0/mlp/fc1",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    64,
+    32
+   ],
+   "bytes": 8704,
+   "sha256": "13cb22256339702d8efd234f71f5bdbcf33399f9a4be05202d82a05e87a67490",
+   "max_abs": 0.216796875,
+   "rel_error": 0.005434493317350978
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.0.mlp.linear_fc2.bias",
+   "object": "vision/layers/0/mlp/fc2_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "a7ce481bbde355622876d7e860a7e2a8440ac1ed6a02abdb937c77c00fb3ef9a",
+   "max_abs": 0.1083984375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.0.mlp.linear_fc2.weight",
+   "object": "vision/layers/0/mlp/fc2",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    32,
+    64
+   ],
+   "bytes": 4352,
+   "sha256": "d847a019716c3f7de4f9890091435c2649f2ca7621d2604858b0523ba18c8f76",
+   "max_abs": 0.15625,
+   "rel_error": 0.005030807688497585
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.0.norm1.bias",
+   "object": "vision/layers/0/norm1/bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "abbeebbb023f3941a701ff69ef89a33a41f5013b5681a3bf49e8f160ba134e84",
+   "max_abs": 0.1298828125,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.0.norm1.weight",
+   "object": "vision/layers/0/norm1/weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "ab8f4454ab7adda29a353ca2eaa1d0b5032fb941a69b8b79147bc2ccfe091671",
+   "max_abs": 0.1328125,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.0.norm2.bias",
+   "object": "vision/layers/0/norm2/bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "4cb26f49a952b0e0cbbdfaea0e04006ee9d9c90f7a4754f7b853bbabbcb005a5",
+   "max_abs": 0.10107421875,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.0.norm2.weight",
+   "object": "vision/layers/0/norm2/weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "0451a668d2153a46adcb859f24bb0ab02de5dc50f7cbd0dd0b3e1f0894343da1",
+   "max_abs": 0.08837890625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.1.attn.proj.bias",
+   "object": "vision/layers/1/attention/output_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "8372a7011e8b5ed2ef0fd8f2e970b6a3381db7eeec4104c8533958f809c72350",
+   "max_abs": 0.1552734375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.1.attn.proj.weight",
+   "object": "vision/layers/1/attention/output",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    32,
+    32
+   ],
+   "bytes": 4352,
+   "sha256": "96b2e0d3580c4f33f52204ad86c482b5bfc7707e8c07e89b7c2d40812757195c",
+   "max_abs": 0.16796875,
+   "rel_error": 0.005222192642165571
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.1.attn.qkv.bias",
+   "object": "vision/layers/1/attention/qkv_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    96
+   ],
+   "bytes": 192,
+   "sha256": "d8741875069865c728ac07c77cdb776fc860da5df881e6ba30f2407b0302fc56",
+   "max_abs": 0.138671875,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.1.attn.qkv.weight",
+   "object": "vision/layers/1/attention/qkv",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    96,
+    32
+   ],
+   "bytes": 13056,
+   "sha256": "b2854c83cdb6278396639cbfec3fa751a4c964b35b24d76d2b17433ea0f75ccf",
+   "max_abs": 0.1904296875,
+   "rel_error": 0.005334159045130002
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.1.mlp.linear_fc1.bias",
+   "object": "vision/layers/1/mlp/fc1_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64
+   ],
+   "bytes": 128,
+   "sha256": "89ff80059992edffc8f9ed18585a16070e386a171513bb58fc4556b29f0dec10",
+   "max_abs": 0.1943359375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.1.mlp.linear_fc1.weight",
+   "object": "vision/layers/1/mlp/fc1",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    64,
+    32
+   ],
+   "bytes": 8704,
+   "sha256": "45561cf55528f348da2711dc0e9bb1965efb137c56b02ea1ea019ee6f61cf89b",
+   "max_abs": 0.1640625,
+   "rel_error": 0.005382094748953114
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.1.mlp.linear_fc2.bias",
+   "object": "vision/layers/1/mlp/fc2_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "26c4f54e9e3baa2c50fb15b69cd4292dae54eb4a023e3ce4b2758842e0747f4c",
+   "max_abs": 0.115234375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.1.mlp.linear_fc2.weight",
+   "object": "vision/layers/1/mlp/fc2",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    32,
+    64
+   ],
+   "bytes": 4352,
+   "sha256": "f86222839d56c959ebf789440dd7426b2461fb63df974e66c490c4e00f60f382",
+   "max_abs": 0.1904296875,
+   "rel_error": 0.005266296581150554
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.1.norm1.bias",
+   "object": "vision/layers/1/norm1/bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "74bb1b89d6247e8dc733930862c2c7c257c43f1143f30e230854605e654737d0",
+   "max_abs": 0.140625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.1.norm1.weight",
+   "object": "vision/layers/1/norm1/weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "2920a6ab18910c2edce1e68094f04fd3ad0d7de0002353cd2a33aaa3db10e0c1",
+   "max_abs": 0.1005859375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.1.norm2.bias",
+   "object": "vision/layers/1/norm2/bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "891149c2a77e4a6b01275a1bf53aea3309e3a04983747427f23a671585a66bf3",
+   "max_abs": 0.1279296875,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.1.norm2.weight",
+   "object": "vision/layers/1/norm2/weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "9f80135ffab5f633c19c399cb2cb2acc90cb14a4572ddd97d9a67b640f7dc7c9",
+   "max_abs": 0.12890625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.2.attn.proj.bias",
+   "object": "vision/layers/2/attention/output_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "7bd4f56ec76e7b1049e08c0d770a458948fe38ab40780ba1648570f86d72d346",
+   "max_abs": 0.11376953125,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.2.attn.proj.weight",
+   "object": "vision/layers/2/attention/output",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    32,
+    32
+   ],
+   "bytes": 4352,
+   "sha256": "2fef7d8ff7bf723ceb55e0992bb3329f20e0808fe8e370dd34c48dd8eb99369e",
+   "max_abs": 0.1640625,
+   "rel_error": 0.005241979580895146
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.2.attn.qkv.bias",
+   "object": "vision/layers/2/attention/qkv_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    96
+   ],
+   "bytes": 192,
+   "sha256": "46b490b681e00d204262f6ca6425eb5b48caa9241e5395a25aa678dd95daa694",
+   "max_abs": 0.134765625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.2.attn.qkv.weight",
+   "object": "vision/layers/2/attention/qkv",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    96,
+    32
+   ],
+   "bytes": 13056,
+   "sha256": "89f84ca19a1178c82e888c0f6e0a6fb684b94411edc737654f9c03a5f1bd0762",
+   "max_abs": 0.1865234375,
+   "rel_error": 0.0053507683631497755
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.2.mlp.linear_fc1.bias",
+   "object": "vision/layers/2/mlp/fc1_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64
+   ],
+   "bytes": 128,
+   "sha256": "95580e5606491bcd2586c7032b73c3375c7b72a4c74a8c16053aa8a3a6e6f748",
+   "max_abs": 0.1025390625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.2.mlp.linear_fc1.weight",
+   "object": "vision/layers/2/mlp/fc1",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    64,
+    32
+   ],
+   "bytes": 8704,
+   "sha256": "f147432cbd0162d5daaa794be538bbfcb45a97aa8a4371b5e5a0e919e54e7f4b",
+   "max_abs": 0.1708984375,
+   "rel_error": 0.005234294089314632
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.2.mlp.linear_fc2.bias",
+   "object": "vision/layers/2/mlp/fc2_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "8600b05f72d2ff2df50bbf89353341689903b753f3a85614008bdd724dda16fd",
+   "max_abs": 0.103515625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.2.mlp.linear_fc2.weight",
+   "object": "vision/layers/2/mlp/fc2",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    32,
+    64
+   ],
+   "bytes": 4352,
+   "sha256": "4fe888354dc7b7f5538f9115ba469ae3ad0386f60a5765e60a5b8d5b4a224dc2",
+   "max_abs": 0.1650390625,
+   "rel_error": 0.0053307542782741685
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.2.norm1.bias",
+   "object": "vision/layers/2/norm1/bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "4c8619fb91cbff2c3d40399eacb6ed3c9d4401518aff35d4cd4c7861b62ef3dc",
+   "max_abs": 0.08935546875,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.2.norm1.weight",
+   "object": "vision/layers/2/norm1/weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "cdc3daf3551cbde8ce4532e1e03c259dff4024a257b5bdfb4bc25ff5c6b93f5f",
+   "max_abs": 0.1044921875,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.2.norm2.bias",
+   "object": "vision/layers/2/norm2/bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "fa7b27a67b03297a937a175eeacbcb077d0550dcf46bd4de2c9454fa9171102e",
+   "max_abs": 0.10107421875,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.blocks.2.norm2.weight",
+   "object": "vision/layers/2/norm2/weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "e364cfe5053e2de77dedd4c82eb41e61b8d60132756401f4e845042a5c29231e",
+   "max_abs": 0.1552734375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.0.linear_fc1.bias",
+   "object": "vision/deepstack/0/fc1_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    128
+   ],
+   "bytes": 256,
+   "sha256": "6b4d0bc069629ba43b48258a2f9de655f9052e1ea83e72ce40ef83295d76ab61",
+   "max_abs": 0.1435546875,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.0.linear_fc1.weight",
+   "object": "vision/deepstack/0/fc1",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    128,
+    128
+   ],
+   "bytes": 17408,
+   "sha256": "8dff9735974628b33725d742489ca319982c5881fee6eb524d2b3518dd09967f",
+   "max_abs": 0.216796875,
+   "rel_error": 0.0053216968837963095
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.0.linear_fc2.bias",
+   "object": "vision/deepstack/0/fc2_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64
+   ],
+   "bytes": 128,
+   "sha256": "9bfb6d0ac0e4a9450fac2883a9a34ec332e0ce936412544d18886e3974a931a4",
+   "max_abs": 0.189453125,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.0.linear_fc2.weight",
+   "object": "vision/deepstack/0/fc2",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    64,
+    128
+   ],
+   "bytes": 8704,
+   "sha256": "6efdf579fa11de3a1ba5b2a304834429f095ceffbf7ed5040f41f27507ffd501",
+   "max_abs": 0.2109375,
+   "rel_error": 0.005371496241556796
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.0.norm.bias",
+   "object": "vision/deepstack/0/norm/bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    128
+   ],
+   "bytes": 256,
+   "sha256": "122fb8fe3cbe4e5387b609838575f08ed621ab5e1e8d772197392bd4215dbc31",
+   "max_abs": 0.140625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.0.norm.weight",
+   "object": "vision/deepstack/0/norm/weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    128
+   ],
+   "bytes": 256,
+   "sha256": "ebd8e86d0068307777aeb23508cd55d85950c907b3b7da9a34d0a6b7adcae47a",
+   "max_abs": 0.1240234375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.1.linear_fc1.bias",
+   "object": "vision/deepstack/1/fc1_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    128
+   ],
+   "bytes": 256,
+   "sha256": "496d4801218ea405e8a956e619d37313135c9c6bcfae589eaf94ea6384c8aea4",
+   "max_abs": 0.1572265625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.1.linear_fc1.weight",
+   "object": "vision/deepstack/1/fc1",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    128,
+    128
+   ],
+   "bytes": 17408,
+   "sha256": "788b0dd6a47a3e3f4121c9caaee3495bf601969e50c52c2c1bfcb056ed3c6b57",
+   "max_abs": 0.220703125,
+   "rel_error": 0.0054126356025685695
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.1.linear_fc2.bias",
+   "object": "vision/deepstack/1/fc2_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64
+   ],
+   "bytes": 128,
+   "sha256": "7ea0e501d0345f937ba4f688f9ef84d579a326ad60a43ff3b525e47dece3cc5e",
+   "max_abs": 0.0947265625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.1.linear_fc2.weight",
+   "object": "vision/deepstack/1/fc2",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    64,
+    128
+   ],
+   "bytes": 8704,
+   "sha256": "807e4dfaaebc5a3caf53dc793ad753e62be92c296b4abdffe34e609fb63c3540",
+   "max_abs": 0.1845703125,
+   "rel_error": 0.005291958505734647
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.1.norm.bias",
+   "object": "vision/deepstack/1/norm/bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    128
+   ],
+   "bytes": 256,
+   "sha256": "ed502f7e9338a10aec6aa9c1158fc7d6ed40644da29b3533b2f7bad71ea908c9",
+   "max_abs": 0.1494140625,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.1.norm.weight",
+   "object": "vision/deepstack/1/norm/weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    128
+   ],
+   "bytes": 256,
+   "sha256": "3c36aeea1eeb0f283b3012ebe2fe3e39617fc525db748473307516cce790c73a",
+   "max_abs": 0.126953125,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.2.linear_fc1.bias",
+   "object": "vision/deepstack/2/fc1_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    128
+   ],
+   "bytes": 256,
+   "sha256": "b736f404c4b57b630ac06a6670da5c2f95de5cf57bb28d5a4f72021ac3a1fcf4",
+   "max_abs": 0.1484375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.2.linear_fc1.weight",
+   "object": "vision/deepstack/2/fc1",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    128,
+    128
+   ],
+   "bytes": 17408,
+   "sha256": "55b3f8335ffd052f79bd8d60ec98c530464626efec83807b5e4ee2ad3e9c319f",
+   "max_abs": 0.212890625,
+   "rel_error": 0.005345698986595786
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.2.linear_fc2.bias",
+   "object": "vision/deepstack/2/fc2_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64
+   ],
+   "bytes": 128,
+   "sha256": "26f1254bad7735da8f341569ff2d9d5ccb12923afbc65dee0ce3aa901444fe49",
+   "max_abs": 0.1328125,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.2.linear_fc2.weight",
+   "object": "vision/deepstack/2/fc2",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    64,
+    128
+   ],
+   "bytes": 8704,
+   "sha256": "6c56fc0ae6739cf62c47d92a162d9cb64d99a792688379c7aa999f1660b68178",
+   "max_abs": 0.1845703125,
+   "rel_error": 0.0053311269045390325
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.2.norm.bias",
+   "object": "vision/deepstack/2/norm/bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    128
+   ],
+   "bytes": 256,
+   "sha256": "b5a072295c60fd87b9f3eb73e4700f56451274757f9d3ae23517f9043830801f",
+   "max_abs": 0.12451171875,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.deepstack_merger_list.2.norm.weight",
+   "object": "vision/deepstack/2/norm/weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    128
+   ],
+   "bytes": 256,
+   "sha256": "f1c6d4cfd32e271f300695040125ce76d5314207e9bf8e898ed9924faa7e9338",
+   "max_abs": 0.14453125,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.merger.linear_fc1.bias",
+   "object": "vision/merger/fc1_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    128
+   ],
+   "bytes": 256,
+   "sha256": "2a746bd8030db7eaf16540ff3172c13e13f742e876df915c269f8da7e598910c",
+   "max_abs": 0.1162109375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.merger.linear_fc1.weight",
+   "object": "vision/merger/fc1",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    128,
+    128
+   ],
+   "bytes": 17408,
+   "sha256": "7a3bf1f4c963e0502706431f9f3d45669cb56bc77464add4554975285c892d9b",
+   "max_abs": 0.228515625,
+   "rel_error": 0.005282876306784822
+  },
+  {
+   "source": "text_encoder/model.visual.merger.linear_fc2.bias",
+   "object": "vision/merger/fc2_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64
+   ],
+   "bytes": 128,
+   "sha256": "0f1a6c03f2619ac271898a07cd2db97678434bc2fc2bf9814f06365c1e938623",
+   "max_abs": 0.1044921875,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.merger.linear_fc2.weight",
+   "object": "vision/merger/fc2",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    64,
+    128
+   ],
+   "bytes": 8704,
+   "sha256": "86d119d91b3341a48056e851a5681de8adef1db5b2d870036caf165e7757bf79",
+   "max_abs": 0.19140625,
+   "rel_error": 0.00543111720272036
+  },
+  {
+   "source": "text_encoder/model.visual.merger.norm.bias",
+   "object": "vision/merger/norm/bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "9973b72de5fe68fd5b9e1d1cb3ec2151b9f716dfec7c4a0c22ad768611e7a292",
+   "max_abs": 0.1748046875,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.merger.norm.weight",
+   "object": "vision/merger/norm/weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "bfe1ea84a2d822d44aa1782fc8887258e542ef3a3f43ab940428858d99a8f07a",
+   "max_abs": 0.15234375,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.patch_embed.proj.bias",
+   "object": "vision/patch_embedding_bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "7e13a9b3d1e3fb5db74aa72d06294789f5ed1dbb67678974ec6f13096442d282",
+   "max_abs": 0.10595703125,
+   "rel_error": null
+  },
+  {
+   "source": "text_encoder/model.visual.patch_embed.proj.weight",
+   "object": "vision/patch_embedding",
+   "encoding": "w8",
+   "format": "W8G32_F16S",
+   "layout": "row-split-k128-v1",
+   "shape": [
+    32,
+    96
+   ],
+   "bytes": 4352,
+   "sha256": "d2cd602bc6db27ff84d6c8f669d2000d5aa197e104eb7c9eaa23ece881976011",
+   "max_abs": 0.205078125,
+   "rel_error": 0.0054319783169425396
+  },
+  {
+   "source": "text_encoder/model.visual.pos_embed.weight",
+   "object": "vision/position_embedding",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    32
+   ],
+   "bytes": 1024,
+   "sha256": "009b158d6ee273a5f29f50a2965a26feed724ded4dc5897b22df7622dcd42fd8",
+   "max_abs": 0.154296875,
+   "rel_error": null
+  },
+  {
+   "source": "transformer/img_in.weight",
+   "object": "transformer/img_in.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    16
+   ],
+   "bytes": 1152,
+   "sha256": "0d72842997cbd311a17a66d83265750b15c6b34583df5fccebd9c09a37501ee5",
+   "max_abs": 0.173828125,
+   "rel_error": 0.021801275810425482
+  },
+  {
+   "source": "transformer/modulation.1.weight",
+   "object": "transformer/modulation.1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    256,
+    64
+   ],
+   "bytes": 32768,
+   "sha256": "7487c6581919ed31e9efe3828ee3a44022aa3766f8d82d618ec89bea2279740d",
+   "max_abs": 0.2294921875,
+   "rel_error": null
+  },
+  {
+   "source": "transformer/time_text_embed.timestep_embedder.linear_1.weight",
+   "object": "transformer/time_text_embed.timestep_embedder.linear_1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64,
+    256
+   ],
+   "bytes": 32768,
+   "sha256": "8caf57cfad6ec7c24e9d9dedab767673ca6f043a8f5d36fc51b2ae3295cd927b",
+   "max_abs": 0.203125,
+   "rel_error": null
+  },
+  {
+   "source": "transformer/time_text_embed.timestep_embedder.linear_2.weight",
+   "object": "transformer/time_text_embed.timestep_embedder.linear_2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 8192,
+   "sha256": "c75dd3c030dd73df4305cd60cc75617a295c8af0f91efd695a7cd34a3fa49201",
+   "max_abs": 0.2080078125,
+   "rel_error": null
+  },
+  {
+   "source": "transformer/transformer_blocks.0.attn.norm_k.weight",
+   "object": "transformer/transformer_blocks.0.attn.norm_k.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "9a6b8774852c32e65d4012146e9f14b255a0adcf23f498e9ebe394dcfbcd9e0e",
+   "max_abs": 0.095703125,
+   "rel_error": null
+  },
+  {
+   "source": "transformer/transformer_blocks.0.attn.norm_q.weight",
+   "object": "transformer/transformer_blocks.0.attn.norm_q.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "42f1c1817c6df5affc4b2a00a3c48d2dd1d7bd410d939efffbcc2f37f9dac307",
+   "max_abs": 0.0908203125,
+   "rel_error": null
+  },
+  {
+   "source": "transformer/transformer_blocks.0.attn.to_k.weight",
+   "object": "transformer/transformer_blocks.0.attn.to_k.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "e725c0de51dda9cffa8e01c956fcbfa0215ec7363969427beb6d0544b4a001cd",
+   "max_abs": 0.173828125,
+   "rel_error": 0.025663194267016597
+  },
+  {
+   "source": "transformer/transformer_blocks.0.attn.to_out.0.weight",
+   "object": "transformer/transformer_blocks.0.attn.to_out.0.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "59dc064f60fcc4ecaa42429227ee13223dc9f07ec0e7837c5bd0e2d2d79ec1c6",
+   "max_abs": 0.1884765625,
+   "rel_error": 0.02506614928195527
+  },
+  {
+   "source": "transformer/transformer_blocks.0.attn.to_q.weight",
+   "object": "transformer/transformer_blocks.0.attn.to_q.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "b1c85e44f38ee9c42b3dcc987ae615a7e81a2da63efd0e99a80cec27d107594c",
+   "max_abs": 0.1650390625,
+   "rel_error": 0.02496964744760706
+  },
+  {
+   "source": "transformer/transformer_blocks.0.attn.to_v.weight",
+   "object": "transformer/transformer_blocks.0.attn.to_v.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "e45da71b6696d94f1c74a223ef8f06dfc606473f197dd44ea0feb167bccadef5",
+   "max_abs": 0.1796875,
+   "rel_error": 0.0254178369268188
+  },
+  {
+   "source": "transformer/transformer_blocks.0.img_mlp.proj.weight",
+   "object": "transformer/transformer_blocks.0.img_mlp.proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    192,
+    64
+   ],
+   "bytes": 12672,
+   "sha256": "6237dab8af102ab18f80324350f6c0aca3f6a51d8653425a893d6053b6b11e08",
+   "max_abs": 0.2119140625,
+   "rel_error": 0.025134895039590457
+  },
+  {
+   "source": "transformer/txt_in.in_layer.weight",
+   "object": "transformer/txt_in.in_layer.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "6f392e024e4d681417e981d6c66749314e160d91f512b047552bb81150db11f2",
+   "max_abs": 0.181640625,
+   "rel_error": 0.025368266852773796
+  },
+  {
+   "source": "transformer/txt_in.out_layer.weight",
+   "object": "transformer/txt_in.out_layer.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "a62f8d5d2a52481a5d583ecdfc187dafd2d8ccf50f30ed25e6fe5883e0f5123b",
+   "max_abs": 0.2041015625,
+   "rel_error": 0.025761099738615192
+  },
+  {
+   "source": "transformer/txt_in.text_norm.weight",
+   "object": "transformer/txt_in.text_norm.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64
+   ],
+   "bytes": 128,
+   "sha256": "7e9b7b887bf9623af9193809d331c56060c474a1749f443f2bd9bbe35fd4d43f",
+   "max_abs": 0.162109375,
+   "rel_error": null
+  },
+  {
+   "source": "transformer/transformer_blocks.0.img_mlp.gate_layer.weight",
+   "object": "transformer/transformer_blocks.0.img_mlp.gate_layer.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    192,
+    64
+   ],
+   "bytes": 12672,
+   "sha256": "408e8013a67ef30ee8c0317bcbe60c6029289ba432ab92a1229960dc82670520",
+   "max_abs": 0.19140625,
+   "rel_error": 0.02513280613360084
+  },
+  {
+   "source": "transformer/transformer_blocks.0.img_mlp.out.weight",
+   "object": "transformer/transformer_blocks.0.img_mlp.out.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    192
+   ],
+   "bytes": 12416,
+   "sha256": "aa4b81b187b5a57da9e95e2449352e14cc23deed5756d31e5780bf54e66d21dd",
+   "max_abs": 0.19140625,
+   "rel_error": 0.025763646485125632
+  },
+  {
+   "source": "transformer/transformer_blocks.1.attn.norm_k.weight",
+   "object": "transformer/transformer_blocks.1.attn.norm_k.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "9d8e9aacc6727aa4915dc7302ef0033e1c3e0c40896c3fb90d5d6bf0c58dbe4c",
+   "max_abs": 0.119140625,
+   "rel_error": null
+  },
+  {
+   "source": "transformer/transformer_blocks.1.attn.norm_q.weight",
+   "object": "transformer/transformer_blocks.1.attn.norm_q.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "d8154909eca63515c7b1671d79ac28c296442680f3349b568e3674656a9566d6",
+   "max_abs": 0.09765625,
+   "rel_error": null
+  },
+  {
+   "source": "transformer/transformer_blocks.1.attn.to_k.weight",
+   "object": "transformer/transformer_blocks.1.attn.to_k.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "5999f10bc6d26261d9d0dfb24c8dea85db171da22afdbd0179c2b71b389d73ec",
+   "max_abs": 0.197265625,
+   "rel_error": 0.02557796852008072
+  },
+  {
+   "source": "transformer/transformer_blocks.1.attn.to_out.0.weight",
+   "object": "transformer/transformer_blocks.1.attn.to_out.0.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "1754669a191c98f409c8f588f38b62f70503f622f0eee87642ebc77fb121dfdb",
+   "max_abs": 0.197265625,
+   "rel_error": 0.02506436528890296
+  },
+  {
+   "source": "transformer/transformer_blocks.1.attn.to_q.weight",
+   "object": "transformer/transformer_blocks.1.attn.to_q.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "3b6dbbbc3d1f979231c868f3bd6d5ed6605e363d4195765327fb6026b2910384",
+   "max_abs": 0.1943359375,
+   "rel_error": 0.02517943819612456
+  },
+  {
+   "source": "transformer/transformer_blocks.1.attn.to_v.weight",
+   "object": "transformer/transformer_blocks.1.attn.to_v.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 4224,
+   "sha256": "21114845d3ae0b3602642c195f35a2a81809b79d75c7839b12a5613336fe2e70",
+   "max_abs": 0.1943359375,
+   "rel_error": 0.024961406445376245
+  },
+  {
+   "source": "transformer/transformer_blocks.1.img_mlp.out.weight",
+   "object": "transformer/transformer_blocks.1.img_mlp.out.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    64,
+    192
+   ],
+   "bytes": 12416,
+   "sha256": "c712d1c8cced66a0788f09c9954ac253ea8298cb133c2ca0f3d173ab6e4e4c19",
+   "max_abs": 0.1982421875,
+   "rel_error": 0.02594304666599635
+  },
+  {
+   "source": "transformer/transformer_blocks.1.img_mlp.proj.weight",
+   "object": "transformer/transformer_blocks.1.img_mlp.proj.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    192,
+    64
+   ],
+   "bytes": 12672,
+   "sha256": "a41ab7d4646cc0cc973d765f51b7cd34fd4c10fe3320c9fd71ff494afd4f7ebe",
+   "max_abs": 0.1982421875,
+   "rel_error": 0.025509855953159393
+  },
+  {
+   "source": "transformer/norm_out.linear.weight",
+   "object": "transformer/norm_out.linear.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    64,
+    64
+   ],
+   "bytes": 8192,
+   "sha256": "483bdfee555366319bba1796aae20e21dcee1c13d4f98033b9e8e5e059c407c1",
+   "max_abs": 0.1943359375,
+   "rel_error": null
+  },
+  {
+   "source": "transformer/proj_out.weight",
+   "object": "transformer/proj_out.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    16,
+    64
+   ],
+   "bytes": 1056,
+   "sha256": "f11698d41b3d2608db81c6293edd7d1ebb09d9385d5e8eddfea0c4d1f9b3e5ac",
+   "max_abs": 0.1865234375,
+   "rel_error": 0.02576631546290717
+  },
+  {
+   "source": "transformer/transformer_blocks.1.img_mlp.gate_layer.weight",
+   "object": "transformer/transformer_blocks.1.img_mlp.gate_layer.weight",
+   "encoding": "fp8",
+   "format": "FP8_E4M3FN_ROW_BF16S",
+   "layout": "row-scale-v1",
+   "shape": [
+    192,
+    64
+   ],
+   "bytes": 12672,
+   "sha256": "a54db3c295a43693a664a24503e04e87e33b61b066dde6effc0d152f4ab759e5",
+   "max_abs": 0.20703125,
+   "rel_error": 0.024964797087566385
+  },
+  {
+   "source": "vae/decoder.conv_in.bias",
+   "object": "vae/decoder.conv_in.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "253c85e2cdddb306145354e8e4a5422a7ed5394a4ce811e95086a2eeab7abf5c",
+   "max_abs": 0.11962890625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.conv_in.weight",
+   "object": "vae/decoder.conv_in.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    16,
+    3,
+    3
+   ],
+   "bytes": 6912,
+   "sha256": "90099f9241907dc2bcbe1135982a6801bb1f842b900e98e8e6d149698e73db0e",
+   "max_abs": 0.1669921875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.conv_out.bias",
+   "object": "vae/decoder.conv_out.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4
+   ],
+   "bytes": 8,
+   "sha256": "8b063b636a4c4c48e026aba57691d084fee04f7cd8be0b706bcdae8bfd55d455",
+   "max_abs": 0.0101318359375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.conv_out.weight",
+   "object": "vae/decoder.conv_out.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    3,
+    3,
+    3
+   ],
+   "bytes": 216,
+   "sha256": "ed228eafbc28d4ec6cd956297cfc3a7308f3ee9030afe8042dfd5ba1ce35e9b0",
+   "max_abs": 0.142578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.attentions.0.norm.gamma",
+   "object": "vae/decoder.mid_block.attentions.0.norm.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "9abddf2eb8bd7976b4aa687d146b72d91e411f7aead10b82557345dc7d00731d",
+   "max_abs": 0.10986328125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.attentions.0.proj.bias",
+   "object": "vae/decoder.mid_block.attentions.0.proj.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "fc08771cce05f9111b95f25ec0f352ac30fc68ff60798a8d73904b07cbea8cff",
+   "max_abs": 0.0908203125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.attentions.0.proj.weight",
+   "object": "vae/decoder.mid_block.attentions.0.proj.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    1,
+    1
+   ],
+   "bytes": 1152,
+   "sha256": "c83ab1862ca1d33dce78ef923bf937d3948e174ad91c71e809b04151a669cde3",
+   "max_abs": 0.1630859375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.attentions.0.to_qkv.bias",
+   "object": "vae/decoder.mid_block.attentions.0.to_qkv.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    72
+   ],
+   "bytes": 144,
+   "sha256": "67c319f4916157594cf8b52b9e2bf3ed26b3631a0dbbec2c21ff0cec46687dd1",
+   "max_abs": 0.1416015625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.attentions.0.to_qkv.weight",
+   "object": "vae/decoder.mid_block.attentions.0.to_qkv.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    72,
+    24,
+    1,
+    1
+   ],
+   "bytes": 3456,
+   "sha256": "c6ef920f54de6332cedefdefa261b1441eb5c4ccdeee411a59ac6fdfc335ea2e",
+   "max_abs": 0.181640625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.resnets.0.conv1.bias",
+   "object": "vae/decoder.mid_block.resnets.0.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "03602a3f29db16407e7cc72474d655defd32e3215d23f480e0c765d248409e21",
+   "max_abs": 0.16015625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.resnets.0.conv1.weight",
+   "object": "vae/decoder.mid_block.resnets.0.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "872a5155792c170bbf6facec04aca51765c84d172866ff77f582d83827a64c46",
+   "max_abs": 0.1923828125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.resnets.0.conv2.bias",
+   "object": "vae/decoder.mid_block.resnets.0.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "d612cdb0a32bf1d0586dfedd3990fc0523a6ecd47d55eb7654ed6d89d6a05e97",
+   "max_abs": 0.11083984375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.resnets.0.conv2.weight",
+   "object": "vae/decoder.mid_block.resnets.0.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "d5a81dd30b48609889f39bfb3f3ce9143d093dd07da02130bb86bb59c01ea09c",
+   "max_abs": 0.1904296875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.resnets.0.norm1.gamma",
+   "object": "vae/decoder.mid_block.resnets.0.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "d89d41beae38688e6827d76c0fbf689d6c5b85779c5001deb2bf4970959482c4",
+   "max_abs": 0.10546875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.resnets.0.norm2.gamma",
+   "object": "vae/decoder.mid_block.resnets.0.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "d17f797cc8a6c1dcbdfeeeeb6681e8f2edbb1885f250d3640175da18bb21719d",
+   "max_abs": 0.11181640625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.resnets.1.conv1.bias",
+   "object": "vae/decoder.mid_block.resnets.1.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "92363c88e0225880e9bf95d51cba00fa6970142fc9c5aab172b369e5601ee03e",
+   "max_abs": 0.10888671875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.resnets.1.conv1.weight",
+   "object": "vae/decoder.mid_block.resnets.1.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "614091060d61115031df7023b67c43ca1f4997f57fbe0fd6a74834086d0ae942",
+   "max_abs": 0.2119140625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.resnets.1.conv2.bias",
+   "object": "vae/decoder.mid_block.resnets.1.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "0985b06c84fca6650adfbc86bbbf0d5921904a21f52e96069f3003966c12b785",
+   "max_abs": 0.0927734375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.resnets.1.conv2.weight",
+   "object": "vae/decoder.mid_block.resnets.1.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "105fb6935158150336c2a6269b6d47f9b24232de73705c2ace67c21ab28fe7be",
+   "max_abs": 0.1767578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.resnets.1.norm1.gamma",
+   "object": "vae/decoder.mid_block.resnets.1.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "9051b1a8d31c3fc6a1f7dd4a5b3339f1c81bd5d987a280e5054528e71820f6fe",
+   "max_abs": 0.1142578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.mid_block.resnets.1.norm2.gamma",
+   "object": "vae/decoder.mid_block.resnets.1.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "17cdb1950204649c4096b40c08bb7cf0b23462b35d99af8082f0229cfda0deb7",
+   "max_abs": 0.11865234375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.norm_out.gamma",
+   "object": "vae/decoder.norm_out.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    1,
+    1,
+    1
+   ],
+   "bytes": 6,
+   "sha256": "6cad93b2254674989b3c3f1dba18bf1265087ca15db539b0f7506e58af1a85c0",
+   "max_abs": 0.037841796875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.0.conv1.bias",
+   "object": "vae/decoder.up_blocks.0.resnets.0.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "cf8dfd683680862af5f829841910c9b22e4ac458c26381546450ee54993bc390",
+   "max_abs": 0.1162109375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.0.conv1.weight",
+   "object": "vae/decoder.up_blocks.0.resnets.0.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "99b97d0fd368af1bbc3da295d56ba761db30b01f39906771a31a5d875ea8f4f2",
+   "max_abs": 0.1953125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.0.conv2.bias",
+   "object": "vae/decoder.up_blocks.0.resnets.0.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "8d3e9b5c3472e09a892c3ee43259cf498e49a0a4235a11764867e29c180cebc9",
+   "max_abs": 0.11865234375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.0.conv2.weight",
+   "object": "vae/decoder.up_blocks.0.resnets.0.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "5a3c3feb48377002d106830fc852d6eed239295c9148e855ce53c5ece0c3f6ed",
+   "max_abs": 0.1650390625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.0.norm1.gamma",
+   "object": "vae/decoder.up_blocks.0.resnets.0.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "666f0ef270a413d656058cdfafedae4aa61ff656244467519fdc253668561b1d",
+   "max_abs": 0.09375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.0.norm2.gamma",
+   "object": "vae/decoder.up_blocks.0.resnets.0.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "d4910cbb8dbf2428918a792bcab63543cdc715f650ea2ea78a863f40fd006c53",
+   "max_abs": 0.10595703125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.1.conv1.bias",
+   "object": "vae/decoder.up_blocks.0.resnets.1.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "8c9c54fce0aeb719d5bb8c28291b0b1659b8db898adc978de17151562d9c9ee6",
+   "max_abs": 0.134765625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.1.conv1.weight",
+   "object": "vae/decoder.up_blocks.0.resnets.1.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "6391f395f4138432438b339f79af4419f26cc8e037ff6d70a3fa6703011a54ff",
+   "max_abs": 0.1923828125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.1.conv2.bias",
+   "object": "vae/decoder.up_blocks.0.resnets.1.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "544e11298c2458ab58587e10bba1905d0656f39f7051557b9794b4fd2810a1d7",
+   "max_abs": 0.07666015625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.1.conv2.weight",
+   "object": "vae/decoder.up_blocks.0.resnets.1.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "b5001b49521197a48fb27fd1f169c0381c37d2eb2b589bdcd1eda4490dd12ebd",
+   "max_abs": 0.17578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.1.norm1.gamma",
+   "object": "vae/decoder.up_blocks.0.resnets.1.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "1403dca1c220fc6e87705b1b7f43eb3fff3271fc91412077901ba9a9321e928e",
+   "max_abs": 0.08203125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.1.norm2.gamma",
+   "object": "vae/decoder.up_blocks.0.resnets.1.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "4ed09749fe7489c39e714ab3d7a2b682429f35f33e28033b79e2063689db689e",
+   "max_abs": 0.103515625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.2.conv1.bias",
+   "object": "vae/decoder.up_blocks.0.resnets.2.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "f497af2a8981e024e3ea9482bfc39217fce0a94d9f04b6078662d5f7de855e8e",
+   "max_abs": 0.12158203125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.2.conv1.weight",
+   "object": "vae/decoder.up_blocks.0.resnets.2.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "8fd9ad6a194c9f102065bdf9a2ea83adcd1433276be43a1a0f39c377e7029b82",
+   "max_abs": 0.220703125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.2.conv2.bias",
+   "object": "vae/decoder.up_blocks.0.resnets.2.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "a357c99ea74428e44460c5aff1bc3aa7af5d856efa9f289eca3004a00e9d51ed",
+   "max_abs": 0.0908203125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.2.conv2.weight",
+   "object": "vae/decoder.up_blocks.0.resnets.2.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "168b7a52f85f44a407a60aad105b01669430ec40c7a7a15d06c70d7a5aad25c8",
+   "max_abs": 0.2021484375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.2.norm1.gamma",
+   "object": "vae/decoder.up_blocks.0.resnets.2.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "ca528e45f2a341253f491eaf920920e770ee2673a1afadf9f9f2834409a3ab5e",
+   "max_abs": 0.125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.resnets.2.norm2.gamma",
+   "object": "vae/decoder.up_blocks.0.resnets.2.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "a863c168355ac51048818d42785576f4264d62e6728f8d906240b28d5320dd92",
+   "max_abs": 0.076171875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.upsampler.resample.1.bias",
+   "object": "vae/decoder.up_blocks.0.upsampler.resample.1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "079a0c3f0c2e25f4e1f1706931d224ed4f2484777c03148ce9f277becdb3a833",
+   "max_abs": 0.1279296875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.upsampler.resample.1.weight",
+   "object": "vae/decoder.up_blocks.0.upsampler.resample.1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "e9b993f88442a62141512784a8592f1bd7512ece6d99a554c5f11ac968668b64",
+   "max_abs": 0.1953125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.upsampler.time_conv.bias",
+   "object": "vae/decoder.up_blocks.0.upsampler.time_conv.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    48
+   ],
+   "bytes": 96,
+   "sha256": "e84e8e75198bb0661cceaa8cb121afce4fe233a8ff90de3b5d475153f0b5ab25",
+   "max_abs": 0.10693359375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.0.upsampler.time_conv.weight",
+   "object": "vae/decoder.up_blocks.0.upsampler.time_conv.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    48,
+    24,
+    1,
+    1
+   ],
+   "bytes": 2304,
+   "sha256": "8ff9b1c0a542baa109cae832a67c6e8e68fb5aef33a7c6650de57724e19fc0cd",
+   "max_abs": 0.17578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.0.conv1.bias",
+   "object": "vae/decoder.up_blocks.1.resnets.0.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "7f1065b7523793baa2b358020ad6da11d3b3b8e8cd3de805bd36c6ca944a3817",
+   "max_abs": 0.0966796875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.0.conv1.weight",
+   "object": "vae/decoder.up_blocks.1.resnets.0.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "a831dc84b680632c0c125aa037dabb3ef54bddae7dd321d38fc077bab8df05e4",
+   "max_abs": 0.171875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.0.conv2.bias",
+   "object": "vae/decoder.up_blocks.1.resnets.0.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "b58a5943bf92b9597c9b5040cc7e31aece6885eb100aa8c92fd6dad06b887647",
+   "max_abs": 0.1064453125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.0.conv2.weight",
+   "object": "vae/decoder.up_blocks.1.resnets.0.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "9d10917bce5933397e71384449217d93f6492049b7ecbb9bf9ec2be2586c2618",
+   "max_abs": 0.203125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.0.norm1.gamma",
+   "object": "vae/decoder.up_blocks.1.resnets.0.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "19cb3b3912a71387d2ac71dec16b11b0c0a50136bbfaaba87c2ad7719a2f1fb9",
+   "max_abs": 0.08544921875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.0.norm2.gamma",
+   "object": "vae/decoder.up_blocks.1.resnets.0.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "2f12b46c1e18170f3bfd920ebabbe6717a12b3797922f3e2144118bd71e7f8f5",
+   "max_abs": 0.1064453125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.1.conv1.bias",
+   "object": "vae/decoder.up_blocks.1.resnets.1.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "13ff8a223abf3ec2b25c2afa466eadc5a606114e27c579f473ba35210f2c12bd",
+   "max_abs": 0.11767578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.1.conv1.weight",
+   "object": "vae/decoder.up_blocks.1.resnets.1.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "73051b1c51d56496e30a7d19c7012c2de48c04a90c05e3b5620cab7c3c444f04",
+   "max_abs": 0.193359375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.1.conv2.bias",
+   "object": "vae/decoder.up_blocks.1.resnets.1.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "34e3edeb8bcaf844b49d4d0057f01d4aa081357d57ebfec6fdb85c7b7018a6c1",
+   "max_abs": 0.1416015625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.1.conv2.weight",
+   "object": "vae/decoder.up_blocks.1.resnets.1.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "8cfaac44aec36582e9de78d29578454bfb82dc41776c9b5b9bcf33f915b59d56",
+   "max_abs": 0.1953125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.1.norm1.gamma",
+   "object": "vae/decoder.up_blocks.1.resnets.1.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "410e9d9cb5630015dbe374a06cc3a3db9c9bd8521a6bef3fa6e62c7d1d677613",
+   "max_abs": 0.0966796875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.1.norm2.gamma",
+   "object": "vae/decoder.up_blocks.1.resnets.1.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "428460d121318b21f8f3c4b06fdf81259ce75c3aeee340c33edb437f52561d25",
+   "max_abs": 0.1259765625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.2.conv1.bias",
+   "object": "vae/decoder.up_blocks.1.resnets.2.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "e3d0413bb55301370cc0d6f0261ce8b68d0ed9aea3e64e9fcf6033f3c169b450",
+   "max_abs": 0.12890625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.2.conv1.weight",
+   "object": "vae/decoder.up_blocks.1.resnets.2.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "a6234a8ca2e6d289ffce7d5eb0c0144b9fab2b5b0c1f7f3021ffe55832104c9b",
+   "max_abs": 0.1884765625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.2.conv2.bias",
+   "object": "vae/decoder.up_blocks.1.resnets.2.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "929591495eb056cd5d20cac7ebfcc45f365af10e5490d577aa59d4e2b2196952",
+   "max_abs": 0.15625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.2.conv2.weight",
+   "object": "vae/decoder.up_blocks.1.resnets.2.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "b93a4231d31b6167c49a68b1b42c2bf4c0c7b1cff3b54868d8c5726a33c03293",
+   "max_abs": 0.1875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.2.norm1.gamma",
+   "object": "vae/decoder.up_blocks.1.resnets.2.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "d9274b9f713511508230731b49970f340fa99ae43b402fec59b1dd5b13f00ef9",
+   "max_abs": 0.11083984375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.resnets.2.norm2.gamma",
+   "object": "vae/decoder.up_blocks.1.resnets.2.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "4200b5e15f17bf7c7afc37fc604eb7ee80f49cb2566b68ac29ea1b9051c88351",
+   "max_abs": 0.08447265625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.upsampler.resample.1.bias",
+   "object": "vae/decoder.up_blocks.1.upsampler.resample.1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "516e7a2a62692c2a8d7aa272fc97279767f10cb8a89c8933f00d30752ef0cd9b",
+   "max_abs": 0.09130859375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.upsampler.resample.1.weight",
+   "object": "vae/decoder.up_blocks.1.upsampler.resample.1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    24,
+    3,
+    3
+   ],
+   "bytes": 10368,
+   "sha256": "a480020f4cd09cfb8db1e3543c37368dcfbfd077fc1d3c0354480b02c933f75f",
+   "max_abs": 0.201171875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.upsampler.time_conv.bias",
+   "object": "vae/decoder.up_blocks.1.upsampler.time_conv.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    48
+   ],
+   "bytes": 96,
+   "sha256": "0d283255305590348290cb169023ea5d185fac5006d662cd6437ea7061bb9efd",
+   "max_abs": 0.1318359375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.1.upsampler.time_conv.weight",
+   "object": "vae/decoder.up_blocks.1.upsampler.time_conv.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    48,
+    24,
+    1,
+    1
+   ],
+   "bytes": 2304,
+   "sha256": "a6b478fd2eba5ed54696c784175374b2069aabf90c5f8923ccc9476356b1714b",
+   "max_abs": 0.1796875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.0.conv1.bias",
+   "object": "vae/decoder.up_blocks.2.resnets.0.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12
+   ],
+   "bytes": 24,
+   "sha256": "a37e82e37d1f4732e2aacf43ebf5914ca57aafda517c88df75d07818b6cbea57",
+   "max_abs": 0.087890625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.0.conv1.weight",
+   "object": "vae/decoder.up_blocks.2.resnets.0.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    24,
+    3,
+    3
+   ],
+   "bytes": 5184,
+   "sha256": "adffdfdc358c5672d6028ee8be96b91ef7ebcdbad5c5a60b78b64667fa119774",
+   "max_abs": 0.1806640625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.0.conv2.bias",
+   "object": "vae/decoder.up_blocks.2.resnets.0.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12
+   ],
+   "bytes": 24,
+   "sha256": "980289fa16dba39b374ad579124d36354dca2ab5e87ca46f64ffe311536e4679",
+   "max_abs": 0.134765625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.0.conv2.weight",
+   "object": "vae/decoder.up_blocks.2.resnets.0.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    12,
+    3,
+    3
+   ],
+   "bytes": 2592,
+   "sha256": "647664748eddc103d7f505747fa8c37e6520c8e61d4ac60c387b8f31a4c8f885",
+   "max_abs": 0.1640625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.0.conv_shortcut.bias",
+   "object": "vae/decoder.up_blocks.2.resnets.0.conv_shortcut.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12
+   ],
+   "bytes": 24,
+   "sha256": "d3afa65800fa318b8b1f769286db00b36c978bc58f85d93f9f21c2a311badc70",
+   "max_abs": 0.126953125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.0.conv_shortcut.weight",
+   "object": "vae/decoder.up_blocks.2.resnets.0.conv_shortcut.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    24,
+    1,
+    1
+   ],
+   "bytes": 576,
+   "sha256": "2b3313b625b181af342f2dc701e5be54ee609a99f4cd8038ccb51d0c020bd819",
+   "max_abs": 0.142578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.0.norm1.gamma",
+   "object": "vae/decoder.up_blocks.2.resnets.0.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    1,
+    1,
+    1
+   ],
+   "bytes": 48,
+   "sha256": "47b48c9183bb66967aedc837a511d66146ef6385163245b6998989b74c6407e9",
+   "max_abs": 0.1494140625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.0.norm2.gamma",
+   "object": "vae/decoder.up_blocks.2.resnets.0.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    1,
+    1,
+    1
+   ],
+   "bytes": 24,
+   "sha256": "e0240a251732fb291a82269fac749d54129a708fec2b712c4ba1b53434851991",
+   "max_abs": 0.10400390625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.1.conv1.bias",
+   "object": "vae/decoder.up_blocks.2.resnets.1.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12
+   ],
+   "bytes": 24,
+   "sha256": "acb6d98b18a8307fcd25885e7a818a600d8deecf4216784f265742d6412557d2",
+   "max_abs": 0.10009765625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.1.conv1.weight",
+   "object": "vae/decoder.up_blocks.2.resnets.1.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    12,
+    3,
+    3
+   ],
+   "bytes": 2592,
+   "sha256": "ba246f91ef5734945bc0d0da7b63162446797a6411b7d3b15a32792f05f3c4ca",
+   "max_abs": 0.173828125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.1.conv2.bias",
+   "object": "vae/decoder.up_blocks.2.resnets.1.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12
+   ],
+   "bytes": 24,
+   "sha256": "0668ade9d36e79d492da6bdd0da8ea63a6eab895f303de2e828384ec79750d98",
+   "max_abs": 0.1416015625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.1.conv2.weight",
+   "object": "vae/decoder.up_blocks.2.resnets.1.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    12,
+    3,
+    3
+   ],
+   "bytes": 2592,
+   "sha256": "6f2c0a29e2fab8802a9b6002e666872085bb31f24fbe777c68861ab3c80a2a42",
+   "max_abs": 0.1904296875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.1.norm1.gamma",
+   "object": "vae/decoder.up_blocks.2.resnets.1.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    1,
+    1,
+    1
+   ],
+   "bytes": 24,
+   "sha256": "826e0e178e8af57e1bbc85508237ba250c040fc6fa6ceb18aeb8b72a5e107e32",
+   "max_abs": 0.0986328125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.1.norm2.gamma",
+   "object": "vae/decoder.up_blocks.2.resnets.1.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    1,
+    1,
+    1
+   ],
+   "bytes": 24,
+   "sha256": "87f8d9fe0cc83895dde9c1718dae72dcc6fb911b8d69f355a6aa97a2ab86cf3d",
+   "max_abs": 0.06201171875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.2.conv1.bias",
+   "object": "vae/decoder.up_blocks.2.resnets.2.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12
+   ],
+   "bytes": 24,
+   "sha256": "2f8cb08332d20ed034230f2be1fcf48a7bae6cf8875ba471ce14a8b204f717f8",
+   "max_abs": 0.07470703125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.2.conv1.weight",
+   "object": "vae/decoder.up_blocks.2.resnets.2.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    12,
+    3,
+    3
+   ],
+   "bytes": 2592,
+   "sha256": "fa10e6301ff487a1d0fce2d7a378ded88a3eaba221c739f2690ce434463f1709",
+   "max_abs": 0.177734375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.2.conv2.bias",
+   "object": "vae/decoder.up_blocks.2.resnets.2.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12
+   ],
+   "bytes": 24,
+   "sha256": "17e59fe21f20588e8e0f6df55072b328ac34eba7e12cd5120ea0bc93116ac0e1",
+   "max_abs": 0.0751953125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.2.conv2.weight",
+   "object": "vae/decoder.up_blocks.2.resnets.2.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    12,
+    3,
+    3
+   ],
+   "bytes": 2592,
+   "sha256": "434a491cca5082228429accf8f6be5314e3cb6c3197e9af6ea7d434d1c6fb480",
+   "max_abs": 0.201171875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.2.norm1.gamma",
+   "object": "vae/decoder.up_blocks.2.resnets.2.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    1,
+    1,
+    1
+   ],
+   "bytes": 24,
+   "sha256": "9fba394c15ed26826371065cb6b17fd7953d137f6e46e27e30afe75a7dc974ce",
+   "max_abs": 0.07080078125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.resnets.2.norm2.gamma",
+   "object": "vae/decoder.up_blocks.2.resnets.2.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    1,
+    1,
+    1
+   ],
+   "bytes": 24,
+   "sha256": "e46bc9d41f2dd7c93500a27cd02df82f3aa8a4390e902a21313cbdee9df7125a",
+   "max_abs": 0.1025390625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.upsampler.resample.1.bias",
+   "object": "vae/decoder.up_blocks.2.upsampler.resample.1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12
+   ],
+   "bytes": 24,
+   "sha256": "f8be2e8a566d8da1376d60878aefacb5885f8278bd6cbe1e854af264d86377af",
+   "max_abs": 0.057373046875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.upsampler.resample.1.weight",
+   "object": "vae/decoder.up_blocks.2.upsampler.resample.1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    12,
+    3,
+    3
+   ],
+   "bytes": 2592,
+   "sha256": "7ea261dcf7e4d822e399a5271497cc0b64d55dbcb5e494127315ccba62583412",
+   "max_abs": 0.169921875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.upsampler.time_conv.bias",
+   "object": "vae/decoder.up_blocks.2.upsampler.time_conv.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24
+   ],
+   "bytes": 48,
+   "sha256": "54e8f40f5413307233ff8b2a82f4524de4e26a9d57850a415215f8f97c9f4a8f",
+   "max_abs": 0.1533203125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.2.upsampler.time_conv.weight",
+   "object": "vae/decoder.up_blocks.2.upsampler.time_conv.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    24,
+    12,
+    1,
+    1
+   ],
+   "bytes": 576,
+   "sha256": "4dd86ec8260629f76d018c43f8084a0ffe92c8ab5ed9510c9acd42cfa9433ff7",
+   "max_abs": 0.1328125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.0.conv1.bias",
+   "object": "vae/decoder.up_blocks.3.resnets.0.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6
+   ],
+   "bytes": 12,
+   "sha256": "74d3405795ebf1db44226cd01c885496182efe34f940261e2e563d0430f817d8",
+   "max_abs": 0.1142578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.0.conv1.weight",
+   "object": "vae/decoder.up_blocks.3.resnets.0.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    12,
+    3,
+    3
+   ],
+   "bytes": 1296,
+   "sha256": "8a626ae1dba7c374fdb382b7db5d3477e76f97c41f6d81224f02e2d6b6049e4b",
+   "max_abs": 0.1787109375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.0.conv2.bias",
+   "object": "vae/decoder.up_blocks.3.resnets.0.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6
+   ],
+   "bytes": 12,
+   "sha256": "7931a41ae360075ae6f2050506ef6e1b8a0feaf692fa90b7022588d072d376f7",
+   "max_abs": 0.057373046875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.0.conv2.weight",
+   "object": "vae/decoder.up_blocks.3.resnets.0.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    6,
+    3,
+    3
+   ],
+   "bytes": 648,
+   "sha256": "b898b5e76507626c1073142df9083c6d539851c6736deb400010fe35e421836e",
+   "max_abs": 0.1708984375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.0.conv_shortcut.bias",
+   "object": "vae/decoder.up_blocks.3.resnets.0.conv_shortcut.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6
+   ],
+   "bytes": 12,
+   "sha256": "4f0071c16679bf1295cc2fe4abbec3ed1060af8102b66cea7b2d4dabe4c9efd0",
+   "max_abs": 0.0908203125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.0.conv_shortcut.weight",
+   "object": "vae/decoder.up_blocks.3.resnets.0.conv_shortcut.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    12,
+    1,
+    1
+   ],
+   "bytes": 144,
+   "sha256": "986633652ec86dd5b2c0a59b837f1bdd26cfeda3ab7e43bcdbddd1433bf26188",
+   "max_abs": 0.1630859375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.0.norm1.gamma",
+   "object": "vae/decoder.up_blocks.3.resnets.0.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    12,
+    1,
+    1,
+    1
+   ],
+   "bytes": 24,
+   "sha256": "097f580ef112c5a5fcf5f6e431f894efc9fd0f6f5aa7261893e99fef5393319d",
+   "max_abs": 0.09423828125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.0.norm2.gamma",
+   "object": "vae/decoder.up_blocks.3.resnets.0.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    1,
+    1,
+    1
+   ],
+   "bytes": 12,
+   "sha256": "a77ee9f4d588a6b890a45e451d16cc479a1d984165c16c562a2a7737db2ac6c8",
+   "max_abs": 0.08740234375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.1.conv1.bias",
+   "object": "vae/decoder.up_blocks.3.resnets.1.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6
+   ],
+   "bytes": 12,
+   "sha256": "d5819dc8946b3dc9eb901ac0014aea28dc6d9b9bd06016e470a76618d55dab24",
+   "max_abs": 0.13671875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.1.conv1.weight",
+   "object": "vae/decoder.up_blocks.3.resnets.1.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    6,
+    3,
+    3
+   ],
+   "bytes": 648,
+   "sha256": "31b59d54f4184cda5784bc53a26514e57445c480ec1b10b13de2b5baa4a1a971",
+   "max_abs": 0.1357421875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.1.conv2.bias",
+   "object": "vae/decoder.up_blocks.3.resnets.1.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6
+   ],
+   "bytes": 12,
+   "sha256": "c336cab89e58ba803f675b2e1480e257fe715807b3a1b5f3bb546a2fbc0c73b4",
+   "max_abs": 0.0966796875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.1.conv2.weight",
+   "object": "vae/decoder.up_blocks.3.resnets.1.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    6,
+    3,
+    3
+   ],
+   "bytes": 648,
+   "sha256": "5ddbe25f4e8f47b02c00a6bacfc70ee54841d2ce7fddc81aa16deb9b7e347aab",
+   "max_abs": 0.1552734375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.1.norm1.gamma",
+   "object": "vae/decoder.up_blocks.3.resnets.1.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    1,
+    1,
+    1
+   ],
+   "bytes": 12,
+   "sha256": "c37db3d5b6aa5847af8e5b005c0fd92a9ccb853bd379cdce2e9fea8477729adc",
+   "max_abs": 0.078125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.1.norm2.gamma",
+   "object": "vae/decoder.up_blocks.3.resnets.1.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    1,
+    1,
+    1
+   ],
+   "bytes": 12,
+   "sha256": "21b5f6160b0646af9542361ff89897204104b5e2ea0910cba4498b91fcfa81df",
+   "max_abs": 0.068359375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.2.conv1.bias",
+   "object": "vae/decoder.up_blocks.3.resnets.2.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6
+   ],
+   "bytes": 12,
+   "sha256": "10ab8e238a2181c3d140b5e4439cf26c062ed7ce84207c2f09cafc31771d7904",
+   "max_abs": 0.09912109375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.2.conv1.weight",
+   "object": "vae/decoder.up_blocks.3.resnets.2.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    6,
+    3,
+    3
+   ],
+   "bytes": 648,
+   "sha256": "2542bbb7ea7d920285ba1de309886beddc045c69921a6c5e098429319114083c",
+   "max_abs": 0.1328125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.2.conv2.bias",
+   "object": "vae/decoder.up_blocks.3.resnets.2.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6
+   ],
+   "bytes": 12,
+   "sha256": "e7572fb7f40fd1f470495d8de6f34ebf712f70eef5ec14db224bb17d21f43f7c",
+   "max_abs": 0.130859375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.2.conv2.weight",
+   "object": "vae/decoder.up_blocks.3.resnets.2.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    6,
+    3,
+    3
+   ],
+   "bytes": 648,
+   "sha256": "937af9c3ab22957f3c2df115c0dd1478736f7acdbf2111d839e83dc414608542",
+   "max_abs": 0.1572265625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.2.norm1.gamma",
+   "object": "vae/decoder.up_blocks.3.resnets.2.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    1,
+    1,
+    1
+   ],
+   "bytes": 12,
+   "sha256": "342d60c0548cb94b64e572ff24213cfb113004e1c91b935fc978eec11c76c9c1",
+   "max_abs": 0.08154296875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.resnets.2.norm2.gamma",
+   "object": "vae/decoder.up_blocks.3.resnets.2.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    1,
+    1,
+    1
+   ],
+   "bytes": 12,
+   "sha256": "ede9511e9ad0bd75ee675cb1dd6509ff55bcfa95b4b063b799beb7e57edad848",
+   "max_abs": 0.1083984375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.upsampler.resample.1.bias",
+   "object": "vae/decoder.up_blocks.3.upsampler.resample.1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6
+   ],
+   "bytes": 12,
+   "sha256": "88d6ca100f7fb55a308804a57db03bd7a2c8b69bddc4419fe339c29ac330ed6d",
+   "max_abs": 0.07958984375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.3.upsampler.resample.1.weight",
+   "object": "vae/decoder.up_blocks.3.upsampler.resample.1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    6,
+    3,
+    3
+   ],
+   "bytes": 648,
+   "sha256": "077739c6b320a3d3f92b2d2d4f087e2649642e6e682cffe6f85e8af98b2eff67",
+   "max_abs": 0.1357421875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.0.conv1.bias",
+   "object": "vae/decoder.up_blocks.4.resnets.0.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3
+   ],
+   "bytes": 6,
+   "sha256": "c9ceffd713da1231039a2a7f716f6befd590f76b5ceb939d82ce979dde669721",
+   "max_abs": 0.0810546875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.0.conv1.weight",
+   "object": "vae/decoder.up_blocks.4.resnets.0.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    6,
+    3,
+    3
+   ],
+   "bytes": 324,
+   "sha256": "3ed65fcc7a48a22a0ec38d477fb622252866b3d8646daf1a58f7f12e9d79916a",
+   "max_abs": 0.1767578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.0.conv2.bias",
+   "object": "vae/decoder.up_blocks.4.resnets.0.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3
+   ],
+   "bytes": 6,
+   "sha256": "5b97fed5d6a72dde454c7690f995aea4c507670a0442d3009552f59157c625d4",
+   "max_abs": 0.07958984375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.0.conv2.weight",
+   "object": "vae/decoder.up_blocks.4.resnets.0.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    3,
+    3,
+    3
+   ],
+   "bytes": 162,
+   "sha256": "3f5e906119ace5965480a3c48cf48b8d2ff21adcb98e94fe4549b7168529dc46",
+   "max_abs": 0.14453125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.0.conv_shortcut.bias",
+   "object": "vae/decoder.up_blocks.4.resnets.0.conv_shortcut.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3
+   ],
+   "bytes": 6,
+   "sha256": "2a475fe398bfb3807515b1588af4a798958de42089b152c03c8b55c82151f57a",
+   "max_abs": 0.11376953125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.0.conv_shortcut.weight",
+   "object": "vae/decoder.up_blocks.4.resnets.0.conv_shortcut.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    6,
+    1,
+    1
+   ],
+   "bytes": 36,
+   "sha256": "f01a14f06dc33b43649d35e5ddb84f0b34d1c8fdd5bab8df8ddcf7b2a16fdac4",
+   "max_abs": 0.1376953125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.0.norm1.gamma",
+   "object": "vae/decoder.up_blocks.4.resnets.0.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    6,
+    1,
+    1,
+    1
+   ],
+   "bytes": 12,
+   "sha256": "c08eabd96db9bcd81246620947d8b9eb4820be1481f4f943d8043b04ff6c433d",
+   "max_abs": 0.1416015625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.0.norm2.gamma",
+   "object": "vae/decoder.up_blocks.4.resnets.0.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    1,
+    1,
+    1
+   ],
+   "bytes": 6,
+   "sha256": "8e31f3f32e0bc385e4deefd519481b199ab904999df67813cec97db5427764bb",
+   "max_abs": 0.0693359375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.1.conv1.bias",
+   "object": "vae/decoder.up_blocks.4.resnets.1.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3
+   ],
+   "bytes": 6,
+   "sha256": "faed470f85b1b5e7c25306ec154b3c1c421e3f2de397af0318432ca3fc562015",
+   "max_abs": 0.1083984375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.1.conv1.weight",
+   "object": "vae/decoder.up_blocks.4.resnets.1.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    3,
+    3,
+    3
+   ],
+   "bytes": 162,
+   "sha256": "447024a8dc372e2d5824a91eaa8de03b380c5cd9382843f3587501984d9db910",
+   "max_abs": 0.13671875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.1.conv2.bias",
+   "object": "vae/decoder.up_blocks.4.resnets.1.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3
+   ],
+   "bytes": 6,
+   "sha256": "7fcc9f3bf2f64638517ad850c0a8e19ae5cf7d0389dbb2567dfc01c5eb11fce6",
+   "max_abs": 0.04638671875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.1.conv2.weight",
+   "object": "vae/decoder.up_blocks.4.resnets.1.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    3,
+    3,
+    3
+   ],
+   "bytes": 162,
+   "sha256": "bdf10745fe45b854de20aee4b0745517cf6d840d11a110662ee3c38c8ebe22f4",
+   "max_abs": 0.1318359375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.1.norm1.gamma",
+   "object": "vae/decoder.up_blocks.4.resnets.1.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    1,
+    1,
+    1
+   ],
+   "bytes": 6,
+   "sha256": "11e96577a3d200fd7131b7ab9d5e1c23bb93248e813917aa053065cfc7eab36b",
+   "max_abs": 0.0272216796875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.1.norm2.gamma",
+   "object": "vae/decoder.up_blocks.4.resnets.1.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    1,
+    1,
+    1
+   ],
+   "bytes": 6,
+   "sha256": "a04ac80ce59a6d7658dcc748eb6f772361b2e1e07c476f27028f59c9100f0c02",
+   "max_abs": 0.08203125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.2.conv1.bias",
+   "object": "vae/decoder.up_blocks.4.resnets.2.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3
+   ],
+   "bytes": 6,
+   "sha256": "5fd35a88ee2479a7e813d7c5f48a4300876cd8dc95888787e5418e803c2c3bcc",
+   "max_abs": 0.021484375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.2.conv1.weight",
+   "object": "vae/decoder.up_blocks.4.resnets.2.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    3,
+    3,
+    3
+   ],
+   "bytes": 162,
+   "sha256": "cff0d24b76628553251619b4536e679f1c988ee27a972215c52fcf4913135993",
+   "max_abs": 0.140625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.2.conv2.bias",
+   "object": "vae/decoder.up_blocks.4.resnets.2.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3
+   ],
+   "bytes": 6,
+   "sha256": "b9ddb5b0ec5afd55c88c09d0350cd92e2256af5c0e7a6ba47f3121d9a51d06ad",
+   "max_abs": 0.039794921875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.2.conv2.weight",
+   "object": "vae/decoder.up_blocks.4.resnets.2.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    3,
+    3,
+    3
+   ],
+   "bytes": 162,
+   "sha256": "1cc82f55c4e1e36615d9c983b500aa0468d2c803413f933d3ceeb1c08e4f2945",
+   "max_abs": 0.12158203125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.2.norm1.gamma",
+   "object": "vae/decoder.up_blocks.4.resnets.2.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    1,
+    1,
+    1
+   ],
+   "bytes": 6,
+   "sha256": "2b0de706106da235e1a7b577882813f8b833eb2a14af040148c80418b60cc09c",
+   "max_abs": 0.03955078125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/decoder.up_blocks.4.resnets.2.norm2.gamma",
+   "object": "vae/decoder.up_blocks.4.resnets.2.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    3,
+    1,
+    1,
+    1
+   ],
+   "bytes": 6,
+   "sha256": "923e2e71ae80b2263b77616f7f8fadd5f6d971174d5796c11b03d998fda4f770",
+   "max_abs": 0.05810546875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.conv_in.bias",
+   "object": "vae/encoder.conv_in.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2
+   ],
+   "bytes": 4,
+   "sha256": "3542bd1f1daf57935647cda10967be635458eddb1b2d7050beceaa82cfc8dae5",
+   "max_abs": 0.1337890625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.conv_in.weight",
+   "object": "vae/encoder.conv_in.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2,
+    4,
+    3,
+    3
+   ],
+   "bytes": 144,
+   "sha256": "3c617ba7a2ab669b99d60d72f94f4512fd994d589b5178020c814626ce9d30c7",
+   "max_abs": 0.12255859375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.conv_out.bias",
+   "object": "vae/encoder.conv_out.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "89937674c77fcd0f356d0067eab8784d5275b60899267c98911261db960538f1",
+   "max_abs": 0.10791015625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.conv_out.weight",
+   "object": "vae/encoder.conv_out.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32,
+    16,
+    3,
+    3
+   ],
+   "bytes": 9216,
+   "sha256": "555695e5502a22900b110d5aeffb325a910ddb2615219ad8eb6a61d9dc88f044",
+   "max_abs": 0.193359375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.downsampler.resample.1.bias",
+   "object": "vae/encoder.down_blocks.0.downsampler.resample.1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2
+   ],
+   "bytes": 4,
+   "sha256": "1b3c757edef97f0eda9b14b9127e85d55ca686a9ff94a4b421cc623cb1c54a57",
+   "max_abs": 0.0152587890625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.downsampler.resample.1.weight",
+   "object": "vae/encoder.down_blocks.0.downsampler.resample.1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2,
+    2,
+    3,
+    3
+   ],
+   "bytes": 72,
+   "sha256": "6b6be0f76b36dc9c7e0bef227903c1ec642d920603022122252c9965551d17cb",
+   "max_abs": 0.12109375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.resnets.0.conv1.bias",
+   "object": "vae/encoder.down_blocks.0.resnets.0.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2
+   ],
+   "bytes": 4,
+   "sha256": "56cab584a087c620fe0451b29e0b757b87ab2677aa8c76ef860997e7085c62c1",
+   "max_abs": 0.00141143798828125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.resnets.0.conv1.weight",
+   "object": "vae/encoder.down_blocks.0.resnets.0.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2,
+    2,
+    3,
+    3
+   ],
+   "bytes": 72,
+   "sha256": "a05efe2a818096dd1cd60a616685981adac89ab3135c5cdc22dc7844fa10a684",
+   "max_abs": 0.15625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.resnets.0.conv2.bias",
+   "object": "vae/encoder.down_blocks.0.resnets.0.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2
+   ],
+   "bytes": 4,
+   "sha256": "ebaf6c820a9a09e2b2038b2b8ce5858720a7b8c2943adf5c0ce8bf891bc0ca6b",
+   "max_abs": 0.126953125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.resnets.0.conv2.weight",
+   "object": "vae/encoder.down_blocks.0.resnets.0.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2,
+    2,
+    3,
+    3
+   ],
+   "bytes": 72,
+   "sha256": "c78e142380455de07c11a779816638128c534a91fa8d47fac784c7f220df5faa",
+   "max_abs": 0.1396484375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.resnets.0.norm1.gamma",
+   "object": "vae/encoder.down_blocks.0.resnets.0.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2,
+    1,
+    1,
+    1
+   ],
+   "bytes": 4,
+   "sha256": "4eb56132586743dc01e5564653e099dd784909ad42bf710e856807da1db8f041",
+   "max_abs": 0.08837890625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.resnets.0.norm2.gamma",
+   "object": "vae/encoder.down_blocks.0.resnets.0.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2,
+    1,
+    1,
+    1
+   ],
+   "bytes": 4,
+   "sha256": "d813fd391d1b43adc015cf471766e935180791484a2f8cc4b642dbf4a4b18f0e",
+   "max_abs": 0.03662109375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.resnets.1.conv1.bias",
+   "object": "vae/encoder.down_blocks.0.resnets.1.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2
+   ],
+   "bytes": 4,
+   "sha256": "d910e5babbf58530f844ddd6665f9f805fb64f2a939733e4a9b7c3a530170447",
+   "max_abs": 0.06298828125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.resnets.1.conv1.weight",
+   "object": "vae/encoder.down_blocks.0.resnets.1.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2,
+    2,
+    3,
+    3
+   ],
+   "bytes": 72,
+   "sha256": "2413f362b6de90223b041ed97901749eac1e095f338b36dab269b7f3e21877ae",
+   "max_abs": 0.1494140625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.resnets.1.conv2.bias",
+   "object": "vae/encoder.down_blocks.0.resnets.1.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2
+   ],
+   "bytes": 4,
+   "sha256": "840cba1cc9fdc2b1104e57eeaf7eedb3546c18c6a2d7b2803cb089a8793dd434",
+   "max_abs": 0.019287109375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.resnets.1.conv2.weight",
+   "object": "vae/encoder.down_blocks.0.resnets.1.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2,
+    2,
+    3,
+    3
+   ],
+   "bytes": 72,
+   "sha256": "0dca5281e0118b51c0ceb6f83b653563256b1290cef77a7409dff6825aa333a8",
+   "max_abs": 0.10693359375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.resnets.1.norm1.gamma",
+   "object": "vae/encoder.down_blocks.0.resnets.1.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2,
+    1,
+    1,
+    1
+   ],
+   "bytes": 4,
+   "sha256": "59a38efffc4dc2c7c55059b4c6d2fa1a9333db9f08dc28f90878c78aed585ace",
+   "max_abs": 0.0269775390625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.0.resnets.1.norm2.gamma",
+   "object": "vae/encoder.down_blocks.0.resnets.1.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2,
+    1,
+    1,
+    1
+   ],
+   "bytes": 4,
+   "sha256": "70d2f66e608059433ec6f6ef7f1761733741ffedc4dcb6caf31d1ab125811e92",
+   "max_abs": 0.080078125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.downsampler.resample.1.bias",
+   "object": "vae/encoder.down_blocks.1.downsampler.resample.1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4
+   ],
+   "bytes": 8,
+   "sha256": "040c162667544891875c81f2a20f59fa49c4f076d577cf022495798fef2b9185",
+   "max_abs": 0.06298828125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.downsampler.resample.1.weight",
+   "object": "vae/encoder.down_blocks.1.downsampler.resample.1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    4,
+    3,
+    3
+   ],
+   "bytes": 288,
+   "sha256": "f0f7748f0b2945e3c18a3429469f95e9957387ed9950ae3fac09e8eb340ef9ed",
+   "max_abs": 0.1328125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.downsampler.time_conv.bias",
+   "object": "vae/encoder.down_blocks.1.downsampler.time_conv.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4
+   ],
+   "bytes": 8,
+   "sha256": "6fac9b0d90d90eaae361bd75c5811de9652c1f2fe62fb21a6f00732b02ebfcdb",
+   "max_abs": 0.05224609375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.downsampler.time_conv.weight",
+   "object": "vae/encoder.down_blocks.1.downsampler.time_conv.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    4,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "a9fdd49c3579433328781f86314a8b3ff3950d0c504b4f7c9f7e3de0abc9a60f",
+   "max_abs": 0.07177734375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.0.conv1.bias",
+   "object": "vae/encoder.down_blocks.1.resnets.0.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4
+   ],
+   "bytes": 8,
+   "sha256": "571a0fa0a9b3e30dfdd36a47b0c30e61fa788c3ed20d3bdbad7bdf45c3c84ced",
+   "max_abs": 0.0576171875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.0.conv1.weight",
+   "object": "vae/encoder.down_blocks.1.resnets.0.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    2,
+    3,
+    3
+   ],
+   "bytes": 144,
+   "sha256": "96e64f9718694e887c08fd221fa56b110edda0a7eaf5dfc50c414b49737f2e27",
+   "max_abs": 0.1318359375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.0.conv2.bias",
+   "object": "vae/encoder.down_blocks.1.resnets.0.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4
+   ],
+   "bytes": 8,
+   "sha256": "0e01b6b884e9cc888fe605ca0ede29fb1a50f269cd3eb398a2fd9a899e5b5dee",
+   "max_abs": 0.049072265625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.0.conv2.weight",
+   "object": "vae/encoder.down_blocks.1.resnets.0.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    4,
+    3,
+    3
+   ],
+   "bytes": 288,
+   "sha256": "c4a48a543b53b2a7846b7ed28c76657c073550bc22c6c51c7bd8cc0e1839b5f7",
+   "max_abs": 0.171875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.0.conv_shortcut.bias",
+   "object": "vae/encoder.down_blocks.1.resnets.0.conv_shortcut.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4
+   ],
+   "bytes": 8,
+   "sha256": "62a34bd5ce2e49e86199f06201974e6a35e6eb26d18a70af86b6ab360e46eed2",
+   "max_abs": 0.032470703125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.0.conv_shortcut.weight",
+   "object": "vae/encoder.down_blocks.1.resnets.0.conv_shortcut.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    2,
+    1,
+    1
+   ],
+   "bytes": 16,
+   "sha256": "80f0fd7f574b41603d87d797ebb5de9905198d29b9ac8574b1371c1c90454e77",
+   "max_abs": 0.1201171875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.0.norm1.gamma",
+   "object": "vae/encoder.down_blocks.1.resnets.0.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    2,
+    1,
+    1,
+    1
+   ],
+   "bytes": 4,
+   "sha256": "ee1b92fa5edd1d68ff0532f7f8e7ab9501ea2ee8fbb7a10c0640162f6b791d1e",
+   "max_abs": 0.057861328125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.0.norm2.gamma",
+   "object": "vae/encoder.down_blocks.1.resnets.0.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    1,
+    1,
+    1
+   ],
+   "bytes": 8,
+   "sha256": "b6c6f6628f83df889f743ace32934490f888189b6574b8b0834a931c311f0a69",
+   "max_abs": 0.05078125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.1.conv1.bias",
+   "object": "vae/encoder.down_blocks.1.resnets.1.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4
+   ],
+   "bytes": 8,
+   "sha256": "eee8b80b06ad2a3e5e5259c15e2bf5b14c7fe3d527fdf5052eefd4ac71636f50",
+   "max_abs": 0.1123046875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.1.conv1.weight",
+   "object": "vae/encoder.down_blocks.1.resnets.1.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    4,
+    3,
+    3
+   ],
+   "bytes": 288,
+   "sha256": "8ce623aaf4761937564314f4bdd89b0021aff40dd379ec415f4db28de60df2c0",
+   "max_abs": 0.1748046875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.1.conv2.bias",
+   "object": "vae/encoder.down_blocks.1.resnets.1.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4
+   ],
+   "bytes": 8,
+   "sha256": "3dbf7450927aeed7e25b3dc4ec635511f169b5118961456405d6afd7a70b9562",
+   "max_abs": 0.05517578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.1.conv2.weight",
+   "object": "vae/encoder.down_blocks.1.resnets.1.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    4,
+    3,
+    3
+   ],
+   "bytes": 288,
+   "sha256": "11c20cf5e0b77fb1d5d4f5c5920a1d37f30b1a879b7ef3469b70ad5e356a45ba",
+   "max_abs": 0.1396484375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.1.norm1.gamma",
+   "object": "vae/encoder.down_blocks.1.resnets.1.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    1,
+    1,
+    1
+   ],
+   "bytes": 8,
+   "sha256": "b124e3e9b6ef8487ed60a28771c3857bcd58ebb85584874a8968c05c920641ca",
+   "max_abs": 0.11669921875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.1.resnets.1.norm2.gamma",
+   "object": "vae/encoder.down_blocks.1.resnets.1.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    1,
+    1,
+    1
+   ],
+   "bytes": 8,
+   "sha256": "e30bcfd04eb4e851af2ee59427018be773dbc940f9da6b7f7d03893352addd9e",
+   "max_abs": 0.12451171875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.downsampler.resample.1.bias",
+   "object": "vae/encoder.down_blocks.2.downsampler.resample.1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8
+   ],
+   "bytes": 16,
+   "sha256": "1387258738f0f6996e5cef42804f7030d94c063f3508043c8db35c8205763603",
+   "max_abs": 0.0771484375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.downsampler.resample.1.weight",
+   "object": "vae/encoder.down_blocks.2.downsampler.resample.1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8,
+    8,
+    3,
+    3
+   ],
+   "bytes": 1152,
+   "sha256": "918e135fc8e5ab26af2b21bdd4f33200ac8920c94b3b93f313b19da3f7c4a6b8",
+   "max_abs": 0.1650390625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.downsampler.time_conv.bias",
+   "object": "vae/encoder.down_blocks.2.downsampler.time_conv.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8
+   ],
+   "bytes": 16,
+   "sha256": "a37dbdd19ab6479e48a254a5fdcad952da5ccee967e8fd53644dedd3072fdc43",
+   "max_abs": 0.09814453125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.downsampler.time_conv.weight",
+   "object": "vae/encoder.down_blocks.2.downsampler.time_conv.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8,
+    8,
+    1,
+    1
+   ],
+   "bytes": 128,
+   "sha256": "43988fc1e5a4679bf4ccd779c319feef8829d9a6e6aa4267357d51fb567cc499",
+   "max_abs": 0.09814453125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.0.conv1.bias",
+   "object": "vae/encoder.down_blocks.2.resnets.0.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8
+   ],
+   "bytes": 16,
+   "sha256": "cd0329b702706c41eb77aaafeab39d8f4245a1926102d2dd5753854ef8b1fdc2",
+   "max_abs": 0.058837890625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.0.conv1.weight",
+   "object": "vae/encoder.down_blocks.2.resnets.0.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8,
+    4,
+    3,
+    3
+   ],
+   "bytes": 576,
+   "sha256": "aec836f31c661d2b2c494ea84a473c0bc1d1b700e1578a0287a1be3c4083dcc7",
+   "max_abs": 0.1455078125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.0.conv2.bias",
+   "object": "vae/encoder.down_blocks.2.resnets.0.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8
+   ],
+   "bytes": 16,
+   "sha256": "edd5bed1dd6e3bf8e95ffbea628e0c00c916c830475de0bb8f871c3e0ea6c16f",
+   "max_abs": 0.083984375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.0.conv2.weight",
+   "object": "vae/encoder.down_blocks.2.resnets.0.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8,
+    8,
+    3,
+    3
+   ],
+   "bytes": 1152,
+   "sha256": "837dba7d3492a58c48bef62a9933598472da413c48267a8608a598e6c15e4e44",
+   "max_abs": 0.1484375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.0.conv_shortcut.bias",
+   "object": "vae/encoder.down_blocks.2.resnets.0.conv_shortcut.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8
+   ],
+   "bytes": 16,
+   "sha256": "b8dfe5891dcc66b3cb49fa8a88529d158ad3e2f6e88085f5655e6dd62c1cbb7a",
+   "max_abs": 0.06591796875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.0.conv_shortcut.weight",
+   "object": "vae/encoder.down_blocks.2.resnets.0.conv_shortcut.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8,
+    4,
+    1,
+    1
+   ],
+   "bytes": 64,
+   "sha256": "f7649df5ba85b65e3659242a3522211d6fa008eb65f239ce5065b4eaa220570d",
+   "max_abs": 0.138671875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.0.norm1.gamma",
+   "object": "vae/encoder.down_blocks.2.resnets.0.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    4,
+    1,
+    1,
+    1
+   ],
+   "bytes": 8,
+   "sha256": "2f9c29c92f610b3eb8163f839d76e51c4ea230369d91f57f754819a1f371b7fc",
+   "max_abs": 0.0546875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.0.norm2.gamma",
+   "object": "vae/encoder.down_blocks.2.resnets.0.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8,
+    1,
+    1,
+    1
+   ],
+   "bytes": 16,
+   "sha256": "66cc49a6b897ed486f940f3a4a4e0a603c52ab3863913da9a27350a85b4d42d4",
+   "max_abs": 0.142578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.1.conv1.bias",
+   "object": "vae/encoder.down_blocks.2.resnets.1.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8
+   ],
+   "bytes": 16,
+   "sha256": "0d91f3fbc24f9fb1a8edc9bd8f979066744c197b933d52b8bbb27bed71087d95",
+   "max_abs": 0.08642578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.1.conv1.weight",
+   "object": "vae/encoder.down_blocks.2.resnets.1.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8,
+    8,
+    3,
+    3
+   ],
+   "bytes": 1152,
+   "sha256": "09d82458ee8c12c1b71fbc5d4448b8af9b8ccbf451f7b8fea1376d9645d6550a",
+   "max_abs": 0.212890625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.1.conv2.bias",
+   "object": "vae/encoder.down_blocks.2.resnets.1.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8
+   ],
+   "bytes": 16,
+   "sha256": "9ad4012616d93d2848c62cce983e62cd3de80c0adbedd75f71f2cda1f7ab1dc2",
+   "max_abs": 0.09765625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.1.conv2.weight",
+   "object": "vae/encoder.down_blocks.2.resnets.1.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8,
+    8,
+    3,
+    3
+   ],
+   "bytes": 1152,
+   "sha256": "439413b33917ded33821f8d8bd7588077a6c336b19b70a9afd3efae8463b5069",
+   "max_abs": 0.1416015625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.1.norm1.gamma",
+   "object": "vae/encoder.down_blocks.2.resnets.1.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8,
+    1,
+    1,
+    1
+   ],
+   "bytes": 16,
+   "sha256": "c9270547861b1ab8330e4e584160f152d18e9619a82506953090ce7eaa1c1421",
+   "max_abs": 0.048583984375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.2.resnets.1.norm2.gamma",
+   "object": "vae/encoder.down_blocks.2.resnets.1.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8,
+    1,
+    1,
+    1
+   ],
+   "bytes": 16,
+   "sha256": "555a80f233cc8734009412ba8184c12a26961fa5949270965fca556bda539782",
+   "max_abs": 0.11865234375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.downsampler.resample.1.bias",
+   "object": "vae/encoder.down_blocks.3.downsampler.resample.1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "6af3bfc64e59f7734b6a143666738d4fba8647c629c22de2c58a5f3ad5fa471f",
+   "max_abs": 0.08984375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.downsampler.resample.1.weight",
+   "object": "vae/encoder.down_blocks.3.downsampler.resample.1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    3,
+    3
+   ],
+   "bytes": 4608,
+   "sha256": "f01f04d9916ddef198e3397c8b2b3473db6441485281a5a5528458242d452c3f",
+   "max_abs": 0.2060546875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.downsampler.time_conv.bias",
+   "object": "vae/encoder.down_blocks.3.downsampler.time_conv.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "87135c1e6722bdb10b28452f727b7b3133ba588df746d0fd41b9a15dc7e6b903",
+   "max_abs": 0.078125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.downsampler.time_conv.weight",
+   "object": "vae/encoder.down_blocks.3.downsampler.time_conv.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    1,
+    1
+   ],
+   "bytes": 512,
+   "sha256": "7d36c1fb50728ee1df6bb81c26efc287215a9df430bb49419709d84795fcdff5",
+   "max_abs": 0.1796875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.0.conv1.bias",
+   "object": "vae/encoder.down_blocks.3.resnets.0.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "0a02aac8cdb19cb2b5a5fbf444d3b7bb70dbe5f59db28370cce0f5dd6b7298f1",
+   "max_abs": 0.09375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.0.conv1.weight",
+   "object": "vae/encoder.down_blocks.3.resnets.0.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    8,
+    3,
+    3
+   ],
+   "bytes": 2304,
+   "sha256": "b457ce47d936c8867bf1def12454aa9b8c870c28ec36e9e2b8989da85ef1d062",
+   "max_abs": 0.1884765625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.0.conv2.bias",
+   "object": "vae/encoder.down_blocks.3.resnets.0.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "535458cd0e56035db883ffe20a23be289976f7d293911edd0322e8c4b2d3f46e",
+   "max_abs": 0.126953125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.0.conv2.weight",
+   "object": "vae/encoder.down_blocks.3.resnets.0.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    3,
+    3
+   ],
+   "bytes": 4608,
+   "sha256": "b313bb0789cb45d89506284739e6fec2dc6825e352dab3e1b9c1804982cbf18c",
+   "max_abs": 0.1845703125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.0.conv_shortcut.bias",
+   "object": "vae/encoder.down_blocks.3.resnets.0.conv_shortcut.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "b54f088c5ef10e27e0d51b13bc50386e4d926870931a4ca40ef8918188dea257",
+   "max_abs": 0.10888671875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.0.conv_shortcut.weight",
+   "object": "vae/encoder.down_blocks.3.resnets.0.conv_shortcut.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    8,
+    1,
+    1
+   ],
+   "bytes": 256,
+   "sha256": "5826998bb2f07dfe16fa732f775c0cf381804e43c73d21ef20691d837248a93f",
+   "max_abs": 0.1484375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.0.norm1.gamma",
+   "object": "vae/encoder.down_blocks.3.resnets.0.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    8,
+    1,
+    1,
+    1
+   ],
+   "bytes": 16,
+   "sha256": "098800093ca7fa02cb9bb646575fc21cff60fe2f5af4743778f546ef8bbf96be",
+   "max_abs": 0.07177734375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.0.norm2.gamma",
+   "object": "vae/encoder.down_blocks.3.resnets.0.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "1558a53ac93f335ca8ca92377f5283a30cb7712ce1d7f2495461faf2ef0b8f4e",
+   "max_abs": 0.0888671875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.1.conv1.bias",
+   "object": "vae/encoder.down_blocks.3.resnets.1.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "1af2d64712b4a1a2dab3d72e8ff01e733518c357960b78c00e380375f37469a5",
+   "max_abs": 0.0986328125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.1.conv1.weight",
+   "object": "vae/encoder.down_blocks.3.resnets.1.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    3,
+    3
+   ],
+   "bytes": 4608,
+   "sha256": "4a00963578c9165bd2fbf09fb373f6f3b8725d81fa69f18f64a636e357393c7b",
+   "max_abs": 0.2041015625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.1.conv2.bias",
+   "object": "vae/encoder.down_blocks.3.resnets.1.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "36adf2e647d00d87c99d90d02e4e1b5e60ede4eb5f676b03b4c4f26c79dea4df",
+   "max_abs": 0.087890625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.1.conv2.weight",
+   "object": "vae/encoder.down_blocks.3.resnets.1.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    3,
+    3
+   ],
+   "bytes": 4608,
+   "sha256": "02652dc226e65c02c483767ee848f36ea268a3e0010214a4479280e4a02eff26",
+   "max_abs": 0.171875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.1.norm1.gamma",
+   "object": "vae/encoder.down_blocks.3.resnets.1.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "09ef366fc4c62896aeba12cf10f2a70c13ee89714197468b47fc81c2fb5084aa",
+   "max_abs": 0.1357421875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.3.resnets.1.norm2.gamma",
+   "object": "vae/encoder.down_blocks.3.resnets.1.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "d6c2a63e9afb3b6cd685f7bb859e1c84fc4ffa97b9a834e0532f76e2099463e4",
+   "max_abs": 0.1123046875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.4.resnets.0.conv1.bias",
+   "object": "vae/encoder.down_blocks.4.resnets.0.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "3b6d5ef1a308657b45ade21625529857715cbefbee522c621eceeb6742d8f0af",
+   "max_abs": 0.08642578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.4.resnets.0.conv1.weight",
+   "object": "vae/encoder.down_blocks.4.resnets.0.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    3,
+    3
+   ],
+   "bytes": 4608,
+   "sha256": "0cbfb27eca8868d3c8ae899378837421c75a7b8534b94345f35133dad3d946f0",
+   "max_abs": 0.19140625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.4.resnets.0.conv2.bias",
+   "object": "vae/encoder.down_blocks.4.resnets.0.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "46b8968c51789d65afd2a767adecc52c5c902133f2e7f6c2eeb870502fe33dcf",
+   "max_abs": 0.1318359375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.4.resnets.0.conv2.weight",
+   "object": "vae/encoder.down_blocks.4.resnets.0.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    3,
+    3
+   ],
+   "bytes": 4608,
+   "sha256": "8bb851631658e4c2c6c57080c20398c5992422cff54b8cda582145bb695283e0",
+   "max_abs": 0.1982421875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.4.resnets.0.norm1.gamma",
+   "object": "vae/encoder.down_blocks.4.resnets.0.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "76cd1076c7d925c957a7f8895ebef536e5fdd8ce174628ad13b0955d9c6b0f4f",
+   "max_abs": 0.09912109375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.4.resnets.0.norm2.gamma",
+   "object": "vae/encoder.down_blocks.4.resnets.0.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "3e31b21c939050b5b8c8a1f3d17709873088f3f748fcfc9311068ef9b6345736",
+   "max_abs": 0.09375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.4.resnets.1.conv1.bias",
+   "object": "vae/encoder.down_blocks.4.resnets.1.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "0db354a1619b7a76b922fef5373201715ce966ce2872dd7a86997a91f0379d29",
+   "max_abs": 0.078125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.4.resnets.1.conv1.weight",
+   "object": "vae/encoder.down_blocks.4.resnets.1.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    3,
+    3
+   ],
+   "bytes": 4608,
+   "sha256": "5f1830f9d4dfcffa1a3e32dfe8f504911fd13a64de000d6e50e0cd30317ebd9c",
+   "max_abs": 0.1904296875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.4.resnets.1.conv2.bias",
+   "object": "vae/encoder.down_blocks.4.resnets.1.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "7ef24fe9c7281a4ed6b16ade4799719c801ed9af6b59a679a1106c88a231490f",
+   "max_abs": 0.087890625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.4.resnets.1.conv2.weight",
+   "object": "vae/encoder.down_blocks.4.resnets.1.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    3,
+    3
+   ],
+   "bytes": 4608,
+   "sha256": "1ec55d238103fd35d34d2664047d4fa7250a4f380571be06c2b7083d768b0579",
+   "max_abs": 0.19921875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.4.resnets.1.norm1.gamma",
+   "object": "vae/encoder.down_blocks.4.resnets.1.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "3cec6d1ceceb217d09a9203c11908ff4ba6e101a6cdb677c0810ecfb77e6266a",
+   "max_abs": 0.1220703125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.down_blocks.4.resnets.1.norm2.gamma",
+   "object": "vae/encoder.down_blocks.4.resnets.1.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "13a152ca1f95af7fceb3fe7cc56422181e9a9fe45b273d06db2a968d6d5764fb",
+   "max_abs": 0.08349609375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.attentions.0.norm.gamma",
+   "object": "vae/encoder.mid_block.attentions.0.norm.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "6aec5bdecf69b1a56de944cd4491ac2e217bbad9527e3175f53ca3aaaacbfb22",
+   "max_abs": 0.091796875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.attentions.0.proj.bias",
+   "object": "vae/encoder.mid_block.attentions.0.proj.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "f8f9b7daaf39017b0fcd3cb789bf1ea0e4fdbce4809dcc14e242a8c670c4ccd0",
+   "max_abs": 0.10009765625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.attentions.0.proj.weight",
+   "object": "vae/encoder.mid_block.attentions.0.proj.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    1,
+    1
+   ],
+   "bytes": 512,
+   "sha256": "dee2f6c38920ca5dda2f6c731232550f27131c2a88b7e6954baefb658af7ba4b",
+   "max_abs": 0.1767578125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.attentions.0.to_qkv.bias",
+   "object": "vae/encoder.mid_block.attentions.0.to_qkv.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    48
+   ],
+   "bytes": 96,
+   "sha256": "495fbf373510b803ad9583d841c299fccbcf22ef03093bf208773e3a3db4e241",
+   "max_abs": 0.10888671875,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.attentions.0.to_qkv.weight",
+   "object": "vae/encoder.mid_block.attentions.0.to_qkv.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    48,
+    16,
+    1,
+    1
+   ],
+   "bytes": 1536,
+   "sha256": "7df88f5f4cb7a9ed5d14a3d1d00aa3e47446d71c6a925cdc3be43582eb890163",
+   "max_abs": 0.1455078125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.resnets.0.conv1.bias",
+   "object": "vae/encoder.mid_block.resnets.0.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "fc9ef0fd71f42421f5d905ab812bf9fce8d786905d05b6ada54aedbd93e196d6",
+   "max_abs": 0.1005859375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.resnets.0.conv1.weight",
+   "object": "vae/encoder.mid_block.resnets.0.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    3,
+    3
+   ],
+   "bytes": 4608,
+   "sha256": "90fc4cce9041151f859d0a7727e71de929b61e22f5a6d9a2eaf0485656e59cd9",
+   "max_abs": 0.1953125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.resnets.0.conv2.bias",
+   "object": "vae/encoder.mid_block.resnets.0.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "82bb09a8e2935ddd57c1994bdf6281e041e219a8994de777a23bc262f37e365c",
+   "max_abs": 0.11181640625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.resnets.0.conv2.weight",
+   "object": "vae/encoder.mid_block.resnets.0.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    3,
+    3
+   ],
+   "bytes": 4608,
+   "sha256": "81e9bc160c8691340812a73a910ccde374c0b75e723a413319eb7b15950dd5a9",
+   "max_abs": 0.173828125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.resnets.0.norm1.gamma",
+   "object": "vae/encoder.mid_block.resnets.0.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "fe7fbe9be8a75d527ab6f97abadefa2aaa86c6a1612e431b2199a255a4a74ab5",
+   "max_abs": 0.12890625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.resnets.0.norm2.gamma",
+   "object": "vae/encoder.mid_block.resnets.0.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "9d0462e4d8d1f60239f0f3831c6dd3d9e5a28e4d12a239fdcde1e39a1beb103b",
+   "max_abs": 0.09521484375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.resnets.1.conv1.bias",
+   "object": "vae/encoder.mid_block.resnets.1.conv1.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "5d38836c64be19cd1f657a29060a7bcb1d48b7eadc64c719df4afa324f0ddadb",
+   "max_abs": 0.12158203125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.resnets.1.conv1.weight",
+   "object": "vae/encoder.mid_block.resnets.1.conv1.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    3,
+    3
+   ],
+   "bytes": 4608,
+   "sha256": "3f45ff94ab3bc1485f3774b0c2f5acba3cbf8ce8ed3e85a23e9dbbbf994fe5c3",
+   "max_abs": 0.203125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.resnets.1.conv2.bias",
+   "object": "vae/encoder.mid_block.resnets.1.conv2.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "120a20d84bdf939e5c257588bf881a810855959c8d909e6ac9823965fe07656a",
+   "max_abs": 0.111328125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.resnets.1.conv2.weight",
+   "object": "vae/encoder.mid_block.resnets.1.conv2.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    3,
+    3
+   ],
+   "bytes": 4608,
+   "sha256": "76d1ba14bf7351b8197d7d371cc42d9d45b3109819b6aa476e03ed9bea52476a",
+   "max_abs": 0.1884765625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.resnets.1.norm1.gamma",
+   "object": "vae/encoder.mid_block.resnets.1.norm1.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "61cc3bbc99ff0ac4caec010461ba8819ebe92104dfc8006cbb26e7aecf6ed87a",
+   "max_abs": 0.09912109375,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.mid_block.resnets.1.norm2.gamma",
+   "object": "vae/encoder.mid_block.resnets.1.norm2.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "3d5a7efab649ed17de967a3a24c30c4cc6d6a75bb2d2955182e5e9e652a2972d",
+   "max_abs": 0.134765625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/encoder.norm_out.gamma",
+   "object": "vae/encoder.norm_out.gamma",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    1,
+    1,
+    1
+   ],
+   "bytes": 32,
+   "sha256": "97ae3ee283324321c58723409d228ea76477666c3c4f07ff655e8b1b668af386",
+   "max_abs": 0.08837890625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/post_quant_conv.bias",
+   "object": "vae/post_quant_conv.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16
+   ],
+   "bytes": 32,
+   "sha256": "eb5da500d48aa0b02c7dfddb325115f56b6a9fb255c293bd26a0eb61e0d77394",
+   "max_abs": 0.08203125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/post_quant_conv.weight",
+   "object": "vae/post_quant_conv.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    16,
+    16,
+    1,
+    1
+   ],
+   "bytes": 512,
+   "sha256": "b4a59ce42d106bb7824f26eded5e0f9f59c499ac1989ff4de9b9886d5632ef6c",
+   "max_abs": 0.134765625,
+   "rel_error": null
+  },
+  {
+   "source": "vae/quant_conv.bias",
+   "object": "vae/quant_conv.bias",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32
+   ],
+   "bytes": 64,
+   "sha256": "4d112ad9983cb964bfaafe21701254586af123c814eb683ef2b430807147170a",
+   "max_abs": 0.1376953125,
+   "rel_error": null
+  },
+  {
+   "source": "vae/quant_conv.weight",
+   "object": "vae/quant_conv.weight",
+   "encoding": "bf16",
+   "format": "BF16",
+   "layout": "contiguous-le-v1",
+   "shape": [
+    32,
+    32,
+    1,
+    1
+   ],
+   "bytes": 2048,
+   "sha256": "3c07436d554e038fb4130aadcb7f832370e5be2a8f465b97672182632caea493",
+   "max_abs": 0.1787109375,
+   "rel_error": null
+  }
+ ],
+ "time_s": 2.1
+}

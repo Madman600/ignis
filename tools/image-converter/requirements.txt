@@ -1,0 +1,26 @@
+# The image converter's and the recorder's venv (spec image-model/01; F:/ai/venvs/ignis-image).
+#
+#   python -m venv F:/ai/venvs/ignis-image
+#   F:/ai/venvs/ignis-image/Scripts/python.exe -m pip install --no-cache-dir torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+#   F:/ai/venvs/ignis-image/Scripts/python.exe -m pip install --no-cache-dir --no-deps torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu130
+#   F:/ai/venvs/ignis-image/Scripts/python.exe -m pip install --no-cache-dir -r tools/image-converter/requirements.txt
+#
+# Never set TORCH_CUDA_ARCH_LIST in this venv. torch and torchvision come from the cu130 index (the
+# lines above); they are pinned here too so a plain `pip install -r` cannot move them.
+torch==2.13.0
+# The recorder: the checkpoint's processor is Qwen2VLImageProcessorFast with Qwen3VLVideoProcessor,
+# which transformers does not build without torchvision.
+torchvision==0.28.0
+# The first release with QwenImage21Pipeline (diffusers PR #14950, merged 2026-10-05).
+diffusers==0.41.0
+# Qwen3-VL (Qwen3VLForConditionalGeneration, Qwen3VLProcessor); the version tools/flash-next-converter runs.
+transformers==5.17.0
+tokenizers==0.23.2
+safetensors==0.8.0
+numpy==2.5.3
+pillow==12.3.0
+accelerate==1.15.0
+# The recorder's preflight (free host RAM); accelerate brings it too.
+psutil==7.2.2
+huggingface_hub==1.33.0
+pytest==9.1.1

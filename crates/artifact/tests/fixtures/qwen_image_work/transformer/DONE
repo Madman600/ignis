@@ -1,0 +1,116 @@
+{
+ "files": {
+  "tensors.json": {
+   "bytes": 8950,
+   "sha256": "cbbd726e257ec96f2a26a55c56af22c0001dd7c84d29e0ca2bab1e359d941bf1"
+  },
+  "transformer.img_in.weight.bin": {
+   "bytes": 1152,
+   "sha256": "0d72842997cbd311a17a66d83265750b15c6b34583df5fccebd9c09a37501ee5"
+  },
+  "transformer.modulation.1.weight.bin": {
+   "bytes": 32768,
+   "sha256": "7487c6581919ed31e9efe3828ee3a44022aa3766f8d82d618ec89bea2279740d"
+  },
+  "transformer.norm_out.linear.weight.bin": {
+   "bytes": 8192,
+   "sha256": "483bdfee555366319bba1796aae20e21dcee1c13d4f98033b9e8e5e059c407c1"
+  },
+  "transformer.proj_out.weight.bin": {
+   "bytes": 1056,
+   "sha256": "f11698d41b3d2608db81c6293edd7d1ebb09d9385d5e8eddfea0c4d1f9b3e5ac"
+  },
+  "transformer.time_text_embed.timestep_embedder.linear_1.weight.bin": {
+   "bytes": 32768,
+   "sha256": "8caf57cfad6ec7c24e9d9dedab767673ca6f043a8f5d36fc51b2ae3295cd927b"
+  },
+  "transformer.time_text_embed.timestep_embedder.linear_2.weight.bin": {
+   "bytes": 8192,
+   "sha256": "c75dd3c030dd73df4305cd60cc75617a295c8af0f91efd695a7cd34a3fa49201"
+  },
+  "transformer.transformer_blocks.0.attn.norm_k.weight.bin": {
+   "bytes": 32,
+   "sha256": "9a6b8774852c32e65d4012146e9f14b255a0adcf23f498e9ebe394dcfbcd9e0e"
+  },
+  "transformer.transformer_blocks.0.attn.norm_q.weight.bin": {
+   "bytes": 32,
+   "sha256": "42f1c1817c6df5affc4b2a00a3c48d2dd1d7bd410d939efffbcc2f37f9dac307"
+  },
+  "transformer.transformer_blocks.0.attn.to_k.weight.bin": {
+   "bytes": 4224,
+   "sha256": "e725c0de51dda9cffa8e01c956fcbfa0215ec7363969427beb6d0544b4a001cd"
+  },
+  "transformer.transformer_blocks.0.attn.to_out.0.weight.bin": {
+   "bytes": 4224,
+   "sha256": "59dc064f60fcc4ecaa42429227ee13223dc9f07ec0e7837c5bd0e2d2d79ec1c6"
+  },
+  "transformer.transformer_blocks.0.attn.to_q.weight.bin": {
+   "bytes": 4224,
+   "sha256": "b1c85e44f38ee9c42b3dcc987ae615a7e81a2da63efd0e99a80cec27d107594c"
+  },
+  "transformer.transformer_blocks.0.attn.to_v.weight.bin": {
+   "bytes": 4224,
+   "sha256": "e45da71b6696d94f1c74a223ef8f06dfc606473f197dd44ea0feb167bccadef5"
+  },
+  "transformer.transformer_blocks.0.img_mlp.gate_layer.weight.bin": {
+   "bytes": 12672,
+   "sha256": "408e8013a67ef30ee8c0317bcbe60c6029289ba432ab92a1229960dc82670520"
+  },
+  "transformer.transformer_blocks.0.img_mlp.out.weight.bin": {
+   "bytes": 12416,
+   "sha256": "aa4b81b187b5a57da9e95e2449352e14cc23deed5756d31e5780bf54e66d21dd"
+  },
+  "transformer.transformer_blocks.0.img_mlp.proj.weight.bin": {
+   "bytes": 12672,
+   "sha256": "6237dab8af102ab18f80324350f6c0aca3f6a51d8653425a893d6053b6b11e08"
+  },
+  "transformer.transformer_blocks.1.attn.norm_k.weight.bin": {
+   "bytes": 32,
+   "sha256": "9d8e9aacc6727aa4915dc7302ef0033e1c3e0c40896c3fb90d5d6bf0c58dbe4c"
+  },
+  "transformer.transformer_blocks.1.attn.norm_q.weight.bin": {
+   "bytes": 32,
+   "sha256": "d8154909eca63515c7b1671d79ac28c296442680f3349b568e3674656a9566d6"
+  },
+  "transformer.transformer_blocks.1.attn.to_k.weight.bin": {
+   "bytes": 4224,
+   "sha256": "5999f10bc6d26261d9d0dfb24c8dea85db171da22afdbd0179c2b71b389d73ec"
+  },
+  "transformer.transformer_blocks.1.attn.to_out.0.weight.bin": {
+   "bytes": 4224,
+   "sha256": "1754669a191c98f409c8f588f38b62f70503f622f0eee87642ebc77fb121dfdb"
+  },
+  "transformer.transformer_blocks.1.attn.to_q.weight.bin": {
+   "bytes": 4224,
+   "sha256": "3b6dbbbc3d1f979231c868f3bd6d5ed6605e363d4195765327fb6026b2910384"
+  },
+  "transformer.transformer_blocks.1.attn.to_v.weight.bin": {
+   "bytes": 4224,
+   "sha256": "21114845d3ae0b3602642c195f35a2a81809b79d75c7839b12a5613336fe2e70"
+  },
+  "transformer.transformer_blocks.1.img_mlp.gate_layer.weight.bin": {
+   "bytes": 12672,
+   "sha256": "a54db3c295a43693a664a24503e04e87e33b61b066dde6effc0d152f4ab759e5"
+  },
+  "transformer.transformer_blocks.1.img_mlp.out.weight.bin": {
+   "bytes": 12416,
+   "sha256": "c712d1c8cced66a0788f09c9954ac253ea8298cb133c2ca0f3d173ab6e4e4c19"
+  },
+  "transformer.transformer_blocks.1.img_mlp.proj.weight.bin": {
+   "bytes": 12672,
+   "sha256": "a41ab7d4646cc0cc973d765f51b7cd34fd4c10fe3320c9fd71ff494afd4f7ebe"
+  },
+  "transformer.txt_in.in_layer.weight.bin": {
+   "bytes": 4224,
+   "sha256": "6f392e024e4d681417e981d6c66749314e160d91f512b047552bb81150db11f2"
+  },
+  "transformer.txt_in.out_layer.weight.bin": {
+   "bytes": 4224,
+   "sha256": "a62f8d5d2a52481a5d583ecdfc187dafd2d8ccf50f30ed25e6fe5883e0f5123b"
+  },
+  "transformer.txt_in.text_norm.weight.bin": {
+   "bytes": 128,
+   "sha256": "7e9b7b887bf9623af9193809d331c56060c474a1749f443f2bd9bbe35fd4d43f"
+  }
+ }
+}

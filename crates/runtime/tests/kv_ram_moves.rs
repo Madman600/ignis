@@ -237,6 +237,7 @@ fn flash_next_moves_are_paced_and_the_27bs_go_in_one_window() {
         TransferPace { move_in_bytes: MOVE_IN_WINDOW_BYTES, move_out_bytes: MOVE_OUT_WINDOW_BYTES }
     );
     assert_eq!(TransferPace::for_family(ModelFamily::Qwen38_27b), TransferPace::UNPACED);
+    assert_eq!(TransferPace::for_family(ModelFamily::QwenImage21), TransferPace::UNPACED);
 
     let (compute, leaf) = rig(ByteLeaf::new());
     let compute = compute.with_transfer_pace(TransferPace::UNPACED);

@@ -17,3 +17,7 @@ Makefile text eol=lf
 # reads trace_v1.txt and compares it with the policy model's LF output): a
 # CRLF checkout on a Windows runner (core.autocrlf=true) breaks the equality.
 kernel/tests/fixtures/residency/*.txt text eol=lf
+
+# The image converter's committed work tree (crates/artifact/tests/qwen_image.rs): each
+# unit's DONE pins the sha256 of its JSON files, so a CRLF checkout would break the pack.
+crates/artifact/tests/fixtures/qwen_image_work/** -text

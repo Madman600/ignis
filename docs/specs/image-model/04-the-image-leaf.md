@@ -105,7 +105,9 @@ first denoising step; the result is the same up to rounding.
    error within spec 01's `thresholds.json` bound at every one of the 8 steps.
    The 1024² case is the first milestone.
 4. **Edit, step by step:** the same holds for the edit case, with the
-   condition prefix built by `encode_condition`.
+   condition prefix built by `encode_condition`. In ACs 3 and 4,
+   `denoise_step` reads ignis's own encoder's output via `encode_condition`,
+   never the recorded fp32 `prompt_embeds`.
 5. The DiT block outputs at blocks 0, 15 and 31 are written beside the
    recorded ones as a diagnostic report, without a threshold: on a failure of
    AC 3 or 4 they show where the error comes from.
