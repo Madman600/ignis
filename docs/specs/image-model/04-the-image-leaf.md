@@ -532,3 +532,192 @@ all 8 steps within the bound. **AC 5** written for t2i-2k and edit (below).
     ignis-core --features cuda --tests`: ok, with only the old warnings.
   - Under the profile: `image_leaf_gpu` 4/4 and `image_leaf_ten_images_gpu`
     1/1.
+
+## As built (321c, 2026-10-14: ACs 6, 8, 9; the VAE decode, n images, release and cancel, the free runs)
+
+Status: **AC 6 done**, every case at least 50 dB per channel, about 3 dB
+above diffusers' own bf16 decode. **AC 8 done**, measured. **AC 9 done**, the
+PNGs are linked below. Only AC 10 (the timing run) is not done; AC 11 still
+applies.
+
+- **Where.**
+  - `crates/core/src/image_autoencoder.rs` gains the decoder:
+    - `VaeDecoderWeights`;
+    - `decode`, with `decode_workspace_bytes`;
+    - the band planner `band_rows` and `bands`, with `BandRows` and
+      `BlockRows`;
+    - the host tail `latents_bf16` and `rgba8`.
+
+    `VaeConfig::parse` now also checks `decoder_base_dim`: absent means
+    diffusers' default, 144; null means `base_dim`.
+  - `crates/core/src/image_leaf.rs` adds:
+    - `LatentNorm::denormalize`;
+    - `ImageLeaf::vae_decode()`, which turns the started image's latents
+      into RGBA8 bytes `[16 h][16 w][4]`;
+    - `vae_decode_in_bands(band_rows)`, for tests and diagnosis;
+    - `device_free_bytes()`.
+
+    The image slot now remembers its (h, w).
+  - Tests:
+    - three new GPU tests in `crates/core/tests/image_leaf_gpu.rs`, which
+      now holds 7: `the_vae_decode_of_the_final_latents_is_the_recorded_png`,
+      `a_job_of_three_images_and_a_cancelled_job_leave_the_device_memory_where_it_was`,
+      `each_case_runs_free_from_its_noise_file`;
+    - CPU tests: the band plan worked by hand, the bands' tiling, the
+      workspace, the bytes against diffusers' own tail, the BF16 rounding,
+      the denormalization and the config.
+  - No kernel change: the decoder is Rust over spec 02's ops.
+- **The decode.**
+  - **The global phase**, on the whole latent grid: `post_quant_conv`,
+    `conv_in`, then the mid block. Its attention is global. The mid
+    block's output (1152 ch) stays whole while the bands run.
+  - **The band phase**: the 5 up blocks, `norm_out`, SiLU and `conv_out`,
+    in horizontal bands of image rows. Each band starts from the mid
+    block's output and works backward from `conv_out`'s halo:
+    - a 3×3 conv needs one row on each side;
+    - the upsampler needs `[(y0 − 1) >> 1, (y1 >> 1) + 1)` of the rows
+      before it;
+    - an upsampled block's output is rounded out to even rows, so the
+      DupUp maps whole rows.
+
+    The convolution pads by the global row, so a band is the whole image's
+    rows bit for bit.
+  - **Slots.** Four slots of the widest activation of any band, as the
+    encoder's `Run`, plus the mid output and the pack scratch.
+    - At 2048² in 224-row bands, a slot is block 3's output: 240 rows ×
+      2048 × 288 ch, 283 MB.
+    - Unbanded at 1024², the widest is 604 MB, so the 1.23 GiB region
+      cannot hold the unbanded decode.
+  - **Band size.** The leaf takes the most rows (a multiple of 16) whose
+    phase (input + fp32 image + workspace) fits the arena's region: 512
+    rows at 1024², 224 at 2048².
+  - **The halo's recompute**, in conv FLOPs of the banded stages: 1.08×
+    at 1024², 1.33× at 2048².
+- **AC 6.** The input is each case's recorded `step7/latents_out`, through
+  `vae_decode`. The reference is the recorded `image.png`, diffusers' fp32
+  decode. The floor is diffusers' own bf16 decode of the same latents
+  through the pipeline's tail (bf16 VAE, the latents and their
+  denormalization in bf16). It ran in the venv, diffusers 0.41.0 / torch
+  2.13, on the RTX 5090, script `.scratch/321c/bf16_floor.py` in the worktree
+  `image-kernels-319` (not tracked).
+
+  PSNR per channel, in dB:
+
+  | case | ignis R / G / B / A | diffusers bf16 R / G / B / A |
+  |---|---|---|
+  | t2i 1024² | **50.76 / 50.05 / 52.36 / 65.89** | 47.71 / 46.99 / 49.12 / 60.30 |
+  | edit 1024² | **55.14 / 56.06 / 55.28 / 63.05** | 52.03 / 52.77 / 52.99 / 55.35 |
+  | t2i-2k 2048² | **52.20 / 51.65 / 53.01 / 65.98** | 49.15 / 48.57 / 50.00 / 59.25 |
+
+  - **Banded against unbanded.** At 1024², the arena's decode in 512-row
+    bands equals the unbanded one bit for bit: 0 differing bytes. The
+    unbanded one ran in a workspace allocated for the call.
+  - **2048² runs in the arena.** `vae_decode` allocates nothing: the free
+    memory is the same before and after. Its 224-row bands equal a decode
+    in 112-row bands bit for bit.
+- **AC 8, measured with `cudaMemGetInfo` after the stream drains.**
+  - **The first job.** One step and a decode leave 2 MiB less free after
+    its release. That is CUDA's lazy loading of the kernels the process
+    launched for the first time: with `CUDA_MODULE_LOADING=EAGER` the same
+    test reads 0, both jobs equal to the byte. It is a once-per-process
+    cost, not the job's. The test runs that first job before it measures.
+  - **n = 3.** One `encode_condition` (the t2i prefix: 18.0 MiB held) and
+    three images from noises A, B, A, each 8 steps then `vae_decode`.
+    - The third image is the first's bytes exactly, so the prefix outlived
+      the image between them unchanged; the second differs.
+    - After `release_condition` the free memory is the before-job value,
+      15,706,619,904 bytes, to the byte.
+  - **Cancel.** A job released after its third step: the free memory is
+    back to the same value, to the byte.
+- **AC 9, the free runs.** Each case from its noise file: `encode_condition`,
+  the 8 steps on the leaf's own latents, `vae_decode`. The PNGs are in
+  `F:/ai/models/ignis-image-2.1-turbo/freerun/<case>/`, `ignis.png` beside
+  `diffusers-fp32.png`:
+  - [t2i](file:///F:/ai/models/ignis-image-2.1-turbo/freerun/t2i/ignis.png)
+    (beside [diffusers](file:///F:/ai/models/ignis-image-2.1-turbo/freerun/t2i/diffusers-fp32.png));
+  - [t2i-2k](file:///F:/ai/models/ignis-image-2.1-turbo/freerun/t2i-2k/ignis.png)
+    (beside [diffusers](file:///F:/ai/models/ignis-image-2.1-turbo/freerun/t2i-2k/diffusers-fp32.png));
+  - [edit](file:///F:/ai/models/ignis-image-2.1-turbo/freerun/edit/ignis.png)
+    (beside [diffusers](file:///F:/ai/models/ignis-image-2.1-turbo/freerun/edit/diffusers-fp32.png)).
+
+  What they look like, by eye:
+  - **t2i and t2i-2k.** The same picture as diffusers': the fox, the
+    "ignis" sign legible, the trees, the dawn sky or the falling snow, the
+    tail. They differ only in the strokes: an ear's outline, the sign's
+    tilt at 2K.
+  - **edit.** Where diffusers' alpha is opaque, the same glass circle,
+    square and triangle, to about 4-6 levels of RGB.
+    - The transparent background differs. ignis keeps a faint trace of the
+      condition image's white-to-blue gradient band, in hidden RGB with
+      alpha up to 18/255. diffusers' alpha there is at most 4.
+    - Viewers that ignore alpha show it as stripes. Over white it is a
+      barely visible grey veil.
+    - That background is why the edit's RGB PSNR against diffusers reads
+      16.6-25.8 dB. Over white it reads 35.1-36.4 dB.
+  - **Distance from diffusers' fp32 run.** The final latents are 8.72%
+    (t2i), 7.36% (2K) and 7.53% (edit) from it. The PSNR against its
+    image is t2i 26.6-27.1, 2K 26.5-29.1 and edit (alpha) 37.9 dB. This
+    is information only: a free run drifts, as the bf16 yardstick's would.
+- **Timing (information only, not AC 10).**
+  - `vae_decode` takes 133-170 ms at 1024² and 643-725 ms at 2048²; spec
+    02's convolutions alone were 104 and 406 ms.
+  - The difference is the halo's recompute (1.33× at 2K), the 3×3
+    weights packed once per band, and the fp32 image's trip to the host.
+  - Free run, warm, t2i: `encode_condition` 60 ms, 8 steps 1.18 s; 2K: 8
+    steps 5.9 s; edit: `encode_condition` 524 ms, 8 steps 1.32 s.
+- **Defaults taken** (the owner may revisit):
+  1. **The denormalization is on the host.** It is `z · std + mean` in
+     fp32 with two roundings, as the pipeline's fp32 path, then one
+     rounding to BF16 for `post_quant_conv`. diffusers' bf16 path rounds
+     the latents to bf16 and denormalizes in bf16.
+  2. **`conv_out` writes fp32.** The pipeline's tail is on the host, in
+     f32: the clamp to [−1, 1], `x · 0.5 + 0.5` clamped to [0, 1], then
+     `(x · 255)` rounded half to even (numpy) to bytes. The expected bytes
+     of the CPU test came from diffusers' own tail.
+  3. **The upsampler adds the DupUp shortcut as its residual**, in place:
+     one rounding, where diffusers' BF16 path rounds the convolution
+     first. The DupUp is written into the output's slot first.
+  4. **Four uniform slots** of the band's widest activation, the encoder's
+     `Run`. One slot size serves the mid block too, and the attention's
+     row tile is halved until its workspace fits a slot.
+  5. **Bands are the most 16-row multiples that fit.** They are not
+     balanced, so the last band is shorter.
+  6. **The 3×3 weights are packed per call, so per band.** That is about
+     0.5 GB of BF16 read and written per band, under a millisecond each.
+  7. **`vae_decode_in_bands`** allocates its workspace outside the plan
+     when the phase does not fit the region. It exists only for tests;
+     `vae_decode` never allocates.
+  8. **The free-run noise** is spec 01's noise file. For AC 8's second
+     image, it is the edit case's noise, also 64 × 64.
+- **For the runner adapter (after #322).**
+  - A job:
+    - `encode_condition` once;
+    - per image, `start_image` (noise from the job's seed), the steps,
+      `vae_decode`;
+    - `release_condition` at the end, or on cancel between any two calls.
+  - `vae_decode` returns RGBA8 bytes ready for PNG. The alpha is the
+    VAE's fourth channel: transparent backgrounds are real, so never drop
+    alpha.
+  - A refusal (`ImageLeafError::Refused`) is a 400. `vae_decode` before
+    `start_image` is one; a decode too wide for the arena would be one,
+    but the presets fit.
+- **For the timing agent (AC 10).**
+  - `vae_decode` is one host trip in (the latents, 1-4 MiB) and one out
+    (the fp32 image, 16-64 MiB), around the device work.
+  - Run one decode before you time: the first launches load kernel
+    modules (2 MiB, lazy).
+  - The halo's recompute and the per-band weight packing are the obvious
+    gaps at 2K. A larger region, or bands that carry halo rows forward
+    instead of recomputing them, would cut them. Not tuned (owner rule).
+- **Gates.**
+  - The CTest under the profile (`kernel/build.ps1 -Test`,
+    `IGNIS_GPU_PROFILE=1`): 124/124, with no flake.
+  - `CARGO_INCREMENTAL=0 cargo test --workspace`: 2880 passed, 0 failed,
+    6 ignored.
+  - `cargo check -p ignis-server --features cuda --tests` and `-p
+    ignis-core --features cuda --tests`: ok, with only the old warnings.
+  - Under the profile: `image_leaf_gpu` 7/7. AC 7's encode still reads
+    1.074%: the encoder's `conv` now goes through the windowed `conv_rows`.
+  - Not rerun: the server's `image_leaf_ten_images_gpu`. What it calls that
+    this change touched (that convolution wrapper, the image slot's shape)
+    is covered by `image_leaf_gpu`'s ACs 3, 4 and 7.
