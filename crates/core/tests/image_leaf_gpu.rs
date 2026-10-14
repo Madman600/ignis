@@ -1,5 +1,5 @@
 //! The image leaf on the real artifact against spec 01's recordings (spec image-model/04, GitHub
-//! #321): acceptance 1, 2, 3 at 1024² and 2048², and 5.
+//! #321): acceptance 1, 2, 3 at 1024² and 2048², 4, 5 and 7.
 //!
 //! - **Load and plan (AC 1).** The family loads from the artifact (`ImageLeaf::load`: the full
 //!   bind, the text encoder, the vision tower and the DiT's descriptors, the arena) and prints its
@@ -14,6 +14,12 @@
 //!   the DiT's prefix pass; then each of the 8 steps is fed the recorded input latents
 //!   (teacher-forced), and its velocity's relative L2 against the recorded velocity must be within
 //!   `thresholds.json`'s per-step bound. The noise file packed is step 0's input, checked.
+//! - **Edit, step by step (AC 4).** `encode_condition` with the condition image: the VAE encode,
+//!   the tower and DeepStack through the encoder's hooks on the recorded sequence and tower input,
+//!   txt_in and img_in laid out in the encoder's order; its segments must be the recorded ones; then
+//!   the 8 steps as in AC 3, against the edit case's bound.
+//! - **VAE encode (AC 7).** `vae_encode` of the condition image (its bytes from the recorded VAE
+//!   input) against the recorded condition latents, within `thresholds.json`'s bound (5 x bf16's).
 //! - **The diagnosis (AC 5).** The residual stream after blocks 0, 15 and 31 beside the recorded
 //!   ones, no threshold: the prefix's rows after `encode_condition` against step 0's first rows,
 //!   step 0's target rows against the rest of step 0's dumps, step 1's against step 1's.
@@ -31,7 +37,8 @@ use std::time::Instant;
 
 use ignis_artifact::{CudaDevice, Reader};
 use ignis_core::gpu_profile;
-use ignis_core::image_leaf::{euler_step, ConditionText, ImageLeaf, ImageLeafError, ImageLeafOptions, ImagePlanError};
+use ignis_core::image_leaf::{euler_step, Condition, ConditionImage, ConditionText, ImageLeaf, ImageLeafError, ImageLeafOptions, ImagePlanError};
+use ignis_core::vision::Grid;
 use ignis_core::vram::VramMode;
 
 const HIDDEN: usize = 4096;
@@ -173,6 +180,45 @@ fn load(reader: &Reader) -> Option<ImageLeaf> {
 fn t2i_case(leaf: &mut ImageLeaf, oracle: &Path, thresholds: &serde_json::Value, name: &str) {
     let dir = oracle.join(name);
     let case: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("case.json")).unwrap()).unwrap();
+    // The condition: ignis's own encoder on the recorded ids and positions.
+    let drop = case["drop_idx"].as_u64().unwrap() as usize;
+    let (ids, positions) = recorded_sequence(&dir);
+    let start = Instant::now();
+    let text = ConditionText { input_ids: &ids, positions: &positions, drop_idx: drop, image_pad_rows: &[] };
+    let Some((condition, prefix_taps)) = ran(leaf.encode_condition_tapped(&text, &[], &TAPS), "encode_condition") else { return };
+    let encode_s = start.elapsed().as_secs_f64();
+    assert_eq!(condition.tokens() as usize, ids.len() - drop);
+    teacher_forced(leaf, &dir, thresholds, name, &case, condition, prefix_taps, encode_s);
+}
+
+/// The blocks AC 5 reads the residual stream after.
+const TAPS: [u32; 3] = [0, 15, 31];
+
+/// The recorded `input_ids` and `mrope_position_ids` (`[3][1][tokens]`).
+fn recorded_sequence(dir: &Path) -> (Vec<u32>, Vec<i32>) {
+    let (shape, ids) = load_npy(&dir.join("input_ids.npy"));
+    let tokens = shape[1];
+    let ids: Vec<u32> = i64s(&ids).into_iter().map(|i| i as u32).collect();
+    let (pshape, pos) = load_npy(&dir.join("mrope_position_ids.npy"));
+    assert_eq!(pshape, vec![3, 1, tokens]);
+    (ids, i64s(&pos).into_iter().map(|p| p as i32).collect())
+}
+
+/// ACs 2, 3 or 4, and 5 over `condition` (from `encode_condition_tapped` with [`TAPS`]): the
+/// prefix's segments against the recorded ones; the prefix's rows at blocks 0, 15, 31 against step
+/// 0's first rows; the 8 steps, teacher-forced, each velocity against the case's bound; the target's
+/// rows at those blocks in steps 0 and 1.
+#[allow(clippy::too_many_arguments)]
+fn teacher_forced(
+    leaf: &mut ImageLeaf,
+    dir: &Path,
+    thresholds: &serde_json::Value,
+    name: &str,
+    case: &serde_json::Value,
+    condition: Condition,
+    prefix_taps: Vec<Vec<f32>>,
+    encode_s: f64,
+) {
     // AC 2: the schedule.
     let sigmas = npy_f32(&dir.join("sigmas.npy"), &[9]);
     let timesteps = npy_f32(&dir.join("timesteps.npy"), &[8]);
@@ -182,38 +228,42 @@ fn t2i_case(leaf: &mut ImageLeaf, oracle: &Path, thresholds: &serde_json::Value,
     let steps = leaf.sampler().steps();
     assert_eq!(steps, 8);
 
-    // The condition: ignis's own encoder on the recorded ids and positions.
-    let drop = case["drop_idx"].as_u64().unwrap() as usize;
-    let (shape, ids) = load_npy(&dir.join("input_ids.npy"));
-    let tokens = shape[1];
-    let ids: Vec<u32> = i64s(&ids).into_iter().map(|i| i as u32).collect();
-    let (pshape, pos) = load_npy(&dir.join("mrope_position_ids.npy"));
-    assert_eq!(pshape, vec![3, 1, tokens]);
-    let positions: Vec<i32> = i64s(&pos).into_iter().map(|p| p as i32).collect();
-    let prefix = tokens - drop;
-    let joint = case["sequence"]["dit"].as_u64().unwrap() as usize;
-    let (h, w) = (case["img_shapes"][0][1].as_u64().unwrap() as u32, case["img_shapes"][0][2].as_u64().unwrap() as u32);
+    // The target is the last of img_shapes; the joint sequence is [prefix ; target].
+    let last = case["img_shapes"].as_array().unwrap().last().unwrap().clone();
+    let (h, w) = (last[1].as_u64().unwrap() as u32, last[2].as_u64().unwrap() as u32);
     let target = (h * w) as usize;
+    let prefix = condition.tokens() as usize;
+    let joint = case["sequence"]["dit"].as_u64().unwrap() as usize;
     assert_eq!(joint, prefix + target, "the joint sequence is [prefix ; target]");
-    let taps = [0u32, 15, 31];
-    let start = Instant::now();
-    let Some((condition, prefix_taps)) =
-        ran(leaf.encode_condition_tapped(&ConditionText { input_ids: &ids, positions: &positions, drop_idx: drop }, &taps), "encode_condition")
-    else {
-        return;
-    };
-    let encode_s = start.elapsed().as_secs_f64();
-    assert_eq!(condition.tokens() as usize, prefix);
+    let recorded_segments: Vec<(u32, u32, bool)> = case["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| (g[0].as_u64().unwrap() as u32, g[1].as_u64().unwrap() as u32, g[2].as_bool().unwrap()))
+        .collect();
+    assert_eq!(condition.segments(), recorded_segments, "the prefix's segments are diffusers'");
 
     // AC 5: the prefix's rows at blocks 0, 15, 31 against step 0's first rows (t = 0, the same at every step).
     let block_dump = |step: usize, b: u32, rows: usize| npy_f32(&dir.join(format!("step{step}/block{b:02}.npy")), &[1, rows, HIDDEN]);
     let mut report = Vec::new();
-    for (i, &b) in taps.iter().enumerate() {
+    // With condition images, also the image blocks' rows and the text rows apart.
+    let image_rows: Vec<bool> = (0..prefix as u32).map(|t| condition.blocks().iter().any(|&(s, (bh, bw))| t >= s && t < s + bh * bw)).collect();
+    let rows_of = |x: &[f32], image: bool| -> Vec<f32> {
+        x.chunks_exact(HIDDEN).zip(&image_rows).filter(|(_, i)| **i == image).flat_map(|(r, _)| r.iter().copied()).collect()
+    };
+    for (i, &b) in TAPS.iter().enumerate() {
         let want = block_dump(0, b, joint);
-        report.push(format!("prefix block {b:2}: {:.3}%", rel_l2(&prefix_taps[i], &want[..prefix * HIDDEN]) * 100.0));
+        let want = &want[..prefix * HIDDEN];
+        let mut line = format!("prefix block {b:2}: {:.3}%", rel_l2(&prefix_taps[i], want) * 100.0);
+        if !condition.blocks().is_empty() {
+            let part = |image: bool| rel_l2(&rows_of(&prefix_taps[i], image), &rows_of(want, image)) * 100.0;
+            line += &format!(" (image rows {:.3}%, text rows {:.3}%)", part(true), part(false));
+        }
+        report.push(line);
     }
+    drop(prefix_taps);
 
-    // AC 3: the 8 steps, teacher-forced.
+    // AC 3 / 4: the 8 steps, teacher-forced.
     let noise = npy_f32(&dir.join("noise.npy"), &[1, 64, h as usize, w as usize]);
     let packed: Vec<f32> = (0..target * 64).map(|i| noise[(i % 64) * target + i / 64]).collect();
     let bound = thresholds["cases"][name]["velocity"]["bound"].as_array().expect("the velocity bound").iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>();
@@ -239,7 +289,7 @@ fn t2i_case(leaf: &mut ImageLeaf, oracle: &Path, thresholds: &serde_json::Value,
         if ran(leaf.set_latents(&latents_in), "set_latents").is_none() {
             return;
         }
-        let step_taps: &[u32] = if step < 2 { &taps } else { &[] };
+        let step_taps: &[u32] = if step < 2 { &TAPS } else { &[] };
         let t = Instant::now();
         let Some(tapped) = ran(leaf.denoise_step_tapped(&condition, step, step_taps), "denoise_step") else { return };
         step_ms.push(t.elapsed().as_secs_f64() * 1e3);
@@ -322,4 +372,31 @@ fn the_edit_condition_image_encodes_within_the_oracle_bound() {
         err / bf16
     );
     assert!(err <= bound, "edit: the condition latents' error {:.3}% is over the bound {:.3}%", err * 100.0, bound * 100.0);
+}
+
+#[test]
+#[ignore = "GPU: run under scripts/gpu-profile.ps1"]
+fn the_edit_steps_are_within_the_oracle_bound() {
+    let Some((reader, oracle, thresholds)) = fixtures() else { return };
+    let dir = oracle.join("edit");
+    let case: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("case.json")).unwrap()).unwrap();
+    let Some(mut leaf) = load(&reader) else { return };
+    // The condition: the recorded sequence and the tower's recorded input (spec 03: the front end
+    // gives both bit for bit), the VAE's input from the recorded VAE input's bytes.
+    let drop = case["drop_idx"].as_u64().unwrap() as usize;
+    let (ids, positions) = recorded_sequence(&dir);
+    let types = i64s(&load_npy(&dir.join("mm_token_type_ids.npy")).1);
+    let pad_rows: Vec<u32> = (0..).zip(types).filter(|&(_, t)| t == 1).map(|(r, _)| r).collect();
+    let grid_thw = i64s(&load_npy(&dir.join("image_grid_thw.npy")).1);
+    let grid = Grid { t: grid_thw[0] as u32, h: grid_thw[1] as u32, w: grid_thw[2] as u32 };
+    let pixels = f32s(&load_npy(&dir.join("pixel_values.npy")).1);
+    let (width, height, rgba) = condition_rgba(&dir);
+    let image = ConditionImage { grid, pixels: &pixels, width, height, rgba: &rgba };
+    let text = ConditionText { input_ids: &ids, positions: &positions, drop_idx: drop, image_pad_rows: &pad_rows };
+    let start = Instant::now();
+    let Some((condition, prefix_taps)) = ran(leaf.encode_condition_tapped(&text, &[image], &TAPS), "encode_condition") else { return };
+    let encode_s = start.elapsed().as_secs_f64();
+    assert_eq!(condition.blocks(), &[(8, (64, 64))], "the condition image's block");
+    assert_eq!(condition.prefix_chunk(), None, "a 4122-token prefix runs whole");
+    teacher_forced(&mut leaf, &dir, &thresholds, "edit", &case, condition, prefix_taps, encode_s);
 }

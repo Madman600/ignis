@@ -156,6 +156,77 @@ impl LatentNorm {
     }
 }
 
+/// Where each part of a condition prefix goes (spec image-model/04, the joint sequence; diffusers'
+/// `QwenImage21Transformer2DModel.forward`): the encoder's rows from `drop_idx` on, in order, a text
+/// row as one prefix token (through `txt_in`), each condition image's image-pad rows as its block of
+/// latent tokens (through `img_in`, 4 a pad: a pad stands for a 2 x 2 group). The image blocks follow
+/// the images' token counts, so two images with no text between them stay two blocks
+/// (`build_token_metadata`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixLayout {
+    pub tokens: u32,
+    /// Each run of text rows: (its first encoder row, its rows, its first prefix token).
+    pub text_runs: Vec<(u32, u32, u32)>,
+    /// Each condition image's block: (its first prefix token, (height, width) in latent tokens).
+    pub blocks: Vec<(u32, (u32, u32))>,
+    /// The attention's segments, `_qwenimage21_prefix_segments`: (start, end, text), a text run
+    /// causal, an image block bidirectional.
+    pub segments: Vec<(u32, u32, bool)>,
+}
+
+impl PrefixLayout {
+    /// The layout of an encoder sequence of `rows` rows whose image-pad rows are `pad_rows`
+    /// (ascending) for condition images of latent shapes `shapes` (in order). Refuses pads that do
+    /// not add up to the images' (height · width / 4 each), an image whose pads are not consecutive,
+    /// or a pad before `drop_idx`.
+    pub fn new(rows: usize, drop_idx: usize, pad_rows: &[u32], shapes: &[(u32, u32)]) -> Result<Self, String> {
+        if drop_idx >= rows {
+            return Err(format!("drop_idx {drop_idx} leaves none of the {rows} tokens"));
+        }
+        let mut pads = Vec::with_capacity(shapes.len());
+        for (k, &(h, w)) in shapes.iter().enumerate() {
+            let tokens = h as u64 * w as u64;
+            if tokens == 0 || tokens % 4 != 0 || tokens > 1 << 24 {
+                return Err(format!("condition image {k}'s {h} x {w} latent tokens are not 1 .. 2^24 in groups of 4"));
+            }
+            pads.push((tokens / 4) as usize);
+        }
+        if pads.iter().sum::<usize>() != pad_rows.len() {
+            return Err(format!("{} image-pad rows for condition images of {} pads", pad_rows.len(), pads.iter().sum::<usize>()));
+        }
+        let mut layout = Self { tokens: 0, text_runs: Vec::new(), blocks: Vec::new(), segments: Vec::new() };
+        let mut token = 0u64;
+        let text = |layout: &mut Self, token: &mut u64, row: usize, len: usize| {
+            if len > 0 {
+                layout.text_runs.push((row as u32, len as u32, *token as u32));
+                layout.segments.push((*token as u32, (*token + len as u64) as u32, true));
+                *token += len as u64;
+            }
+        };
+        let (mut row, mut at) = (drop_idx, 0);
+        for (k, (&n, &(h, w))) in pads.iter().zip(shapes).enumerate() {
+            let first = pad_rows[at] as usize;
+            if first < row || first + n > rows {
+                return Err(format!("condition image {k}'s pads start at row {first}, not within rows {row} .. {rows}"));
+            }
+            if !pad_rows[at..at + n].iter().enumerate().all(|(i, &r)| r as usize == first + i) {
+                return Err(format!("condition image {k}'s {n} pad rows from row {first} are not consecutive"));
+            }
+            text(&mut layout, &mut token, row, first - row);
+            layout.blocks.push((token as u32, (h, w)));
+            layout.segments.push((token as u32, (token + h as u64 * w as u64) as u32, false));
+            token += h as u64 * w as u64;
+            (row, at) = (first + n, at + n);
+        }
+        text(&mut layout, &mut token, row, rows - row);
+        if token > 1 << 30 {
+            return Err(format!("a condition prefix of {token} tokens"));
+        }
+        layout.tokens = token as u32;
+        Ok(layout)
+    }
+}
+
 /// What the image leaf's load knows before it allocates anything but its weights.
 pub struct ImagePlanRequest<'a> {
     pub mode: VramMode,
@@ -310,11 +381,12 @@ mod device {
     use ignis_artifact::qwen_image::{self, QwenImageGeometry};
     use ignis_artifact::{materialize, CudaDevice, Device, DeviceBuffer, MaterializedArtifact, ObjectHandle, Reader};
 
-    use super::{ImagePlan, ImagePlanError, ImagePlanRequest, LatentNorm, Sampler, MAX_TARGET_TOKENS};
+    use super::{ImagePlan, ImagePlanError, ImagePlanRequest, LatentNorm, PrefixLayout, Sampler, MAX_TARGET_TOKENS};
     use crate::image_autoencoder::{self as autoencoder, VaeConfig, VaeEncoderWeights};
     use crate::image_encoder::{self, embed_rows, TextEncoderConfig, TextEncoderWeights};
     use crate::image_transformer::{self as transformer, ffi as tffi, TransformerConfig, TransformerWeights};
-    use crate::image_vision::{VisionTowerConfig, VisionWeights};
+    use crate::image_vision::{self, vision_call, VisionCall, VisionTowerConfig, VisionWeights};
+    use crate::vision::Grid;
     use crate::vram::VramMode;
     use crate::{image_attn, image_dit, image_gemm, moe};
 
@@ -372,12 +444,29 @@ mod device {
     /// A condition's text: the text encoder's input (the server's `EncoderFrontend` builds it).
     #[derive(Debug, Clone, Copy)]
     pub struct ConditionText<'a> {
-        /// The prompt's token ids, the system message included.
+        /// The prompt's token ids, the system message included, each image's pads expanded.
         pub input_ids: &'a [u32],
         /// The mrope positions, int32 `[3][tokens]` (rows t, h, w).
         pub positions: &'a [i32],
         /// The system message's length: the DiT reads the encoder's rows from here on.
         pub drop_idx: usize,
+        /// The rows of `input_ids` that are image pads, ascending (none for text-to-image): where
+        /// the tower's features go in the encoder, and each condition image's latents in the prefix.
+        pub image_pad_rows: &'a [u32],
+    }
+
+    /// A condition image (spec image-model/04): what the vision tower reads and what the VAE reads,
+    /// of one image (the server's `EncoderFrontend` and its media step build both).
+    #[derive(Debug, Clone, Copy)]
+    pub struct ConditionImage<'a> {
+        /// The processor's grid in 16-pixel patches (`image_grid_thw`, one frame).
+        pub grid: Grid,
+        /// Its f32 `pixel_values`, `[raw patches][1536]`.
+        pub pixels: &'a [f32],
+        /// The VAE's input: RGBA8 `[height][width][4]`, row-major, the grid's size in pixels.
+        pub width: u32,
+        pub height: u32,
+        pub rgba: &'a [u8],
     }
 
     /// A condition prefix (spec image-model/04): every block's K/V run of the prefix's tokens,
@@ -392,12 +481,29 @@ mod device {
         /// The prefix's image blocks (start, (height, width)): the joint sequence's RoPE
         /// positions depend on them.
         blocks: Vec<(u32, (u32, u32))>,
+        /// The chunk the prefix pass ran in, when it did not run whole.
+        chunk: Option<u32>,
     }
 
     impl Condition {
         /// The prefix's tokens.
         pub fn tokens(&self) -> u32 {
             self.tokens
+        }
+
+        /// The prefix's attention segments: (start, end, text).
+        pub fn segments(&self) -> Vec<(u32, u32, bool)> {
+            self.segments.iter().map(|g| (g.start, g.end, g.text != 0)).collect()
+        }
+
+        /// Its condition images' blocks: (start, (height, width) in latent tokens).
+        pub fn blocks(&self) -> &[(u32, (u32, u32))] {
+            &self.blocks
+        }
+
+        /// The chunk, in tokens, the prefix pass ran in when the whole pass did not fit the arena.
+        pub fn prefix_chunk(&self) -> Option<u32> {
+            self.chunk
         }
 
         /// Its device bytes.
@@ -454,36 +560,122 @@ mod device {
         align(tokens as u64 * ROW) + transformer::workspace_bytes(tokens)
     }
 
-    /// `encode_condition`'s phase: the encoder's residual stream and positions, the prefix's RoPE
-    /// positions, then either the encoder's workspace or (once it has run) the prefix's residual
-    /// stream, RoPE table, modulation and the DiT's workspace.
+    /// `encode_condition`'s phase of the sequential region. First the condition images' latents
+    /// (fp32, normalized), which live until img_in; each image's VAE encode runs after them. Then the
+    /// encoder's residual stream, its positions and pad rows, the prefix's RoPE positions, and a
+    /// union: the tower's four outputs and the tower's or the encoder's workspace, or (once the
+    /// encoder has run) the prefix's residual stream, its RoPE table, the modulation and the DiT's
+    /// workspace. The prefix pass runs whole when its workspace fits what is left, else in the
+    /// largest chunk (a multiple of 128) that fits ([`transformer::prefix_blocks`]).
     struct EncodePhase {
+        latents: Vec<u64>,
+        vae: u64,
         x: u64,
         positions: u64,
+        pad_rows: u64,
         prefix_positions: u64,
-        union: u64,
+        embeds: [u64; 4],
+        encoder_workspace: u64,
+        encoder_workspace_bytes: u64,
         prefix_x: u64,
         rope: u64,
         modulation: u64,
         out_scale: u64,
         workspace: u64,
-        bytes: u64,
+        workspace_bytes: u64,
+        chunk: Option<u32>,
     }
 
     impl EncodePhase {
-        fn new(tokens: u32, prefix: u32) -> Self {
+        /// The phase of an encoder sequence of `tokens` rows with `pads` image pads (the tower's
+        /// `call` over the condition images of `sizes`, (width, height) in pixels) and a prefix of
+        /// `prefix` tokens, in a region of `region` bytes; Err names what does not fit.
+        fn new(
+            vae: &ignis_artifact::qwen_image::VaeGeometry,
+            tokens: u32,
+            pads: u32,
+            call: Option<&VisionCall>,
+            sizes: &[(u32, u32)],
+            prefix: u32,
+            region: u64,
+        ) -> Result<Self, String> {
             let (l, p) = (tokens as u64, prefix as u64);
-            let x = 0;
+            let mut latents = Vec::with_capacity(sizes.len());
+            let mut at = 0;
+            for &(w, h) in sizes {
+                latents.push(at);
+                at += align((w / 16) as u64 * (h / 16) as u64 * LATENT as u64 * 4);
+            }
+            let vae_phase = sizes.iter().map(|&(w, h)| VaePhase::new(vae, w, h).bytes).max().unwrap_or(0);
+            let vae_end = at + vae_phase;
+            let x = at;
             let positions = x + align(l * ROW);
-            let prefix_positions = positions + align(l * 12);
+            let pad_rows = positions + align(l * 12);
+            let prefix_positions = pad_rows + align(pads as u64 * 4);
             let union = prefix_positions + align(p * 12);
+            let rows = align(pads as u64 * HIDDEN as u64 * 2);
+            let embeds = [union, union + rows, union + 2 * rows, union + 3 * rows];
+            let encoder_workspace = if call.is_some() { union + 4 * rows } else { union };
+            let tower = call.map_or(0, |c| image_vision::workspace_bytes(c.tokens(), c.segments()));
+            let encoder_workspace_bytes = image_encoder::workspace_bytes(tokens).max(tower);
+            let encoder_end = encoder_workspace + encoder_workspace_bytes;
             let prefix_x = union;
             let rope = prefix_x + align(p * ROW);
             let modulation = rope + align(p * ROPE_ROW);
             let out_scale = modulation + align(tffi::MODULATION as u64 * 4);
             let workspace = out_scale + align(ROW);
-            let bytes = union + image_encoder::workspace_bytes(tokens).max(workspace - union + transformer::workspace_bytes(prefix));
-            Self { x, positions, prefix_positions, union, prefix_x, rope, modulation, out_scale, workspace, bytes }
+            let need = |what: &str, end: u64| {
+                if end > region {
+                    Err(format!(
+                        "the condition ({tokens} encoder tokens, {pads} image pads, {prefix} prefix tokens) needs {end} bytes of arena for \
+                         its {what}, the arena holds {region}"
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+            need("VAE encode", vae_end)?;
+            need("tower and encoder", encoder_end)?;
+            need("prefix", workspace)?;
+            let left = region - workspace;
+            let whole = transformer::workspace_bytes(prefix);
+            let chunk = if whole <= left {
+                None
+            } else {
+                // The largest multiple of 128 whose workspace fits: the workspace grows with the chunk.
+                let (mut lo, mut hi) = (0u32, prefix.div_ceil(128));
+                while hi - lo > 1 {
+                    let mid = lo + (hi - lo) / 2;
+                    if transformer::workspace_bytes(mid * 128) <= left { lo = mid } else { hi = mid }
+                }
+                if lo == 0 {
+                    need("prefix pass in chunks of 128", workspace + transformer::workspace_bytes(128))?;
+                }
+                Some(lo * 128)
+            };
+            Ok(Self {
+                latents,
+                vae: at,
+                x,
+                positions,
+                pad_rows,
+                prefix_positions,
+                embeds,
+                encoder_workspace,
+                encoder_workspace_bytes,
+                prefix_x,
+                rope,
+                modulation,
+                out_scale,
+                workspace,
+                workspace_bytes: left,
+                chunk,
+            })
+        }
+
+        /// The rows txt_in, img_in and a pass take at once: the prefix's, or the chunk's.
+        fn rows(&self, prefix: u32) -> u32 {
+            self.chunk.unwrap_or(prefix)
         }
     }
 
@@ -552,10 +744,11 @@ mod device {
                 Err(_) => dev.free_bytes().ok_or_else(|| ImageLeafError::Failed("the device reports no free memory".into()))?,
             };
             let blocks = geometry.dit.blocks as u64;
+            // A prefix's 32 runs, and the BF16 K and V a chunked prefix pass holds while it runs.
             let prefix_bytes = move |n: u64| match u32::try_from(n) {
                 Ok(0) => 0,
-                Ok(n) => blocks * align(image_attn::kv8_bytes(n)),
-                Err(_) => u64::MAX,
+                Ok(n) if n <= 1 << 20 => blocks * align(image_attn::kv8_bytes(n)) + transformer::prefix_kv_bytes(n),
+                _ => u64::MAX,
             };
             let plan = ImagePlan::new(&ImagePlanRequest {
                 mode: options.vram,
@@ -658,7 +851,8 @@ mod device {
 
         /// The DiT's blocks in place on `x` (`tokens` rows at arena offset `x`), split after each
         /// block of `taps` (ascending, each below the block count) to copy the residual stream out:
-        /// the split runs the same blocks, bit for bit (ignis_image_transformer.h).
+        /// the split runs the same blocks, bit for bit (ignis_image_transformer.h). `chunked`, for
+        /// the prefix pass only: its K/V buffer and chunk ([`transformer::prefix_blocks`]).
         #[allow(clippy::too_many_arguments)]
         fn blocks_tapped(
             &mut self,
@@ -668,6 +862,7 @@ mod device {
             rope: u64,
             modulation: u64,
             prefix: &tffi::ignis_image_transformer_prefix,
+            chunked: Option<(*mut c_void, u32)>,
             workspace: u64,
             workspace_bytes: u64,
             taps: &[u32],
@@ -676,21 +871,14 @@ mod device {
             let mut out = Vec::with_capacity(taps.len());
             let mut first = 0;
             for end in taps.iter().map(|&t| t + 1).chain(std::iter::once(desc.block_count)) {
-                unsafe {
-                    transformer::blocks(
-                        &desc,
-                        first,
-                        end,
-                        self.at(x) as *mut f32,
-                        tokens,
-                        target,
-                        self.at(rope) as *const f32,
-                        self.at(modulation) as *const f32,
-                        prefix,
-                        self.at(workspace),
-                        workspace_bytes,
-                        std::ptr::null_mut(),
-                    )
+                let (x_at, rope_at, modulation_at, ws) = (self.at(x) as *mut f32, self.at(rope) as *const f32, self.at(modulation) as *const f32, self.at(workspace));
+                match chunked {
+                    None => unsafe {
+                        transformer::blocks(&desc, first, end, x_at, tokens, target, rope_at, modulation_at, prefix, ws, workspace_bytes, std::ptr::null_mut())
+                    },
+                    Some((kv, chunk)) => unsafe {
+                        transformer::prefix_blocks(&desc, first, end, x_at, rope_at, modulation_at, prefix, kv, chunk, ws, workspace_bytes, std::ptr::null_mut())
+                    },
                 }
                 .map_err(failed("the DiT's blocks"))?;
                 if end < desc.block_count || taps.last() == Some(&(end - 1)) {
@@ -712,11 +900,13 @@ mod device {
             Ok(())
         }
 
-        /// `encode_condition` for a text-only condition (text-to-image): the text encoder, txt_in
-        /// on its rows from `drop_idx`, and the DiT over those prefix tokens at t = 0, storing each
-        /// block's K/V run.
-        pub fn encode_condition(&mut self, text: &ConditionText<'_>) -> Result<Condition, ImageLeafError> {
-            self.encode_condition_tapped(text, &[]).map(|(c, _)| c)
+        /// `encode_condition` (spec image-model/04): the condition images' VAE encodes; the vision
+        /// tower on them and the text encoder with its hooks (spec 03); txt_in on the encoder's text
+        /// rows and img_in on each image's latents, laid out in the encoder's order
+        /// ([`PrefixLayout`]); then the DiT over those prefix tokens at t = 0, storing each block's
+        /// K/V run. No images: text-to-image.
+        pub fn encode_condition(&mut self, text: &ConditionText<'_>, images: &[ConditionImage<'_>]) -> Result<Condition, ImageLeafError> {
+            self.encode_condition_tapped(text, images, &[]).map(|(c, _)| c)
         }
 
         /// [`ImageLeaf::encode_condition`], with the prefix's residual stream copied out after
@@ -724,6 +914,7 @@ mod device {
         pub fn encode_condition_tapped(
             &mut self,
             text: &ConditionText<'_>,
+            images: &[ConditionImage<'_>],
             taps: &[u32],
         ) -> Result<(Condition, Vec<Vec<f32>>), ImageLeafError> {
             self.check_taps(taps)?;
@@ -731,24 +922,45 @@ mod device {
             if text.positions.len() != 3 * tokens {
                 return Err(ImageLeafError::Refused(format!("{} mrope positions for {tokens} tokens", text.positions.len())));
             }
-            if text.drop_idx >= tokens {
-                return Err(ImageLeafError::Refused(format!("drop_idx {} leaves none of the {tokens} tokens", text.drop_idx)));
+            for (k, image) in images.iter().enumerate() {
+                if image.grid.t != 1 || image.grid.h as u64 * 16 != image.height as u64 || image.grid.w as u64 * 16 != image.width as u64 {
+                    return Err(ImageLeafError::Refused(format!(
+                        "condition image {k}: a {}x{}x{} grid is not its {} x {} pixels in 16-pixel patches, one frame",
+                        image.grid.t, image.grid.h, image.grid.w, image.width, image.height
+                    )));
+                }
             }
-            let prefix = (tokens - text.drop_idx) as u32;
+            let shapes: Vec<(u32, u32)> = images.iter().map(|i| (i.height / 16, i.width / 16)).collect();
+            let layout = PrefixLayout::new(tokens, text.drop_idx, text.image_pad_rows, &shapes).map_err(ImageLeafError::Refused)?;
+            let prefix = layout.tokens;
             if prefix as u64 > self.plan.condition_budget_tokens {
                 return Err(ImageLeafError::Refused(format!(
                     "the condition's {prefix} prefix tokens are above the condition budget of {} tokens",
                     self.plan.condition_budget_tokens
                 )));
             }
-            let prefix_positions = image_dit::rope_positions(prefix, &[], &[]).map_err(ImageLeafError::Refused)?;
-            let phase = EncodePhase::new(tokens as u32, prefix);
-            if phase.bytes > self.layout.seq_bytes {
-                return Err(ImageLeafError::Refused(format!(
-                    "the condition ({tokens} encoder tokens, {prefix} prefix tokens) needs {} bytes of arena, the arena holds {}",
-                    phase.bytes, self.layout.seq_bytes
-                )));
-            }
+            let starts: Vec<u32> = layout.blocks.iter().map(|b| b.0).collect();
+            let prefix_positions = image_dit::rope_positions(prefix, &starts, &shapes).map_err(ImageLeafError::Refused)?;
+            let call = if images.is_empty() {
+                None
+            } else {
+                let call = vision_call(&images.iter().map(|i| (i.grid, i.pixels)).collect::<Vec<_>>()).map_err(ImageLeafError::Refused)?;
+                if call.tokens() as usize != text.image_pad_rows.len() {
+                    return Err(ImageLeafError::Refused(format!("the tower's {} tokens for {} image-pad rows", call.tokens(), text.image_pad_rows.len())));
+                }
+                Some(call)
+            };
+            let sizes: Vec<(u32, u32)> = images.iter().map(|i| (i.width, i.height)).collect();
+            let phase = EncodePhase::new(
+                self.vae.geometry(),
+                tokens as u32,
+                text.image_pad_rows.len() as u32,
+                call.as_ref(),
+                &sizes,
+                prefix,
+                self.layout.seq_bytes,
+            )
+            .map_err(ImageLeafError::Refused)?;
             let x0 = embed_rows(self.artifact.host_tensor_bytes(self.embed_tokens).map_err(|e| failed("the embedding")(e.to_string()))?, HIDDEN, text.input_ids)
                 .map_err(ImageLeafError::Refused)?;
 
@@ -759,10 +971,27 @@ mod device {
                 run_ptrs: (0..blocks).map(|b| unsafe { runs.base_ptr().add(b * run_bytes as usize) as *mut c_void }).collect(),
                 runs,
                 tokens: prefix,
-                segments: vec![tffi::ignis_image_transformer_segment { start: 0, end: prefix, text: 1 }],
-                blocks: Vec::new(),
+                segments: layout.segments.iter().map(|&(start, end, text)| tffi::ignis_image_transformer_segment { start, end, text: text as u32 }).collect(),
+                blocks: layout.blocks.clone(),
+                chunk: phase.chunk,
             };
-            match self.run_prefix(text, &x0, &prefix_positions, &phase, &condition, taps) {
+            // The chunked pass's K/V, from the condition budget while the pass runs.
+            let kv = match phase.chunk {
+                None => None,
+                Some(_) => match self.dev.allocate(transformer::prefix_kv_bytes(prefix)) {
+                    Ok(kv) => Some(kv),
+                    Err(e) => {
+                        let _ = self.release_condition(condition);
+                        return Err(failed("the prefix pass's K/V")(e.to_string()));
+                    }
+                },
+            };
+            let ran = self.run_prefix(text, images, call.as_ref(), &layout, &x0, &prefix_positions, &phase, &condition, kv.as_ref(), taps);
+            if let Some(kv) = kv {
+                let _ = sync();
+                let _ = self.dev.deallocate(kv);
+            }
+            match ran {
                 Ok(tapped) => Ok((condition, tapped)),
                 Err(e) => {
                     let _ = self.release_condition(condition);
@@ -771,27 +1000,56 @@ mod device {
             }
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn run_prefix(
             &mut self,
             text: &ConditionText<'_>,
+            images: &[ConditionImage<'_>],
+            call: Option<&VisionCall>,
+            layout: &PrefixLayout,
             x0: &[f32],
             prefix_positions: &[i32],
             phase: &EncodePhase,
             condition: &Condition,
+            kv: Option<&DeviceBuffer>,
             taps: &[u32],
         ) -> Result<Vec<Vec<f32>>, ImageLeafError> {
             let seq = self.layout.seq;
             let tokens = text.input_ids.len() as u32;
             let prefix = condition.tokens;
             let null = std::ptr::null_mut();
+            // The condition images' latents, each VAE encode in the region after them.
+            for (k, image) in images.iter().enumerate() {
+                let latents = self.vae_latents(image.width, image.height, image.rgba, seq + phase.vae)?;
+                self.upload(seq + phase.latents[k], bytes_of(&latents))?;
+                self.dev.synchronize().map_err(|e| failed("the latents' upload")(e.to_string()))?;
+            }
             sync()?;
+            let pad_rows: Vec<i32> = text.image_pad_rows.iter().map(|&r| r as i32).collect();
             self.upload(seq + phase.x, bytes_of(x0))?;
             self.upload(seq + phase.positions, bytes_of(text.positions))?;
+            if !pad_rows.is_empty() {
+                self.upload(seq + phase.pad_rows, bytes_of(&pad_rows))?;
+            }
             self.upload(seq + phase.prefix_positions, bytes_of(prefix_positions))?;
             self.dev.synchronize().map_err(|e| failed("the uploads")(e.to_string()))?;
 
+            // The tower, then the text encoder with its hooks (spec 03: the merger's rows over the
+            // pads, the DeepStack mergers' added after the first text layers).
+            let embeds = phase.embeds.map(|e| self.at(seq + e));
+            let encoder_ws = self.at(seq + phase.encoder_workspace);
+            if let Some(call) = call {
+                let desc = self.vision.descriptor();
+                unsafe { image_vision::forward(&desc, call, embeds[0], Some(&[embeds[1], embeds[2], embeds[3]]), encoder_ws, phase.encoder_workspace_bytes, null) }
+                    .map_err(failed("the vision tower"))?;
+            }
+            let vision = call.map(|_| image_encoder::ffi::ignis_image_encoder_vision {
+                rows: pad_rows.len() as u32,
+                row_index: self.at(seq + phase.pad_rows) as *const i32,
+                embeds: embeds[0],
+                deepstack: [embeds[1] as *const c_void, embeds[2] as *const c_void, embeds[3] as *const c_void],
+            });
             let text_desc = self.text.descriptor();
-            let encoder_ws = seq + phase.union;
             unsafe {
                 image_encoder::forward(
                     &text_desc,
@@ -800,28 +1058,55 @@ mod device {
                     self.at(seq + phase.x) as *mut f32,
                     tokens,
                     self.at(seq + phase.positions) as *const i32,
-                    None,
-                    self.at(encoder_ws),
-                    image_encoder::workspace_bytes(tokens),
+                    vision.as_ref(),
+                    encoder_ws,
+                    phase.encoder_workspace_bytes,
                     null,
                 )
             }
             .map_err(failed("the text encoder"))?;
+
+            // txt_in on each run of text rows, img_in on each image's latents, at their prefix rows;
+            // both row by row, so in pieces of at most the pass's rows.
             let desc = self.transformer.descriptor();
             let workspace = seq + phase.workspace;
-            let workspace_bytes = phase.bytes - phase.workspace;
-            unsafe {
-                transformer::txt_in(
-                    &desc,
-                    self.at(seq + phase.x + text.drop_idx as u64 * ROW) as *const f32,
-                    prefix,
-                    self.at(seq + phase.prefix_x) as *mut f32,
-                    self.at(workspace),
-                    workspace_bytes,
-                    null,
-                )
+            let workspace_bytes = phase.workspace_bytes;
+            let rows = phase.rows(prefix);
+            for &(row, len, token) in &layout.text_runs {
+                for at in (0..len).step_by(rows as usize) {
+                    let n = rows.min(len - at);
+                    unsafe {
+                        transformer::txt_in(
+                            &desc,
+                            self.at(seq + phase.x + (row + at) as u64 * ROW) as *const f32,
+                            n,
+                            self.at(seq + phase.prefix_x + (token + at) as u64 * ROW) as *mut f32,
+                            self.at(workspace),
+                            workspace_bytes,
+                            null,
+                        )
+                    }
+                    .map_err(failed("txt_in"))?;
+                }
             }
-            .map_err(failed("txt_in"))?;
+            for (k, &(token, (h, w))) in layout.blocks.iter().enumerate() {
+                let len = h * w;
+                for at in (0..len).step_by(rows as usize) {
+                    let n = rows.min(len - at);
+                    unsafe {
+                        transformer::img_in(
+                            &desc,
+                            self.at(seq + phase.latents[k] + at as u64 * LATENT as u64 * 4) as *const f32,
+                            n,
+                            self.at(seq + phase.prefix_x + (token + at) as u64 * ROW) as *mut f32,
+                            self.at(workspace),
+                            workspace_bytes,
+                            null,
+                        )
+                    }
+                    .map_err(failed("img_in"))?;
+                }
+            }
             unsafe { image_dit::rope_table(self.at(seq + phase.prefix_positions) as *const i32, prefix, self.at(seq + phase.rope) as *mut f32, null) }
                 .map_err(failed("the prefix's RoPE table"))?;
             unsafe {
@@ -836,6 +1121,7 @@ mod device {
                 )
             }
             .map_err(failed("the t = 0 modulation"))?;
+            let chunked = phase.chunk.zip(kv).map(|(chunk, kv)| (kv.base_ptr() as *mut c_void, chunk));
             let tapped = self.blocks_tapped(
                 seq + phase.prefix_x,
                 prefix,
@@ -843,6 +1129,7 @@ mod device {
                 seq + phase.rope,
                 seq + phase.modulation,
                 &condition.descriptor(),
+                chunked,
                 workspace,
                 workspace_bytes,
                 taps,
@@ -963,7 +1250,7 @@ mod device {
             .map_err(failed("the modulation"))?;
             unsafe { transformer::img_in(&desc, self.at(l.latents) as *const f32, tokens, self.at(x) as *mut f32, self.at(workspace), workspace_bytes, null) }
                 .map_err(failed("img_in"))?;
-            let tapped = self.blocks_tapped(x, tokens, true, l.rope, l.modulation, &condition.descriptor(), workspace, workspace_bytes, taps)?;
+            let tapped = self.blocks_tapped(x, tokens, true, l.rope, l.modulation, &condition.descriptor(), None, workspace, workspace_bytes, taps)?;
             unsafe {
                 transformer::head(
                     &desc,
@@ -1114,6 +1401,35 @@ mod tests {
         assert!(LatentNorm::parse(&json(serde_json::json!([0.0]), serde_json::json!([1.0, 1.0])), 2).unwrap_err().contains("1 latents_mean"));
         assert!(LatentNorm::parse(&json(serde_json::json!([0.0, 0.0]), serde_json::json!([1.0, 0.0])), 2).unwrap_err().contains("not positive"));
         assert!(LatentNorm::parse(b"{}", 2).unwrap_err().contains("no latents_mean"));
+    }
+
+    #[test]
+    fn the_prefix_lays_text_rows_and_image_blocks_out_in_the_encoders_order() {
+        // The oracle's edit case: 1064 rows, drop_idx 14, 1024 pads at rows 22 .. 1046 for a 64 x 64
+        // condition image; case.json's segments are [0, 8) text, [8, 4104) image, [4104, 4122) text.
+        let pads: Vec<u32> = (22..1046).collect();
+        let edit = PrefixLayout::new(1064, 14, &pads, &[(64, 64)]).unwrap();
+        assert_eq!(edit.tokens, 4122);
+        assert_eq!(edit.segments, vec![(0, 8, true), (8, 4104, false), (4104, 4122, true)]);
+        assert_eq!(edit.text_runs, vec![(14, 8, 0), (1046, 18, 4104)]);
+        assert_eq!(edit.blocks, vec![(8, (64, 64))]);
+        // Text to image: the rows from drop_idx, one causal segment.
+        let t2i = PrefixLayout::new(45, 14, &[], &[]).unwrap();
+        assert_eq!((t2i.tokens, t2i.segments.clone(), t2i.text_runs.clone()), (31, vec![(0, 31, true)], vec![(14, 31, 0)]));
+        // Two images with no text between them stay two blocks: rows 2, 3 text, row 4 a 2 x 2
+        // image's one pad, rows 5 .. 8 a 2 x 6 image's three, row 8 text.
+        let adjacent = PrefixLayout::new(9, 2, &[4, 5, 6, 7], &[(2, 2), (2, 6)]).unwrap();
+        assert_eq!(adjacent.segments, vec![(0, 2, true), (2, 6, false), (6, 18, false), (18, 19, true)]);
+        assert_eq!(adjacent.blocks, vec![(2, (2, 2)), (6, (2, 6))]);
+        assert_eq!(adjacent.text_runs, vec![(2, 2, 0), (8, 1, 18)]);
+        // A sequence may end on an image.
+        assert_eq!(PrefixLayout::new(6, 2, &[4, 5], &[(2, 4)]).unwrap().segments, vec![(0, 2, true), (2, 10, false)]);
+        assert!(PrefixLayout::new(8, 2, &[4, 5, 6, 7], &[(2, 2), (2, 2)]).unwrap_err().contains("4 image-pad rows for condition images of 2 pads"));
+        // Refusals: pads before drop_idx, an image's pads not consecutive, shapes not in 2 x 2 groups.
+        assert!(PrefixLayout::new(10, 5, &[3, 4, 5, 6], &[(4, 4)]).unwrap_err().contains("not within rows 5"));
+        assert!(PrefixLayout::new(10, 2, &[3, 4, 6, 7], &[(4, 4)]).unwrap_err().contains("not consecutive"));
+        assert!(PrefixLayout::new(10, 2, &[3], &[(1, 3)]).unwrap_err().contains("groups of 4"));
+        assert!(PrefixLayout::new(10, 10, &[], &[]).unwrap_err().contains("drop_idx"));
     }
 
     fn request(mode: VramMode, free: u64, cap: Option<u64>) -> ImagePlanRequest<'static> {
