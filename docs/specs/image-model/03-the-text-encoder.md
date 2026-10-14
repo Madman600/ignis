@@ -76,15 +76,17 @@ because the text tokens after an image attend to it.
 3. The **t2i case**: the encoder output against the recorded fp32 output has
    an error ≤ the `encoder` bound in spec 01's `thresholds.json`, both
    measured with spec 01's encoder metric over the text rows: the positions
-   after `drop_idx` that are not image-pad, each row's relative L2, then
-   their RMS. This is the first milestone. The first row's error
-   (`encoder_row0`) is reported beside the yardsticks', without a bound.
+   after `drop_idx` that are not image-pad, from row 1 on, each row's
+   relative L2, then their RMS. This is the first milestone. The first row's
+   error (`encoder_row0`) is reported beside the yardsticks', in no bound.
 4. The **edit case**: with the vision tower and DeepStack on, the error over
-   the text rows after the vision span is ≤ the `encoder_after_vision`
+   the text rows after the first image pad is ≤ the `encoder_after_vision`
    bound. With DeepStack off, the same test fails; that check proves
    DeepStack matters to the test. In spec 01's yardstick session, the fp32
    encoder with DeepStack off exceeded that bound by only 4% (26.85% against
-   25.76%), so the check is narrow. The error over all the text rows (the
+   25.76%), so the check is narrow, and it is weak: the fail rests on 2 of
+   the 18 rows, `<|vision_end|>` (42.0%) and one text row, " the" (60.0%);
+   without both, the error is under the bound (95% of it). The error over all the text rows (the
    `encoder` bound) is reported beside it; DeepStack off did not exceed that
    bound (spec 01, As built).
 5. The 27B's vision tests pass unchanged after the tower is parametrised.

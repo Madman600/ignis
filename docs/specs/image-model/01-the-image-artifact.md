@@ -119,18 +119,26 @@ The artifact is published on Hugging Face as `gpillon/ignis-image-2.1-turbo`.
   The metrics are against fp32, in float64:
   - the velocity and the condition latents: relative L2 over the whole
     tensor;
-  - the encoder over its **text rows** only: the positions after
-    `drop_idx` whose `image_pad_mask` is 0. The DiT replaces the image-pad
-    rows with the condition latents, so their error never reaches it. Each
-    row's relative L2 is taken, then their RMS,
+  - the encoder over its **text rows from row 1 on**: the positions after
+    `drop_idx` whose `image_pad_mask` is 0, row 0 excluded. The DiT replaces
+    the image-pad rows with the condition latents, so their error never
+    reaches it. Each row's relative L2 is taken, then their RMS,
     sqrt(mean_r ‖e_r‖²/‖ref_r‖²): the DiT reads each row through an
-    RMSNorm (`txt_in`), so one large row cannot stand for the others;
+    RMSNorm (`txt_in`), so a row's scale does not weigh in;
   - with a condition image, the same metric over the text rows **after the
-    vision span** only, the ones the image can reach;
-  - the first row after `drop_idx` alone, reported and never bounded.
+    first image pad** only (the rows any image reaches; with several images
+    that includes the text between them);
+  - the first row after `drop_idx` alone (`encoder_row0`, the user turn's
+    `<|im_start|>`), reported and in no bound. It is an ill-conditioned
+    template row, not a sink: the same ids and positions in every prompt,
+    yet its error depends on the sequence length (bf16 alone is 54% off on
+    it for t2i and 30% for edit), and it is 79-96% of the bf16 mean square
+    of the text rows. Bounded with them, it would let the other rows read
+    ~5× the error they have.
 
   The **bound** ignis is held to is **max(2 × sim error, 5 × bf16 error)**,
-  per step, for both encoder quantities and for the condition latents. Both
+  per step, for both encoder quantities (row 0 has none) and for the
+  condition latents. Both
   factors are flags with these defaults. `thresholds.json` carries both
   errors, the bound, each quantity's metric, the factors, the oracle's and
   the yardstick's session ids, and the artifact's sha256. It is written
@@ -175,8 +183,9 @@ The artifact is published on Hugging Face as `gpillon/ignis-image-2.1-turbo`.
 6. `thresholds.json` holds, for each case:
    - the teacher-forced per-step velocity error of both yardsticks (bf16
      and simulated W8A8);
-   - their encoder error over the text rows (and, with a condition image,
-     after the vision span), and their condition-latent error;
+   - their encoder error over the text rows from row 1 on (and, with a
+     condition image, after the first image pad), their row 0 error as
+     information, and their condition-latent error;
    - the bound max(2 × sim, 5 × bf16) for each of these.
 
    It also holds the metrics, the factors, the artifact's sha256, and both
@@ -379,7 +388,29 @@ and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
 - **For spec 03.** AC 1's templates with 2 and 10 condition images and
   AC 6's 3-image mrope table need no GPU recording: both come on the CPU
   from the pinned processor and transformers' rope index, without weights.
-- **thresholds.json** (schema v3) comes from `record.py yardstick
+- **thresholds.json v4 (current)** comes from `record.py yardstick
+  --replace-thresholds --supersede-bound`: session `2026-10-13T22:22:54Z`,
+  commit `1451c3f` (clean), on oracle session `2026-10-13T18:08:17Z`. Its
+  sha256 is
+  `3e25d06e8c00f0deb8a41212a5f961394ca33436ea21e6fcd0142c6e32c75c43`.
+  - Row 0 leaves every encoder bound (the coordinator's decision,
+    2026-10-14; see the metric above).
+  - Everything else is bit-identical to v3: the velocity, the condition
+    latents and the after-the-first-pad encoder quantity. The session
+    refuses a supersede otherwise.
+  - The encoder over the text rows from row 1 on, in % (bf16 / sim /
+    bound):
+    - t2i and t2i-2k: 2.03 / 9.75 / **19.50**;
+    - edit: 3.13 / 14.49 / **28.99**;
+    - edit after the first image pad: 3.22 / 12.88 / **25.76**
+      (unchanged).
+  - Row 0 is information only: t2i 53.72 / 93.86, edit 30.42 / 21.12.
+  - Its report is `oracle/yardstick-report.json`, archived per session as
+    `yardstick-report.<session>.json`. v3 is kept as
+    `thresholds.2026-10-13T214507Z.json`.
+  - The numbers below are v3's. Only its encoder column and row 0's
+    standing changed in v4.
+- **thresholds.json v3** (superseded) came from `record.py yardstick
   --replace-thresholds`, one session under the GPU lock: session
   `2026-10-13T21:45:07Z`, commit `4fa6502` (clean), on oracle session
   `2026-10-13T18:08:17Z`. It is the bound max(2 × sim, 5 × bf16), both
