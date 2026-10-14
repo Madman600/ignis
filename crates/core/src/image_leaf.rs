@@ -252,6 +252,662 @@ impl ImagePlan {
     }
 }
 
+/// The largest target the arena is sized for, in latent tokens: 2400 x 1792 pixels (150 x 112),
+/// the largest preset by cells (spec image-model/04's 2752 x 1536 is 16,512).
+pub const MAX_TARGET_TOKENS: u32 = 16_800;
+
+#[cfg(feature = "cuda")]
+pub use device::*;
+
+#[cfg(feature = "cuda")]
+mod device {
+    use std::os::raw::c_void;
+    use std::time::Instant;
+
+    use ignis_artifact::qwen_image::{self, QwenImageGeometry};
+    use ignis_artifact::{materialize, CudaDevice, Device, DeviceBuffer, MaterializedArtifact, ObjectHandle, Reader};
+
+    use super::{ImagePlan, ImagePlanError, ImagePlanRequest, Sampler, MAX_TARGET_TOKENS};
+    use crate::image_encoder::{self, embed_rows, TextEncoderConfig, TextEncoderWeights};
+    use crate::image_transformer::{self as transformer, ffi as tffi, TransformerConfig, TransformerWeights};
+    use crate::image_vision::{VisionTowerConfig, VisionWeights};
+    use crate::vram::VramMode;
+    use crate::{image_attn, image_dit, image_gemm, moe};
+
+    const HIDDEN: usize = 4096;
+    /// One fp32 residual row.
+    const ROW: u64 = HIDDEN as u64 * 4;
+    /// One token's RoPE table row: 64 (cos, sin) fp32 pairs.
+    const ROPE_ROW: u64 = 64 * 2 * 4;
+    const LATENT: usize = 64;
+
+    fn align(n: u64) -> u64 {
+        (n + 255) & !255
+    }
+
+    /// Why a call did not run.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ImageLeafError {
+        /// The request is one the leaf refuses (a RoPE position outside the table, a prefix above
+        /// the condition budget, a size above the arena, a token outside the vocabulary): the
+        /// server answers it as a bad request, never a server error.
+        Refused(String),
+        /// The device or the leaf failed.
+        Failed(String),
+        /// The load does not fit the card.
+        Plan(ImagePlanError),
+    }
+
+    impl std::fmt::Display for ImageLeafError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Refused(why) => write!(f, "refused: {why}"),
+                Self::Failed(why) => write!(f, "{why}"),
+                Self::Plan(e) => write!(f, "{e}"),
+            }
+        }
+    }
+
+    impl std::error::Error for ImageLeafError {}
+
+    fn failed(what: &str) -> impl Fn(String) -> ImageLeafError + '_ {
+        move |e| ImageLeafError::Failed(format!("{what}: {e}"))
+    }
+
+    /// The load's knobs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ImageLeafOptions {
+        /// How the VRAM budget is chosen (the server's `vram` config).
+        pub vram: VramMode,
+        /// `image.condition_budget_tokens` (spec image-model/05), when named.
+        pub condition_budget_cap: Option<u64>,
+        /// The largest target, in latent tokens, the arena is sized for.
+        pub max_target_tokens: u32,
+    }
+
+    /// A condition's text: the text encoder's input (the server's `EncoderFrontend` builds it).
+    #[derive(Debug, Clone, Copy)]
+    pub struct ConditionText<'a> {
+        /// The prompt's token ids, the system message included.
+        pub input_ids: &'a [u32],
+        /// The mrope positions, int32 `[3][tokens]` (rows t, h, w).
+        pub positions: &'a [i32],
+        /// The system message's length: the DiT reads the encoder's rows from here on.
+        pub drop_idx: usize,
+    }
+
+    /// A condition prefix (spec image-model/04): every block's K/V run of the prefix's tokens,
+    /// stored once by `encode_condition` and read by every denoising step of every image of the
+    /// job. Free it with [`ImageLeaf::release_condition`].
+    #[derive(Debug)]
+    pub struct Condition {
+        runs: DeviceBuffer,
+        run_ptrs: Vec<*mut c_void>,
+        tokens: u32,
+        segments: Vec<tffi::ignis_image_transformer_segment>,
+        /// The prefix's image blocks (start, (height, width)): the joint sequence's RoPE
+        /// positions depend on them.
+        blocks: Vec<(u32, (u32, u32))>,
+    }
+
+    impl Condition {
+        /// The prefix's tokens.
+        pub fn tokens(&self) -> u32 {
+            self.tokens
+        }
+
+        /// Its device bytes.
+        pub fn bytes(&self) -> u64 {
+            self.runs.len()
+        }
+
+        fn descriptor(&self) -> tffi::ignis_image_transformer_prefix {
+            tffi::ignis_image_transformer_prefix {
+                tokens: self.tokens,
+                runs: self.run_ptrs.as_ptr(),
+                segments: self.segments.as_ptr(),
+                segment_count: self.segments.len() as u32,
+            }
+        }
+    }
+
+    /// The arena: the image slot (one image's state across its steps), then the sequential region
+    /// every call carves by phase. Byte offsets from the arena's start.
+    #[derive(Debug, Clone, Copy)]
+    struct Layout {
+        max_target: u32,
+        latents: u64,
+        velocity: u64,
+        positions: u64,
+        rope: u64,
+        modulation: u64,
+        out_scale: u64,
+        seq: u64,
+        seq_bytes: u64,
+    }
+
+    impl Layout {
+        fn new(max_target: u32) -> Self {
+            let n = max_target as u64;
+            let latents = 0;
+            let velocity = latents + align(n * LATENT as u64 * 4);
+            let positions = velocity + align(n * LATENT as u64 * 4);
+            let rope = positions + align(n * 12);
+            let modulation = rope + align(n * ROPE_ROW);
+            let out_scale = modulation + align(tffi::MODULATION as u64 * 4);
+            let seq = out_scale + align(ROW);
+            Self { max_target, latents, velocity, positions, rope, modulation, out_scale, seq, seq_bytes: step_bytes(max_target) }
+        }
+
+        fn total(&self) -> u64 {
+            self.seq + self.seq_bytes
+        }
+    }
+
+    /// A denoising step's phase of the sequential region: the residual stream, then the DiT's
+    /// workspace.
+    fn step_bytes(tokens: u32) -> u64 {
+        align(tokens as u64 * ROW) + transformer::workspace_bytes(tokens)
+    }
+
+    /// `encode_condition`'s phase: the encoder's residual stream and positions, the prefix's RoPE
+    /// positions, then either the encoder's workspace or (once it has run) the prefix's residual
+    /// stream, RoPE table, modulation and the DiT's workspace.
+    struct EncodePhase {
+        x: u64,
+        positions: u64,
+        prefix_positions: u64,
+        union: u64,
+        prefix_x: u64,
+        rope: u64,
+        modulation: u64,
+        out_scale: u64,
+        workspace: u64,
+        bytes: u64,
+    }
+
+    impl EncodePhase {
+        fn new(tokens: u32, prefix: u32) -> Self {
+            let (l, p) = (tokens as u64, prefix as u64);
+            let x = 0;
+            let positions = x + align(l * ROW);
+            let prefix_positions = positions + align(l * 12);
+            let union = prefix_positions + align(p * 12);
+            let prefix_x = union;
+            let rope = prefix_x + align(p * ROW);
+            let modulation = rope + align(p * ROPE_ROW);
+            let out_scale = modulation + align(tffi::MODULATION as u64 * 4);
+            let workspace = out_scale + align(ROW);
+            let bytes = union + image_encoder::workspace_bytes(tokens).max(workspace - union + transformer::workspace_bytes(prefix));
+            Self { x, positions, prefix_positions, union, prefix_x, rope, modulation, out_scale, workspace, bytes }
+        }
+    }
+
+    fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+    }
+
+    fn sync() -> Result<(), ImageLeafError> {
+        moe::stream_sync(std::ptr::null_mut()).map_err(failed("the stream"))
+    }
+
+    /// The image leaf, loaded: the family's weights on the device (the text encoder, the vision
+    /// tower, the DiT; the VAE's tensors materialized for the decode), its descriptors, the sampler,
+    /// the plan and the arena.
+    pub struct ImageLeaf {
+        artifact: MaterializedArtifact,
+        embed_tokens: ObjectHandle,
+        text: TextEncoderWeights,
+        vision: VisionWeights,
+        transformer: TransformerWeights,
+        sampler: Sampler,
+        plan: ImagePlan,
+        layout: Layout,
+        arena: Option<DeviceBuffer>,
+        /// The started image's target tokens.
+        image: Option<u32>,
+        dev: CudaDevice,
+    }
+
+    impl ImageLeaf {
+        /// Loads the family from the artifact: binds every object, plans the device memory (a
+        /// load whose weights and arena do not fit is refused before anything is placed, naming
+        /// the shortfall), materializes the weights and allocates the arena.
+        pub fn load(reader: &Reader, mut dev: CudaDevice, options: &ImageLeafOptions) -> Result<Self, ImageLeafError> {
+            if options.max_target_tokens == 0 || options.max_target_tokens > 1 << 20 {
+                return Err(ImageLeafError::Refused(format!("max_target_tokens {} is not 1 .. 2^20", options.max_target_tokens)));
+            }
+            let geometry = QwenImageGeometry::qwen_image_21_turbo();
+            let bound = qwen_image::bind(reader, &geometry).map_err(|e| failed("the artifact does not bind")(e.to_string()))?;
+            let layout = Layout::new(options.max_target_tokens);
+            let free = match CudaDevice::nvml_memory(0) {
+                Ok((free, _)) => free,
+                Err(_) => dev.free_bytes().ok_or_else(|| ImageLeafError::Failed("the device reports no free memory".into()))?,
+            };
+            let blocks = geometry.dit.blocks as u64;
+            let prefix_bytes = move |n: u64| match u32::try_from(n) {
+                Ok(0) => 0,
+                Ok(n) => blocks * align(image_attn::kv8_bytes(n)),
+                Err(_) => u64::MAX,
+            };
+            let plan = ImagePlan::new(&ImagePlanRequest {
+                mode: options.vram,
+                free_at_start_bytes: free,
+                weights_bytes: bound.plan.device_capacity_bytes,
+                arena_bytes: layout.total(),
+                prefix_bytes: &prefix_bytes,
+                condition_budget_cap: options.condition_budget_cap,
+            })
+            .map_err(ImageLeafError::Plan)?;
+
+            let start = Instant::now();
+            let mut artifact = materialize(reader, &bound.plan, &mut dev, None).map_err(|e| failed("materialize")(e.to_string()))?;
+            let built = (|| -> Result<_, ImageLeafError> {
+                let resource = |name: &str| artifact.resource_bytes(bound.handles[name]).map_err(|e| failed(name)(e.to_string()));
+                let text_json = resource(qwen_image::TEXT_ENCODER_CONFIG)?;
+                let text_config = TextEncoderConfig::parse(text_json, &geometry.text).map_err(failed("the text config"))?;
+                let tower_config = VisionTowerConfig::parse(text_json, &geometry.vision).map_err(failed("the vision config"))?;
+                let transformer_config =
+                    TransformerConfig::parse(resource(qwen_image::TRANSFORMER_CONFIG)?, &geometry.dit).map_err(failed("the transformer config"))?;
+                let sampler = Sampler::parse(resource(qwen_image::IMAGE_MODEL)?).map_err(failed("the sampler"))?;
+                let text = TextEncoderWeights::new(&artifact, &bound.handles, &geometry.text, text_config).map_err(failed("the text encoder"))?;
+                let vision = VisionWeights::new(&artifact, &bound.handles, &geometry.vision, &tower_config).map_err(failed("the vision tower"))?;
+                let transformer = TransformerWeights::new(&artifact, &bound.handles, &geometry.dit, transformer_config).map_err(failed("the DiT"))?;
+                image_gemm::prepare().map_err(failed("image_gemm::prepare"))?;
+                Ok((text, vision, transformer, sampler))
+            })();
+            let (text, vision, transformer, sampler) = match built {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = artifact.release_arena(&mut dev);
+                    return Err(e);
+                }
+            };
+            let arena = match dev.allocate(layout.total()) {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = artifact.release_arena(&mut dev);
+                    return Err(failed("the arena")(e.to_string()));
+                }
+            };
+            tracing::info!(load_s = start.elapsed().as_secs_f64(), "{}", plan.line());
+            Ok(Self {
+                artifact,
+                embed_tokens: bound.handles["text_encoder/embed_tokens.weight"],
+                text,
+                vision,
+                transformer,
+                sampler,
+                plan,
+                layout,
+                arena: Some(arena),
+                image: None,
+                dev,
+            })
+        }
+
+        /// The load's plan (its line: [`ImagePlan::line`]).
+        pub fn plan(&self) -> &ImagePlan {
+            &self.plan
+        }
+
+        /// The denoising schedule.
+        pub fn sampler(&self) -> &Sampler {
+            &self.sampler
+        }
+
+        /// The vision tower's descriptors (for `encode_condition`'s condition images).
+        pub fn vision(&self) -> &VisionWeights {
+            &self.vision
+        }
+
+        fn arena(&self) -> &DeviceBuffer {
+            self.arena.as_ref().expect("the arena lives as long as the leaf")
+        }
+
+        fn at(&self, offset: u64) -> *mut c_void {
+            unsafe { self.arena().base_ptr().add(offset as usize) as *mut c_void }
+        }
+
+        fn upload(&mut self, offset: u64, bytes: &[u8]) -> Result<(), ImageLeafError> {
+            let arena = *self.arena();
+            self.dev.copy_h2d(&arena, offset, bytes).map_err(|e| failed("an upload")(e.to_string()))
+        }
+
+        fn download_f32(&mut self, offset: u64, count: usize) -> Result<Vec<f32>, ImageLeafError> {
+            sync()?;
+            let mut bytes = vec![0u8; count * 4];
+            let arena = *self.arena();
+            self.dev.copy_d2h(&arena, offset, &mut bytes).map_err(|e| failed("a download")(e.to_string()))?;
+            self.dev.synchronize().map_err(|e| failed("a download")(e.to_string()))?;
+            Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        }
+
+        /// The DiT's blocks in place on `x` (`tokens` rows at arena offset `x`), split after each
+        /// block of `taps` (ascending, each below the block count) to copy the residual stream out:
+        /// the split runs the same blocks, bit for bit (ignis_image_transformer.h).
+        #[allow(clippy::too_many_arguments)]
+        fn blocks_tapped(
+            &mut self,
+            x: u64,
+            tokens: u32,
+            target: bool,
+            rope: u64,
+            modulation: u64,
+            prefix: &tffi::ignis_image_transformer_prefix,
+            workspace: u64,
+            workspace_bytes: u64,
+            taps: &[u32],
+        ) -> Result<Vec<Vec<f32>>, ImageLeafError> {
+            let desc = self.transformer.descriptor();
+            let mut out = Vec::with_capacity(taps.len());
+            let mut first = 0;
+            for end in taps.iter().map(|&t| t + 1).chain(std::iter::once(desc.block_count)) {
+                unsafe {
+                    transformer::blocks(
+                        &desc,
+                        first,
+                        end,
+                        self.at(x) as *mut f32,
+                        tokens,
+                        target,
+                        self.at(rope) as *const f32,
+                        self.at(modulation) as *const f32,
+                        prefix,
+                        self.at(workspace),
+                        workspace_bytes,
+                        std::ptr::null_mut(),
+                    )
+                }
+                .map_err(failed("the DiT's blocks"))?;
+                if end < desc.block_count || taps.last() == Some(&(end - 1)) {
+                    out.push(self.download_f32(x, tokens as usize * HIDDEN)?);
+                }
+                first = end;
+                if first == desc.block_count {
+                    break;
+                }
+            }
+            Ok(out)
+        }
+
+        fn check_taps(&self, taps: &[u32]) -> Result<(), ImageLeafError> {
+            let blocks = self.transformer.descriptor().block_count;
+            if !taps.windows(2).all(|w| w[0] < w[1]) || taps.last().is_some_and(|&t| t >= blocks) {
+                return Err(ImageLeafError::Refused(format!("the taps {taps:?} are not ascending blocks below {blocks}")));
+            }
+            Ok(())
+        }
+
+        /// `encode_condition` for a text-only condition (text-to-image): the text encoder, txt_in
+        /// on its rows from `drop_idx`, and the DiT over those prefix tokens at t = 0, storing each
+        /// block's K/V run.
+        pub fn encode_condition(&mut self, text: &ConditionText<'_>) -> Result<Condition, ImageLeafError> {
+            self.encode_condition_tapped(text, &[]).map(|(c, _)| c)
+        }
+
+        /// [`ImageLeaf::encode_condition`], with the prefix's residual stream copied out after
+        /// each block of `taps` (spec image-model/04 acceptance 5's diagnosis).
+        pub fn encode_condition_tapped(
+            &mut self,
+            text: &ConditionText<'_>,
+            taps: &[u32],
+        ) -> Result<(Condition, Vec<Vec<f32>>), ImageLeafError> {
+            self.check_taps(taps)?;
+            let tokens = text.input_ids.len();
+            if text.positions.len() != 3 * tokens {
+                return Err(ImageLeafError::Refused(format!("{} mrope positions for {tokens} tokens", text.positions.len())));
+            }
+            if text.drop_idx >= tokens {
+                return Err(ImageLeafError::Refused(format!("drop_idx {} leaves none of the {tokens} tokens", text.drop_idx)));
+            }
+            let prefix = (tokens - text.drop_idx) as u32;
+            if prefix as u64 > self.plan.condition_budget_tokens {
+                return Err(ImageLeafError::Refused(format!(
+                    "the condition's {prefix} prefix tokens are above the condition budget of {} tokens",
+                    self.plan.condition_budget_tokens
+                )));
+            }
+            let prefix_positions = image_dit::rope_positions(prefix, &[], &[]).map_err(ImageLeafError::Refused)?;
+            let phase = EncodePhase::new(tokens as u32, prefix);
+            if phase.bytes > self.layout.seq_bytes {
+                return Err(ImageLeafError::Refused(format!(
+                    "the condition ({tokens} encoder tokens, {prefix} prefix tokens) needs {} bytes of arena, the arena holds {}",
+                    phase.bytes, self.layout.seq_bytes
+                )));
+            }
+            let x0 = embed_rows(self.artifact.host_tensor_bytes(self.embed_tokens).map_err(|e| failed("the embedding")(e.to_string()))?, HIDDEN, text.input_ids)
+                .map_err(ImageLeafError::Refused)?;
+
+            let blocks = self.transformer.descriptor().block_count as usize;
+            let run_bytes = align(image_attn::kv8_bytes(prefix));
+            let runs = self.dev.allocate(run_bytes * blocks as u64).map_err(|e| failed("the condition prefix")(e.to_string()))?;
+            let condition = Condition {
+                run_ptrs: (0..blocks).map(|b| unsafe { runs.base_ptr().add(b * run_bytes as usize) as *mut c_void }).collect(),
+                runs,
+                tokens: prefix,
+                segments: vec![tffi::ignis_image_transformer_segment { start: 0, end: prefix, text: 1 }],
+                blocks: Vec::new(),
+            };
+            match self.run_prefix(text, &x0, &prefix_positions, &phase, &condition, taps) {
+                Ok(tapped) => Ok((condition, tapped)),
+                Err(e) => {
+                    let _ = self.release_condition(condition);
+                    Err(e)
+                }
+            }
+        }
+
+        fn run_prefix(
+            &mut self,
+            text: &ConditionText<'_>,
+            x0: &[f32],
+            prefix_positions: &[i32],
+            phase: &EncodePhase,
+            condition: &Condition,
+            taps: &[u32],
+        ) -> Result<Vec<Vec<f32>>, ImageLeafError> {
+            let seq = self.layout.seq;
+            let tokens = text.input_ids.len() as u32;
+            let prefix = condition.tokens;
+            let null = std::ptr::null_mut();
+            sync()?;
+            self.upload(seq + phase.x, bytes_of(x0))?;
+            self.upload(seq + phase.positions, bytes_of(text.positions))?;
+            self.upload(seq + phase.prefix_positions, bytes_of(prefix_positions))?;
+            self.dev.synchronize().map_err(|e| failed("the uploads")(e.to_string()))?;
+
+            let text_desc = self.text.descriptor();
+            let encoder_ws = seq + phase.union;
+            unsafe {
+                image_encoder::forward(
+                    &text_desc,
+                    0,
+                    text_desc.layer_count,
+                    self.at(seq + phase.x) as *mut f32,
+                    tokens,
+                    self.at(seq + phase.positions) as *const i32,
+                    None,
+                    self.at(encoder_ws),
+                    image_encoder::workspace_bytes(tokens),
+                    null,
+                )
+            }
+            .map_err(failed("the text encoder"))?;
+            let desc = self.transformer.descriptor();
+            let workspace = seq + phase.workspace;
+            let workspace_bytes = phase.bytes - phase.workspace;
+            unsafe {
+                transformer::txt_in(
+                    &desc,
+                    self.at(seq + phase.x + text.drop_idx as u64 * ROW) as *const f32,
+                    prefix,
+                    self.at(seq + phase.prefix_x) as *mut f32,
+                    self.at(workspace),
+                    workspace_bytes,
+                    null,
+                )
+            }
+            .map_err(failed("txt_in"))?;
+            unsafe { image_dit::rope_table(self.at(seq + phase.prefix_positions) as *const i32, prefix, self.at(seq + phase.rope) as *mut f32, null) }
+                .map_err(failed("the prefix's RoPE table"))?;
+            unsafe {
+                transformer::modulation(
+                    &desc,
+                    0.0,
+                    self.at(seq + phase.modulation) as *mut f32,
+                    self.at(seq + phase.out_scale) as *mut f32,
+                    self.at(workspace),
+                    workspace_bytes,
+                    null,
+                )
+            }
+            .map_err(failed("the t = 0 modulation"))?;
+            let tapped = self.blocks_tapped(
+                seq + phase.prefix_x,
+                prefix,
+                false,
+                seq + phase.rope,
+                seq + phase.modulation,
+                &condition.descriptor(),
+                workspace,
+                workspace_bytes,
+                taps,
+            )?;
+            sync()?;
+            Ok(tapped)
+        }
+
+        /// Frees a condition prefix.
+        pub fn release_condition(&mut self, condition: Condition) -> Result<(), ImageLeafError> {
+            sync()?;
+            self.dev.deallocate(condition.runs).map_err(|e| failed("release_condition")(e.to_string()))
+        }
+
+        /// Starts an image of `height` x `width` latent tokens over `condition`: its latents are
+        /// `noise` (packed fp32 `[tokens][64]`, `packed[y * width + x][c] = noise[c][y][x]`), and its
+        /// RoPE table the target block's rows of the joint sequence.
+        pub fn start_image(&mut self, condition: &Condition, height: u32, width: u32, noise: &[f32]) -> Result<(), ImageLeafError> {
+            let tokens = height as u64 * width as u64;
+            if tokens == 0 || tokens > self.layout.max_target as u64 {
+                return Err(ImageLeafError::Refused(format!(
+                    "a {height} x {width} target is {tokens} latent tokens, the arena holds 1 .. {}",
+                    self.layout.max_target
+                )));
+            }
+            let tokens = tokens as u32;
+            if noise.len() != tokens as usize * LATENT {
+                return Err(ImageLeafError::Refused(format!("{} noise values for {tokens} tokens of 64", noise.len())));
+            }
+            let mut starts: Vec<u32> = condition.blocks.iter().map(|b| b.0).collect();
+            let mut shapes: Vec<(u32, u32)> = condition.blocks.iter().map(|b| b.1).collect();
+            starts.push(condition.tokens);
+            shapes.push((height, width));
+            let joint = condition.tokens.checked_add(tokens).ok_or_else(|| ImageLeafError::Refused("the joint sequence is too long".into()))?;
+            let positions = image_dit::rope_positions(joint, &starts, &shapes).map_err(ImageLeafError::Refused)?;
+            sync()?;
+            self.upload(self.layout.latents, bytes_of(noise))?;
+            self.upload(self.layout.positions, bytes_of(&positions[3 * condition.tokens as usize..]))?;
+            self.dev.synchronize().map_err(|e| failed("the image's uploads")(e.to_string()))?;
+            unsafe { image_dit::rope_table(self.at(self.layout.positions) as *const i32, tokens, self.at(self.layout.rope) as *mut f32, std::ptr::null_mut()) }
+                .map_err(failed("the target's RoPE table"))?;
+            sync()?;
+            self.image = Some(tokens);
+            Ok(())
+        }
+
+        /// Denoising step `step` of the started image: the DiT over the target tokens at the
+        /// step's σ, attending to `condition`, then the Euler update of the latents on the device.
+        pub fn denoise_step(&mut self, condition: &Condition, step: usize) -> Result<(), ImageLeafError> {
+            self.denoise_step_tapped(condition, step, &[]).map(|_| ())
+        }
+
+        /// [`ImageLeaf::denoise_step`], with the target's residual stream copied out after each
+        /// block of `taps`.
+        pub fn denoise_step_tapped(&mut self, condition: &Condition, step: usize, taps: &[u32]) -> Result<Vec<Vec<f32>>, ImageLeafError> {
+            self.check_taps(taps)?;
+            let tokens = self.image.ok_or_else(|| ImageLeafError::Refused("denoise_step before start_image".into()))?;
+            if step >= self.sampler.steps() {
+                return Err(ImageLeafError::Refused(format!("step {step} of a {}-step schedule", self.sampler.steps())));
+            }
+            let (sigma, sigma_next) = self.sampler.sigma(step);
+            let seq = self.layout.seq;
+            let x = seq;
+            let workspace = seq + align(tokens as u64 * ROW);
+            let workspace_bytes = self.layout.seq_bytes - align(tokens as u64 * ROW);
+            let desc = self.transformer.descriptor();
+            let null = std::ptr::null_mut();
+            let l = self.layout;
+            unsafe {
+                transformer::modulation(&desc, sigma, self.at(l.modulation) as *mut f32, self.at(l.out_scale) as *mut f32, self.at(workspace), workspace_bytes, null)
+            }
+            .map_err(failed("the modulation"))?;
+            unsafe { transformer::img_in(&desc, self.at(l.latents) as *const f32, tokens, self.at(x) as *mut f32, self.at(workspace), workspace_bytes, null) }
+                .map_err(failed("img_in"))?;
+            let tapped = self.blocks_tapped(x, tokens, true, l.rope, l.modulation, &condition.descriptor(), workspace, workspace_bytes, taps)?;
+            unsafe {
+                transformer::head(
+                    &desc,
+                    self.at(x) as *const f32,
+                    tokens,
+                    self.at(l.out_scale) as *const f32,
+                    self.at(l.velocity) as *mut f32,
+                    Some(self.at(l.latents) as *mut f32),
+                    sigma,
+                    sigma_next,
+                    self.at(workspace),
+                    workspace_bytes,
+                    null,
+                )
+            }
+            .map_err(failed("the head"))?;
+            sync()?;
+            Ok(tapped)
+        }
+
+        /// Overwrites the started image's latents (packed fp32 `[tokens][64]`): a teacher-forced
+        /// step's input.
+        pub fn set_latents(&mut self, latents: &[f32]) -> Result<(), ImageLeafError> {
+            let tokens = self.image.ok_or_else(|| ImageLeafError::Refused("set_latents before start_image".into()))?;
+            if latents.len() != tokens as usize * LATENT {
+                return Err(ImageLeafError::Refused(format!("{} latents for {tokens} tokens of 64", latents.len())));
+            }
+            sync()?;
+            self.upload(self.layout.latents, bytes_of(latents))?;
+            self.dev.synchronize().map_err(|e| failed("the latents' upload")(e.to_string()))
+        }
+
+        /// The started image's latents, packed fp32 `[tokens][64]`.
+        pub fn latents(&mut self) -> Result<Vec<f32>, ImageLeafError> {
+            let tokens = self.image.ok_or_else(|| ImageLeafError::Refused("latents before start_image".into()))?;
+            self.download_f32(self.layout.latents, tokens as usize * LATENT)
+        }
+
+        /// The last step's velocity, packed fp32 `[tokens][64]`.
+        pub fn velocity(&mut self) -> Result<Vec<f32>, ImageLeafError> {
+            let tokens = self.image.ok_or_else(|| ImageLeafError::Refused("velocity before start_image".into()))?;
+            self.download_f32(self.layout.velocity, tokens as usize * LATENT)
+        }
+    }
+
+    impl Drop for ImageLeaf {
+        fn drop(&mut self) {
+            let _ = sync();
+            if let Some(arena) = self.arena.take() {
+                let _ = self.dev.deallocate(arena);
+            }
+            let _ = self.artifact.release_arena(&mut self.dev);
+        }
+    }
+
+    impl ImageLeafOptions {
+        /// The server's VRAM mode, no cap, the arena sized for [`MAX_TARGET_TOKENS`].
+        pub fn new(vram: VramMode) -> Self {
+            Self { vram, condition_budget_cap: None, max_target_tokens: MAX_TARGET_TOKENS }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

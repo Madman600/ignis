@@ -62,6 +62,7 @@ pub mod image_encoder_attn;
 #[cfg(feature = "cuda")]
 pub mod image_gemm;
 pub mod image_leaf;
+pub mod image_transformer;
 #[cfg(feature = "cuda")]
 pub mod image_vae;
 pub mod image_vision;
