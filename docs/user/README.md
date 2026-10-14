@@ -936,8 +936,11 @@ id; a `model` that names a known model of the route's kind switches to it under
 
 **Licence.** The weights are under the **Qwen Research License: non-commercial
 use only**, with a "Built with Qwen" notice. Do not serve the image model in a
-commercial product. The notice and the third-party terms the image path carries
-are in the repository's [`NOTICE`](../../NOTICE).
+commercial product. The weights' terms are the model repository's own:
+[`LICENSE`](https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/LICENSE) and
+[`NOTICE`](https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/NOTICE) at the pinned
+revision. The repository's [`NOTICE`](../../NOTICE) covers the third-party code
+and text the image path carries (Pillow's resize, Qwen's enhancement prompts).
 
 | Route | Body |
 |---|---|
@@ -964,15 +967,20 @@ curl http://127.0.0.1:8000/v1/images/generations \
 **Sizes.** `size` is one of `image.sizes`: 2048x2048, 2400x1792, 1792x2400,
 2528x1696, 1696x2528, 2752x1536, 1536x2752 (the checkpoint's presets) and
 1024x1024 (the size OpenAI clients often send); anything else is a `400` that
-lists them. Every side is a multiple of 32. `auto` is 2048x2048 for a
-generation and, for an edit, the preset whose aspect ratio is nearest the last
-condition image's.
+lists them. Every side is a multiple of 32. A size in `image.sizes` past the
+largest image the loaded model makes is a `400` too, listing the sizes it
+serves. `auto` is 2048x2048 for a generation and, for an edit, the preset whose
+aspect ratio is nearest the last condition image's, always among the sizes
+served.
 
 **Condition images.** Each is resized to about 1024x1024 of area, keeping its
-aspect ratio. When the prompt and all of them exceed the condition budget they
-are scaled down together, never below `image.condition_floor_px` squared; below
-that the request is a `400` naming the budget. A condition image is refused only
-for decoding to more than `image.max_condition_mipx`.
+aspect ratio, as soon as it is decoded. When the prompt and all of them exceed
+the condition budget they are scaled down together, never below
+`image.condition_floor_px` squared; below that the request is a `400` naming the
+budget. A condition image that is not a PNG, JPEG or WebP (a GIF, say), that
+does not decode, or that decodes to more than `image.max_condition_mipx` is a
+`400`. `image.max_condition_decodes` edits decode at a time; the others wait
+their turn.
 
 **The queue.** One image job runs at a time and `image.queue_depth` wait in
 order; a full queue answers `503 engine_full` with `Retry-After`. A client that
@@ -984,7 +992,8 @@ running or queued job counts as use for [idle unload](#idle-unload).
 | `queue_depth` | `4` | Jobs that may wait behind the running one (0..64). |
 | `max_n` | `10` | The most images one request may ask for (1..64). |
 | `max_condition_images` | `10` | The most condition images one edit may send (1..10). |
-| `max_condition_mipx` | `16` | The largest a condition image may decode to, in megapixels (1..64); a larger one is refused. 16 takes any phone camera and bounds what one edit decodes (64 MiB). |
+| `max_condition_mipx` | `16` | The largest a condition image may decode to, in Mi pixels of 1,048,576 each (1..64); a larger one is refused. 16 takes any phone camera and bounds each image's frame at 64 MiB; an edit decodes up to `max_condition_images` of them. |
+| `max_condition_decodes` | `1` | The most edits that decode their condition images at once (1..16); the others wait their turn. |
 | `sizes` | the eight above | The sizes a request may ask for. |
 | `condition_budget_tokens` | `0` | Lowers the condition budget (0 is the whole budget the load planned). |
 | `condition_floor_px` | `512` | The smallest a condition image may be scaled to, as the side of a square of the same area (32..1024). |
@@ -1001,17 +1010,27 @@ It is not free:
 
 - With a text model loaded, the job is rewritten first when that model is the
   enhancer; otherwise the server switches to the enhancer, rewrites, then
-  switches to the image model.
+  switches to the image model, and `GET /v1/models`' `last_switch` records
+  both switches. An enhancer the idle clock unloaded is loaded for the rewrite,
+  then the server switches once: two loads.
 - With the **image model loaded, each job makes a visit: two reloads** (image
   model to enhancer, and back). During the visit every other request gets
   `503 model_switching` with `Retry-After`, and `GET /v1/models` reads
-  `switching`.
+  `switching`; the visit leaves `last_switch` as it was.
+- The visit waits its **turn in the queue**: the jobs admitted before the
+  enhanced request finish on the image model, and the visit begins with none
+  running (a full queue is `503 engine_full`, as for a job). The jobs admitted
+  behind it run while the visit drains the image model, as for any switch:
+  past `switch.drain_timeout` they end `503 model_stopped`.
 - `image.prompt_enhancer` must be a **known model**: listed in
   `--switch-known-models`, the model the server started with, or a catalog
-  entry already downloaded. The default `qwen3.8-27b` is none of those on a
-  server that knows no text model, and then every enhanced request falls back.
-  An unknown enhancer, or a rewrite that fails, never fails the request: the
-  prompt is used as sent and the response carries `warnings`.
+  entry already downloaded (or the text model loaded). The default
+  `qwen3.8-27b` is none of those on a server that knows no text model: the
+  start warns (`ignis.config.prompt_enhancer_unknown`), and every enhanced
+  request falls back. A `PATCH /v1/config` naming an enhancer that is none is
+  refused (`400 config_invalid`). An enhancer that cannot be reached, or a
+  rewrite that fails, never fails the request: the prompt is used as sent and
+  the response carries `warnings`.
 - An edit shows the enhancer its condition images only when its vision tower is
   loaded; otherwise it reads text only, with a warning.
 
