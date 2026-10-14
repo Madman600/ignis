@@ -386,6 +386,31 @@ impl ImagePlan {
 /// the largest preset by cells (spec image-model/04's 2752 x 1536 is 16,512).
 pub const MAX_TARGET_TOKENS: u32 = 16_800;
 
+/// Why a call did not run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageLeafError {
+    /// The request is one the leaf refuses (a RoPE position outside the table, a prefix above
+    /// the condition budget, a size above the arena, a token outside the vocabulary): the
+    /// server answers it as a bad request, never a server error.
+    Refused(String),
+    /// The device or the leaf failed.
+    Failed(String),
+    /// The load does not fit the card.
+    Plan(ImagePlanError),
+}
+
+impl std::fmt::Display for ImageLeafError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) => write!(f, "refused: {why}"),
+            Self::Failed(why) => write!(f, "{why}"),
+            Self::Plan(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ImageLeafError {}
+
 #[cfg(feature = "cuda")]
 pub use device::*;
 
@@ -397,7 +422,7 @@ mod device {
     use ignis_artifact::qwen_image::{self, QwenImageGeometry};
     use ignis_artifact::{materialize, CudaDevice, Device, DeviceBuffer, MaterializedArtifact, ObjectHandle, Reader};
 
-    use super::{ImagePlan, ImagePlanError, ImagePlanRequest, LatentNorm, PrefixLayout, Sampler, MAX_TARGET_TOKENS};
+    use super::{ImageLeafError, ImagePlan, ImagePlanRequest, LatentNorm, PrefixLayout, Sampler, MAX_TARGET_TOKENS};
     use crate::image_autoencoder::{self as autoencoder, VaeConfig, VaeDecoderWeights, VaeEncoderWeights};
     use crate::image_encoder::{self, embed_rows, TextEncoderConfig, TextEncoderWeights};
     use crate::image_transformer::{self as transformer, ffi as tffi, TransformerConfig, TransformerWeights};
@@ -416,31 +441,6 @@ mod device {
     fn align(n: u64) -> u64 {
         (n + 255) & !255
     }
-
-    /// Why a call did not run.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum ImageLeafError {
-        /// The request is one the leaf refuses (a RoPE position outside the table, a prefix above
-        /// the condition budget, a size above the arena, a token outside the vocabulary): the
-        /// server answers it as a bad request, never a server error.
-        Refused(String),
-        /// The device or the leaf failed.
-        Failed(String),
-        /// The load does not fit the card.
-        Plan(ImagePlanError),
-    }
-
-    impl std::fmt::Display for ImageLeafError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::Refused(why) => write!(f, "refused: {why}"),
-                Self::Failed(why) => write!(f, "{why}"),
-                Self::Plan(e) => write!(f, "{e}"),
-            }
-        }
-    }
-
-    impl std::error::Error for ImageLeafError {}
 
     fn failed(what: &str) -> impl Fn(String) -> ImageLeafError + '_ {
         move |e| ImageLeafError::Failed(format!("{what}: {e}"))
@@ -487,8 +487,10 @@ mod device {
 
     /// A condition prefix (spec image-model/04): every block's K/V run of the prefix's tokens,
     /// stored once by `encode_condition` and read by every denoising step of every image of the
-    /// job. Free it with [`ImageLeaf::release_condition`].
+    /// job. Free it with [`ImageLeaf::release_condition`]: it has no `Drop` (freeing needs the
+    /// leaf's device), so whoever holds one releases it on every path.
     #[derive(Debug)]
+    #[must_use = "a condition prefix holds device memory until ImageLeaf::release_condition"]
     pub struct Condition {
         runs: DeviceBuffer,
         run_ptrs: Vec<*mut c_void>,
@@ -604,13 +606,13 @@ mod device {
 
     impl EncodePhase {
         /// The phase of an encoder sequence of `tokens` rows with `pads` image pads (the tower's
-        /// `call` over the condition images of `sizes`, (width, height) in pixels) and a prefix of
-        /// `prefix` tokens, in a region of `region` bytes; Err names what does not fit.
+        /// merged tokens over the condition images of `sizes`, (width, height) in pixels, one
+        /// segment each; none, no tower) and a prefix of `prefix` tokens, in a region of `region`
+        /// bytes; Err names what does not fit. Host-side: it sizes, it allocates nothing.
         fn new(
             vae: &ignis_artifact::qwen_image::VaeGeometry,
             tokens: u32,
             pads: u32,
-            call: Option<&VisionCall>,
             sizes: &[(u32, u32)],
             prefix: u32,
             region: u64,
@@ -631,8 +633,9 @@ mod device {
             let union = prefix_positions + align(p * 12);
             let rows = align(pads as u64 * HIDDEN as u64 * 2);
             let embeds = [union, union + rows, union + 2 * rows, union + 3 * rows];
-            let encoder_workspace = if call.is_some() { union + 4 * rows } else { union };
-            let tower = call.map_or(0, |c| image_vision::workspace_bytes(c.tokens(), c.segments()));
+            let segments = sizes.len() as u32;
+            let encoder_workspace = if segments > 0 { union + 4 * rows } else { union };
+            let tower = if segments > 0 { image_vision::workspace_bytes(pads, segments) } else { 0 };
             let encoder_workspace_bytes = image_encoder::workspace_bytes(tokens).max(tower);
             let encoder_end = encoder_workspace + encoder_workspace_bytes;
             let prefix_x = union;
@@ -798,7 +801,7 @@ mod device {
             let geometry = QwenImageGeometry::qwen_image_21_turbo();
             let bound = qwen_image::bind(reader, &geometry).map_err(|e| failed("the artifact does not bind")(e.to_string()))?;
             let layout = Layout::new(options.max_target_tokens);
-            let free = match CudaDevice::nvml_memory(0) {
+            let free = match CudaDevice::nvml_memory(dev.ordinal()) {
                 Ok((free, _)) => free,
                 Err(_) => dev.free_bytes().ok_or_else(|| ImageLeafError::Failed("the device reports no free memory".into()))?,
             };
@@ -893,6 +896,15 @@ mod device {
         /// The vision tower's descriptors (for `encode_condition`'s condition images).
         pub fn vision(&self) -> &VisionWeights {
             &self.vision
+        }
+
+        /// Whether `encode_condition` has room in the arena for a condition of `tokens` encoder
+        /// rows, `pads` of them image pads, condition images of `sizes` ((width, height) in
+        /// pixels) and a prefix of `prefix` tokens: the limit on a condition beside the condition
+        /// budget (ten condition images near 1024² take most of the region in the tower and the
+        /// encoder). Host-side, from the shapes alone; Err is `encode_condition`'s refusal.
+        pub fn condition_fits(&self, tokens: u32, pads: u32, sizes: &[(u32, u32)], prefix: u32) -> Result<(), String> {
+            EncodePhase::new(self.vae.geometry(), tokens, pads, sizes, prefix, self.layout.seq_bytes).map(|_| ())
         }
 
         fn arena(&self) -> &DeviceBuffer {
@@ -1022,17 +1034,10 @@ mod device {
                 }
                 Some(call)
             };
+            // The tower's call is one segment an image (one frame each, checked above), over the pads.
             let sizes: Vec<(u32, u32)> = images.iter().map(|i| (i.width, i.height)).collect();
-            let phase = EncodePhase::new(
-                self.vae.geometry(),
-                tokens as u32,
-                text.image_pad_rows.len() as u32,
-                call.as_ref(),
-                &sizes,
-                prefix,
-                self.layout.seq_bytes,
-            )
-            .map_err(ImageLeafError::Refused)?;
+            let phase = EncodePhase::new(self.vae.geometry(), tokens as u32, text.image_pad_rows.len() as u32, &sizes, prefix, self.layout.seq_bytes)
+                .map_err(ImageLeafError::Refused)?;
             let x0 = embed_rows(self.artifact.host_tensor_bytes(self.embed_tokens).map_err(|e| failed("the embedding")(e.to_string()))?, HIDDEN, text.input_ids)
                 .map_err(ImageLeafError::Refused)?;
 
@@ -1256,8 +1261,10 @@ mod device {
             Ok(latents)
         }
 
-        /// Frees a condition prefix.
+        /// Frees a condition prefix. The started image goes with it: its RoPE table was laid out
+        /// after a prefix, so the next image starts again (`start_image`) over a held one.
         pub fn release_condition(&mut self, condition: Condition) -> Result<(), ImageLeafError> {
+            self.image = None;
             sync()?;
             self.dev.deallocate(condition.runs).map_err(|e| failed("release_condition")(e.to_string()))
         }

@@ -184,6 +184,8 @@ impl Device for CpuDevice {
 #[cfg(feature = "cuda")]
 pub struct CudaDevice {
     handle: *mut crate::ffi::IgnisDevice,
+    /// The ordinal it was created on.
+    device_id: i32,
 }
 
 #[cfg(feature = "cuda")]
@@ -199,7 +201,12 @@ impl CudaDevice {
                 "ignis_device_create({device_id}) failed; is the CUDA driver available?"
             )));
         }
-        Ok(CudaDevice { handle })
+        Ok(CudaDevice { handle, device_id })
+    }
+
+    /// The device's ordinal: what [`CudaDevice::nvml_memory`] reads for it.
+    pub fn ordinal(&self) -> i32 {
+        self.device_id
     }
 
     /// Free and total memory of device `device_id` as NVML reports it -- what

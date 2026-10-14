@@ -565,6 +565,8 @@ fn a_job_of_three_images_and_a_cancelled_job_leave_the_device_memory_where_it_wa
     // (CUDA's lazy loading), device memory that stays. Measured: 2 MiB here, none with
     // CUDA_MODULE_LOADING=EAGER. The jobs after it launch no new kernel.
     let Some(first) = ran(leaf.device_free_bytes(), "the free memory") else { return };
+    // Review-321c L3: no image started, nothing to decode: a refusal (a 400), not a failure.
+    assert!(matches!(leaf.vae_decode(), Err(ImageLeafError::Refused(_))), "vae_decode before start_image is refused");
     let Some(condition) = encode_case(&mut leaf, &t2i) else { return };
     if ran(leaf.start_image(&condition, h, w, &a), "start_image").is_none()
         || ran(leaf.denoise_step(&condition, 0), "denoise_step").is_none()
@@ -573,6 +575,9 @@ fn a_job_of_three_images_and_a_cancelled_job_leave_the_device_memory_where_it_wa
         return;
     }
     ran(leaf.release_condition(condition), "release_condition");
+    // The started image goes with its prefix: its RoPE table was laid out after it.
+    assert!(matches!(leaf.vae_decode(), Err(ImageLeafError::Refused(_))), "release_condition clears the image slot");
+    assert!(matches!(leaf.latents(), Err(ImageLeafError::Refused(_))), "release_condition clears the image slot");
     let Some(before) = ran(leaf.device_free_bytes(), "the free memory") else { return };
     println!(
         "the first job: {} bytes less free after its release (kernel modules loaded at first launch; CUDA_MODULE_LOADING={})",
