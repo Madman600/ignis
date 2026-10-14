@@ -9,6 +9,9 @@ into the engine. Our kernels are original." becomes this ADR's three tiers.
 **Extends ADR 0010**: a vendored op may come from a third party, not only from
 the reference.
 
+Amended 2026-10-14 (owner): MIT-CMU (HPND) joins the licences that may be
+copied, for Pillow's resize, which `crates/server/src/media.rs` ports.
+
 ## Context
 
 ADR 0010 made a vendored op a verbatim copy of the reference (ninfer) under a
@@ -44,8 +47,11 @@ A kernel in ignis is one of three things:
    - ADR 0010's manifest is shaped for ninfer. A third-party vendored op gets
      its own manifest entry with the same fields.
 
-**Licences.** Only MIT, BSD or Apache-2.0 code is copied, since ignis is
-Apache-2.0. Nothing GPL, nothing under a vendor's source licence. FlashInfer's
+**Licences.** Only MIT, BSD, Apache-2.0 or MIT-CMU (HPND) code is copied,
+since ignis is Apache-2.0. MIT-CMU asks that its copyright and permission
+notice travel with the copy, so copied MIT-CMU code puts that notice in the
+root `NOTICE` (host code) or `kernel/NOTICE` (kernels). Nothing GPL, nothing
+under a vendor's source licence. FlashInfer's
 `csrc/fmha_v2` is under the TensorRT licence, and ExLlamaV3's QTIP-derived
 code is GPL-3.0: neither is copied or read for implementation.
 
@@ -63,3 +69,6 @@ resort, when it removes much more work than it costs to carry.
 - `CONTEXT.md` gains *Adapted op*, and *Vendored op* widens from "copied from
   the reference" to "copied verbatim from a named upstream".
 - A licence check is part of the review of any adapted or vendored op.
+- Pillow (MIT-CMU) may be copied from: the Lanczos resize in `media.rs`
+  matches Pillow byte for byte, which the condition images need, and its
+  notice is in the root `NOTICE` (2026-10-14).
