@@ -1027,5 +1027,7 @@ three loads, where the server already had the text-first path (one load).
     rather than a third, longer label.
 - **Gates** (on 4bd8923). `CARGO_INCREMENTAL=0 cargo test --workspace`
   2983/0/6 (321f's 2980 plus the three tests above); in `web/`, `npm test`
-  870 and `npm run build` green. The view was not looked at in a browser (the
-  owner watches :5173).
+  870 and `npm run build` green (again on b52e530, the band's copy);
+  `cargo check -p ignis-server --features cuda --tests` clean (its one
+  warning, `openapi.rs`' unused import, is older). The view was not looked at
+  in a browser (the owner watches :5173).
