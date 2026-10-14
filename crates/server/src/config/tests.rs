@@ -2060,6 +2060,7 @@ fn every_image_field_resolves_from_flag_env_and_file_by_precedence() {
         ("queue_depth", "1", "2", "3"),
         ("max_n", "4", "5", "6"),
         ("max_condition_images", "7", "8", "9"),
+        ("max_condition_mipx", "4", "8", "32"),
         ("sizes", "1024x1024", "2048x2048;1024x1024", "2752x1536"),
         ("condition_budget_tokens", "8192", "16384", "4096"),
         ("condition_floor_px", "256", "384", "640"),
@@ -2095,7 +2096,13 @@ fn every_image_field_resolves_from_flag_env_and_file_by_precedence() {
 /// not a multiple of 32.
 #[test]
 fn an_image_field_past_its_bounds_is_refused_naming_it() {
-    for (name, low, high) in [("queue_depth", 0, 64), ("max_n", 1, 64), ("max_condition_images", 1, 10), ("condition_floor_px", 32, 1024)] {
+    for (name, low, high) in [
+        ("queue_depth", 0, 64),
+        ("max_n", 1, 64),
+        ("max_condition_images", 1, 10),
+        ("max_condition_mipx", 1, 64),
+        ("condition_floor_px", 32, 1024),
+    ] {
         let flag = schema::field("image", name).unwrap().flag();
         for taken in [low, high] {
             assert!(resolve(&args(&[&flag, &taken.to_string()]), no_env).is_ok(), "{flag} {taken}");

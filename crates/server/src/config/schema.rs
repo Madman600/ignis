@@ -477,6 +477,12 @@ config_group! {
         /// The most condition images one edit may send. At most 10, what the
         /// image model's encoder holds.
         max_condition_images: Images = 10, between(1, 10), ALL, [Visible, Patchable];
+        /// The largest a condition image may decode to, in Mi pixels
+        /// (1,048,576 pixels, a 1024x1024 image, each); a larger one is
+        /// refused. A condition image is encoded at 1024x1024 of area at
+        /// most, so 16 — a 16-megapixel photo, 64 MiB decoded — takes any
+        /// phone camera's own output and bounds what one edit decodes.
+        max_condition_mipx: Mipx = 16, between(1, 64), ALL, [Visible, Patchable];
         /// The sizes a request may ask for, `<width>x<height>` with each side
         /// a multiple of 32: by default the checkpoint's presets and
         /// 1024x1024, the size OpenAI clients often send. `auto` picks among

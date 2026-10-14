@@ -194,6 +194,10 @@ count_kind!(
     /// A length in pixels.
     Pixels: u32, "pixels", "pixel count"
 );
+count_kind!(
+    /// An area in units of 1,048,576 pixels, a 1024x1024 image each.
+    Mipx: u32, "Mipx", "Mi-pixel count"
+);
 
 /// A byte count with the size suffixes an operator actually types: a bare
 /// count, or one followed by `K`/`M`/`G` (case-insensitive, binary — `4G`

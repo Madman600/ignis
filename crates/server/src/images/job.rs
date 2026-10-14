@@ -305,7 +305,7 @@ mod tests {
     }
 
     fn decode(png: &[u8]) -> RgbaImage {
-        crate::media::decode_condition_image(png).expect("a PNG the job made")
+        crate::media::decode_condition_image(png, 64 << 20).expect("a PNG the job made")
     }
 
     /// AC 3 and AC 6: `n` RGBA PNGs from `seed + i`, the same seed the same

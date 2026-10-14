@@ -831,15 +831,12 @@ impl MediaAcquirer {
 
 // ── the image model's condition images ──────────────────────────────────
 
-/// The largest frame a condition image may decode to, in pixels: the vision
-/// processor's own cap (`ignis_artifact::vision`).
-const CONDITION_MAX_DECODED_PIXELS: u64 = 64 << 20;
-
 /// An edit's condition image (spec image-model/05): PNG, JPEG or WebP bytes
-/// decoded to RGBA, PNG and WebP with their alpha, JPEG opaque. The message
-/// says why it is not one.
-pub fn decode_condition_image(bytes: &[u8]) -> Result<RgbaImage, String> {
-    match ignis_artifact::vision::decode_image_rgba(bytes, CONDITION_MAX_DECODED_PIXELS) {
+/// decoded to RGBA, PNG and WebP with their alpha, JPEG opaque, refused past
+/// `max_pixels` before its frame is allocated (`image.max_condition_mipx`).
+/// The message says why it is not one.
+pub fn decode_condition_image(bytes: &[u8], max_pixels: u64) -> Result<RgbaImage, String> {
+    match ignis_artifact::vision::decode_image_rgba(bytes, max_pixels) {
         Ok(image) => Ok(RgbaImage { size: ImageSize::new(image.width, image.height), pixels: image.rgba }),
         Err(DecodeFailure::Invalid(InvalidMedia::Undecodable(why))) => Err(format!("cannot decode image: {why}")),
         Err(DecodeFailure::Invalid(InvalidMedia::Unsupported(why))) => Err(format!("unsupported image: {why}")),
@@ -848,7 +845,7 @@ pub fn decode_condition_image(bytes: &[u8]) -> Result<RgbaImage, String> {
             Err(format!("unsupported image: {width}x{height}"))
         }
         Err(DecodeFailure::Pixels(pixels)) => Err(format!(
-            "the image has {pixels} pixels, over the {CONDITION_MAX_DECODED_PIXELS} a condition image may decode to"
+            "the image has {pixels} pixels, over the {max_pixels} a condition image may decode to (image.max_condition_mipx)"
         )),
     }
 }
@@ -1077,7 +1074,7 @@ mod tests {
     /// as diffusers resizes a condition image.
     #[test]
     fn the_condition_resize_is_pillows_lanczos_byte_for_byte() {
-        let decode = |bytes: &[u8]| decode_condition_image(bytes).unwrap();
+        let decode = |bytes: &[u8]| decode_condition_image(bytes, 64 << 20).unwrap();
         let alpha = decode(include_bytes!("../../artifact/tests/fixtures/vision/images/alpha.png"));
         let crop = RgbaImage {
             size: ImageSize::new(100, 60),
@@ -1111,8 +1108,8 @@ mod tests {
 
     #[test]
     fn a_condition_image_that_is_not_png_jpeg_or_webp_is_refused_saying_so() {
-        assert!(decode_condition_image(b"GIF89a....").unwrap_err().starts_with("unsupported image"));
-        assert!(decode_condition_image(b"\x89PNG\r\n\x1a\nxx").unwrap_err().starts_with("cannot decode image"));
+        assert!(decode_condition_image(b"GIF89a....", 64 << 20).unwrap_err().starts_with("unsupported image"));
+        assert!(decode_condition_image(b"\x89PNG\r\n\x1a\nxx", 64 << 20).unwrap_err().starts_with("cannot decode image"));
     }
 }
 

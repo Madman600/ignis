@@ -424,15 +424,18 @@ pub(crate) async fn create_image_edit(State(server): State<Arc<Server>>, multipa
             "image",
         );
     }
+    let max_pixels = u64::from(limits.max_condition_mipx) << 20;
+    let decoding = server.image_decodes.acquire().await.expect("the decode permits are never closed");
     let decoded = tokio::task::spawn_blocking(move || {
         form.images
             .iter()
             .enumerate()
-            .map(|(i, bytes)| crate::media::decode_condition_image(bytes).map_err(|why| format!("condition image {i}: {why}")))
+            .map(|(i, bytes)| crate::media::decode_condition_image(bytes, max_pixels).map_err(|why| format!("condition image {i}: {why}")))
             .collect::<Result<Vec<_>, _>>()
     })
     .await
     .expect("decoding condition images does not panic");
+    drop(decoding);
     match decoded {
         Ok(images) => serve(server, request, images, Route::Edits).await,
         Err(why) => bad_request_param(&why, "image"),

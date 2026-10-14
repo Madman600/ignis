@@ -1209,7 +1209,10 @@ async fn the_image_fields_are_listed_and_change_live_within_their_bounds() {
     let names: Vec<&str> = all_fields().filter(|meta| meta.group == "image").map(|meta| meta.name).collect();
     assert_eq!(
         names,
-        ["queue_depth", "max_n", "max_condition_images", "sizes", "condition_budget_tokens", "condition_floor_px", "prompt_enhancement", "prompt_enhancer"]
+        [
+            "queue_depth", "max_n", "max_condition_images", "max_condition_mipx", "sizes", "condition_budget_tokens", "condition_floor_px",
+            "prompt_enhancement", "prompt_enhancer",
+        ]
     );
     for name in names {
         let field = declaration(&fields, &format!("image.{name}"));
@@ -1218,6 +1221,7 @@ async fn the_image_fields_are_listed_and_change_live_within_their_bounds() {
     }
     assert_eq!(declaration(&fields, "image.queue_depth")["rule"], json!({ "min": 0, "max": 64 }));
     assert_eq!(declaration(&fields, "image.max_condition_images")["rule"], json!({ "min": 1, "max": 10 }));
+    assert_eq!(declaration(&fields, "image.max_condition_mipx")["rule"], json!({ "min": 1, "max": 64 }));
     assert_eq!(declaration(&fields, "image.sizes")["default"][7], "1024x1024");
     let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
     assert_eq!(document["image"]["queue_depth"], 3, "{document}");

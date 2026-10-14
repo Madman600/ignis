@@ -478,6 +478,34 @@ async fn an_edit_below_the_floor_is_refused_naming_the_budget() {
     assert!(harness.encodes().len() == 1 && harness.jobs().in_flight().is_idle());
 }
 
+/// Review-322b F2: a condition image past `image.max_condition_mipx` is
+/// refused before its frame is decoded, naming the field; at the cap it is
+/// taken. One edit decodes at a time: while the server's decode permit is
+/// held, an edit waits for it and reaches nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn condition_images_decode_one_edit_at_a_time_up_to_the_cap() {
+    let harness = Harness::new(Gate::opened());
+    harness.server.update_live(|live| live.image.max_condition_mipx = 1);
+    // 1024x1025 is one row past 1 Mi pixels; 1024x1024 is the cap itself.
+    let past = encode(&RgbaImage { size: ImageSize::new(1024, 1025), pixels: vec![200; 1024 * 1025 * 4] });
+    let at = encode(&RgbaImage { size: ImageSize::new(1024, 1024), pixels: vec![200; 1024 * 1024 * 4] });
+    let (status, refused) = send(&harness.app, form_request(&[("prompt", Part::Text("x")), ("image[]", Part::File(&past))])).await;
+    assert_eq!((status, refused["error"]["param"].as_str()), (StatusCode::BAD_REQUEST, Some("image")), "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("1049600 pixels") && message.contains("image.max_condition_mipx"), "{message}");
+    let (status, body) = send(&harness.app, form_request(&[("prompt", Part::Text("x")), ("image[]", Part::File(&at))])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let permit = Arc::clone(&harness.server.image_decodes).acquire_owned().await.unwrap();
+    let app = harness.app.clone();
+    let waiting = tokio::spawn(async move { send(&app, form_request(&[("prompt", Part::Text("held")), ("image[]", Part::File(JPEG))])).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!harness.encodes().contains(&"held".to_owned()) && !waiting.is_finished(), "the edit waits for the decode permit");
+    drop(permit);
+    assert_eq!(waiting.await.unwrap().0, StatusCode::OK);
+    assert_eq!(harness.encodes().last().map(String::as_str), Some("held"));
+}
+
 /// The edit route's body limit is the media one on every load: a form past
 /// a text load's 16 MiB is read.
 #[tokio::test]
