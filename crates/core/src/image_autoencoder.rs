@@ -52,6 +52,8 @@
 
 use ignis_artifact::qwen_image::VaeGeometry;
 
+use crate::image_vision::to_bf16;
+
 /// The VAE config's settings the encoder and decoder depend on (`frontend/vae_config.json`, the checkpoint's
 /// `vae/config.json` verbatim), checked against the artifact's inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,26 +166,14 @@ pub fn encode_workspace_bytes(g: &VaeGeometry, height: u32, width: u32) -> u64 {
 /// `2 (u / 255) − 1` in f32 (`VaeImageProcessor`'s `/ 255` then `normalize`), rounded to BF16
 /// (nearest even), the convolution's NHWC input.
 pub fn input_bf16(rgba: &[u8]) -> Vec<u16> {
-    let table: Vec<u16> = (0..=255u32)
-        .map(|u| {
-            let v = 2.0f32 * (u as f32 / 255.0f32) - 1.0f32;
-            let b = v.to_bits();
-            ((b + 0x7FFF + ((b >> 16) & 1)) >> 16) as u16
-        })
-        .collect();
+    let table: Vec<u16> = (0..=255u32).map(|u| to_bf16(2.0f32 * (u as f32 / 255.0f32) - 1.0f32)).collect();
     rgba.iter().map(|&u| table[u as usize]).collect()
 }
 
 /// The decoder's input from the denormalized latents (packed fp32 `[tokens][z_dim]`): each value
 /// rounded to BF16 (nearest even), post_quant_conv's input.
 pub fn latents_bf16(latents: &[f32]) -> Vec<u16> {
-    latents
-        .iter()
-        .map(|v| {
-            let b = v.to_bits();
-            ((b + 0x7FFF + ((b >> 16) & 1)) >> 16) as u16
-        })
-        .collect()
+    latents.iter().map(|&v| to_bf16(v)).collect()
 }
 
 /// The decode's tail on the host: conv_out's fp32 output (`[height][width][4]`) to RGBA8 bytes as
@@ -1087,6 +1077,11 @@ mod tests {
         // 1 + 2^-8 is halfway between BF16's 1 and 1 + 2^-7: the even one, 1. 1 + 3 x 2^-8 is
         // halfway between 1 + 2^-7 and 1 + 2^-6: the even one, 1 + 2^-6.
         assert_eq!(latents_bf16(&[1.0 + 1.0 / 256.0, 1.0 + 3.0 / 256.0, -2.5]), vec![0x3F80, 0x3F82, 0xC020]);
+        // A NaN stays a NaN, whatever its bits: torch's quiet NaN, never a zero or an overflow
+        // (bits at or above 0x7FFF8000 would carry into the sign, or past u32 for a negative one).
+        let nans = [f32::NAN, f32::from_bits(0x7FFF_FFFF), f32::from_bits(0xFFFF_FFFF), f32::from_bits(0xFF80_0001)];
+        assert_eq!(latents_bf16(&nans), vec![0x7FC0; 4]);
+        assert_eq!(latents_bf16(&[f32::INFINITY, f32::NEG_INFINITY, f32::MAX]), vec![0x7F80, 0xFF80, 0x7F80]);
     }
 
     #[test]
@@ -1096,9 +1091,6 @@ mod tests {
         assert_eq!((got[0], got[1]), (0xBF80, 0x3F80));
         assert_eq!(got[2], 0x3B81);
         let v = 2.0f32 * (1.0f32 / 255.0) - 1.0;
-        assert_eq!(f32::from_bits((got[3] as u32) << 16), {
-            let b = v.to_bits();
-            f32::from_bits(((b + 0x7FFF + ((b >> 16) & 1)) >> 16) << 16)
-        });
+        assert_eq!(got[3], to_bf16(v));
     }
 }
