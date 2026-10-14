@@ -533,13 +533,17 @@ impl Server {
     /// feeding the projection, its own counters (Flash-Next's, GitHub #301)
     /// are read, and `reserved` replaces what the previous load reserved. The
     /// start does the same through [`Server::with_metrics`] and
-    /// [`Server::with_load_reservations`]. Nothing without `--server-metrics`.
+    /// [`Server::with_load_reservations`]. The image model has no engine to
+    /// feed them (spec image-model/05): what a text model's load reserved and
+    /// occupied reads as no load, as while unloaded. Nothing without
+    /// `--server-metrics`.
     pub(crate) fn observe_load(&self, model: &ActiveModel, reserved: Option<metrics::LoadReservations>) {
         let Some(metrics) = &self.metrics else {
             return;
         };
-        if let Some(engine) = model.engine() {
-            engine.install_metrics(std::sync::Arc::clone(metrics));
+        match model.engine() {
+            Some(engine) => engine.install_metrics(std::sync::Arc::clone(metrics)),
+            None => metrics.set_unloaded(),
         }
         if let Some(reserved) = reserved {
             self.install_reservations(model, reserved);

@@ -15,7 +15,7 @@ pub(crate) mod routes;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ignis_core::image::{ImagePlan, ImageRunner, ImageSize};
 
@@ -61,16 +61,18 @@ impl ImageModel {
 
     /// Run `calls` on the runner, holding it: `None` once the model was shut
     /// down. A job holds it for as many calls as it makes in one go, and a
-    /// shutdown waits for that.
+    /// shutdown waits for that. A call that panicked leaves the lock
+    /// poisoned, not the runner unreachable: the job's prefix is still
+    /// released, and the shutdown still drops it.
     pub fn with_runner<T>(&self, calls: impl FnOnce(&mut dyn ImageRunner) -> T) -> Option<T> {
-        let mut runner = self.runner.lock().expect("image runner lock");
+        let mut runner = self.runner.lock().unwrap_or_else(PoisonError::into_inner);
         runner.as_mut().map(|runner| calls(runner.as_mut()))
     }
 
     /// Drop the runner, once whatever holds it lets go. Blocking; calling it
     /// twice is harmless.
     pub fn shut_down(&self) {
-        drop(self.runner.lock().expect("image runner lock").take());
+        drop(self.runner.lock().unwrap_or_else(PoisonError::into_inner).take());
     }
 }
 
@@ -228,7 +230,7 @@ impl Drop for Running {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ignis_core::image::{FakeImageRunner, ImageCondition};
+    use ignis_core::image::{ConditionId, FakeImageRunner, ImageCondition, ImageError, RgbaImage, TargetLatents};
 
     /// A job is counted from its admission until its guard goes, waiting then
     /// running, and is never between the two.
@@ -324,6 +326,59 @@ mod tests {
         assert_eq!(served_sizes(&defaults, &square), [ImageSize::new(2048, 2048), ImageSize::new(1024, 1024)]);
         let huge = [ImageSize::new(8192, 8192), ImageSize::new(1024, 1024)];
         assert_eq!(served_sizes(&huge, &ignis_core::image::fake_plan()), [ImageSize::new(1024, 1024)]);
+    }
+
+    /// `FakeImageRunner`, but every denoising step panics.
+    struct PanicsOnStep(FakeImageRunner);
+
+    impl ImageRunner for PanicsOnStep {
+        fn plan(&self) -> &ImagePlan {
+            self.0.plan()
+        }
+
+        fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> u64 {
+            self.0.condition_tokens(prompt, images)
+        }
+
+        fn encode_condition(&mut self, condition: &ImageCondition) -> Result<ConditionId, ImageError> {
+            self.0.encode_condition(condition)
+        }
+
+        fn denoise_step(&mut self, _: ConditionId, _: &mut TargetLatents, _: f32, _: f32, _: Option<&mut Vec<f32>>) -> Result<(), ImageError> {
+            panic!("a leaf fault");
+        }
+
+        fn vae_decode(&mut self, latents: &TargetLatents) -> Result<RgbaImage, ImageError> {
+            self.0.vae_decode(latents)
+        }
+
+        fn release_condition(&mut self, condition: ConditionId) {
+            self.0.release_condition(condition);
+        }
+    }
+
+    /// A runner call that panics leaves the lock poisoned, not the runner
+    /// stuck: the job's prefix is still released through it, and the
+    /// shutdown still drops it — and every buffer of its leaf with it.
+    #[test]
+    fn a_runner_call_that_panics_neither_keeps_its_prefix_nor_survives_the_shutdown() {
+        let inner = FakeImageRunner::default();
+        let held = inner.held_conditions();
+        let alive = Arc::downgrade(&held);
+        let model = ImageModel::new("ignis-image-2.1-turbo", Box::new(PanicsOnStep(inner)));
+        let condition = ImageCondition { prompt: "a cat".into(), images: Vec::new() };
+        let id = model.with_runner(|runner| runner.encode_condition(&condition)).unwrap().unwrap();
+        let mut latents = TargetLatents::zeros(ImageSize::new(32, 32));
+        let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            model.with_runner(|runner| runner.denoise_step(id, &mut latents, 1.0, 0.0, None))
+        }));
+        assert!(step.is_err(), "the step panicked");
+        model.with_runner(|runner| runner.release_condition(id)).expect("the runner is still there");
+        assert_eq!(held.load(std::sync::atomic::Ordering::SeqCst), 0, "the prefix released");
+        drop(held);
+        model.shut_down();
+        assert_eq!(alive.strong_count(), 0, "the runner was dropped");
+        assert!(model.with_runner(|_| ()).is_none());
     }
 
     /// The shutdown drops the runner, and a call after it finds none.

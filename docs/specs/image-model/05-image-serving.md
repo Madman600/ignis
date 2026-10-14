@@ -411,3 +411,16 @@ The findings of `.scratch/orchestra/reviews/review-322a.md` (F1-F8), on
   (16,800) and 2528x1696 (16,748) are larger: an arena for 16,512 drops both
   defaults at load. Size it for 16,800, and plan `max_target_cells` as what
   it holds.
+- **A name it cannot switch to (F2).** `api::unswitchable_named`: with the
+  loaded model — or the unloaded one — of the other kind, a request naming a
+  model the switcher does not know (implicit switching off, or an unknown
+  id) is refused by name at once (`404 model_not_found`, decide's `422`),
+  before `ensure_loaded` would reload the image model only to refuse it.
+  With a model of the route's kind loaded, such a name passes as before.
+- **Metrics on the image model (F3).** `observe_load` of a model with no
+  engine calls `Metrics::set_unloaded`: the text model's reservations, KV
+  pages and occupancy read zero while the image model holds the card, as
+  while unloaded.
+- **A runner call that panics (F5).** `with_runner` and `shut_down` take a
+  poisoned lock (`PoisonError::into_inner`): the job's prefix is still
+  released while it unwinds, and the shutdown still drops the runner.

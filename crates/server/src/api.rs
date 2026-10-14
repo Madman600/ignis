@@ -343,12 +343,17 @@ fn switching_message(from: &str, to: &str) -> String {
 /// model-switch/02).
 ///
 /// A route of kind `route` refuses first a request a model of the other kind
-/// would serve ([`check_kind`], spec image-model/05): a request never loads
-/// or switches to a model only to be refused by it. The route checks again
-/// once pinned ([`check_served_kind`]).
+/// would serve ([`check_kind`]), or one naming a model it cannot switch to
+/// while the model of the other kind would serve it ([`unswitchable_named`],
+/// [`unknown_model`]), spec image-model/05: a request never loads or switches
+/// to a model only to be refused by it. The route checks again once pinned
+/// ([`check_served_kind`]).
 pub(crate) async fn switch_to_named_model(server: &Server, route: ModelKind, model: Option<&str>) -> Result<(), Response> {
     let (named, _) = split_model_lane(model.map(str::to_owned));
     check_kind(server, route, named.as_deref())?;
+    if let Some(named) = unswitchable_named(server, route, named.as_deref()) {
+        return Err(unknown_model(server, named));
+    }
     crate::model_switch::ensure_loaded(server, named.as_deref()).await.map_err(|reason| load_failed(server, &reason))?;
     crate::model_switch::implicit_switch(server, named.as_deref()).await.map_err(implicit_switch_refused)
 }
@@ -393,6 +398,24 @@ pub(crate) fn check_kind(server: &Server, route: ModelKind, model: Option<&str>)
         ),
     };
     Err(error_response_naming(StatusCode::CONFLICT, "invalid_request_error", "model_kind_mismatch", message, Some("model")))
+}
+
+/// The model a request on a route of `route`'s kind names when the server
+/// can neither serve it nor switch to it, while the model that would serve
+/// the request instead — the loaded one, or the unloaded one a request would
+/// load again — is of the other kind (spec image-model/05): that request is
+/// refused by name, and refused at once, before
+/// [`crate::model_switch::ensure_loaded`] reloads a model only to refuse it.
+/// Run past [`check_kind`]: the name is of `route`'s kind, or of none the
+/// server can tell.
+pub(crate) fn unswitchable_named<'a>(server: &Server, route: ModelKind, model: Option<&'a str>) -> Option<&'a str> {
+    let loaded = server.active();
+    if loaded.kind() == route {
+        return None;
+    }
+    let named = model.filter(|named| !named.is_empty() && *named != loaded.model_id())?;
+    let switchable = server.switcher.as_ref().is_some_and(|switcher| switcher.known(named).is_some());
+    (!switchable).then_some(named)
 }
 
 /// "a text model", "an image model".

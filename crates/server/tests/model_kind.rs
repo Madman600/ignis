@@ -230,15 +230,37 @@ async fn a_text_route_naming_the_image_model_is_refused_without_switching_to_it(
     assert_eq!(loader.loads(), [IMAGE]);
 }
 
+/// A series' value in a `/metrics` scrape, if the scrape has it.
+fn gauge(scrape: &Value, series: &str) -> Option<u64> {
+    scrape.as_str()?.lines().find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+}
+
 /// AC 2: `/metrics`, the tokenize routes and `GET /v1/models` answer with the
 /// image model loaded — the counting routes refuse it, the others report —
 /// and a switch to it and back with metrics on touches no engine that is not
-/// there.
+/// there. What the text model's load reserved reads zero once the image
+/// model holds the card.
 #[tokio::test]
 async fn metrics_the_tokenize_routes_and_the_models_list_answer_with_the_image_model_loaded() {
     let loader = MockLoader::new();
-    let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]).with_metrics();
+    let reserved = ignis_server::metrics::LoadReservations {
+        lines: ignis_core::VramLines { weights: 7 << 30, ..Default::default() },
+        budget_bytes: 30 << 30,
+        kv_pool_pages: 1024,
+        kv_page_bytes: 1 << 20,
+        residency_bytes: 0,
+        expert_cache_bytes: 0,
+        kv_ram_arena_bytes: 0,
+        retained_slots: 0,
+        retained_host_slots: 0,
+        retained_host_bytes: 0,
+        kv_disk_bytes: None,
+        flash_next: None,
+    };
+    let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]).with_metrics().with_load_reservations(reserved);
     let (app, metrics) = (server.app(), server.metrics_app().expect("metrics are on"));
+    let (_, scraped) = send(&metrics, Method::GET, "/metrics", None).await;
+    assert_eq!(gauge(&scraped, "ignis_kv_pool_pages"), Some(1024), "the text model's load");
     let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
     assert_eq!((models["data"][0]["kind"].as_str(), models["data"][0]["max_model_len"].is_u64()), (Some("text"), true), "{models}");
 
@@ -259,6 +281,9 @@ async fn metrics_the_tokenize_routes_and_the_models_list_answer_with_the_image_m
     let (status, scraped) = send(&metrics, Method::GET, "/metrics", None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(scraped.as_str().is_some_and(|text| text.contains("# TYPE")), "{scraped}");
+    for series in ["ignis_kv_pool_pages", "ignis_vram_budget_bytes", "ignis_vram_reserved_bytes{line=\"weights\"}"] {
+        assert_eq!(gauge(&scraped, series), Some(0), "{series} with the image model loaded");
+    }
     let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
     assert_eq!(models["data"][0]["kind"], "image");
 
@@ -326,6 +351,37 @@ async fn an_unused_image_model_unloads_and_the_next_request_that_needs_a_model_l
     assert_eq!(status, StatusCode::OK, "{completion}");
     assert_eq!(completion["model"], "mock-a");
     assert_eq!(loader.loads(), [IMAGE, "mock-a"], "one load each, never the image model before the text one");
+}
+
+/// The same as [`implicit_off`] or [`implicit_on`], with the idle clock's
+/// `model.idle_unload` at [`IDLE`].
+fn idle(server: Server) -> Server {
+    server.with_idle_unload(IDLE)
+}
+
+/// AC 1 with the image model unloaded: a text request naming a model the
+/// server cannot switch to — implicit switching off, or a model it does not
+/// know — is refused by name at once, as the loaded image model refuses it,
+/// and never reloads the image model only for that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_the_image_model_unloaded_a_text_request_naming_a_model_it_cannot_switch_to_loads_nothing() {
+    for (server, named) in [
+        (idle(implicit_off(&MockLoader::new(), IMAGE, &[IMAGE, "mock-a"])), "mock-a"),
+        (idle(implicit_on(&MockLoader::new(), IMAGE, &[IMAGE, "mock-a"])), "mock-unknown"),
+    ] {
+        let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+        let app = server.app();
+        unloaded(&server).await;
+        for (uri, body) in text_routes(Some(named)) {
+            let (status, refused) = send(&app, Method::POST, uri, Some(body)).await;
+            let expected = if uri.starts_with("/v1/chat") || uri == "/v1/responses" { StatusCode::NOT_FOUND } else { StatusCode::UNPROCESSABLE_ENTITY };
+            assert_eq!(status, expected, "{named} on {uri}: {refused}");
+            assert_eq!(refused["error"]["code"], "model_not_found", "{named} on {uri}: {refused}");
+            let message = refused["error"]["message"].as_str().unwrap();
+            assert!(message.contains(named) && message.contains(IMAGE), "{named} on {uri}: {message}");
+        }
+        assert_eq!(server.status().as_str(), "unloaded", "{named}: nothing was loaded for a request it would refuse");
+    }
 }
 
 // ── the production loader on the image artifact ───────────────────────────

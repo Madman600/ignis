@@ -496,7 +496,7 @@ impl Switcher {
 
     /// The artifact a request naming `model` would switch to, if it is known:
     /// the known models' entry for it, else a catalog entry on disk.
-    fn known(&self, model: &str) -> Option<PathBuf> {
+    pub(crate) fn known(&self, model: &str) -> Option<PathBuf> {
         if let Some(listed) = self.known.lock().expect("known models lock").get(model) {
             return Some(listed.clone());
         }

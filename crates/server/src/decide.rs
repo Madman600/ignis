@@ -2469,6 +2469,14 @@ pub async fn decide(
     if let Err(refused) = crate::api::check_kind(&server, ModelKind::Text, named.as_deref()) {
         return refused;
     }
+    // Nor a request naming a text model it cannot switch to: the image model
+    // would only refuse it, as below.
+    if let Some(unswitchable) = crate::api::unswitchable_named(&server, ModelKind::Text, named.as_deref()) {
+        return refused(&Refusal::new(
+            "model_not_found",
+            format!("`model` names {unswitchable:?}, and this engine serves {:?}", server.active().model_id()),
+        ));
+    }
     // A model the idle clock unloaded is loaded first, the named one when
     // the server knows it (spec model-switch/02) — only for a body that
     // parsed: a malformed one is refused `422` below and must not cost a
