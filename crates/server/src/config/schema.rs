@@ -259,9 +259,11 @@ config_group! {
         /// Serve the Playground at /ui/. A binary built without web/dist
         /// serves a page saying how to build it.
         ui: Bool = super::DEFAULT_UI, NO_RULE, ALL, [Visible];
-        /// How long a non-streaming request waits for its completion before
-        /// the handler gives up with a 504, in seconds. A ceiling against a
-        /// fat-fingered value, not a real operating point.
+        /// How long a non-streaming text request waits for its completion
+        /// before the handler gives up with a 504, in seconds. A ceiling
+        /// against a fat-fingered value, not a real operating point. The
+        /// image routes are not bounded by it: ten images at 2048x2048 take
+        /// longer.
         request_timeout: Secs = super::DEFAULT_REQUEST_TIMEOUT_SECS, between(1, super::MAX_REQUEST_TIMEOUT_SECS as i64), ALL, [Visible, Patchable];
         /// Where `system` messages go: `merge` joins a leading run into the
         /// system prompt and keeps a later one as its own block in place;

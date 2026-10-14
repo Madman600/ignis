@@ -16,8 +16,10 @@
 //!
 //! When that is over the budget, every image is scaled by one factor — all
 //! of them get the same smaller area — until the prefix fits, never below
-//! `image.condition_floor_px`² of area; one that does not fit even there is
-//! refused, naming the budget ([`fit`]).
+//! `image.condition_floor_px`² of area before its sides are rounded to 32
+//! (the rounding may take an image a little under it: 672 x 384 at a 512
+//! floor); one that does not fit even there is refused, naming the budget
+//! ([`fit`]).
 
 use ignis_core::image::{ImagePlan, ImageSize};
 

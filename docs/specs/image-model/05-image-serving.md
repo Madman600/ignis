@@ -70,6 +70,10 @@ WebP, decoded to RGBA):
   `phase` is `enhancing`, `switching`, `loading`, `encoding`, `denoising` or
   `decoding`.
 - One `image_generation.completed` per image, with its `b64_json`.
+- On `/v1/images/edits` the same events are named `image_edit.progress` and
+  `image_edit.completed`. `image_edit.completed` is OpenAI's own name, so
+  OpenAI SDKs read an edit stream; `image_edit.progress` is ignis's, beside
+  it (coordinator's ruling on review-322b F3).
 - Partial images are not sent.
 
 ### Sizes
@@ -87,7 +91,9 @@ All are multiples of 32.
   ratio, with sides rounded to 32 (diffusers' `calculate_dimensions`).
 - If the prompt plus all condition images exceed the condition budget (spec
   04), every condition image is scaled down by the same factor until they
-  fit, never below `image.condition_floor_px`² area.
+  fit, never below `image.condition_floor_px`² area before the sides are
+  rounded to 32 (the rounding may take an image a little under it: 672x384
+  at a 512 floor).
 - Below the floor the request is `400`, naming the budget.
 - `image.condition_budget_tokens` (0 = the plan's whole budget) lowers the
   budget.
@@ -318,8 +324,11 @@ docs and the Playground are the agents after it.
   before it costs anything — the field table against `image.*`, an edit's
   images decoded (`media::decode_condition_image`: PNG and WebP keep their
   alpha, JPEG is opaque, GIF is refused) — and only then
-  `switch_to_named_model`, the pin and `check_served_kind`: a 400 never
-  loads or switches a model. Unknown fields are ignored; OpenAI's `quality`,
+  `switch_to_named_model`, the pin and `check_served_kind`: those 400s never
+  load or switch a model. (Review-322b L1: a size past the load's largest
+  target, `auto` with no size served, and `condition_budget_exceeded` need
+  the loaded image model, so they come after the switch.) Unknown fields are
+  ignored; OpenAI's `quality`,
   `style`, `moderation`, `output_compression`, `partial_images` and `user`
   are named inert in the operation. `auto` is the size in `image.sizes`
   whose ratio is nearest on the log scale (1 for a generation, the last

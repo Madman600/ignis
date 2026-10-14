@@ -3,11 +3,14 @@
 //! (multipart), OpenAI's Images API on the image model, with the job queue
 //! behind them ([`super::job`]).
 //!
-//! A request is checked whole before it costs anything: its fields against
-//! `image.*`, an edit's condition images decoded — then the kind check and
-//! the implicit switch ([`crate::api::switch_to_named_model`]), the queue's
-//! admission, the condition budget ([`super::budget`]) and the resize, and
-//! the job. Its answer is one JSON body, or with `stream` its events as
+//! A request's fields are checked against `image.*`, and an edit's condition
+//! images decoded, before anything loads or switches — then the kind check
+//! and the implicit switch ([`crate::api::switch_to_named_model`]), the
+//! queue's admission, the condition budget ([`super::budget`]) and the
+//! resize, and the job. Two 400s come after the switch, since they need the
+//! loaded image model: a size past what its load makes (and `auto` with none
+//! of `image.sizes` made), and a prefix over the condition budget, which the
+//! runner's tokenizer counts. Its answer is one JSON body, or with `stream` its events as
 //! Server-Sent Events, one per progress unit and one per finished image.
 
 use std::convert::Infallible;

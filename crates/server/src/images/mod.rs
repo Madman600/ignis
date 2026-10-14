@@ -113,15 +113,13 @@ impl ImageJobs {
         self.state.lock().expect("image queue lock")
     }
 
-    /// One job counted as waiting, at the back of the queue: it waits until
+    /// One job counted as waiting, at the back of the queue, whatever the
+    /// depth ([`ImageJobs::admit`] without its bound): it waits until
     /// [`Waiting::start`] or [`Waiting::turn`], and leaves the count when the
-    /// guard is dropped — run, refused or cancelled alike.
+    /// guard is dropped — run, refused or cancelled alike. The queue must be
+    /// open.
     pub fn wait(self: &Arc<Self>) -> Waiting {
-        let mut queue = self.queue();
-        let ticket = queue.next;
-        queue.next += 1;
-        queue.waiting.push_back(ticket);
-        Waiting { jobs: Some(Arc::clone(self)), ticket }
+        self.admit(u32::MAX).expect("an open queue admits without a bound")
     }
 
     /// One job admitted to the back of the queue, counted as waiting, when
