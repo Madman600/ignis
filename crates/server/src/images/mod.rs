@@ -12,6 +12,7 @@
 pub mod budget;
 pub mod enhance;
 pub mod job;
+pub mod leaf;
 mod prompts;
 pub(crate) mod routes;
 

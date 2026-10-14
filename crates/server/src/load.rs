@@ -401,21 +401,20 @@ fn load_image_model(
     Ok(LoadedModel { model: active, reservations: None })
 }
 
-/// The image leaf's runner for `artifact` (spec image-model/04, GitHub #321,
-/// which builds it): an adapter here, in the server, over the leaf — the
-/// artifact's tokenizer and templates and `crate::media`'s Qwen3-VL
-/// preprocessing on the host (spec image-model/03 §Seams), the leaf's calls
-/// on the device. Until #321 builds it, the load is refused naming it.
+/// The image leaf's runner for `artifact` (spec image-model/04, GitHub #321):
+/// the adapter in the server over the leaf ([`crate::images::leaf::LeafRunner`])
+/// — the artifact's tokenizer, templates and Qwen3-VL preprocessing on the
+/// host (spec image-model/03 §Seams), the leaf's calls on the device. A load
+/// the leaf's plan refuses names the shortfall.
 #[cfg(feature = "cuda")]
 fn cuda_image_runner(
     artifact: &std::path::Path,
-    _config: &crate::config::Config,
+    config: &crate::config::Config,
 ) -> Result<Box<dyn ImageRunner>, LoadError> {
-    Err(LoadError::LoadFailed(format!(
-        "{} cannot load {}: the image leaf is not built yet (spec image-model/04, GitHub #321)",
-        ModelFamily::QwenImage21.name(),
-        artifact.display()
-    )))
+    let runner = crate::images::leaf::LeafRunner::load(artifact, config).map_err(|why| {
+        LoadError::LoadFailed(format!("{} cannot load {}: {why}", ModelFamily::QwenImage21.name(), artifact.display()))
+    })?;
+    Ok(Box::new(runner))
 }
 
 /// The GPU-backed scheduler for `artifact` (GitHub #61 / P1-25), logged as

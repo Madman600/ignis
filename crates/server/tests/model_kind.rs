@@ -462,8 +462,9 @@ fn start_options() -> ignis_server::config::Config {
 
 /// The production loader reads the image artifact's kind off its header,
 /// verifies it against its sidecar, fits the options to the image family
-/// and loads it — on the fake runner in a build without `cuda`, and refused
-/// naming the leaf still to come with it. A sidecar that does not match is
+/// and loads it — on the fake runner in a build without `cuda`; with it, the
+/// leaf's runner refuses the synthetic artifact, whose front end is a stub
+/// (its tokenizer is `{}`), naming the model. A sidecar that does not match is
 /// refused before anything loads.
 #[tokio::test]
 async fn the_artifact_loader_verifies_the_image_artifact_and_loads_its_runner() {
@@ -489,7 +490,7 @@ async fn the_artifact_loader_verifies_the_image_artifact_and_loads_its_runner() 
         assert!(image.with_runner(|runner| runner.plan().clone()).is_none(), "shut down, the runner is gone");
     }
     #[cfg(feature = "cuda")]
-    assert!(loaded.err().expect("no image leaf yet").contains("#321"));
+    assert!(loaded.err().expect("the synthetic front end does not load").contains("cannot load"));
 
     let sidecar = ignis_artifact::packer::sidecar_path(&artifact);
     let mut record: Value = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
