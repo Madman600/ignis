@@ -613,7 +613,7 @@ The baseline on 96db56b (322d never recorded one): `cargo test --workspace`
   11. Done (322e); the revision is pinned to d6912417 (c81e8c6).
   12. Done (322f): the image view, its switch button and gallery; see "As built (322f)".
   13. Done: OpenAPI (322b) and the user docs (322e).
-  14. Remains: the live run needs spec 04's real leaf and runner adapter (#321).
+  14. The runner adapter is built (321d, below); the live run from the Playground remains.
 
 ## As built (322f, 2026-10-14, branch `image-serving-322`: AC 12)
 
@@ -651,3 +651,41 @@ The Playground's image view. Web only; no Rust touched.
   retry. The previews are object URLs, revoked on unmount.
 - **Gates.** `npm test` (855 tests) and `npm run build` pass. The view was not
   looked at in a browser (the owner watches :5173).
+
+## As built (321d, 2026-10-14, branch `image-leaf-321`: the real runner behind these routes)
+
+Spec 04's "As built (321d)" has the adapter itself. What it settles on this
+side of the seam:
+
+- **The runner.** Under `cuda`, `load_model` loads `images::leaf::LeafRunner`
+  (the stub `cuda_image_runner` is gone): the artifact's front end, then the
+  image leaf on device 0 in `vram`'s budget. A plan that does not fit is the
+  load's refusal (`ignis.model.load_failed`), naming the shortfall.
+- **`condition_tokens` is the leaf's own count** (322c's F1), and more: within
+  the plan's budget, a condition the leaf's arena has no room for, or a
+  condition size the encoder's processor would not keep (past 200:1, off the
+  32-pixel grid, under its pixel floor), counts one past the plan's budget.
+  `budget::fit` then scales the images for those limits as for the budget.
+- **`max_target_cells`** is the largest of `image.sizes` at load, and the
+  leaf's arena is sized for it: 16,800 cells by default. So at load no
+  configured size is past the plan, and the `ignis.image.sizes_not_served`
+  warning fires only for a size a live `PATCH` added; that size is served
+  after the next load.
+- **A refusal of the runner's own** is `ImageError::Refused`, answered
+  `400 invalid_request_error` with code `image_refused` in the runner's words
+  (whole, or as the stream's `error` event), logged `ignis.image.job_refused`
+  at info. Examples: a prompt past the RoPE table (about 8,000 tokens), a
+  condition size the processor would not keep. `500 engine_error` is now a
+  failure of the leaf, not a refusal.
+- **A prefix outlives no runner.** The runner frees every prefix it still
+  holds when it is dropped: a switch or an idle unload that ends a running
+  job between two calls drops the runner first, and `Held`'s release then
+  finds none (measured: +0.0 MiB, against −1,042 MiB without it).
+- **A corner for the fit.** The processor's 200:1 limit is not monotone in
+  the area, and `fit` reads the floor first: ten 16380x100 panoramas round to
+  6560x32 at the 512 floor and are refused `400 condition_budget_exceeded`,
+  though 12800x64 would serve. Not changed here.
+- **AC 14.** The routes now run on the real leaf through the router
+  (`tests/image_runner_gpu.rs`: a 1024² generation in 1.70 s and an edit in
+  2.25 s, the same bytes twice each). The live run from the Playground,
+  switching from the 27B and back, remains the owner's.

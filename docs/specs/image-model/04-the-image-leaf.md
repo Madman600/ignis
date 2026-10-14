@@ -722,3 +722,132 @@ applies.
   - Not rerun: the server's `image_leaf_ten_images_gpu`. What it calls that
     this change touched (that convolution wrapper, the image slot's shape)
     is covered by `image_leaf_gpu`'s ACs 3, 4 and 7.
+
+## As built (321d, 2026-10-14: the runner adapter, the leaf end to end through HTTP)
+
+Status: the image model serves spec 05's routes on this leaf, loaded by the
+server's loader like a text model (start, switch, idle unload's reload). No
+AC of this spec changes status: AC 10 (timing) is open, AC 11 applies. The
+branch merged `image-serving-322` first (d7447b4; the conflicts were additive:
+`NOTICE` and the two module lists).
+
+- **Where.**
+  - `crates/server/src/images/leaf.rs`: `LeafRunner` (with `cuda`), the
+    `ImageRunner` over `ImageLeaf` and spec 03's `EncoderFrontend`;
+    `load.rs`'s `cuda_image_runner` loads it in place of the stub. Its CPU
+    helpers: `max_target_cells`, the latents' packing, the step lookup, the
+    error map.
+  - `crates/server/src/image_encoder_input.rs`: `EncoderFrontend::count`
+    (`ConditionCount`) and `ImageProcessor::keeps`; `image_prompt.rs`:
+    `ImagePrompt::rows`.
+  - The leaf: `ImageLeaf::condition_fits`; `release_condition` clears the
+    image slot; NVML is read for `CudaDevice::ordinal()`; `ImageLeafError`
+    lives outside the `cuda` module; `Condition` is `#[must_use]`.
+  - `ignis_core::image::ImageError::Refused`, which the routes answer
+    `400 image_refused`.
+- **The count** (review-321ab I3: "a refusal is a bug").
+  `condition_tokens(prompt, sizes)` is `EncoderFrontend::count`'s prefix: the
+  raw template tokenized once with one pad a slot, its `rows − n − drop_idx`
+  text rows, plus each image's latent cells. That is `PrefixLayout`'s count,
+  the one `encode_condition` refuses by:
+  - a CPU test checks it against the front end's own input laid out by
+    `PrefixLayout`;
+  - on the real tokenizer it gives the oracle's prefixes, 31 (t2i) and
+    4,122 (edit), and 41,041 for ten 1024² images, the ten-image test's.
+
+  Within the plan's budget it counts `budget + 1` when:
+  - the arena has no room for the condition (`ImageLeaf::condition_fits`:
+    `EncodePhase` from the shapes alone, the VAE encode, the tower and
+    encoder, the prefix);
+  - or a condition size is one the processor would not keep
+    (`ImageProcessor::keeps`: `smart_resize` changes it or refuses it; off the
+    32-pixel grid, under its pixel floor, past 200:1).
+
+  So `budget::fit` scales the images for those limits too, and
+  `encode_condition` refuses them, 400, before any image is prepared.
+  Measured on an oversubscribed 40 GiB budget (93,888 tokens): ten 13120x96
+  images, the worst condition size (49,200 cells, 1,230 merged tokens each),
+  count 93,889 for the arena, and the fit lands on 12800x64. On this card's
+  own budget (45,184 tokens) the budget binds first.
+- **The largest target, one source** (review-321ab I2). `max_target_cells`
+  is the largest of `image.sizes` in latent cells: 16,800 (2400x1792) by
+  default. It sets both `ImageLeafOptions.max_target_tokens` (the arena) and
+  `ImagePlan.max_target_cells` (the routes' `takes`). A larger size added by
+  a live `PATCH` is served after the next load.
+- **The calls.**
+  - `encode_condition`: the count (`Refused`, or `OverBudget` past the
+    plan's budget), `EncoderFrontend::input`, then the leaf's encode. Its
+    `Condition` goes into the runner's map at once; nothing fallible sits
+    between.
+  - `denoise_step`: the job's channel-major latents go up packed,
+    `[y·w + x][c]`. An image starts (`start_image`, its RoPE table) at its
+    first step over a prefix, tracked as (prefix, size); later steps
+    `set_latents`. The step is the sampler's whose (σ, σ_next) are the job's,
+    bit for bit: the plan copies the sampler's sigmas. The latents come back
+    channel-major, and the velocity when asked.
+  - `vae_decode`: the job's latents into the slot of the image a step
+    started, then the leaf's decode. Another size is a server bug: `Leaf`,
+    a 500.
+- **Errors.** The leaf's `Refused` and every front-end refusal are
+  `ImageError::Refused`: `400 invalid_request_error`, code `image_refused`,
+  in the leaf's words, also as the stream's `error` event. `Failed` is
+  `Leaf`, `500 engine_error`. `Plan` is the load's refusal, naming the
+  shortfall. Over HTTP, a 9,000-word prompt answers 400: "a text position
+  falls outside [-1024, 8192)".
+- **Release on every path** (review-321c I2, review-321ab I4). The runner
+  holds each prefix from its encode on. `release_condition` frees it, and
+  `Drop for LeafRunner` frees every one still held before the leaf drops.
+  That path is real: a switch or an idle unload drops the runner between
+  two calls of a running job, and the job's own release then finds no
+  runner.
+  - Measured: a model shut down holding the edit's prefix (1,042 MiB)
+    leaves the free memory where a clean unload left it, +0.0 MiB.
+  - With the `Drop` disabled the same test reads −1,042 MiB: red, then
+    green.
+  - `Condition` gets no `Drop` of its own: freeing needs the leaf's device.
+- **Step 0 done here.**
+  - Review-321c L3: `vae_decode` and `latents` before `start_image` and
+    after `release_condition` are `Refused`, asserted in AC 8's GPU test.
+    The release clears the slot because its RoPE table was laid out after
+    that prefix.
+  - Review-321ab L3: NVML is read for the device the leaf was given. The
+    server still runs device 0, as the text models do.
+- **Through HTTP** (the 5090, `ArtifactLoader` on the default options,
+  `crates/server/tests/image_runner_gpu.rs`):
+  - the load takes 8.5-11.0 s; the condition budget is 45,184 tokens;
+  - a 1024² generation (encode, 8 steps, decode, PNG) takes 1.70 s, and the
+    same seed again gives the same bytes;
+  - a 1024² edit with the oracle's 1024² condition image takes 2.25 s, the
+    same bytes twice;
+  - the PNGs are `F:/ai/models/ignis-image-2.1-turbo/freerun/http/t2i-seed7.png`
+    (the fox and a legible "ignis" sign) and `edit-seed3.png` (the glass
+    shapes, a transparent background whose hidden RGB keeps the condition's
+    band: review-321c M1, open).
+- **Defaults taken** (the owner may revisit):
+  1. **The arena follows `image.sizes`.** It is sized for the largest size at
+     load, with no field of its own: fewer and smaller sizes give a smaller
+     arena and a larger condition budget.
+  2. **`image.condition_budget_tokens` is not the leaf's load cap**
+     (`condition_budget_cap: None`). The routes apply it per request, so a
+     `PATCH` of it holds live.
+  3. **Past the arena or the processor, the count is `budget + 1`**, not an
+     error of its own. A fit refused there names a token count one past the
+     budget.
+  4. **The latents cross to the host every step**, the trait's contract,
+     with no skip for an unchanged upload: about 4 MiB each way at 2K,
+     against 0.7 s steps.
+  5. **Device 0**, as the text models. `LeafRunner` is `Send` under
+     `ImageModel`'s one lock; the leaf's FFI selects the device on each call.
+  6. **The front end is read by the load**, not by `prepare_model`. A
+     broken image artifact is refused by the load, and a switch then puts
+     the old model back.
+- **Left for the next agent** (`.scratch/orchestra/step0-321d.md`): M1
+  (chunked against whole on real weights), L1 (the timestep), L2 (a budget
+  floor), L4 (a non-square VAE encode), L5, I1 (§Seams' 16,512 line), and
+  review-321c's M1 (the edit's background), L1, L2, L4, I1 and I3; then AC
+  10's timing run.
+  - One corner for spec 05's fit: the processor's 200:1 limit is not
+    monotone in the area, and `budget::fit` reads the floor first. Ten
+    16380x100 panoramas at the default 512 floor round to 6560x32, past
+    200:1, and the request is refused `400 condition_budget_exceeded`,
+    though 12800x64 would serve (the GPU test fits from 640).

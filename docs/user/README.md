@@ -971,8 +971,11 @@ condition image's.
 **Condition images.** Each is resized to about 1024x1024 of area, keeping its
 aspect ratio. When the prompt and all of them exceed the condition budget they
 are scaled down together, never below `image.condition_floor_px` squared; below
-that the request is a `400` naming the budget. A condition image is refused only
-for decoding to more than `image.max_condition_mipx`.
+that the request is a `400` naming the budget. A condition image is refused for
+decoding to more than `image.max_condition_mipx`. The image model itself refuses,
+as `400 image_refused` in its own words, a prompt too long for its positions
+(about 8,000 tokens) and a condition image its encoder would not take at its
+condition size (a panorama past 200:1).
 
 **The queue.** One image job runs at a time and `image.queue_depth` wait in
 order; a full queue answers `503 engine_full` with `Retry-After`. A client that
@@ -985,7 +988,7 @@ running or queued job counts as use for [idle unload](#idle-unload).
 | `max_n` | `10` | The most images one request may ask for (1..64). |
 | `max_condition_images` | `10` | The most condition images one edit may send (1..10). |
 | `max_condition_mipx` | `16` | The largest a condition image may decode to, in megapixels (1..64); a larger one is refused. 16 takes any phone camera and bounds what one edit decodes (64 MiB). |
-| `sizes` | the eight above | The sizes a request may ask for. |
+| `sizes` | the eight above | The sizes a request may ask for. The load sizes the image model's working memory for the largest, so a larger size added live is served after the next load. |
 | `condition_budget_tokens` | `0` | Lowers the condition budget (0 is the whole budget the load planned). |
 | `condition_floor_px` | `512` | The smallest a condition image may be scaled to, as the side of a square of the same area (32..1024). |
 | `prompt_enhancement` | `false` | Whether a request that does not say has its prompt rewritten first. |
