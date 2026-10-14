@@ -70,6 +70,10 @@ WebP, decoded to RGBA):
   `phase` is `enhancing`, `switching`, `loading`, `encoding`, `denoising` or
   `decoding`.
 - One `image_generation.completed` per image, with its `b64_json`.
+- On `/v1/images/edits` the same events are named `image_edit.progress` and
+  `image_edit.completed`. `image_edit.completed` is OpenAI's own name, so
+  OpenAI SDKs read an edit stream; `image_edit.progress` is ignis's, beside
+  it (coordinator's ruling on review-322b F3).
 - Partial images are not sent.
 
 ### Sizes
@@ -87,7 +91,9 @@ All are multiples of 32.
   ratio, with sides rounded to 32 (diffusers' `calculate_dimensions`).
 - If the prompt plus all condition images exceed the condition budget (spec
   04), every condition image is scaled down by the same factor until they
-  fit, never below `image.condition_floor_px`² area.
+  fit, never below `image.condition_floor_px`² area before the sides are
+  rounded to 32 (the rounding may take an image a little under it: 672x384
+  at a 512 floor).
 - Below the floor the request is `400`, naming the budget.
 - `image.condition_budget_tokens` (0 = the plan's whole budget) lowers the
   budget.
@@ -242,3 +248,406 @@ not told to.
 14. With spec 04's leaf: one live run on the 5090 serves a 2048² generation
     and a 2-image edit from the Playground, switching from the 27B and back.
     The times are written in "As built".
+
+## As built (322a, 2026-10-13, branch `image-serving-322`: AC 1, 2, 8, 10)
+
+Against `FakeImageRunner`; the image routes, the queue, the PNG, prompt
+enhancement and the Playground are the agents after it.
+
+- **The kind.** `ModelKind { Text, Image }` and `ModelFamily::kind()` in
+  `crates/core/src/compute.rs`. `ActiveModel.runner` is
+  `Runner::Text(Engine) | Runner::Image(ImageModel)`; `kind()`, `model_id()`
+  and `in_flight()` serve both, `engine()` is `None` on the image model, and
+  `text_engine()` is what a text route reads past the kind check (it panics
+  on the image model). The template, calibrations, labels and acquirer stay
+  on `ActiveModel`: the image model carries the placeholder template and
+  none of the rest.
+- **The runner.** `ignis_core::image::ImageRunner`, in core so the image
+  leaf's crate implements it as the text leaf implements `Compute`:
+  `plan()` (condition budget, sample sigmas), `encode_condition(&ImageCondition)`
+  → `ConditionId`, `denoise_step(id, &mut TargetLatents, σ, σ_next,
+  velocity)`, `vae_decode` → RGBA, `release_condition`. `&mut self`: one job
+  at a time. The prompt goes in as text and the condition images as RGBA at
+  their budgeted size; the runner tokenizes and prepares them (322c's F7,
+  below, says where that runner lives). The latents cross to the host
+  between calls (≤ 4 MiB a step).
+  `vae_encode` is inside `encode_condition`. `FakeImageRunner` is
+  deterministic in the condition and the noise and counts its held prefixes.
+- **The image model in the server** (`crates/server/src/images/mod.rs`):
+  `ImageModel` holds the runner behind a lock (`with_runner`), and its
+  shutdown drops it — the counterpart of joining a text model's thread.
+  `ImageJobs` is the queue-busy hook: `wait()` → `Waiting`, `start()` →
+  `Running`, RAII; `in_flight()` is what the idle clock and a switch's drain
+  read; `close()` is a switch's or an unload's stop.
+- **The kind check** (`crates/server/src/api.rs`):
+  `switch_to_named_model(server, route_kind, model)` refuses
+  `409 model_kind_mismatch` (`param: model`) before any load or switch when
+  the model that would serve the request is of the other kind: the one
+  `model` names when it is another, its kind read by the switcher
+  (`Switcher::kind_of`, `ModelLoader::kind_of`: the artifact's header for a
+  known model, else the id when it is a family's own), or the loaded one —
+  also while unloaded, so a text request never reloads the image model only
+  to be refused. `check_served_kind` runs again on the pinned server and
+  refuses by name (`404 model_not_found`) a model of the route's kind that
+  was not switched to; `/v1/decide` answers that with its own `422`. The
+  tokenize routes never switch: `409` with the image model loaded.
+- **Other consumers.** The warm-up is a text model's only; metrics install
+  into an engine when there is one (`/metrics` serves either way); the
+  decide heads log and the thinking checks (start, `PATCH`) skip the image
+  model. `GET /v1/models` gains `kind`, and `max_model_len` is a text
+  model's only.
+- **The load.** `prepare_model` reads the family first: the image artifact
+  is verified against its sidecar (no text frontend is read) and the
+  options fitted to the family. `load_model` then loads `FakeImageRunner`
+  without `cuda`, and under `cuda` refuses naming #321
+  (`cuda_image_runner`, the stub the leaf fills).
+- **Config** (`config_group! { ImageGroup = "image" }`): the table's fields
+  and defaults, each with flag and env var, `[Visible, Patchable]`, every
+  family taking them (they matter while a text model is loaded too). Bounds:
+  `queue_depth` 0..=64, `max_n` 1..=64, `max_condition_images` 1..=10 (the
+  encoder's), `condition_floor_px` 32..=1024; `sizes` is its own list kind,
+  each side a multiple of 32; `condition_budget_tokens` and the enhancement
+  fields have no bound. The live knobs carry the group
+  (`server.live().image`). No `qwenimage21` family scope.
+- **Tests.** `crates/server/tests/model_kind.rs` (AC 1, 2, 8 and the
+  loader on the converter's synthetic artifact), `config/tests.rs` and
+  `tests/config_http.rs` (AC 10), `core::image` and `server::images` units.
+
+## As built (322b, 2026-10-14, branch `image-serving-322`: AC 3-7, 13's OpenAPI)
+
+Against `FakeImageRunner`; prompt enhancement, the catalog, Make, the user
+docs and the Playground are the agents after it.
+
+- **The routes** (`crates/server/src/images/routes.rs`): `create_image`
+  (JSON) and `create_image_edit` (multipart: `image[]`, or `image` for one;
+  the other parts are the JSON fields as text). A request is checked whole
+  before it costs anything — the field table against `image.*`, an edit's
+  images decoded (`media::decode_condition_image`: PNG and WebP keep their
+  alpha, JPEG is opaque, GIF is refused) — and only then
+  `switch_to_named_model`, the pin and `check_served_kind`: those 400s never
+  load or switch a model. (Review-322b L1: a size past the load's largest
+  target, `auto` with no size served, and `condition_budget_exceeded` need
+  the loaded image model, so they come after the switch.) Unknown fields are
+  ignored; OpenAI's `quality`,
+  `style`, `moderation`, `output_compression`, `partial_images` and `user`
+  are named inert in the operation. `auto` is the size in `image.sizes`
+  whose ratio is nearest on the log scale (1 for a generation, the last
+  condition image's for an edit), the larger on a tie. The response adds
+  OpenAI's `size` (`auto` resolved), `background` and `output_format` to the
+  spec's fields. The edit route has the media body limit (384 MiB) on every
+  load.
+- **Images and seeds.** RGBA 8-bit PNG (`png`). `opaque` is
+  `(c·a + 255·(255 − a) + 127) / 255`, alpha 255. Image `i` starts from
+  `TargetLatents::noise(size, seed + i)` (core: splitmix64's stream,
+  Box–Muller). A request without a seed takes `server.seedless_seed`, else a
+  drawn one, and it is returned.
+- **The condition budget** (`images/budget.rs`). `condition_size` is
+  diffusers' `calculate_dimensions` (halves to even; a side is never 0).
+  A prefix holds what `ImageRunner::condition_tokens(prompt, sizes)`
+  counts: the prompt as templated plus `(W / 16) · (H / 16)` per image
+  (322c's call, below). Over the budget
+  (`min(plan, image.condition_budget_tokens)`), every image gets the same
+  area s², s the largest in [floor, 1024] that fits (bisected: the tokens
+  only grow with s); below the floor `400 condition_budget_exceeded`
+  (`param` `image`, or `prompt` for a generation). The resize is
+  `media::resize_rgba`, Pillow's Lanczos on `RGBa` in Pillow's fixed point,
+  byte-equal to Pillow 12.3 on three committed fixtures.
+- **A new runner call:** `ImageRunner::prompt_tokens`, which 322c widened
+  into `condition_tokens` (below). The runner holds the image model's
+  tokenizer, so the server asks it for the prefix's tokens.
+- **The queue** (`images/mod.rs`). `ImageJobs` is a ticket queue under a
+  lock. `admit(depth)` admits while waiting + running ≤ `image.queue_depth`;
+  past it the answer is `503 engine_full` with `Retry-After: 1`, and on a
+  closed queue `503 model_stopped`. `Waiting::turn()` runs the jobs in the
+  order they were admitted, not the order they ask, and gives `None` once the
+  queue is closed. `wait()` / `start()` keep 322a's counting meaning.
+- **The job** (`images/job.rs`). `spawn` waits for the turn and also
+  watches the request: a waiting job whose request went away leaves the
+  queue at once. `run` (blocking) encodes once, then for each image: noise,
+  steps, decode, PNG. It holds `with_runner` for one call at a time. Between
+  calls a closed queue ends it `Stopped`, and a channel with no reader ends
+  it `Cancelled`. `Held` releases the prefix on every path. The job leaves
+  the count before its request hears that it ended.
+- **Answers.**
+  - Not streaming: `200` with the JSON body; `503 model_stopped` with
+    `Retry-After`; `500 engine_error` when the runner refuses a call.
+  - Streaming: `event: <type>` and a `data:` object. Generations send
+    `image_generation.progress` and `.completed`; edits send
+    `image_edit.progress` and `.completed`, OpenAI's names for the edit
+    route (the spec says `image_generation.*` for both).
+  - A progress event announces a unit as it starts: encoding 1/1, then for
+    each image denoising k/total and decoding 1/1. A job that ends early
+    sends one `error` event (`{type, error}`). No `[DONE]`.
+- **OpenAPI.** An `images` tag and both routes, the edit as a multipart
+  `EditForm`. `ImageStreamEvent` is oneOf progress / completed / error, and
+  `Phase` lists all six phases.
+- **Not applied.** `server.request_timeout` (a text knob, 30 s by default)
+  does not bound an image request. `prompt_enhancement` is parsed and has no
+  effect until 322c.
+- **Tests.**
+  - `crates/server/tests/images_http.rs`: AC 3-7, the `409` with a text
+    model loaded, and the edit's body limit.
+  - Unit tests in `images::{budget, job, routes}`, the queue's in `images`,
+    `media` (the Pillow fixtures), `vision::decode` (RGBA), and `core::image`
+    (the noise and the prefix count).
+  - `tests/openapi_http.rs`: AC 13's OpenAPI part.
+
+## As built (322c, 2026-10-14, branch `image-serving-322`: the 322a review's fixes)
+
+The findings of `.scratch/orchestra/reviews/review-322a.md` (F1-F8), on
+322a's and 322b's work.
+
+- **The prefix count (F1).** `ImageRunner::condition_tokens(prompt,
+  &[ImageSize]) -> u64` replaces 322b's `prompt_tokens(prompt, n)`: the
+  whole condition prefix, the prompt as the runner's template and tokenizer
+  lay it out plus `latent_cells` per image. `budget::fit` takes the count as
+  a function of the images' sizes; `prepare` holds the runner for the fit's
+  few host-side counts (a bisection). **#321 implements it with the very
+  count `encode_condition` refuses by**: the fit trusts it, so an
+  `OverBudget` from the encode is a server bug (`500 engine_error`).
+- **The largest target (F4).** `ImagePlan.max_target_cells`, what the load
+  sized its arena for, and `ImagePlan::takes(size)`. The fake plans 2400x1792
+  (16,800 cells), the largest default preset in latent cells. Once pinned, a
+  requested size past it is `400` (`param: size`), naming the cells and
+  listing the sizes served; `auto` picks only among the served sizes
+  (`images::served_sizes`), and with none of them is `400`. The load warns
+  (`ignis.image.sizes_not_served`) of each `image.sizes` entry past its plan.
+  **Default taken:** such an entry is dropped from what this load serves,
+  not from the config — `GET /v1/config` still lists it, a load that can
+  make it serves it, and a `PATCH` adding one is refused per request, not at
+  the patch.
+- **For #321, the arena.** Spec 04 sizes the arena for "the largest preset
+  (2752 × 1536, 16,512 target tokens)", but in latent cells 2400x1792
+  (16,800) and 2528x1696 (16,748) are larger: an arena for 16,512 drops both
+  defaults at load. Size it for 16,800, and plan `max_target_cells` as what
+  it holds.
+- **A name it cannot switch to (F2).** `api::unswitchable_named`: with the
+  loaded model — or the unloaded one — of the other kind, a request naming a
+  model the switcher does not know (implicit switching off, or an unknown
+  id) is refused by name at once (`404 model_not_found`, decide's `422`),
+  before `ensure_loaded` would reload the image model only to refuse it.
+  With a model of the route's kind loaded, such a name passes as before.
+- **Metrics on the image model (F3).** `observe_load` of a model with no
+  engine calls `Metrics::set_unloaded`: the text model's reservations, KV
+  pages and occupancy read zero while the image model holds the card, as
+  while unloaded.
+- **A runner call that panics (F5).** `with_runner` and `shut_down` take a
+  poisoned lock (`PoisonError::into_inner`): the job's prefix is still
+  released while it unwinds, and the shutdown still drops the runner.
+- **Where the real runner lives (F7).** Spec 03 §Seams puts the tokenizer,
+  the templates and the Qwen3-VL preprocessing in server-side Rust
+  (`crates/server/src/media.rs`), and the trait holds: #321's runner is an
+  adapter in `crates/server`, beside `cuda_image_runner` (`load.rs`), over
+  the image leaf. The adapter owns the artifact's tokenizer and templates and
+  `media.rs`'s preprocessing, and it hands the leaf token ids and prepared
+  patches. So the routes pass the prompt as text and the images as RGBA, and
+  `condition_tokens` is host-side.
+- **Coverage (F6).** These tests pin behaviour already built: the switch
+  drain's image arm (a running job holds the teardown back; past a short
+  window the queue closes and the switch lands, the runner gone before the
+  next load); the thinking checks' skip on the image model (`PATCH`); and
+  the Responses socket on the image model (`409` as an `error` event, with
+  the socket left open). `main.rs`'s skip of the thinking validation stays
+  untested, as the review allowed.
+- **322b's review notes, checked.**
+  - The edit's media body limit is a layer on the edit route alone, so it
+    holds on the image model and on a text load without vision; both are
+    tested.
+  - A job holds `with_runner` for one call at a time, on `spawn_blocking`.
+  - A job that passes the gate between the drain and `close()` stops at its
+    next call: `run` checks the queue before every call, and a runner taken
+    by the shutdown answers `Stopped`.
+  - `auto` without 2048x2048 picks the nearest ratio among the sizes served.
+- **Not done.** F8, caching `kind_of` per artifact, is left out: optional in
+  the review, and a header read costs nothing next to the switch it
+  precedes.
+- **Tests.** `core::image` (the count, `takes`), `images` (`served_sizes`,
+  the poisoned lock), `tests/images_http.rs` (the size past the plan, `auto`
+  among the served sizes, the body limit on a text load), and
+  `tests/model_kind.rs` (the unloaded refusal, the metrics after a switch,
+  the drain), plus `tests/config_http.rs` and `tests/responses_socket.rs`.
+
+## As built (322d, 2026-10-14, branch `image-serving-322`: the 322b review's fixes, AC 9)
+
+The findings of `.scratch/orchestra/reviews/review-322b.md`, then prompt
+enhancement, against the mock loader's text models and `FakeImageRunner`.
+The workspace on 08c23b3, which 322c never recorded, was 2896/0/6.
+
+- **Review-322b.**
+  - **F1.** 322c's poisoned-lock fix (F5) already keeps `Held::drop` from
+    panicking while a runner's panic unwinds: no abort. A route test now
+    drives a runner whose step panics: `500 engine_error`, the prefix
+    released, the model serving the next request. The shutdown half is
+    322c's unit test.
+  - **F2.** The decode cap is `image.max_condition_mipx` (16 Mi pixels by
+    default, 1..=64, live), named in the 400; `Server.image_decodes`, one
+    permit, holds each edit's decode.
+  - **F3, F4.** §Streaming names the edit events (the coordinator's ruling).
+    `media.rs` names the Pillow 12.3.0 files its resize ports and root
+    `NOTICE` carries Pillow's notice; ADR 0051's licence list is the owner's
+    and is left as written.
+  - **L1-L7, N1, N4.** No doc claims a 400 never loads a model. A runner's
+    own `OverBudget` is `400 condition_budget_exceeded`. OpenAI's Images
+    fields go through `openai_fields` (`Surface::Images`: `partial_images`
+    above 0 refused, the rest inert), the validator and the OpenAPI alike.
+    `server.request_timeout`'s doc says it bounds text requests. `wait()` is
+    `admit` without its bound. A mid-run stop's released prefix is unit
+    tested. A stream short of its images sends `error`. `testing.md` records
+    the Pillow fixtures' recipe, checked against their pixels. The floor
+    holds before the sides are rounded.
+- **What a request waits on, streamed.** `serve` refuses the kind
+  mismatch and a name it cannot switch to as statuses, before anything
+  loads. `admit` then runs the load of an unloaded model, prompt
+  enhancement and the implicit switch, each sending its phases
+  (`loading`, `enhancing`, `switching` with `step`/`total`), before the pin,
+  the size, the queue, the fit and the job. A streamed request that waits
+  on any of them starts its stream at once, and a refusal past that point
+  is its `error` event; one the loaded image model takes as it is starts
+  once admitted, every refusal a status. `model_switch` tells its beginner
+  each step (`SwitchStep`, `implicit_switch_telling`).
+- **The visit** (`model_switch::visit`). Two switches in one hold of the
+  switch's slot (`Run::Visit`): to the visited model, which is handed over
+  pinned (`Visit::arrived`) with the status still `switching` (visited →
+  next), then on (`Visit::on`, or the beginner gone). Every other request
+  meets `503 model_switching` with `Retry-After`, and a switch `409`, from
+  the first step to the last. `last_switch` is never written: `run` and
+  `restore` record a switch or a reload only. A way there refused or failed
+  ends the visit with the old model serving, reloaded if need be; a way on
+  that fails reloads the visited model. `SwitchRefusal::NotServing` refuses
+  a visit with nothing serving.
+- **Prompt enhancement** (`images::enhance`, the routes' `enhance`).
+  - On when the request's `prompt_enhancement`, else
+    `image.prompt_enhancement`, says so. The enhancer serving: the rewrite on
+    it, then the request's own switch to the image model, one switch.
+    Otherwise a visit: from the image model and back, or from another text
+    model on to the image model the request names.
+  - `image.prompt_enhancer` resolves as an explicit switch by id does
+    (`Switcher::text_model`: the listed models, then a catalog entry on
+    disk), whatever `switch.allow_implicit` says, never to an image model.
+  - The rewrite: Qwen's system prompts in `images/prompts.rs`, generated
+    from QwenLM/Qwen-Image 6b5e1f5 (`prompt_utils_2512.py` for a
+    generation, Chinese when the prompt holds U+4E00..U+9FFF;
+    `prompt_utils.py`'s edit prompt), each literal trimmed, sent as the
+    system turn; upstream's user turn; root `NOTICE` names them. Reasoning
+    off, the instruct sampling seeded with the job's seed (the same seed, the
+    same rewrite), at most `image.prompt_enhancer_max_tokens` (new, 1024,
+    16..=8192), within `server.request_timeout`. Lines are joined as upstream
+    joins them; an edit's `{"Rewritten": ...}` is unwrapped.
+  - An edit's images go to an enhancer with a vision tower as PNG
+    `image_url` parts; without one it rewrites from the text, and says so.
+  - The rewrite is each image's `revised_prompt` and each completed event's;
+    `warnings`, new on the answer and the completed event, says why there
+    is none: an enhancer it cannot switch to, a visit that did not get
+    there, a rewrite that failed. The job then runs on the prompt as sent.
+    A visit that cannot get back to the image model is `503
+    model_switch_failed`. The condition budget is fitted to the final prompt.
+- **Defaults taken** (owner may revisit).
+  - An `image.prompt_enhancer` that names no switchable text model falls back
+    with a warning rather than refusing the request; a `PATCH` naming one is
+    accepted.
+  - A visit drains the image model as any switch does: a running or queued
+    job gets `switch.drain_timeout`, then ends `503 model_stopped`. Taking
+    the queue's turn first was considered and not built.
+  - An unloaded image model loads first and is then visited: three loads.
+    Loading the enhancer straight away would race the requests waiting on
+    the unloaded image model.
+  - The enhancer-serving path's switch to the image model is an ordinary
+    implicit switch, written to `last_switch`; a visit from another text
+    model is not.
+  - The rewrite is a client request on the enhancer (logged and counted),
+    not an internal one. Upstream's user turn is kept verbatim, its stray
+    space before `Rewritten Prompt:` included. An edit's answer that is not
+    the JSON object is taken as the prompt; a rewrite cut at the token cap
+    is used as it is.
+  - One decode permit, fixed: it mirrors the one-job queue rather than
+    being a tunable.
+- **Tests.** `tests/image_enhancement.rs` (the streamed phases, the visit
+  and its failures, AC 9: the enhancer-serving path's one switch and its
+  Chinese system prompt, the visit's two switches and untouched
+  `last_switch`, `503 model_switching` mid-visit, `revised_prompt`, the four
+  fallbacks, the edit without vision); `images::enhance` units (the CJK
+  pick, the turns, the answer's reading); `tests/images_http.rs` (F1, F2,
+  L2, L7, no switcher); `openai_fields`, `config` and `openapi_http`.
+
+## As built (322e, 2026-10-14, branch `image-serving-322`: AC 11, 13's user docs, the AC map)
+
+The baseline on 96db56b (322d never recorded one): `cargo test --workspace`
+2913/0/6, `cargo check -p ignis-server --features cuda --tests` clean.
+
+- **Catalog (AC 11).** `ignis-image-2.1-turbo` is the fourth built-in entry:
+  repo `gpillon/ignis-image-2.1-turbo`, the artifact
+  `ignis_image_2_1_turbo-v2.ninfer` (16,721,644,544 bytes, sha256
+  `4205dd19...6050af`) and its `.conversion.json` record (617,924 bytes,
+  sha256 `a97f0491...0f33ca`), which the catalog's parser requires beside any
+  artifact and the loader verifies against. That record is the published one:
+  its `converter.command` paths are placeholders, so its bytes differ from the
+  local record (618,040 bytes, `b96d32ef...13ce`). The revision is the
+  upload's hub commit `d6912417aa47320cd71c78e19d99872faa5cb63b` (2026-10-14),
+  pinned in `catalog.yaml` and in `catalog.rs`'s `RELEASES`. Tests: `RELEASES`
+  holds the four entries value for value, `entry("Ignis-Image-2.1-Turbo")`
+  resolves (what `model download` looks up), and the listing, `--all` and
+  operator-catalog tests count four. No test downloads the 15.6 GiB.
+- **Make (AC 11).** `MODEL=image` is family `image` in `mk/config.mk`: its
+  artifact path (`F:/ai/models/ignis-image-2.1-turbo/...`, `ARTIFACT` wins),
+  served id `ignis-image-2.1-turbo`, and the context, KV format, prefill
+  chunk, decode share, speculation, rope scaling, vision and KV-RAM knobs
+  defaulting to empty, so no text flag reaches the server. `make config`
+  prints a PLAN and MODEL line for it. `mk/flags-selftest.sh` asserts both the
+  flags that arrive and the eleven that do not.
+- **User docs (AC 13).** `docs/user/README.md`: the catalog table, the two
+  routes in the API table, an "Image generation" section (licence, routes,
+  streaming, sizes, condition images, queue, the `image.*` table with
+  `max_condition_mipx` and `prompt_enhancer_max_tokens`, prompt enhancement
+  and its cost, the known-model rule) and a `MODEL=image` paragraph under make.
+- **The acceptance map.**
+  1. Done (322a, `model_kind_mismatch` and the implicit switch).
+  2. Done (322a).
+  3. Done (322b).
+  4. Done (322b).
+  5. Done (322b, with 322c's fixes).
+  6. Done (322b, 322d's phases).
+  7. Done (322b).
+  8. Done (322a).
+  9. Done (322d).
+  10. Done (322a).
+  11. Done (322e); the revision is pinned to d6912417 (c81e8c6).
+  12. Done (322f): the image view, its switch button and gallery; see "As built (322f)".
+  13. Done: OpenAPI (322b) and the user docs (322e).
+  14. Remains: the live run needs spec 04's real leaf and runner adapter (#321).
+
+## As built (322f, 2026-10-14, branch `image-serving-322`: AC 12)
+
+The Playground's image view. Web only; no Rust touched.
+
+- **Files.** `web/src/api/images.ts` (the two routes, JSON and multipart, whole
+  and SSE, refusals with `Retry-After`), `web/src/image/studio.ts` (pure parts:
+  limits, `performRun`, `switchToImageModel`, download), `useStudio.ts` (state),
+  `ImageView.tsx`. The header's `View` gains `image`; the view stays mounted
+  from its first visit, like the Server view.
+- **The form.** Prompt; size (`auto` plus `image.sizes` read from
+  `GET /v1/config`, the server's defaults until read); `n` (`image.max_n`);
+  seed (blank is the server's draw); up to `image.max_condition_images`
+  condition images by drop or pick (PNG, JPEG, WebP), shown over a checkerboard
+  (`.checker`) so alpha reads; the enhancement toggle, which starts at
+  `image.prompt_enhancement` and is always sent explicitly; a "Show progress"
+  toggle (stream or whole answer). Any condition image makes it an edit.
+- **Progress.** The stream's phase, the image of `n` and the denoising step.
+  The revised prompt, the answer's `warnings` and `condition_sizes` show beside
+  it. A 409 names the way out, a 503 shows its `Retry-After`, an `error` event
+  keeps the pictures made before it.
+- **The switch.** With any model but the image model loaded, a band offers
+  "Switch to the image model": `POST /v1/models/switch` by catalog id
+  (the Server view's `switchTo`), then the page follows the model each second.
+  Generate stays disabled until the image model serves. No request of the view
+  names a `model` except that switch; tests assert it for all four
+  route/stream combinations.
+- **Model kind.** `ModelState` carries `kind` and `canChat` (chat and Decide
+  are not offered an image model: they would get a 409), so the context bar,
+  which reads `max_model_len`, gets `null` and draws no limit; the chat's empty
+  state says the image model is loaded.
+- **Defaults taken.** The gallery lives in the tab (data URLs, newest first,
+  removable, cleared on reload) and downloads a PNG named
+  `ignis-<seed+index>-<size>.png`. No auto-retry on 503: the line says when to
+  retry. The previews are object URLs, revoked on unmount.
+- **Gates.** `npm test` (855 tests) and `npm run build` pass. The view was not
+  looked at in a browser (the owner watches :5173).

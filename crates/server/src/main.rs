@@ -365,16 +365,19 @@ async fn main() {
 
     // A default the loaded template cannot honour is a refused start (a
     // model swap must not silently change behaviour), matching how the
-    // server already treats a missing EOS token or an unclean checksum.
+    // server already treats a missing EOS token or an unclean checksum. The
+    // image model thinks nothing: a text model's load judges them.
     let thinking_defaults = ThinkingDefaults {
         enable_thinking: default_enable_thinking,
         reasoning_effort: default_reasoning_effort,
     };
-    if let Err(err) =
-        thinking::validate_defaults(&thinking_defaults, &server.active().template.thinking_capabilities())
-    {
-        tracing::error!(name: "ignis.config.thinking_invalid", error = %err, "refusing to start");
-        exit_after_flush(&logging_handle, 1);
+    if server.active().engine().is_some() {
+        if let Err(err) =
+            thinking::validate_defaults(&thinking_defaults, &server.active().template.thinking_capabilities())
+        {
+            tracing::error!(name: "ignis.config.thinking_invalid", error = %err, "refusing to start");
+            exit_after_flush(&logging_handle, 1);
+        }
     }
     let server = server
         .with_thinking_defaults(default_enable_thinking, default_reasoning_effort)
@@ -474,7 +477,7 @@ async fn main() {
         name: "ignis.process.started",
         // The id the load is served under (`config::Config::for_family`): a
         // Flash-Next artifact started without `--model-id` is its own.
-        model = %server.active().engine.model_id(),
+        model = %server.active().model_id(),
         bind = %bind,
         api_key_required = auth,
         metrics = metrics.as_deref().unwrap_or("off"),

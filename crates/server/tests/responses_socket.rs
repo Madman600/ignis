@@ -318,6 +318,27 @@ async fn refused_events_and_bad_frames_are_error_events_and_the_socket_stays_ope
     assert_eq!(stream_until_terminal(&mut socket, None).await.last().unwrap()["type"], "response.incomplete");
 }
 
+/// Spec image-model/05: the socket is a text route like the HTTP one. With
+/// the image model loaded a `response.create` naming no model is refused as
+/// over HTTP — `409 model_kind_mismatch`, as an `error` event — and the
+/// socket stays open.
+#[tokio::test]
+async fn on_the_image_model_a_socket_response_is_a_kind_mismatch_and_the_socket_stays_open() {
+    let runner = ignis_core::image::FakeImageRunner::default();
+    let image = ignis_server::images::ImageModel::new("ignis-image-2.1-turbo", Box::new(runner));
+    let live = live(ignis_server::Server::from_active(ignis_server::ActiveModel::image(image))).await;
+    let mut socket = socket(&live).await;
+    let mut body = short("hi");
+    body.as_object_mut().unwrap().remove("model");
+    for _ in 0..2 {
+        send(&mut socket, create(&body, None)).await;
+        let refused = next_event(&mut socket).await;
+        assert_eq!(refused["type"], "error", "{refused}");
+        assert_eq!(refused["status"], 409, "{refused}");
+        assert_eq!(refused["error"]["code"], "model_kind_mismatch", "{refused}");
+    }
+}
+
 // ── acceptance 8: response.cancel ────────────────────────────────────────
 
 #[tokio::test]

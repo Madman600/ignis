@@ -5,12 +5,16 @@
 //!
 //! [`prepare_model`] is everything that can refuse a load short of the GPU;
 //! [`load_model`] is the load itself. The split is what lets a switch refuse
-//! a bad target while the old model is still serving. Start-up code, not the
+//! a bad target while the old model is still serving. The image model (ADR
+//! 0050) takes the same two steps: its artifact verified, then its runner
+//! loaded (spec image-model/05). Start-up code, not the
 //! per-token path: its logging is the once-per-load kind (`hotpath_lint`
 //! watches `runtime.rs`, the scheduler construction it calls into).
 
 use std::sync::Arc;
 
+use ignis_core::compute::{ModelFamily, ModelKind};
+use ignis_core::image::ImageRunner;
 use ignis_core::{ConcreteScheduler, SchedulerConfig, TokenId};
 
 #[cfg(feature = "cuda")]
@@ -137,9 +141,17 @@ pub struct PreparedModel {
     /// The id the load is served under ([`crate::config::Config::for_family`]).
     pub model: String,
     /// The artifact's model (ADR 0043).
-    pub family: ignis_core::compute::ModelFamily,
+    pub family: ModelFamily,
     /// The start options the load runs with.
     config: crate::config::Config,
+    /// What only a text model's load prepares; `None` for the image model,
+    /// whose runner — the adapter [`cuda_image_runner`] builds — reads the
+    /// tokenizer and templates itself (spec image-model/03 §Seams, 05).
+    text: Option<PreparedText>,
+}
+
+/// The template, thinking close and vision processor of a text model's load.
+struct PreparedText {
     provider: crate::artifact_template::ArtifactTemplateProvider,
     acquirer: Option<Arc<crate::media::MediaAcquirer>>,
     /// The vision processor's largest item, in tokens: what the encoder's
@@ -185,6 +197,11 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
         return Err(LoadError::ArtifactMissing);
     }
     let sidecar = crate::loader::find_sidecar(artifact).map_err(|e| LoadError::SidecarMissing(e.to_string()))?;
+    // The image model's container holds no text frontend (spec
+    // image-model/01): it is verified, and its runner reads the rest.
+    if crate::loader::artifact_family(artifact).ok().flatten().map(ModelFamily::kind) == Some(ModelKind::Image) {
+        return prepare_image_model(config, artifact, &sidecar);
+    }
     let frontend =
         crate::loader::load_artifact(artifact, &sidecar).map_err(|e| LoadError::ArtifactInvalid(e.to_string()))?;
     tracing::info!(
@@ -199,15 +216,8 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
     // 27B always was.
     let family = crate::loader::artifact_family(artifact)
         .map_err(|e| LoadError::ArtifactInvalid(e.to_string()))?
-        .unwrap_or(ignis_core::compute::ModelFamily::Qwen38_27b);
-    // The options fitted to the family (spec config-v2/01): at start, its
-    // scoped values applied and anything the family cannot take refused; a
-    // switch hands over options it already fitted (`config::fit_to_family`,
-    // which drops instead of refusing), and those are used as they are.
-    let config = match config.basis.family() {
-        Some(fitted) if fitted == family => config.clone(),
-        _ => config.for_family(family).map_err(|e| LoadError::ModelMismatch(e.to_string()))?,
-    };
+        .unwrap_or(ModelFamily::Qwen38_27b);
+    let config = fitted(config, family)?;
     let model = config.model.clone();
 
     // The thinking budget's forced close (2026-09-24), in this model's own
@@ -271,12 +281,39 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
         model,
         family,
         config,
-        provider,
-        acquirer,
-        item_bound,
-        thinking_close,
-        eos,
+        text: Some(PreparedText { provider, acquirer, item_bound, thinking_close, eos }),
     })
+}
+
+/// The options fitted to `family` (spec config-v2/01): at start, its scoped
+/// values applied and anything the family cannot take refused; a switch
+/// hands over options it already fitted (`config::fit_to_family`, which
+/// drops instead of refusing), and those are used as they are.
+fn fitted(config: &crate::config::Config, family: ModelFamily) -> Result<crate::config::Config, LoadError> {
+    match config.basis.family() {
+        Some(fitted) if fitted == family => Ok(config.clone()),
+        _ => config.for_family(family).map_err(|e| LoadError::ModelMismatch(e.to_string())),
+    }
+}
+
+/// [`prepare_model`] for the image model (spec image-model/05): the checksum
+/// against `sidecar` must report clean, and the start options must fit the
+/// image family — a speculative backend or the vision tower named for it is
+/// refused at start, dropped on a switch, as for any family.
+fn prepare_image_model(
+    config: &crate::config::Config,
+    artifact: &std::path::Path,
+    sidecar: &std::path::Path,
+) -> Result<PreparedModel, LoadError> {
+    crate::loader::verify_artifact(artifact, sidecar).map_err(|e| LoadError::ArtifactInvalid(e.to_string()))?;
+    tracing::info!(
+        name: "ignis.artifact.verified",
+        artifact = %artifact.display(),
+        "checksum clean — the image model's runner reads its own frontend"
+    );
+    let family = ModelFamily::QwenImage21;
+    let config = fitted(config, family)?;
+    Ok(PreparedModel { artifact: artifact.to_path_buf(), model: config.model.clone(), family, config, text: None })
 }
 
 /// Finish a [`PreparedModel`]: build its scheduler — the real GPU-backed one
@@ -288,8 +325,10 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
 /// runs it on `spawn_blocking`. It needs a tokio runtime context: the
 /// engine's telemetry consumer is spawned onto it.
 pub fn load_model(prepared: PreparedModel) -> Result<LoadedModel, LoadError> {
-    let PreparedModel { artifact, model, family, config, provider, acquirer, item_bound, thinking_close, eos } =
-        prepared;
+    let PreparedModel { artifact, model, family, config, text } = prepared;
+    let Some(PreparedText { provider, acquirer, item_bound, thinking_close, eos }) = text else {
+        return load_image_model(artifact, model, &config);
+    };
     #[cfg(feature = "cuda")]
     let (scheduler, reservations) = {
         let eos = eos.ok_or(LoadError::EosMissing)?;
@@ -317,6 +356,68 @@ pub fn load_model(prepared: PreparedModel) -> Result<LoadedModel, LoadError> {
     Ok(LoadedModel { model: active, reservations })
 }
 
+/// The image model's load (spec image-model/05): its runner — the image
+/// leaf's under `cuda` ([`cuda_image_runner`]), [`ignis_core::image::FakeImageRunner`]
+/// otherwise, as a build without `cuda` serves `MockCompute` — and the model
+/// over it, its source kept for a switch back and for the idle unload.
+fn load_image_model(
+    artifact: std::path::PathBuf,
+    model: String,
+    config: &crate::config::Config,
+) -> Result<LoadedModel, LoadError> {
+    #[cfg(feature = "cuda")]
+    let runner = cuda_image_runner(&artifact, config)?;
+    #[cfg(not(feature = "cuda"))]
+    let runner: Box<dyn ImageRunner> = {
+        tracing::warn!(
+            name: "ignis.model.fake_image_runner",
+            "built without --features cuda — the fake image runner despite --model-artifact (its images are deterministic noise, not the prompt's)"
+        );
+        Box::new(ignis_core::image::FakeImageRunner::default())
+    };
+    tracing::info!(
+        name: "ignis.model.loaded",
+        artifact = %artifact.display(),
+        kind = ModelKind::Image.as_str(),
+        condition_budget_tokens = runner.plan().condition_budget_tokens,
+        sample_sigmas = runner.plan().sample_sigmas.len(),
+        max_target_cells = runner.plan().max_target_cells,
+        "image model loaded"
+    );
+    // A size this load cannot make is dropped from what it serves, and said
+    // so; the config keeps it, for a load that can.
+    let past: Vec<String> =
+        config.settings().image.sizes.iter().filter(|&&size| !runner.plan().takes(size)).map(ToString::to_string).collect();
+    if !past.is_empty() {
+        tracing::warn!(
+            name: "ignis.image.sizes_not_served",
+            sizes = %past.join(", "),
+            max_target_cells = runner.plan().max_target_cells,
+            "image.sizes names sizes past the largest image this load makes: they are not served"
+        );
+    }
+    let image = crate::images::ImageModel::new(model.clone(), runner);
+    let active = crate::ActiveModel::image(image).with_source(crate::ModelSource { artifact, model });
+    Ok(LoadedModel { model: active, reservations: None })
+}
+
+/// The image leaf's runner for `artifact` (spec image-model/04, GitHub #321,
+/// which builds it): an adapter here, in the server, over the leaf — the
+/// artifact's tokenizer and templates and `crate::media`'s Qwen3-VL
+/// preprocessing on the host (spec image-model/03 §Seams), the leaf's calls
+/// on the device. Until #321 builds it, the load is refused naming it.
+#[cfg(feature = "cuda")]
+fn cuda_image_runner(
+    artifact: &std::path::Path,
+    _config: &crate::config::Config,
+) -> Result<Box<dyn ImageRunner>, LoadError> {
+    Err(LoadError::LoadFailed(format!(
+        "{} cannot load {}: the image leaf is not built yet (spec image-model/04, GitHub #321)",
+        ModelFamily::QwenImage21.name(),
+        artifact.display()
+    )))
+}
+
 /// The GPU-backed scheduler for `artifact` (GitHub #61 / P1-25), logged as
 /// `ignis.model.loaded` with the shape it was built with.
 #[cfg(feature = "cuda")]
@@ -329,7 +430,6 @@ fn cuda_scheduler_for(
     vision_item_bound: Option<u64>,
     thinking_close: Option<Arc<ignis_core::thinking_budget::ThinkingClose>>,
 ) -> Result<(Box<dyn ignis_core::Scheduler>, crate::metrics::LoadReservations), LoadError> {
-    use ignis_core::compute::ModelFamily;
     let shape = EngineShape::from(config);
     // The encoder holds one item at a time, and the processor bounds an item
     // below the envelope (`ProcessorOptions::max_item_tokens`): the load
@@ -361,9 +461,9 @@ fn cuda_scheduler_for(
             thinking_close,
             &config.kv_disk_location,
         ),
-        // The image model has no token scheduler: its leaf and its serving
-        // are specs image-model/04 and 05.
-        ModelFamily::QwenImage21 => Err(format!("{} is not served yet (spec image-model/05)", family.name())),
+        // The image model has no token scheduler: `load_image_model` loads
+        // it, never this.
+        ModelFamily::QwenImage21 => Err(format!("{} has no token scheduler", family.name())),
     };
     let (scheduler, reserved) = loaded.map_err(LoadError::LoadFailed)?;
     tracing::info!(

@@ -143,6 +143,24 @@ has "UNCENSORED=1" "$out" "--model-artifact ./models/qwen3_8_27b_nvfp4full-v2-hu
 lacks "27B default" "$(flags)" "--model-id"
 has "UNCENSORED=1 MODEL=mine" "$(flags UNCENSORED=1 MODEL=mine)" "--model-id mine"
 
+# The image model (spec image-model/05): MODEL=image selects its own family,
+# artifact and served id, and none of the text engine's knobs reach the server
+# (it has no context, lanes, chunk, speculation, KV format or vision); the
+# settings every model shares still do.
+out="$(flags MODEL=image)"
+has "MODEL=image" "$out" "--model-artifact F:/ai/models/ignis-image-2.1-turbo/ignis_image_2_1_turbo-v2.ninfer"
+has "MODEL=image" "$out" "--model-id ignis-image-2.1-turbo"
+has "MODEL=image" "$out" "--server-request-timeout 1800"
+for text_knob in --model-max-context --model-prefill-chunk --model-decode-share --model-kv-format --model-rope-scaling                  --spec-decode-lanes --spec-backend --spec-draft-tokens --vision-enabled --reuse-kv-host-pool-bytes --kv-disk; do
+    lacks "MODEL=image" "$out" "$text_knob"
+done
+has "MODEL=image ARTIFACT" "$(flags MODEL=image ARTIFACT=D:/x/img.ninfer)" "--model-artifact D:/x/img.ninfer"
+has "MODEL=image IDLE_UNLOAD" "$(flags MODEL=image IDLE_UNLOAD=0)" "--model-idle-unload 0"
+fact="$(make config CUDA=1 MODEL=image 2>/dev/null | sed -n 's/^MODEL  *//p')"
+case "$fact" in "image  "*) ;; *) fail "MODEL line of the image family: $fact" ;; esac
+plan="$(plan_of MODEL=image)"
+case "$plan" in *"image model"*) ;; *) fail "PLAN of the image family: $plan" ;; esac
+
 if [ "$failed" -ne 0 ]; then
     printf 'flags-selftest: %d failure(s)\n' "$failed" >&2
     exit 1

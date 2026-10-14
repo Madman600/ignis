@@ -346,7 +346,7 @@ mod tests {
     /// hold, value for value (`id`, `repo`, `revision`, `artifact`, then each
     /// file's name, bytes and SHA-256 in the order listed).
     #[allow(clippy::type_complexity)]
-    const RELEASES: [(&str, &str, &str, &str, &[(&str, u64, &str)]); 3] = [
+    const RELEASES: [(&str, &str, &str, &str, &[(&str, u64, &str)]); 4] = [
         (
             "qwen3.8-27b",
             "gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer",
@@ -395,6 +395,18 @@ mod tests {
                 ("qwen3_8_flash_next_trellis_a25-v2.ninfer", 71_760_711_680, "12e3b265b0678ba935a4b05d1b612ba4b68b3a96c3026d818ad65838985fd864"),
             ],
         ),
+        // The image model: the upload's hub commit, and the published sidecar
+        // (converter.command paths replaced by placeholders).
+        (
+            "ignis-image-2.1-turbo",
+            "gpillon/ignis-image-2.1-turbo",
+            "d6912417aa47320cd71c78e19d99872faa5cb63b",
+            "ignis_image_2_1_turbo-v2.ninfer",
+            &[
+                ("ignis_image_2_1_turbo-v2.ninfer.conversion.json", 617_924, "a97f04912b9a6d76e828efc02b7e458d0f45d00bc00d794cca39d703ad0f33ca"),
+                ("ignis_image_2_1_turbo-v2.ninfer", 16_721_644_544, "4205dd1932f0801804b0a544fe1340697e4e0a0dea4a276996bcb981006050af"),
+            ],
+        ),
     ];
 
     /// A minimal valid operator entry, YAML, for the refusal table to break
@@ -414,10 +426,10 @@ mod tests {
     }
 
     /// AC 1: the built-in catalog is the data file, it parses under every
-    /// rule an operator's does, and it holds exactly the spec's three
+    /// rule an operator's does, and it holds exactly the spec's four
     /// releases with those values.
     #[test]
-    fn the_built_in_catalog_holds_exactly_the_three_releases_with_their_pins() {
+    fn the_built_in_catalog_holds_exactly_the_four_releases_with_their_pins() {
         let document = Format::Yaml.read(BUILT_IN_TEXT).expect("YAML");
         let parsed = parse(&document, "built into this binary", CatalogLayer::BuiltIn).expect("every invariant holds");
         assert_eq!(parsed, BUILT_IN_CATALOG.entries);
@@ -441,6 +453,13 @@ mod tests {
         assert_eq!(catalog.entry(crate::config::DEFAULT_MODEL).map(|e| e.artifact.as_str()), Some("qwen3_8_27b_nvfp4full-v2.ninfer"));
         assert_eq!(catalog.entry("QWEN3.8-27B").map(|e| e.id.as_str()), Some("qwen3.8-27b"), "case-insensitive");
         assert!(catalog.entry("qwen3.8-27b-instruct").is_none());
+        // `model download ignis-image-2.1-turbo` (spec image-model/05): the image
+        // model resolves like the others, its container beside the sidecar the
+        // loader verifies it against.
+        let image = catalog.entry("Ignis-Image-2.1-Turbo").expect("the image model");
+        assert_eq!(image.id, "ignis-image-2.1-turbo");
+        assert_eq!(image.artifact, "ignis_image_2_1_turbo-v2.ninfer");
+        assert_eq!(image.files.len(), 2);
         // The loader finds Flash-Next's companion beside the main container
         // under its fixed name, so the entry must land it under that name.
         let flash = catalog.entry("qwen3.8-flash-next").expect("Flash-Next");
@@ -462,7 +481,7 @@ mod tests {
         let json = serde_json::to_string(&Format::Yaml.read(OPERATOR).unwrap()).unwrap();
         let from_json = parse_operator(&json, Format::Json, "acme.catalog.json").expect("valid");
         assert_eq!(from_yaml, from_json);
-        assert_eq!(from_yaml.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "acme-qwen3.8-27b-ft"]);
+        assert_eq!(from_yaml.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "acme-qwen3.8-27b-ft"]);
         let acme = from_yaml.entry("acme-qwen3.8-27b-ft").unwrap();
         assert_eq!(acme.layer, CatalogLayer::Operator);
         assert_eq!(acme.revision, "v1");

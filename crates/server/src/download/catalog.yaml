@@ -38,3 +38,15 @@ models:
       - { name: qwen3_8_flash_next_trellis_a25-v2.ninfer.conversion.json, bytes: 1183942, sha256: "9858d9fb03dd66fa2558b5dc6aa6463ee70f00024ffbd746545b231c9514f7a0" }
       - { name: qwen3_8_flash_next_mtp_3p0-v2.ninfer, bytes: 1037905920, sha256: "432fe5c0838027047c5b46c4fde526f3d3ef3d126f00fed1213921f8705988d2" }
       - { name: qwen3_8_flash_next_trellis_a25-v2.ninfer, bytes: 71760711680, sha256: "12e3b265b0678ba935a4b05d1b612ba4b68b3a96c3026d818ad65838985fd864" }
+
+  # The image model (ADR 0050, spec image-model/05): its container and the
+  # conversion record the loader verifies it against.
+  # Pinned to the upload's hub commit (2026-10-14); the sidecar is the published
+  # one, its converter.command paths replaced by placeholders.
+  - id: ignis-image-2.1-turbo
+    repo: gpillon/ignis-image-2.1-turbo
+    revision: "d6912417aa47320cd71c78e19d99872faa5cb63b"
+    artifact: ignis_image_2_1_turbo-v2.ninfer
+    files:
+      - { name: ignis_image_2_1_turbo-v2.ninfer.conversion.json, bytes: 617924, sha256: "a97f04912b9a6d76e828efc02b7e458d0f45d00bc00d794cca39d703ad0f33ca" }
+      - { name: ignis_image_2_1_turbo-v2.ninfer, bytes: 16721644544, sha256: "4205dd1932f0801804b0a544fe1340697e4e0a0dea4a276996bcb981006050af" }

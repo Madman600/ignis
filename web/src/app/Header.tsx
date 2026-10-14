@@ -6,7 +6,7 @@ import { MonitorPulse } from "../monitor/MonitorPulse.tsx";
 import { useMemoryNotes } from "../tools/local/memory.ts";
 import { IconSessions, IconSliders } from "../ui/icons.tsx";
 
-export type View = "chat" | "decide" | "monitor" | "server";
+export type View = "chat" | "decide" | "monitor" | "server" | "image";
 
 /** The kiln bar: brand, the view switch, model status, and the drawer buttons below `lg`. */
 export function Header({
@@ -33,7 +33,7 @@ export function Header({
 }) {
   const chat = view === "chat";
   // The chat and the bench both have two side columns that are drawers below
-  // `lg`; the Monitor and the Server view have none.
+  // `lg`; the Monitor, the Server view and the Image view have none.
   const sided = view === "chat" || view === "decide";
   return (
     <header className="z-20 shrink-0 bg-kiln text-[#eae8e4]">
@@ -79,12 +79,14 @@ function ViewSwitch({ view, onView, monitorAvailable }: { view: View; onView: (v
   // Below `sm` the views are one native menu: four tabs and the rest of the
   // bar do not fit a phone. (A native menu, since `.cut` is a clip-path: a
   // popup of our own inside a clipped box would be cut.)
+  // The Image view talks to /v1/images/* (spec image-model/05) and offers the switch to the image model itself.
   // The Monitor is only on offer when ignis serves metrics; the Decide tab
   // talks to /v1/decide and the Server view to /v1/models and /v1/config
   // (spec playground/05), so they are there either way.
   const views: [View, string][] = [
     ["chat", "Playground"],
     ["decide", "Decide"],
+    ["image", "Image"],
     ...(monitorAvailable ? ([["monitor", "Monitor"]] as [View, string][]) : []),
     ["server", "Server"],
   ];

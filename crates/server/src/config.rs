@@ -26,6 +26,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ignis_core::image::ImageSize;
+
 use crate::instruction::InstructionPolicy;
 use crate::thinking::ReasoningEffort;
 
@@ -133,6 +135,21 @@ pub const MAX_REQUEST_TIMEOUT_SECS: u32 = 3600;
 /// (ADR 0030) — and 64 GiB is past the largest card this engine runs on, so
 /// this only catches a unit mistake.
 pub const MAX_VISION_EMBEDDING_POOL_MIB: u64 = 64 * 1024;
+
+/// The sizes an image request may ask for unless the operator names others
+/// (`--image-sizes`, spec image-model/05 §Sizes): the checkpoint card's
+/// presets, then 1024x1024, diffusers' own default output, which OpenAI
+/// clients often send.
+pub const DEFAULT_IMAGE_SIZES: [ImageSize; 8] = [
+    ImageSize::new(2048, 2048),
+    ImageSize::new(2400, 1792),
+    ImageSize::new(1792, 2400),
+    ImageSize::new(2528, 1696),
+    ImageSize::new(1696, 2528),
+    ImageSize::new(2752, 1536),
+    ImageSize::new(1536, 2752),
+    ImageSize::new(1024, 1024),
+];
 
 // The prefill-chunk and per-sequence-context defaults live in
 // `ignis_runtime` (re-exported below), the same numbers `CudaLeafConfig`

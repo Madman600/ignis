@@ -19,7 +19,13 @@ export function EmptyState({ model }: { model: ModelState }) {
           {HEADLINE[model.state]}
         </p>
         <p className="text-sm text-ash">
-          {model.state === "ready" && (
+          {model.state === "ready" && model.kind === "image" && (
+            <>
+              <span className="font-display text-ink">{model.id}</span> makes images, not replies. Make them in the Image view; a chat model
+              loads from the Server view.
+            </>
+          )}
+          {model.state === "ready" && model.kind !== "image" && (
             <>
               Send a prompt to <span className="font-display text-ink">{model.id}</span>. Timings for each reply show up
               under it and in this session's log below.

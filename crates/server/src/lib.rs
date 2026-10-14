@@ -36,6 +36,7 @@ pub mod expose;
 pub mod idle;
 pub mod image_encoder_input;
 pub mod image_prompt;
+pub mod images;
 pub mod instruction;
 pub mod load;
 pub mod locate;
@@ -63,7 +64,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use axum::Router;
 
-pub use crate::active::{ActiveModel, ModelSource, ModelStatus, StatusCell};
+pub use crate::active::{ActiveModel, InFlight, ModelSource, ModelStatus, Runner, StatusCell};
 use crate::engine::Engine;
 use crate::template::TemplateProvider;
 use crate::thinking::ReasoningEffort;
@@ -138,6 +139,12 @@ pub struct Server {
     /// routes `501`: a server built in a test without one has no config to
     /// show or change.
     pub config: Option<std::sync::Arc<config_http::ConfigState>>,
+    /// The edits decoding their condition images now: one at a time
+    /// (review-322b F2), since each may decode `image.max_condition_images`
+    /// frames of up to `image.max_condition_mipx` before the queue sees it,
+    /// and the queue behind runs one job at a time anyway — decodes side by
+    /// side would buy memory, not throughput.
+    pub image_decodes: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 /// The server-level knobs a live config change may touch (spec config-v2/02
@@ -167,6 +174,11 @@ pub struct Live {
     /// it (`--model-idle-unload`, spec model-switch/02); zero never unloads.
     /// Read by the clock at every tick, so a live change needs no restart.
     pub idle_unload: Duration,
+    /// The image model's serving (`image.*`, spec image-model/05): its
+    /// queue, what one request may ask for, the condition budget, prompt
+    /// enhancement — each read per request, so a live change needs no
+    /// reload.
+    pub image: config::schema::ImageGroup,
 }
 
 impl Default for Live {
@@ -183,6 +195,7 @@ impl Default for Live {
             default_thinking_budget: None,
             instruction_policy: instruction::InstructionPolicy::default(),
             idle_unload: Duration::ZERO,
+            image: config::schema::ImageGroup::default(),
         }
     }
 }
@@ -197,6 +210,7 @@ impl Live {
             default_thinking_budget: config.thinking_budget,
             instruction_policy: config.instruction_policy,
             idle_unload: Duration::from_secs(u64::from(config.idle_unload_secs)),
+            image: config.settings().image.clone(),
         }
     }
 }
@@ -248,6 +262,16 @@ pub async fn warm_up_engine(engine: &Engine) -> Result<Duration, String> {
     Ok(started.elapsed())
 }
 
+/// The first traversal of `model` before it serves: a text model's
+/// [`warm_up_engine`]. The image model has no decode graphs to capture and
+/// none is run (spec image-model/05): it serves once loaded.
+pub async fn warm_up_model(model: &ActiveModel) -> Result<Duration, String> {
+    match model.engine() {
+        Some(engine) => warm_up_engine(engine).await,
+        None => Ok(Duration::ZERO),
+    }
+}
+
 impl Server {
     /// A server over `engine`'s scheduler with the given template provider.
     pub fn new(engine: Engine, template: Box<dyn TemplateProvider>) -> Self {
@@ -274,6 +298,7 @@ impl Server {
             usage: std::sync::Arc::default(),
             switcher: None,
             config: None,
+            image_decodes: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -373,13 +398,13 @@ impl Server {
     }
 
     /// The first traversal (GitHub #129): one two-token request through the
-    /// scheduler ([`warm_up_engine`]), so the prefill and decode kernels
+    /// scheduler ([`warm_up_model`]), so the prefill and decode kernels
     /// have run and the decode graphs are captured before a client's request
     /// needs them, then the API is marked ready and `ignis.process.ready`
     /// says how long it took. A warm-up that does not complete is an error
     /// and leaves the server not ready: better refused than silently cold.
     pub async fn warm_up(&self) -> Result<Duration, String> {
-        let took = warm_up_engine(&self.active().engine).await?;
+        let took = warm_up_model(&self.active()).await?;
         self.status.store(std::sync::Arc::new(ModelStatus::Serving));
         tracing::info!(
             name: "ignis.process.ready",
@@ -492,10 +517,13 @@ impl Server {
     /// set): installs the projection into the engine's telemetry consumer,
     /// which alone keeps it up to date from the facts it already receives.
     /// It is served by [`Server::metrics_app`] and, with the Playground, at
-    /// `/ui/metrics`.
+    /// `/ui/metrics`. The image model has no engine to feed it: the
+    /// projection is served as the last text model left it.
     pub fn with_metrics(mut self) -> Self {
         let metrics = std::sync::Arc::new(metrics::Metrics::new());
-        self.active().engine.install_metrics(std::sync::Arc::clone(&metrics));
+        if let Some(engine) = self.active().engine() {
+            engine.install_metrics(std::sync::Arc::clone(&metrics));
+        }
         self.responses.install_metrics(std::sync::Arc::clone(&metrics));
         self.metrics = Some(metrics);
         self
@@ -514,12 +542,18 @@ impl Server {
     /// feeding the projection, its own counters (Flash-Next's, GitHub #301)
     /// are read, and `reserved` replaces what the previous load reserved. The
     /// start does the same through [`Server::with_metrics`] and
-    /// [`Server::with_load_reservations`]. Nothing without `--server-metrics`.
+    /// [`Server::with_load_reservations`]. The image model has no engine to
+    /// feed them (spec image-model/05): what a text model's load reserved and
+    /// occupied reads as no load, as while unloaded. Nothing without
+    /// `--server-metrics`.
     pub(crate) fn observe_load(&self, model: &ActiveModel, reserved: Option<metrics::LoadReservations>) {
         let Some(metrics) = &self.metrics else {
             return;
         };
-        model.engine.install_metrics(std::sync::Arc::clone(metrics));
+        match model.engine() {
+            Some(engine) => engine.install_metrics(std::sync::Arc::clone(metrics)),
+            None => metrics.set_unloaded(),
+        }
         if let Some(reserved) = reserved {
             self.install_reservations(model, reserved);
         }
@@ -557,7 +591,9 @@ impl Server {
     /// reads it at every tick (GitHub #301, #302) — goes to `model`'s engine.
     fn install_reservations(&self, model: &ActiveModel, mut reserved: metrics::LoadReservations) {
         if let Some(metrics) = &self.metrics {
-            model.engine.install_counter_source(reserved.flash_next.take());
+            if let Some(engine) = model.engine() {
+                engine.install_counter_source(reserved.flash_next.take());
+            }
             metrics.set_load_reservations(reserved);
         }
     }

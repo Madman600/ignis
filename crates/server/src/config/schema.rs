@@ -259,9 +259,11 @@ config_group! {
         /// Serve the Playground at /ui/. A binary built without web/dist
         /// serves a page saying how to build it.
         ui: Bool = super::DEFAULT_UI, NO_RULE, ALL, [Visible];
-        /// How long a non-streaming request waits for its completion before
-        /// the handler gives up with a 504, in seconds. A ceiling against a
-        /// fat-fingered value, not a real operating point.
+        /// How long a non-streaming text request waits for its completion
+        /// before the handler gives up with a 504, in seconds. A ceiling
+        /// against a fat-fingered value, not a real operating point. The
+        /// image routes are not bounded by it: ten images at 2048x2048 take
+        /// longer.
         request_timeout: Secs = super::DEFAULT_REQUEST_TIMEOUT_SECS, between(1, super::MAX_REQUEST_TIMEOUT_SECS as i64), ALL, [Visible, Patchable];
         /// Where `system` messages go: `merge` joins a leading run into the
         /// system prompt and keeps a later one as its own block in place;
@@ -462,6 +464,55 @@ config_group! {
 }
 
 config_group! {
+    /// The image model's serving (spec image-model/05, ADR 0050): its job
+    /// queue, what one request may ask for, the condition budget, prompt
+    /// enhancement. Read while any model is loaded — a text model is the
+    /// enhancer — so every family takes them, and each changes live.
+    ImageGroup = "image" {
+        /// The image jobs that may wait behind the one running, in order; one
+        /// more is refused `503 engine_full` with `Retry-After`. 0 runs one
+        /// at a time with none waiting.
+        queue_depth: Jobs = 4, between(0, 64), ALL, [Visible, Patchable];
+        /// The most images one request may ask for (`n`), made one after
+        /// another over the job's one condition prefix.
+        max_n: Images = 10, between(1, 64), ALL, [Visible, Patchable];
+        /// The most condition images one edit may send. At most 10, what the
+        /// image model's encoder holds.
+        max_condition_images: Images = 10, between(1, 10), ALL, [Visible, Patchable];
+        /// The largest a condition image may decode to, in Mi pixels
+        /// (1,048,576 pixels, a 1024x1024 image, each); a larger one is
+        /// refused. A condition image is encoded at 1024x1024 of area at
+        /// most, so 16 — a 16-megapixel photo, 64 MiB decoded — takes any
+        /// phone camera's own output and bounds what one edit decodes.
+        max_condition_mipx: Mipx = 16, between(1, 64), ALL, [Visible, Patchable];
+        /// The sizes a request may ask for, `<width>x<height>` with each side
+        /// a multiple of 32: by default the checkpoint's presets and
+        /// 1024x1024, the size OpenAI clients often send. `auto` picks among
+        /// them.
+        sizes: Sizes = super::DEFAULT_IMAGE_SIZES.to_vec(), NO_RULE, ALL, [Visible, Patchable];
+        /// The condition budget, in condition-prefix tokens (~256 KiB each, a
+        /// 1024x1024 condition image 4,096 of them). 0 is the whole budget the
+        /// load planned; a value can only lower it.
+        condition_budget_tokens: Tokens = 0, NO_RULE, ALL, [Visible, Patchable];
+        /// The smallest the budget may scale a condition image down to, as
+        /// the side of a square of the same area, in pixels; a request whose
+        /// images would go below it is refused, naming the budget.
+        condition_floor_px: Pixels = 512, between(32, 1024), ALL, [Visible, Patchable];
+        /// Whether a request that does not say has its prompt rewritten by
+        /// `prompt_enhancer` before the image model reads it.
+        prompt_enhancement: Bool = false, NO_RULE, ALL, [Visible, Patchable];
+        /// The text model that rewrites prompts: the served id of a model an
+        /// explicit switch may name (`switch.known_models`, the start model,
+        /// or a downloaded catalog entry), whatever `switch.allow_implicit`
+        /// says. An id that names none skips the rewrite, with a warning.
+        prompt_enhancer: Text = ModelFamily::Qwen38_27b.model_id().to_owned(), NO_RULE, ALL, [Visible, Patchable];
+        /// The most tokens one rewrite may take. Qwen's prompts ask for
+        /// about 200 words; a longer answer is cut here and used as it is.
+        prompt_enhancer_max_tokens: Tokens = 1024, between(16, 8192), ALL, [Visible, Patchable];
+    }
+}
+
+config_group! {
     /// Fetching a missing model.
     DownloadGroup = "download" {
         /// Fetch the model when no artifact is on disk — asked first when
@@ -541,6 +592,8 @@ settings! {
     vision: VisionGroup,
     /// Media acquisition.
     media: MediaGroup,
+    /// The image model's serving.
+    image: ImageGroup,
     /// Model download.
     download: DownloadGroup,
     /// The n-gram table.
@@ -584,6 +637,7 @@ mod tests {
             (SpecGroup::NAME, debug_field_names(&SpecGroup::default())),
             (VisionGroup::NAME, debug_field_names(&VisionGroup::default())),
             (MediaGroup::NAME, debug_field_names(&MediaGroup::default())),
+            (ImageGroup::NAME, debug_field_names(&ImageGroup::default())),
             (DownloadGroup::NAME, debug_field_names(&DownloadGroup::default())),
             (NgramGroup::NAME, debug_field_names(&NgramGroup::default())),
             (KvDiskGroup::NAME, debug_field_names(&KvDiskGroup::default())),
@@ -602,11 +656,12 @@ mod tests {
         );
     }
 
-    /// The eleven groups spec config-v2/01 §Groups names, no more.
+    /// The eleven groups spec config-v2/01 §Groups names, and the image
+    /// model's (spec image-model/05), no more.
     #[test]
     fn the_groups_are_the_specs() {
         let names: Vec<&str> = GROUPS.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["server", "model", "vram", "reuse", "switch", "spec", "vision", "media", "download", "ngram", "kv_disk"]);
+        assert_eq!(names, ["server", "model", "vram", "reuse", "switch", "spec", "vision", "media", "image", "download", "ngram", "kv_disk"]);
     }
 
     /// No two fields share a spelling on any surface, family-scoped ones

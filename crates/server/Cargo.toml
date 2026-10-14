@@ -19,7 +19,9 @@ serde_json = { workspace = true }
 serde_yaml = "0.9"
 # `ws`: the Responses API's WebSocket mode (GitHub #282), `tokio-tungstenite`
 # 0.29 underneath; a probe on 2026-09-29 found it adds no host `windows-sys`.
-axum = { workspace = true, features = ["ws"] }
+# `multipart`: `POST /v1/images/edits`' form (spec image-model/05), `multer`
+# underneath.
+axum = { workspace = true, features = ["ws", "multipart"] }
 # The body trait itself (axum re-exports it, not its `Frame`): a response
 # body that holds its request's in-flight count until it ends, for idle
 # unload (spec model-switch/02, `idle.rs`). Already in the tree under axum.
@@ -41,10 +43,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # The media cache's key: the SHA-256 of the acquired bytes, computed before
 # the lookup so a hit skips decode, resize and packing.
 sha2 = "0.10"
+# The image routes' output (spec image-model/05): RGBA 8-bit PNG, the
+# version `ignis-artifact` decodes with.
+png = "0.18"
 
 [dev-dependencies]
-# Encodes the flat test images the media tests send (`tests/support/media.rs`).
-png = "0.18"
 tower = { workspace = true }
 http-body-util = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -2047,3 +2047,80 @@ fn help_lists_the_expose_flag() {
     let text = help();
     assert!(text.contains("--server-expose") && text.contains("cloudflare-quick"), "{text}");
 }
+
+// ── the image model's group (spec image-model/05 AC 10) ─────────────────
+
+/// AC 10: every `image.*` field resolves from its flag, its env var and the
+/// config file with config v2's precedence — the flag over the env var over
+/// the file over the default — and the server's live knobs carry it.
+#[test]
+fn every_image_field_resolves_from_flag_env_and_file_by_precedence() {
+    // Per field: the file's value, the env var's, the flag's.
+    let cases = [
+        ("queue_depth", "1", "2", "3"),
+        ("max_n", "4", "5", "6"),
+        ("max_condition_images", "7", "8", "9"),
+        ("max_condition_mipx", "4", "8", "32"),
+        ("sizes", "1024x1024", "2048x2048;1024x1024", "2752x1536"),
+        ("condition_budget_tokens", "8192", "16384", "4096"),
+        ("condition_floor_px", "256", "384", "640"),
+        ("prompt_enhancement", "true", "false", "true"),
+        ("prompt_enhancer", "qwen3.8-flash-next", "my-27b", "qwen3.8-27b"),
+        ("prompt_enhancer_max_tokens", "256", "512", "2048"),
+    ];
+    assert_eq!(cases.len(), schema::ImageGroup::FIELDS.len(), "every image field has a case");
+    for (name, file, env, flag) in cases {
+        let meta = schema::field("image", name).unwrap();
+        let canonical = |raw: &str| (meta.canonical)(raw).unwrap();
+        let resolved = |config: &Config| config.settings().render()["image"][name].clone();
+        let files = MemFiles::with(&[("c.yaml", &format!("image:\n  {name}: \"{file}\"\n"))]);
+        let env_var = |key: &str| (key == meta.env()).then(|| env.to_owned());
+
+        assert_eq!(resolved(&config(&[])), (meta.default)(), "{name}: the default");
+        let from_file = with_files(&["--config", "c.yaml"], no_env, &files).unwrap();
+        assert_eq!(resolved(&from_file), canonical(file), "{name}: the file over the default");
+        let from_env = with_files(&["--config", "c.yaml"], env_var, &files).unwrap();
+        assert_eq!(resolved(&from_env), canonical(env), "{name}: the env var over the file");
+        let from_flag = with_files(&["--config", "c.yaml", &meta.flag(), flag], env_var, &files).unwrap();
+        assert_eq!(resolved(&from_flag), canonical(flag), "{name}: the flag over the env var");
+        assert!(meta.visible && meta.patchable && !meta.reload_required, "{name}: shown and changed live");
+    }
+    let image = crate::Live::of(&config(&["--image-queue-depth", "2", "--image-sizes", "1024x1024"])).image;
+    assert_eq!((image.queue_depth, image.sizes), (2, vec![ImageSize::new(1024, 1024)]));
+    assert_eq!(config(&[]).settings().image.sizes, DEFAULT_IMAGE_SIZES);
+    assert_eq!(config(&[]).settings().image.prompt_enhancer, "qwen3.8-27b");
+}
+
+/// AC 10: a value past an `image.*` field's bounds is refused naming the
+/// spelling it came under and the bound, from a flag, an env var or the
+/// file alike; at the bound it is taken. The sizes refuse a side that is
+/// not a multiple of 32.
+#[test]
+fn an_image_field_past_its_bounds_is_refused_naming_it() {
+    for (name, low, high) in [
+        ("queue_depth", 0, 64),
+        ("max_n", 1, 64),
+        ("max_condition_images", 1, 10),
+        ("max_condition_mipx", 1, 64),
+        ("condition_floor_px", 32, 1024),
+        ("prompt_enhancer_max_tokens", 16, 8192),
+    ] {
+        let flag = schema::field("image", name).unwrap().flag();
+        for taken in [low, high] {
+            assert!(resolve(&args(&[&flag, &taken.to_string()]), no_env).is_ok(), "{flag} {taken}");
+        }
+        let err = refused(&[&flag, &(high + 1).to_string()]);
+        assert!(err.contains(&flag) && err.contains(&format!("{low}..={high}")), "{err}");
+        if low > 0 {
+            assert!(refused(&[&flag, &(low - 1).to_string()]).contains(&format!("{low}..={high}")));
+        }
+    }
+    let env = env_map(&[("IGNIS_IMAGE_MAX_CONDITION_IMAGES", "11")]);
+    let err = resolve(&[], env).expect_err("past the encoder's ten").0;
+    assert!(err.contains("IGNIS_IMAGE_MAX_CONDITION_IMAGES") && err.contains("1..=10"), "{err}");
+    let files = MemFiles::with(&[("c.yaml", "image:\n  queue_depth: 65\n")]);
+    let err = with_files(&["--config", "c.yaml"], no_env, &files).expect_err("past the queue's bound").0;
+    assert!(err.contains("image.queue_depth") && err.contains("0..=64"), "{err}");
+    let err = refused(&["--image-sizes", "1000x1000"]);
+    assert!(err.contains("--image-sizes") && err.contains("multiples of 32"), "{err}");
+}

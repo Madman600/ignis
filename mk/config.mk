@@ -31,7 +31,7 @@ MODEL ?=
 # The family MODEL selects, decided here once: every other place reads this.
 # The server still checks it against the artifact's own at start, and refuses
 # a served id that names the other model.
-MODEL_FAMILY := $(if $(filter flash-next,$(MODEL)),flash-next,27b)
+MODEL_FAMILY := $(if $(filter flash-next,$(MODEL)),flash-next,$(if $(filter image,$(MODEL)),image,27b))
 ifeq ($(MODEL_FAMILY),flash-next)
   ARTIFACT ?= F:/ai/models/Qwen3.8-Flash-Next-ignis/qwen3_8_flash_next_trellis_a25-v2.ninfer
   # 262,144 tokens per lane under hq-e8-2b, the checkpoint's whole trained
@@ -73,6 +73,27 @@ ifeq ($(MODEL_FAMILY),flash-next)
   # with the desktop). The expert cache takes what the budget leaves: 1536M
   # measured +5-13% over 4G, while 1G let WDDM page the model out (finding
   # 2026-10-09-vram-headroom-wddm-paging). VRAM_HEADROOM=4G restores the ceiling.
+endif
+
+ifeq ($(MODEL_FAMILY),image)
+  # MODEL=image serves the image model (spec image-model/05) as
+  # ignis-image-2.1-turbo, from its own artifact (`ignis-server model download
+  # ignis-image-2.1-turbo` fetches it). It has no context, lanes, prefill
+  # chunk, speculation, KV format or vision, so none of those knobs defaults
+  # to a value: they are empty, and a flag the server does not take for this
+  # family is never passed. The settings every model shares (BIND, API_KEY,
+  # REQUEST_TIMEOUT, IDLE_UNLOAD, ...) are unchanged.
+  ARTIFACT ?= F:/ai/models/ignis-image-2.1-turbo/ignis_image_2_1_turbo-v2.ninfer
+  MAX_CONTEXT ?=
+  KV_FORMAT ?=
+  PREFILL_CHUNK ?=
+  DECODE_SHARE ?=
+  SPEC ?=
+  DRAFT_TOKENS ?=
+  DRAFT_ROWS ?=
+  ROPE_SCALING ?=
+  VISION ?=
+  KV_HOST_POOL_BYTES ?=
 endif
 
 # The .ninfer container (used with CUDA=1 only). See README "Models".

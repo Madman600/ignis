@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { forgetKey, useAuth } from "../api/auth.ts";
-import { canSend, loadUnderWay, type ModelState, useModel } from "../api/model.ts";
+import { canChat, loadUnderWay, type ModelState, useModel } from "../api/model.ts";
 import { Composer } from "../conversation/Composer.tsx";
 import { imageFromFile, type PromptImage } from "../conversation/images.ts";
 import { DecideView, type Drawer as DecideDrawer } from "../decide/DecideView.tsx";
@@ -11,6 +11,8 @@ import { MonitorView } from "../monitor/MonitorView.tsx";
 import { useMonitor, useMonitorVisible } from "../monitor/useMonitor.ts";
 import { SessionLog } from "../sessions/SessionLog.tsx";
 import { SessionsPanel } from "../sessions/SessionsPanel.tsx";
+import { ImageView } from "../image/ImageView.tsx";
+import { useStudio } from "../image/useStudio.ts";
 import { ServerView } from "../server/ServerView.tsx";
 import { useServer, useTick } from "../server/useServer.ts";
 import { DEFAULT_SETTINGS, type PlaygroundSettings } from "../settings/defaults.ts";
@@ -68,9 +70,12 @@ export function App() {
   const monitoring = view === "monitor" && monitorVisible;
   const deciding = view === "decide";
   const serving = view === "server";
+  const imaging = view === "image";
   // Mounted from its first visit on, like the Decide tab: a draft of changes
   // and a reload being followed survive a look at the chat.
   const [serverOpened, setServerOpened] = useState(false);
+  // The Image view the same: its prompt, its condition images and its gallery outlive a look at the chat.
+  const [imageOpened, setImageOpened] = useState(false);
   // A switch or a load runs the header's flame and heat bar as a reply does (spec playground/05).
   const busy = chat.busy || loadUnderWay(model);
 
@@ -136,9 +141,10 @@ export function App() {
         onOpen={(which) => (deciding ? setDecideDrawer(which) : setDrawer(which))}
         onForgetKey={auth.key ? forgetKey : undefined}
         onOpenMemory={() => setMemoryOpen(true)}
-        view={monitoring ? "monitor" : deciding ? "decide" : serving ? "server" : "chat"}
+        view={monitoring ? "monitor" : deciding ? "decide" : serving ? "server" : imaging ? "image" : "chat"}
         onView={(next) => {
           if (next === "server") setServerOpened(true);
+          if (next === "image") setImageOpened(true);
           setView(next);
         }}
         monitorAvailable={monitorVisible}
@@ -152,7 +158,7 @@ export function App() {
           holds a whole typed request, and a glance at the Monitor is not a
           reason to lose it. Nothing here fetches on mount. */}
       <div className={deciding ? "contents" : "hidden"}>
-        <DecideView ready={canSend(model)} drawer={decideDrawer} onDrawer={setDecideDrawer} />
+        <DecideView ready={canChat(model)} drawer={decideDrawer} onDrawer={setDecideDrawer} />
       </div>
 
       {serverOpened && (
@@ -161,7 +167,13 @@ export function App() {
         </div>
       )}
 
-      <div className={monitoring || deciding || serving ? "hidden" : "contents"}>
+      {imageOpened && (
+        <div className={imaging ? "contents" : "hidden"}>
+          <Image model={model} refreshModel={refreshModel} visible={imaging} />
+        </div>
+      )}
+
+      <div className={monitoring || deciding || serving || imaging ? "hidden" : "contents"}>
         <div className="relative flex min-h-0 flex-1">
           {drawer && (
             <div className="fixed inset-0 z-30 bg-[#1c2026]/60 lg:hidden" onClick={() => setDrawer(null)} aria-hidden />
@@ -194,10 +206,10 @@ export function App() {
             <Composer
               value={input}
               onChange={setInput}
-              ready={canSend(model)}
+              ready={canChat(model)}
               busy={chat.sendBlocked}
               streamingHere={chat.streamingHere}
-              usage={contextUsage(active.log, settings.maxTokens, canSend(model) ? model.contextLimit : null)}
+              usage={contextUsage(active.log, settings.maxTokens, canChat(model) ? model.contextLimit : null)}
               onSend={send}
               onStop={chat.stop}
               canAttach={tools.enabled && tools.readFiles}
@@ -259,4 +271,10 @@ function Server({ model, refreshModel, streaming, visible }: { model: ModelState
   const [state, actions] = useServer(model, refreshModel, visible);
   const now = useTick(loadUnderWay(model));
   return <ServerView model={model} state={state} actions={actions} streaming={streaming} now={now} />;
+}
+
+/** The Image view's state lives here, so the form and the gallery stay while the chat shows. */
+function Image({ model, refreshModel, visible }: { model: ModelState; refreshModel: () => void; visible: boolean }) {
+  const [state, actions] = useStudio(model, refreshModel, visible);
+  return <ImageView model={model} state={state} actions={actions} />;
 }

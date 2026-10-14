@@ -9,18 +9,26 @@
 //! compute is alive exactly as long as the scheduler that owns it, so the
 //! count of live ones when a load begins is how many models were still
 //! resident then — the mock's proof that the old model was gone first.
+//!
+//! An id of the image family (`ignis-image-2.1-turbo`, spec image-model/05)
+//! builds the image model over a `FakeImageRunner` instead, resident until
+//! its runner is dropped, the prompt of every condition prefix it encodes
+//! logged.
 
 #![allow(dead_code)]
 
 use std::collections::HashSet;
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
 
 use ignis_core::compute::ModelFamily;
+use ignis_core::image::{ConditionId, FakeImageRunner, ImageCondition, ImageError, ImagePlan, ImageRunner, ImageSize, RgbaImage, TargetLatents};
 use ignis_core::mock::{GateController, GatedCompute, MockCompute};
 use ignis_core::{Compute, ConcreteScheduler, SchedulerConfig};
 use ignis_server::config_http::ConfigState;
 use ignis_server::engine::Engine;
+use ignis_server::images::ImageModel;
 use ignis_server::model_switch::{load_options, ModelLoader, PreparedLoad};
 use ignis_server::load::LoadedModel;
 use ignis_server::telemetry::SystemClock;
@@ -32,6 +40,11 @@ use ignis_server::{ActiveModel, ModelSource};
 struct State {
     /// Every compute built, weakly.
     built: Mutex<Vec<Weak<dyn Compute>>>,
+    /// Every image runner built, by a handle only the runner keeps alive.
+    built_images: Mutex<Vec<Weak<AtomicUsize>>>,
+    /// The prompt of every condition prefix an image runner encoded, in
+    /// order.
+    encoded: Arc<Mutex<Vec<String>>>,
     /// How many built models were still alive as each load began.
     resident_at_load: Mutex<Vec<usize>>,
     /// The ids loaded, in order.
@@ -157,6 +170,12 @@ impl MockLoader {
         self.state.loads.lock().unwrap().clone()
     }
 
+    /// The prompt of every condition prefix the image models encoded, in
+    /// order: what an image job ran on.
+    pub fn encoded_prompts(&self) -> Vec<String> {
+        self.state.encoded.lock().unwrap().clone()
+    }
+
     /// How many built models are alive now.
     pub fn resident(&self) -> usize {
         resident(&self.state)
@@ -174,10 +193,17 @@ impl MockLoader {
 }
 
 fn resident(state: &State) -> usize {
-    state.built.lock().unwrap().iter().filter(|built| built.strong_count() > 0).count()
+    let images = state.built_images.lock().unwrap().iter().filter(|built| built.strong_count() > 0).count();
+    images + state.built.lock().unwrap().iter().filter(|built| built.strong_count() > 0).count()
 }
 
 fn build(state: &State, id: &str, compute: Arc<dyn Compute>) -> ActiveModel {
+    if ModelFamily::of_model_id(id) == Some(ModelFamily::QwenImage21) {
+        let runner = FakeImageRunner::default();
+        state.built_images.lock().unwrap().push(Arc::downgrade(&runner.held_conditions()));
+        let runner = Logged { inner: runner, encoded: Arc::clone(&state.encoded) };
+        return ActiveModel::image(ImageModel::new(id, Box::new(runner))).with_source(source(id));
+    }
     state.built.lock().unwrap().push(Arc::downgrade(&compute));
     let scheduler =
         ConcreteScheduler::with_config(SchedulerConfig { model: id.into(), ..SchedulerConfig::default() }, compute);
@@ -228,5 +254,45 @@ impl PreparedLoad for MockPrepared {
 
     fn options(&self) -> Option<&ignis_server::config::Config> {
         self.options.as_ref()
+    }
+}
+
+/// `FakeImageRunner`, logging the prompt of each prefix it encodes.
+struct Logged {
+    inner: FakeImageRunner,
+    encoded: Arc<Mutex<Vec<String>>>,
+}
+
+impl ImageRunner for Logged {
+    fn plan(&self) -> &ImagePlan {
+        self.inner.plan()
+    }
+
+    fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> u64 {
+        self.inner.condition_tokens(prompt, images)
+    }
+
+    fn encode_condition(&mut self, condition: &ImageCondition) -> Result<ConditionId, ImageError> {
+        self.encoded.lock().unwrap().push(condition.prompt.clone());
+        self.inner.encode_condition(condition)
+    }
+
+    fn denoise_step(
+        &mut self,
+        condition: ConditionId,
+        latents: &mut TargetLatents,
+        sigma: f32,
+        sigma_next: f32,
+        velocity: Option<&mut Vec<f32>>,
+    ) -> Result<(), ImageError> {
+        self.inner.denoise_step(condition, latents, sigma, sigma_next, velocity)
+    }
+
+    fn vae_decode(&mut self, latents: &TargetLatents) -> Result<RgbaImage, ImageError> {
+        self.inner.vae_decode(latents)
+    }
+
+    fn release_condition(&mut self, condition: ConditionId) {
+        self.inner.release_condition(condition);
     }
 }

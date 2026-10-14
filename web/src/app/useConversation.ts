@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { canSend, loadAwaited, type ModelState } from "../api/model.ts";
+import { canChat, loadAwaited, type ModelState } from "../api/model.ts";
 import { conversationTurns, type Exchange, type Settings, thinkingBudgetOf, type ToolExtras } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { streamChat } from "../api/stream.ts";
@@ -115,7 +115,7 @@ export function useConversation({
   const busy = streaming.size > 0;
   const streamingHere = streaming.has(active.id);
   /** A new turn can start in the session on screen, and the model is known. */
-  const canRun = canStartTurn(streaming, active.id, parallel) && canSend(model);
+  const canRun = canStartTurn(streaming, active.id, parallel) && canChat(model);
   /** Send waits: this session streams, or another one does and turns are not parallel. */
   const sendBlocked = !canStartTurn(streaming, active.id, parallel);
 
@@ -157,7 +157,7 @@ export function useConversation({
    * ends the whole turn, agents included.
    */
   async function exchange(sessionId: number, history: Message[], prompt: string | null, images: PromptImage[] = []) {
-    if (!canStartTurn(running(), sessionId, parallel) || !canSend(model)) return;
+    if (!canStartTurn(running(), sessionId, parallel) || !canChat(model)) return;
     // A request names no model: the server serves the one it has loaded, and a name could only switch it. The
     // page asks again which that is, so the header follows a switch another client made.
     refreshModel();
@@ -440,7 +440,7 @@ export function useConversation({
    */
   function rerun(messageId: number, prompt: string | null) {
     const index = active.messages.findIndex((m) => m.id === messageId);
-    if (index === -1 || !canStartTurn(running(), active.id, parallel) || !canSend(model)) return;
+    if (index === -1 || !canStartTurn(running(), active.id, parallel) || !canChat(model)) return;
     const sessionId = active.id;
     const images = active.messages[index].images ?? [];
     setList((l) => ({ ...l, sessions: truncateFrom(l.sessions, sessionId, messageId) }));
