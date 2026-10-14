@@ -35,7 +35,7 @@ use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use ignis_artifact::CudaDevice;
 use ignis_core::gpu_profile;
-use ignis_core::image::{ImageCondition, ImageSize, RgbaImage};
+use ignis_core::image::{ConditionUnfit, ImageCondition, ImageSize, RgbaImage};
 use ignis_server::model_switch::{ArtifactLoader, ModelLoader};
 use ignis_server::{ActiveModel, ModelSource, Server};
 use serde_json::{json, Value};
@@ -161,11 +161,16 @@ fn unbase64(text: &str) -> Vec<u8> {
     out
 }
 
+/// The answer's images' PNG bytes, in order.
+fn pngs_of(answer: &Value) -> Vec<Vec<u8>> {
+    answer["data"].as_array().expect("data").iter().map(|image| unbase64(image["b64_json"].as_str().expect("b64_json"))).collect()
+}
+
 /// The answer's one image: its PNG bytes, decoded as RGBA8.
 fn png_of(answer: &Value) -> (Vec<u8>, RgbaImage) {
-    let data = answer["data"].as_array().expect("data");
-    assert_eq!(data.len(), 1, "{answer}");
-    let png = unbase64(data[0]["b64_json"].as_str().expect("b64_json"));
+    let pngs = pngs_of(answer);
+    assert_eq!(pngs.len(), 1, "{answer}");
+    let png = pngs[0].clone();
     let mut reader = png::Decoder::new(Cursor::new(png.clone())).read_info().expect("a PNG");
     let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
     let frame = reader.next_frame(&mut pixels).unwrap();
@@ -212,7 +217,7 @@ async fn the_image_model_serves_generations_and_edits_over_http_and_frees_what_i
     let square = ImageSize::new(1024, 1024);
     let prompt = |case: &Value| case["case"]["prompt"].as_str().unwrap().to_owned();
     let counted = image.with_runner(|runner| (runner.condition_tokens(&prompt(&t2i), &[]), runner.condition_tokens(&prompt(&edit), &[square]))).unwrap();
-    assert_eq!(counted, (recorded_prefix(&t2i), recorded_prefix(&edit)), "the runner's count is diffusers' prefix");
+    assert_eq!(counted, (Ok(recorded_prefix(&t2i)), Ok(recorded_prefix(&edit))), "the runner's count is diffusers' prefix");
 
     let server = Server::from_active(model);
     let app = server.app();
@@ -232,6 +237,18 @@ async fn the_image_model_serves_generations_and_edits_over_http_and_frees_what_i
     println!("generation: channel spread {spread_t2i:.1?}");
     assert!(spread_t2i[..3].iter().all(|&s| s > 10.0), "a picture, not a flat field: {spread_t2i:?}");
     keep(out.as_deref(), "t2i-seed7.png", &png);
+    // n = 2 (review-321d Info): image i starts from seed + i, image 1 after image 0's decode in
+    // the same job over the same prefix. Image 0 is seed 7's, image 1 seed 8's alone.
+    let (status, two, took) = send(&app, json_request("/v1/images/generations", &json!({ "prompt": prompt(&t2i), "size": "1024x1024", "n": 2, "seed": 7 }))).await;
+    assert_eq!(status, StatusCode::OK, "{two}");
+    println!("generation 1024², n = 2: {:.2} s", took.as_secs_f64());
+    let (status, eight, _) = send(&app, json_request("/v1/images/generations", &json!({ "prompt": prompt(&t2i), "size": "1024x1024", "n": 1, "seed": 8 }))).await;
+    assert_eq!(status, StatusCode::OK, "{eight}");
+    let two = pngs_of(&two);
+    assert_eq!(two.len(), 2);
+    assert_eq!(two[0], png, "image 0 of seed 7 is seed 7's");
+    assert_eq!(two[1], png_of(&eight).0, "image 1 of seed 7 is image 0 of seed 8");
+    assert_ne!(two[0], two[1]);
 
     // An edit of the oracle's condition image, twice.
     let fields = [("prompt", prompt(&edit)), ("size", "1024x1024".to_owned()), ("seed", "3".to_owned())];
@@ -290,16 +307,17 @@ async fn the_image_model_serves_generations_and_edits_over_http_and_frees_what_i
 /// Review-321ab I3: the leaf's arena is a second limit on a condition beside the budget. With a
 /// budget past what the card has (an explicit 40 GiB, oversubscribed: a larger card's), ten
 /// condition images at the worst condition size (13120x96, 1,230 merged tokens each, spec
-/// image-model/03: a 16380x100 source at 1024² of area) fit the budget, and the count says past it
-/// when the arena has no room for their tower and encoder; the fit then scales them to sizes the
-/// arena takes. A size the encoder's processor would not keep counts past the budget too: scaled
-/// to 13088x64 the panorama passes 200:1. The fit runs from a floor of 640: at the default 512 the
-/// floor's own sizes (6560x32) pass 200:1, and the fit, which reads the floor first, refuses
-/// (the processor's limit is not monotone in the area; a corner left to the fit). Host-side counts
-/// only, after the load: nothing is encoded.
+/// image-model/03: a 16380x100 source at 1024² of area) fit the budget, and the count says the
+/// runner has no room for their tower and encoder; the fit then scales them to sizes the arena
+/// takes, from the default 512 floor, whose own sizes (6560x32) the processor refuses (review-321d:
+/// the fit no longer reads the floor first). A size the processor would not keep (13088x64, past
+/// 200:1) is refused in its words. The RoPE table is a third limit (review-321d L1): five 12800x64
+/// images take 4,000 of its 8,192 positions, and a prompt of ~4,300 words on top has no room for
+/// the target, which scaling the images makes. Host-side counts only, after the load: nothing is
+/// encoded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "GPU: run under scripts/gpu-profile.ps1"]
-async fn the_count_holds_the_arena_beside_the_budget() {
+async fn the_count_holds_the_arena_and_the_rope_table_beside_the_budget() {
     use ignis_server::images::budget;
     let Some((artifact, oracle)) = fixtures() else { return };
     let edit = case(&oracle.join("edit"));
@@ -311,28 +329,45 @@ async fn the_count_holds_the_arena_beside_the_budget() {
     let worst = vec![budget::condition_size(1024.0 * 1024.0, 163.8); 10];
     assert_eq!(worst[0], ImageSize::new(13120, 96), "the worst condition size");
     let squares = vec![ImageSize::new(1024, 1024); 10];
-    let (counted_worst, counted_squares, fitted) = image
+    let long = format!("{prompt} {}", "fox ".repeat(4300));
+    let five = vec![ImageSize::new(12800, 64); 5];
+    let (counted_worst, counted_squares, fitted, past_ratio) = image
         .with_runner(|runner| {
-            let fitted = budget::fit(|sizes| runner.condition_tokens(prompt, sizes), &sources, budget, 640);
-            assert_eq!(runner.condition_tokens(prompt, &[ImageSize::new(13088, 64); 10]), budget + 1, "past 200:1");
-            (runner.condition_tokens(prompt, &worst), runner.condition_tokens(prompt, &squares), fitted)
+            let fitted = budget::fit(|sizes| runner.condition_tokens(prompt, sizes), &sources, budget, 512);
+            let past_ratio = runner.condition_tokens(prompt, &[ImageSize::new(13088, 64); 10]);
+            (runner.condition_tokens(prompt, &worst), runner.condition_tokens(prompt, &squares), fitted, past_ratio)
         })
         .unwrap();
     let cells = |sizes: &[ImageSize]| sizes.iter().map(|size| size.latent_cells() as u64).sum::<u64>();
     println!(
-        "a {budget}-token budget: ten 13120x96 images ({} latent cells) count {counted_worst}; ten 1024² ({} cells) count {counted_squares}; \
-         the fit: {:?}",
+        "a {budget}-token budget: ten 13120x96 images ({} latent cells) count {counted_worst:?}; ten 1024² ({} cells) count          {counted_squares:?}; the fit: {:?}; ten 13088x64: {past_ratio:?}",
         cells(&worst),
         cells(&squares),
         fitted
     );
     assert!(cells(&worst) < budget, "the worst case fits the budget: {} cells", cells(&worst));
-    assert_eq!(counted_worst, budget + 1, "past the arena's room, the count is one past the budget");
-    assert!(counted_squares <= budget && counted_squares > cells(&squares), "ten 1024² images fit both");
-    let fitted = fitted.expect("the fit scales the worst case into the arena");
+    assert!(matches!(counted_worst, Err(ConditionUnfit::NoRoom(_))), "past the arena's room: {counted_worst:?}");
+    assert!(matches!(&past_ratio, Err(ConditionUnfit::Refused(why)) if why.contains("200:1")), "past 200:1: {past_ratio:?}");
+    assert!(matches!(counted_squares, Ok(tokens) if tokens <= budget && tokens > cells(&squares)), "ten 1024² images fit both");
+    let fitted = fitted.expect("the fit scales the worst case into the arena, from the default floor");
     assert!(fitted.scaled, "{fitted:?}");
     let counted = image.with_runner(|runner| runner.condition_tokens(prompt, &fitted.sizes)).unwrap();
-    assert!(counted <= budget, "the fitted sizes count within the budget, so within the arena and the processor: {counted}");
+    assert!(matches!(counted, Ok(tokens) if tokens <= budget), "the fitted sizes count within the budget, the arena and the processor: {counted:?}");
+
+    // The RoPE table: five 12800x64 images take 5 x 800 positions before the target.
+    let (short, long_five, long_fitted) = image
+        .with_runner(|runner| {
+            let fitted = budget::fit(|sizes| runner.condition_tokens(&long, sizes), &[ImageSize::new(16380, 100); 5], budget, 512);
+            (runner.condition_tokens(prompt, &five), runner.condition_tokens(&long, &five), fitted)
+        })
+        .unwrap();
+    println!("five 12800x64: {short:?} with the edit's prompt, {long_five:?} with ~4,300 more words; the fit then: {long_fitted:?}");
+    assert!(matches!(short, Ok(tokens) if tokens <= budget), "{short:?}");
+    assert!(matches!(&long_five, Err(ConditionUnfit::NoRoom(why)) if why.contains("8192")), "no RoPE position left for the target: {long_five:?}");
+    let long_fitted = long_fitted.expect("smaller images leave the target a position");
+    assert!(long_fitted.scaled && long_fitted.sizes[0].width < 12800, "{long_fitted:?}");
+    let counted = image.with_runner(|runner| runner.condition_tokens(&long, &long_fitted.sizes)).unwrap();
+    assert!(matches!(counted, Ok(tokens) if tokens <= budget), "{counted:?}");
     tokio::task::spawn_blocking(move || model.shut_down()).await.unwrap();
 }
 

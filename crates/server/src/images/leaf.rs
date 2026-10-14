@@ -6,12 +6,14 @@
 //! host, and the job's condition prefixes, by [`ConditionId`].
 //!
 //! - **The count.** `condition_tokens` is [`EncoderFrontend::count`]'s
-//!   prefix, the very count the leaf's `encode_condition` refuses by. A
-//!   condition within the plan's budget that the leaf's arena has no room to
-//!   encode (`ImageLeaf::condition_fits`), or with a condition size the
-//!   encoder's processor would not keep (a panorama scaled past 200:1),
-//!   counts one past the budget, so the server's fit (`images::budget::fit`)
-//!   scales the images for those limits too.
+//!   prefix, the very count the leaf's `encode_condition` refuses by, or why
+//!   there is none ([`ignis_core::image::ConditionUnfit`]). A condition size the encoder's
+//!   processor would not keep (a panorama past 200:1) is refused, in the
+//!   processor's words. A condition within the plan's budget that the leaf's
+//!   arena has no room to encode (`ImageLeaf::condition_fits`), or whose
+//!   images leave the target no RoPE position ([`target_rope_layout`]), has
+//!   no room: the server's fit (`images::budget::fit`) scales the images for
+//!   those limits too. With no image to scale, it is refused.
 //! - **The latents.** A job keeps its target's latents on the host,
 //!   channel-major ([`TargetLatents`]); the leaf keeps the started image's in
 //!   its slot, packed `[y · w + x][c]` ([`packed`]). Each step sends them up
@@ -42,6 +44,35 @@ pub use device::LeafRunner;
 /// cells.
 pub fn max_target_cells(sizes: &[ImageSize]) -> usize {
     sizes.iter().map(|size| size.latent_cells()).max().unwrap_or(MAX_TARGET_TOKENS as usize)
+}
+
+/// The joint sequence a target starts over, for the leaf's RoPE rule
+/// (`ignis_core::image_dit::rope_positions`, which `ImageLeaf::start_image`
+/// runs): a prefix of `prefix` tokens with condition images of `images`
+/// (sides multiples of 16), laid out text first, then each image's block,
+/// then a one-cell target block at the prefix's end — its tokens, the
+/// blocks' starts and their (height, width) in latent cells.
+///
+/// The leaf's own layout interleaves the text and the images
+/// (`PrefixLayout`), but the rule refuses the same prefixes either way: a
+/// text token moves the position one and an image block its longer side, so
+/// the target's block starts at the same position, and every position
+/// before it is below that. The target's shape moves only its own rows'
+/// height and width positions, within the table for any side
+/// `image.sizes` allows.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn target_rope_layout(prefix: u32, images: &[ImageSize]) -> (u32, Vec<u32>, Vec<(u32, u32)>) {
+    let mut shapes: Vec<(u32, u32)> = images.iter().map(|size| (size.height / LATENT_SCALE, size.width / LATENT_SCALE)).collect();
+    let cells: u32 = shapes.iter().map(|&(height, width)| height * width).sum();
+    let mut starts = Vec::with_capacity(shapes.len() + 1);
+    let mut start = prefix - cells;
+    for &(height, width) in &shapes {
+        starts.push(start);
+        start += height * width;
+    }
+    starts.push(prefix);
+    shapes.push((1, 1));
+    (prefix + 1, starts, shapes)
 }
 
 /// `latents` as the leaf's image slot holds them: `packed[y · w + x][c] =
@@ -112,10 +143,11 @@ mod device {
     use std::path::Path;
 
     use ignis_artifact::{CudaDevice, Reader};
-    use ignis_core::image::{ConditionId, ImageCondition, ImageError, ImagePlan, ImageRunner, ImageSize, RgbaImage, TargetLatents, LATENT_SCALE};
+    use ignis_core::image::{ConditionId, ConditionUnfit, ImageCondition, ImageError, ImagePlan, ImageRunner, ImageSize, RgbaImage, TargetLatents, LATENT_SCALE};
+    use ignis_core::image_dit::rope_positions;
     use ignis_core::image_leaf::{Condition, ConditionImage as LeafImage, ConditionText, ImageLeaf, ImageLeafOptions};
 
-    use super::{channels, check_target, image_error, max_target_cells, packed, step_of};
+    use super::{channels, check_target, image_error, max_target_cells, packed, step_of, target_rope_layout};
     use crate::image_encoder_input::{ConditionImage, EncoderFrontend};
 
     /// The image leaf behind [`ImageRunner`] (the module's doc says how).
@@ -179,19 +211,29 @@ mod device {
             &self.plan
         }
 
-        /// The front end's count; one past the budget when it refuses (a
-        /// size the processor would not keep, a tokenizer failure) or the
-        /// arena has no room for the condition.
-        fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> u64 {
-            let past = self.plan.condition_budget_tokens.saturating_add(1);
-            let Ok(count) = self.frontend.count(prompt, images) else { return past };
+        /// The front end's count, refused for a size the processor would
+        /// not keep or a prompt the template refuses. Within the budget it
+        /// meets the limits beside it — the arena's room for the condition
+        /// (`ImageLeaf::condition_fits`), a RoPE position for the target
+        /// after it ([`target_rope_layout`]) — and past either has no room
+        /// while there are images to scale down, else is refused.
+        fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> Result<u64, ConditionUnfit> {
+            let count = self.frontend.count(prompt, images).map_err(ConditionUnfit::Refused)?;
             if count.prefix > self.plan.condition_budget_tokens {
-                return count.prefix;
+                return Ok(count.prefix);
             }
             // Within the budget, which is below 2^20 tokens: each count is a u32.
             let sizes: Vec<(u32, u32)> = images.iter().map(|size| (size.width, size.height)).collect();
-            let fits = self.leaf.condition_fits(count.encoder_rows as u32, count.pads as u32, &sizes, count.prefix as u32);
-            if fits.is_ok() { count.prefix } else { past }
+            let (tokens, starts, shapes) = target_rope_layout(count.prefix as u32, images);
+            let room = self
+                .leaf
+                .condition_fits(count.encoder_rows as u32, count.pads as u32, &sizes, count.prefix as u32)
+                .and_then(|()| rope_positions(tokens, &starts, &shapes).map(|_| ()));
+            match room {
+                Ok(()) => Ok(count.prefix),
+                Err(why) if images.is_empty() => Err(ConditionUnfit::Refused(why)),
+                Err(why) => Err(ConditionUnfit::NoRoom(why)),
+            }
         }
 
         /// The count first: a size the processor would not keep, or a prefix
@@ -361,6 +403,18 @@ mod tests {
         assert_eq!(max_target_cells(&crate::config::DEFAULT_IMAGE_SIZES), 16_800);
         assert_eq!(max_target_cells(&crate::config::DEFAULT_IMAGE_SIZES), MAX_TARGET_TOKENS as usize);
         assert_eq!(max_target_cells(&[ImageSize::new(1024, 1024), ImageSize::new(512, 768)]), 4096);
+    }
+
+    /// The RoPE layout of a prefix: its text first, each image's block in
+    /// latent cells (height, width), the one-cell target at its end. The
+    /// edit oracle's prefix: 26 text tokens and one 1024² image.
+    #[test]
+    fn the_targets_rope_layout_is_the_text_then_the_images_then_one_cell() {
+        assert_eq!(target_rope_layout(31, &[]), (32, vec![31], vec![(1, 1)]));
+        let (tokens, starts, shapes) = target_rope_layout(4122, &[ImageSize::new(1024, 1024)]);
+        assert_eq!((tokens, starts, shapes), (4123, vec![26, 4122], vec![(64, 64), (1, 1)]));
+        let (_, starts, shapes) = target_rope_layout(9 + 2048 + 64, &[ImageSize::new(512, 1024), ImageSize::new(128, 128)]);
+        assert_eq!((starts, shapes), (vec![9, 9 + 2048, 9 + 2048 + 64], vec![(64, 32), (8, 8), (1, 1)]));
     }
 
     /// A target is whole latent cells, a value a channel a cell.

@@ -18,7 +18,7 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use ignis_core::image::{
-    ConditionId, FakeImageRunner, ImageCondition, ImageError, ImagePlan, ImageRunner, ImageSize, RgbaImage, TargetLatents,
+    ConditionId, ConditionUnfit, FakeImageRunner, ImageCondition, ImageError, ImagePlan, ImageRunner, ImageSize, RgbaImage, TargetLatents,
 };
 use ignis_server::images::ImageModel;
 use ignis_server::{ActiveModel, Server};
@@ -85,6 +85,13 @@ struct Faults {
     undercount: AtomicUsize,
     /// What the next `encode_condition` answers instead of encoding, once.
     encode_error: Mutex<Option<ImageError>>,
+    /// What `condition_tokens` refuses every condition with while set, in
+    /// the runner's words: a size its processor would not keep.
+    count_refusal: Mutex<Option<String>>,
+    /// The most latent cells a condition image may have before
+    /// `condition_tokens` says the runner has no room for it (its arena); 0
+    /// is no limit.
+    room_cells: AtomicUsize,
 }
 
 /// `FakeImageRunner`, logging each call, each step behind `gate`.
@@ -101,8 +108,15 @@ impl ImageRunner for Recording {
         self.inner.plan()
     }
 
-    fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> u64 {
-        self.inner.condition_tokens(prompt, images).saturating_sub(self.faults.undercount.load(Ordering::SeqCst) as u64)
+    fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> Result<u64, ConditionUnfit> {
+        if let Some(why) = self.faults.count_refusal.lock().unwrap().clone() {
+            return Err(ConditionUnfit::Refused(why));
+        }
+        let room = self.faults.room_cells.load(Ordering::SeqCst);
+        if let Some(size) = images.iter().find(|size| room > 0 && size.latent_cells() > room) {
+            return Err(ConditionUnfit::NoRoom(format!("no room in the arena for a {size} condition image")));
+        }
+        Ok(self.inner.condition_tokens(prompt, images)?.saturating_sub(self.faults.undercount.load(Ordering::SeqCst) as u64))
     }
 
     fn encode_condition(&mut self, condition: &ImageCondition) -> Result<ConditionId, ImageError> {
@@ -785,6 +799,45 @@ async fn what_the_leaf_refuses_is_a_400_and_what_it_fails_at_a_500() {
     assert_eq!(harness.held.load(Ordering::SeqCst), 0);
     let (status, _) = send(&harness.app, json_request("/v1/images/generations", &body)).await;
     assert_eq!(status, StatusCode::OK, "the model serves on");
+}
+
+/// Review-321d F1: what the runner's count refuses — a condition image its
+/// processor would not keep at 1024² of area — is `400 image_refused` in its
+/// words, before anything is encoded; what it has no room for is scaled down
+/// as for the budget, and past its room even at the floor is `400
+/// condition_budget_exceeded`, naming the room.
+#[tokio::test]
+async fn what_the_count_refuses_is_image_refused_and_what_it_has_no_room_for_is_scaled() {
+    let harness = Harness::new(Gate::opened());
+    let refusal = "condition image 0 is 16192x64: the encoder's processor refuses it (at most 200:1)";
+    *harness.faults.count_refusal.lock().unwrap() = Some(refusal.into());
+    let parts = [("prompt", Part::Text("x")), ("image[]", Part::File(JPEG))];
+    let (status, refused) = send(&harness.app, form_request(&parts)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!((refused["error"]["code"].as_str(), refused["error"]["message"].as_str()), (Some("image_refused"), Some(refusal)), "{refused}");
+    assert!(harness.encodes().is_empty(), "refused before anything is encoded");
+    *harness.faults.count_refusal.lock().unwrap() = None;
+
+    // The JPEG at 1024² of area is 1184x896, 4,144 cells: past a room of
+    // 2,000, scaled to fit it.
+    harness.faults.room_cells.store(2000, Ordering::SeqCst);
+    let (status, body) = send(&harness.app, form_request(&parts)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let Some(Call::Encode { sizes, .. }) = harness.calls().into_iter().find(|call| matches!(call, Call::Encode { .. })) else { panic!("no encode") };
+    assert!(sizes[0].latent_cells() <= 2000 && sizes[0].latent_cells() > 1000, "{sizes:?}");
+    assert_eq!(body["condition_sizes"], json!([sizes[0].to_string()]), "{body}");
+
+    // At the 512 floor it is 608x448, 1,064 cells: past a room of 1,000.
+    let at_floor = ignis_server::images::budget::condition_size(512.0 * 512.0, 321.0 / 240.0);
+    assert_eq!((at_floor, at_floor.latent_cells()), (ImageSize::new(608, 448), 1064));
+    harness.faults.room_cells.store(1000, Ordering::SeqCst);
+    let (status, refused) = send(&harness.app, form_request(&parts)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!((refused["error"]["code"].as_str(), refused["error"]["param"].as_str()), (Some("condition_budget_exceeded"), Some("image")), "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("512x512 pixels of area") && message.contains("no room in the arena for a 608x448"), "{message}");
+    assert_eq!(harness.encodes().len(), 1, "only the scaled edit was encoded");
+    assert_eq!(harness.held.load(Ordering::SeqCst), 0);
 }
 
 /// Spec image-model/05 §Prompt enhancement: on a server that cannot switch

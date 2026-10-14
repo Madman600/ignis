@@ -411,7 +411,7 @@ mod tests {
             self.inner.plan()
         }
 
-        fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> u64 {
+        fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> Result<u64, ignis_core::image::ConditionUnfit> {
             self.inner.condition_tokens(prompt, images)
         }
 

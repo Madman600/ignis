@@ -191,6 +191,21 @@ impl std::fmt::Display for ImageError {
     }
 }
 
+/// Why [`ImageRunner::condition_tokens`] gives a condition no count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionUnfit {
+    /// Within the budget, but a limit beside it is short for condition
+    /// images of these sizes — the leaf's arena, the RoPE positions the
+    /// images take before the target — in the runner's words. Smaller images
+    /// may fit: the server's fit scales them down for it, as for the budget.
+    NoRoom(String),
+    /// The runner refuses the request at these sizes, in its words: a
+    /// condition size the encoder's processor would not keep (past 200:1), a
+    /// prompt its template refuses, a prompt with no image too long for a
+    /// limit beside the budget. No scaling makes it: `400 image_refused`.
+    Refused(String),
+}
+
 /// The image model's compute seam: the only calls an image job makes on the
 /// model, one at a time. The real runner is the server's adapter over the
 /// image leaf (spec image-model/04, 05); [`FakeImageRunner`] stands in for it
@@ -210,10 +225,12 @@ pub trait ImageRunner: Send {
     /// the count [`ImageRunner::encode_condition`] refuses past the budget.
     /// Host-side and cheap: the server, which holds no tokenizer for the
     /// image model, fits the condition images to the budget with it before it
-    /// encodes them. A condition within the budget that the runner has no
-    /// room to encode (the leaf's arena) counts one token past the plan's
-    /// budget, so the fit scales the images down for that limit too.
-    fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> u64;
+    /// encodes them. A count past the budget is still the count. No count is
+    /// a condition within the budget that the runner has no room for as it
+    /// is ([`ConditionUnfit::NoRoom`]: the fit scales the images down for
+    /// that limit too) or that it refuses at these sizes
+    /// ([`ConditionUnfit::Refused`]).
+    fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> Result<u64, ConditionUnfit>;
 
     /// The encoder over the prompt and the condition images, the VAE encode
     /// of each image, and the DiT over the prefix tokens at t = 0: the
@@ -288,10 +305,11 @@ impl FakeImageRunner {
         Arc::clone(&self.held)
     }
 
-    /// The prefix's tokens, as [`FakeImageRunner`] counts them.
-    fn tokens(&self, condition: &ImageCondition) -> u64 {
-        let sizes: Vec<ImageSize> = condition.images.iter().map(|image| image.size).collect();
-        self.condition_tokens(&condition.prompt, &sizes)
+    /// The prefix's tokens, as [`FakeImageRunner`] counts them: one token a
+    /// word of the prompt, at least one, and the images' cells.
+    fn count(prompt: &str, images: &[ImageSize]) -> u64 {
+        let words = prompt.split_whitespace().count().max(1) as u64;
+        words + images.iter().map(|size| size.latent_cells() as u64).sum::<u64>()
     }
 }
 
@@ -305,14 +323,14 @@ impl ImageRunner for FakeImageRunner {
         &self.plan
     }
 
-    /// One token a word of the prompt, at least one, and the images' cells.
-    fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> u64 {
-        let words = prompt.split_whitespace().count().max(1) as u64;
-        words + images.iter().map(|size| size.latent_cells() as u64).sum::<u64>()
+    /// Its count, always: the fake has no limit beside the budget.
+    fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> Result<u64, ConditionUnfit> {
+        Ok(Self::count(prompt, images))
     }
 
     fn encode_condition(&mut self, condition: &ImageCondition) -> Result<ConditionId, ImageError> {
-        let (tokens, budget) = (self.tokens(condition), self.plan.condition_budget_tokens);
+        let sizes: Vec<ImageSize> = condition.images.iter().map(|image| image.size).collect();
+        let (tokens, budget) = (Self::count(&condition.prompt, &sizes), self.plan.condition_budget_tokens);
         if tokens > budget {
             return Err(ImageError::OverBudget { tokens, budget });
         }
@@ -505,12 +523,12 @@ mod tests {
     fn the_fake_counts_its_prefix_as_the_prompt_tokens_plus_the_latent_cells() {
         let mut runner = FakeImageRunner::new(ImagePlan { condition_budget_tokens: 3 + 4096, ..fake_plan() });
         let square = ImageSize::new(1024, 1024);
-        assert_eq!(runner.condition_tokens("make it blue", &[square]), 3 + 4096);
-        assert_eq!(runner.condition_tokens("", &[]), 1);
-        assert_eq!(runner.condition_tokens("x", &[square, ImageSize::new(512, 256)]), 1 + 4096 + 512);
+        assert_eq!(runner.condition_tokens("make it blue", &[square]), Ok(3 + 4096));
+        assert_eq!(runner.condition_tokens("", &[]), Ok(1));
+        assert_eq!(runner.condition_tokens("x", &[square, ImageSize::new(512, 256)]), Ok(1 + 4096 + 512));
+        assert_eq!(runner.condition_tokens("x", &[square; 3]), Ok(1 + 3 * 4096), "past the budget, still the count");
         let image = RgbaImage { size: square, pixels: vec![0; 1024 * 1024 * 4] };
         let edit = ImageCondition { prompt: "make it blue".into(), images: vec![image] };
-        assert_eq!(runner.tokens(&edit), 3 + 4096);
         assert!(runner.encode_condition(&edit).is_ok(), "exactly the budget fits");
         let plan = fake_plan();
         assert!(plan.takes(ImageSize::new(2400, 1792)) && plan.takes(ImageSize::new(1536, 2752)) && plan.takes(square));

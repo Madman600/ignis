@@ -406,7 +406,7 @@ Prompt enhancement (`prompt_enhancement: true`, or `image.prompt_enhancement` wh
             (ImagesResponse = "application/json"),
             (ImageStreamEvent = "text/event-stream"),
         )),
-        (status = 400, description = "A field outside its rule: no `prompt`, `n` outside 1..`image.max_n`, a `size` not in `image.sizes`, or past the largest image the loaded model makes (the message lists the sizes), `response_format: url`, an `output_format` other than `png`, an unknown `background`, `partial_images` above 0; or a prompt longer than the condition budget (`condition_budget_exceeded`); or a request the image model refuses as it encodes it, in its words (`image_refused`: a prompt whose positions run past the model's RoPE table).", body = ApiError),
+        (status = 400, description = "A field outside its rule: no `prompt`, `n` outside 1..`image.max_n`, a `size` not in `image.sizes`, or past the largest image the loaded model makes (the message lists the sizes), `response_format: url`, an `output_format` other than `png`, an unknown `background`, `partial_images` above 0; or a prompt longer than the condition budget (`condition_budget_exceeded`); or a request the image model refuses, in its words (`image_refused`: a prompt whose positions run past the model's RoPE table).", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 409, description = "The model that would serve the request is a text model (`model_kind_mismatch`, naming both kinds and the loaded id).", body = ApiError),
@@ -439,7 +439,7 @@ Each condition image is resized to 1024x1024 pixels of area at its own aspect ra
             (ImagesResponse = "application/json"),
             (ImageStreamEvent = "text/event-stream"),
         )),
-        (status = 400, description = "As for a generation; or no condition image, more than `image.max_condition_images`, one that is not a PNG, JPEG or WebP, a `mask`, or condition images that do not fit the condition budget even at `image.condition_floor_px` (`condition_budget_exceeded`); or a condition image the image model refuses (`image_refused`).", body = ApiError),
+        (status = 400, description = "As for a generation; or no condition image, more than `image.max_condition_images`, one that is not a PNG, JPEG or WebP, a `mask`, or condition images that do not fit the condition budget, or the image model's room for them, even at `image.condition_floor_px` (`condition_budget_exceeded`); or a condition image the image model refuses, in its words (`image_refused`: one its encoder's processor would not keep at its condition size, a panorama past 200:1).", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 409, description = "The model that would serve the request is a text model (`model_kind_mismatch`).", body = ApiError),
@@ -915,14 +915,15 @@ fn prepare(
     let Some(fitted) = fitted else {
         return Err(model_stopped());
     };
-    let fitted = fitted.map_err(|over| {
-        error_response_naming(
+    let fitted = fitted.map_err(|unfit| match unfit {
+        budget::NotFitted::Refused(why) => error_response_naming(StatusCode::BAD_REQUEST, "invalid_request_error", "image_refused", why, None),
+        over => error_response_naming(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "condition_budget_exceeded",
             over.to_string(),
             Some(route.condition_param()),
-        )
+        ),
     })?;
     // Each image was decoded at its unscaled size: only one the budget scaled
     // is resized again, from that.
