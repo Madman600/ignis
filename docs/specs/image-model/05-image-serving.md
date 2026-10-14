@@ -1001,7 +1001,8 @@ three loads, where the server already had the text-first path (one load).
   `loading` event the view reads `GET /v1/models` once, and `useModel`
   follows the switch from there as any switch; a run that named a model reads
   it again at its end. Without "Show progress" the line says the image model
-  loads first.
+  is loaded before the job. With `switch.allow_implicit` off the band no
+  longer says Generate switches.
 - **Untouched.** The chat and Decide never send `model` (the #305 lesson); the
   view's own requests on the image model send none either.
 - **Server.** No change: three router tests through the mock loader in

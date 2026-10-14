@@ -61,7 +61,7 @@ export function SwitchBand({ model, state, onSwitch }: { model: ModelState; stat
             {under
               ? "The page follows the switch and opens the form once the image model serves."
               : row
-                ? "Images are made by the image model. Generate switches to it on its own, or switch now: either unloads the model serving and loads it, and the chat waits until a text model is loaded again."
+                ? `Images are made by the image model. ${state.limits.allowImplicit ? "Generate switches to it on its own, or switch now: either" : "Switching"} unloads the model serving and loads it, and the chat waits until a text model is loaded again.`
                 : "ignis lists no image model. Fetch it with `ignis-server model download ignis-image-2.1-turbo`, then reload this page."}
           </p>
           {state.switchRefusal && <p className="text-sm text-[#ff7b6b] [overflow-wrap:anywhere]">{state.switchRefusal}</p>}
@@ -362,7 +362,7 @@ function Progress({ run }: { run: NonNullable<StudioState["run"]> }) {
   return (
     <div role="status" aria-live="polite" className="flex flex-col gap-2 border border-line bg-surface p-3">
       <p className="font-display text-sm font-medium">
-        {progress ? progressLine(progress, run.n) : `Sending the ${run.edit ? "edit" : "request"}${run.switches ? ": the image model loads first…" : "…"}`}
+        {progress ? progressLine(progress, run.n) : `Sending the ${run.edit ? "edit" : "request"}${run.switches ? ": the image model is loaded before the job…" : "…"}`}
       </p>
       <div className="h-1.5 overflow-hidden bg-line" aria-hidden>
         <div className="h-full bg-ember transition-[width] motion-reduce:transition-none" style={{ width: `${Math.round(share * 100)}%` }} />

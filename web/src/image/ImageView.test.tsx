@@ -48,13 +48,15 @@ describe("ImageView", () => {
     const html = render(text, { limits: { ...DEFAULT_LIMITS, allowImplicit: false } });
     expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Generate<\/button>/);
     expect(html).toContain("switch.allow_implicit");
+    expect(html).not.toContain("Generate switches to it on its own");
+    expect(render(text)).toContain("Generate switches to it on its own");
   });
 
   it("does not take the switch button while a run switches, and shows the run's phase", () => {
     const html = render(text, { run: { edit: false, n: 1, switches: true, progress: { phase: "switching", image: 0, step: 1, total: 1 } } });
     expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Switch to the image model<\/button>/);
     expect(html).toContain("Switching models");
-    expect(render(text, { run: { edit: false, n: 1, switches: true, progress: null } })).toContain("the image model loads first");
+    expect(render(text, { run: { edit: false, n: 1, switches: true, progress: null } })).toContain("the image model is loaded before the job");
   });
 
   it("shows the switch under way, not pressable", () => {
