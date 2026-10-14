@@ -967,22 +967,25 @@ curl http://127.0.0.1:8000/v1/images/generations \
 **Sizes.** `size` is one of `image.sizes`: 2048x2048, 2400x1792, 1792x2400,
 2528x1696, 1696x2528, 2752x1536, 1536x2752 (the checkpoint's presets) and
 1024x1024 (the size OpenAI clients often send); anything else is a `400` that
-lists them. Every side is a multiple of 32. A size in `image.sizes` past the
-largest image the loaded model makes is a `400` too, listing the sizes it
-serves. `auto` is 2048x2048 for a generation and, for an edit, the preset whose
-aspect ratio is nearest the last condition image's, always among the sizes
-served.
+lists them. Every side is a multiple of 32, at most 16384. The load makes room
+for the largest of them within `image.max_target_cells` (2400x1792 by
+default); a size past that is not served, and the load warns of it. A request
+for it is a `400` too, listing the sizes served. `auto` is 2048x2048 for a
+generation and, for an edit, the preset whose aspect ratio is nearest the last
+condition image's, always among the sizes served.
 
 **Condition images.** Each is resized to about 1024x1024 of area, keeping its
 aspect ratio, as soon as it is decoded. When the prompt and all of them exceed
-the condition budget they are scaled down together, never below
-`image.condition_floor_px` squared; below that the request is a `400` naming the
-budget. A condition image that is not a PNG, JPEG or WebP (a GIF, say), that
+the condition budget, or the room the image model has for them, they are
+scaled down together, never below `image.condition_floor_px` squared; below
+that the request is a `400` (`condition_budget_exceeded`) naming the budget or
+the room. A condition image that is not a PNG, JPEG or WebP (a GIF, say), that
 does not decode, or that decodes to more than `image.max_condition_mipx` is a
 `400`. `image.max_condition_decodes` edits decode at a time; the others wait
 their turn. The image model itself refuses, as `400 image_refused` in its own
-words, a prompt too long for its positions (about 8,000 tokens) and a condition
-image its encoder would not take at its condition size (a panorama past 200:1).
+words and before anything is encoded, a prompt too long for its positions
+(about 8,000 tokens) and a condition image its encoder would not take at its
+condition size (a panorama past 200:1).
 
 **The queue.** One image job runs at a time and `image.queue_depth` wait in
 order; a full queue answers `503 engine_full` with `Retry-After`. A client that
@@ -996,7 +999,8 @@ running or queued job counts as use for [idle unload](#idle-unload).
 | `max_condition_images` | `10` | The most condition images one edit may send (1..10). |
 | `max_condition_mipx` | `16` | The largest a condition image may decode to, in Mi pixels of 1,048,576 each (1..64); a larger one is refused. 16 takes any phone camera and bounds each image's frame at 64 MiB; an edit decodes up to `max_condition_images` of them. |
 | `max_condition_decodes` | `1` | The most edits that decode their condition images at once (1..16); the others wait their turn. |
-| `sizes` | the eight above | The sizes a request may ask for. The load sizes the image model's working memory for the largest, so a larger size added live is served after the next load. |
+| `sizes` | the eight above | The sizes a request may ask for, each side a multiple of 32 up to 16384. The load sizes the image model's working memory for the largest within `max_target_cells`, so a larger size added live is served after the next load. |
+| `max_target_cells` | `16800` | The largest image the image model's load makes room for, in latent cells of 16x16 pixels (1..1048576): 16,800 is 2400x1792, the largest preset. A size in `sizes` past it is not served, and the load warns. Read by the load, so a change holds from the next one. |
 | `condition_budget_tokens` | `0` | Lowers the condition budget (0 is the whole budget the load planned). |
 | `min_condition_budget_tokens` | `8191` | The least condition budget the image model's load accepts (0..1048576); a load whose VRAM leaves less is refused, naming the shortfall. 8,191 is the longest text-to-image prompt the model's positions admit; 0 takes any. Read by the load, so a change holds from the next one. |
 | `condition_floor_px` | `512` | The smallest a condition image may be scaled to, as the side of a square of the same area (32..1024). |

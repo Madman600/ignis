@@ -83,18 +83,24 @@ WebP, decoded to RGBA):
   1696x2528, 2752x1536, 1536x2752;
 - 1024x1024, diffusers' own default output, which OpenAI clients often send.
 
-All are multiples of 32.
+All are multiples of 32. A side is at most 16,384 pixels (321f). The load
+sizes its arena for the largest size within `image.max_target_cells`
+(16,800 cells, 2400x1792, by default; 321f). A size past it is not served,
+and the load warns (`ignis.image.sizes_not_served`).
 
 ### The condition budget
 
 - Condition images are resized to 1024² area each, keeping their aspect
   ratio, with sides rounded to 32 (diffusers' `calculate_dimensions`).
 - If the prompt plus all condition images exceed the condition budget (spec
-  04), every condition image is scaled down by the same factor until they
-  fit, never below `image.condition_floor_px`² area before the sides are
-  rounded to 32 (the rounding may take an image a little under it: 672x384
-  at a 512 floor).
-- Below the floor the request is `400`, naming the budget.
+  04), or the room the runner has for them beside it (the leaf's arena, the
+  RoPE positions before the target; 321f), every condition image is scaled
+  down by the same factor until they fit, never below
+  `image.condition_floor_px`² area before the sides are rounded to 32 (the
+  rounding may take an image a little under it: 672x384 at a 512 floor).
+- Below the floor the request is `400`, naming the budget (or the room).
+- A condition the runner refuses at diffusers' sizes (a panorama past 200:1)
+  is `400 image_refused`, in its words (321f).
 - `image.condition_budget_tokens` (0 = the plan's whole budget) lowers the
   budget.
 
@@ -486,7 +492,8 @@ The workspace on 08c23b3, which 322c never recorded, was 2896/0/6.
     panicking while a runner's panic unwinds: no abort. A route test now
     drives a runner whose step panics: `500 engine_error`, the prefix
     released, the model serving the next request. The shutdown half is
-    322c's unit test.
+    322c's unit test. (321f: the model no longer serves on; it fails, see
+    "As built (321f)".)
   - **F2.** The decode cap is `image.max_condition_mipx` (16 Mi pixels by
     default, 1..=64, live), named in the 400; `Server.image_decodes`, one
     permit, holds each edit's decode.
@@ -752,7 +759,8 @@ e74a0e6..HEAD.
 - **For #321.** A runner that panicked keeps serving: the job is `500
   engine_error` and its prefix is released. With the real leaf, a panic may
   leave device state behind, so the adapter should then fail the model
-  (status `failed`, with a switch or reload as the way back).
+  (status `failed`, with a switch or reload as the way back). (321f: done,
+  as an unload the next request loads back from; see "As built (321f)".)
 - **Also.** `tests/idle_unload.rs`' `unloaded()` waits for the unload to
   free the switch's slot. Under CPU load, four tests met the slot still held
   (`409 switch_in_progress`).
@@ -775,11 +783,15 @@ side of the seam:
   condition size the encoder's processor would not keep (past 200:1, off the
   32-pixel grid, under its pixel floor), counts one past the plan's budget.
   `budget::fit` then scales the images for those limits as for the budget.
+  (321f: superseded. The count now says why it has none: no room is scaled
+  for, and a size the processor would not keep is `400 image_refused`.)
 - **`max_target_cells`** is the largest of `image.sizes` at load, and the
   leaf's arena is sized for it: 16,800 cells by default. So at load no
   configured size is past the plan, and the `ignis.image.sizes_not_served`
   warning fires only for a size a live `PATCH` added; that size is served
-  after the next load.
+  after the next load. (321f: superseded. The arena takes the largest size
+  within `image.max_target_cells`, and the warning fires at load for every
+  size past it.)
 - **A refusal of the runner's own** is `ImageError::Refused`, answered
   `400 invalid_request_error` with code `image_refused` in the runner's words
   (whole, or as the stream's `error` event), logged `ignis.image.job_refused`
@@ -793,8 +805,35 @@ side of the seam:
 - **A corner for the fit.** The processor's 200:1 limit is not monotone in
   the area, and `fit` reads the floor first: ten 16380x100 panoramas round to
   6560x32 at the 512 floor and are refused `400 condition_budget_exceeded`,
-  though 12800x64 would serve. Not changed here.
+  though 12800x64 would serve. Not changed here. (321f: fixed. The fit no
+  longer reads the floor first.)
 - **AC 14.** The routes now run on the real leaf through the router
   (`tests/image_runner_gpu.rs`: a 1024² generation in 1.70 s and an edit in
   2.25 s, the same bytes twice each). The live run from the Playground,
   switching from the 27B and back, remains the owner's.
+
+## As built (321f, 2026-10-14, branch `image-leaf-321`: the review-321d close-out)
+
+Spec 04's "As built (321f)" has the details. On this side of the seam:
+
+- **Refusals.** Two requests are `400 image_refused` in the model's words,
+  at the fit, before anything is encoded:
+  - a condition image the model refuses at its condition size (a panorama
+    past 200:1);
+  - a prompt with no image that runs past the model's positions.
+
+  When the condition images have no room even at the floor, the answer is
+  `400 condition_budget_exceeded`, naming the room. The OpenAPI descriptions
+  and the user README say so.
+- **The fit's corner is fixed** (321d's): the fit no longer reads the floor
+  first.
+- **`image.max_target_cells`** is a new live field: 16,800 cells by default,
+  1..=2^20, read by the load. The arena is sized for the largest of
+  `image.sizes` within it. A size past it is not served, and the load warns
+  `ignis.image.sizes_not_served`. `image.sizes` takes sides up to 16,384.
+- **A runner that panics fails its model.** Its request gets `500
+  engine_error`, and at once the queue closes and the runner is dropped.
+  Then the model is unloaded, and the next request loads it again. Without
+  a switcher the answer is `503 model_stopped`.
+- **AC 14** remains the owner's. Spec 04's "As built (321f)" has the notes
+  for it.

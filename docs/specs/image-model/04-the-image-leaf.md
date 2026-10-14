@@ -767,6 +767,9 @@ branch merged `image-serving-322` first (d7447b4; the conflicts were additive:
 
   So `budget::fit` scales the images for those limits too, and
   `encode_condition` refuses them, 400, before any image is prepared.
+  (321f: superseded. The count carries a reason instead: the arena's
+  shortfall is no room, scaled for; a size the processor would not keep is
+  refused, `400 image_refused`. See "As built (321f)".)
   Measured on an oversubscribed 40 GiB budget (93,888 tokens): ten 13120x96
   images, the worst condition size (49,200 cells, 1,230 merged tokens each),
   count 93,889 for the arena, and the fit lands on 12800x64. On this card's
@@ -775,7 +778,8 @@ branch merged `image-serving-322` first (d7447b4; the conflicts were additive:
   is the largest of `image.sizes` in latent cells: 16,800 (2400x1792) by
   default. It sets both `ImageLeafOptions.max_target_tokens` (the arena) and
   `ImagePlan.max_target_cells` (the routes' `takes`). A larger size added by
-  a live `PATCH` is served after the next load.
+  a live `PATCH` is served after the next load. (321f: within
+  `image.max_target_cells`, a new field; a size past it is not served.)
 - **The calls.**
   - `encode_condition`: the count (`Refused`, or `OverBudget` past the
     plan's budget), `EncoderFrontend::input`, then the leaf's encode. Its
@@ -834,7 +838,7 @@ branch merged `image-serving-322` first (d7447b4; the conflicts were additive:
      `PATCH` of it holds live.
   3. **Past the arena or the processor, the count is `budget + 1`**, not an
      error of its own. A fit refused there names a token count one past the
-     budget.
+     budget. (321f: replaced by `ConditionUnfit`.)
   4. **The latents cross to the host every step**, the trait's contract,
      with no skip for an unchanged upload: about 4 MiB each way at 2K,
      against 0.7 s steps.
@@ -852,7 +856,8 @@ branch merged `image-serving-322` first (d7447b4; the conflicts were additive:
     monotone in the area, and `budget::fit` reads the floor first. Ten
     16380x100 panoramas at the default 512 floor round to 6560x32, past
     200:1, and the request is refused `400 condition_budget_exceeded`,
-    though 12800x64 would serve (the GPU test fits from 640).
+    though 12800x64 would serve (the GPU test fits from 640). (321f: fixed;
+    the GPU test fits from 512.)
 - **Gates.**
   - The CTest under the profile (`kernel/build.ps1 -Test`,
     `IGNIS_GPU_PROFILE=1`): 124/124.
@@ -1082,8 +1087,9 @@ Status, one line per AC (the AC 11 run, below, on dbc760e):
     W8A8's.
   - Still open, from 322g: a runner that panicked keeps serving. With the
     real leaf, a panic may leave device state behind, and the adapter could
-    then fail the model.
+    then fail the model. (321f: done.)
   - Still open, from 321d: spec 05's fit corner (ten 16380x100 panoramas).
+    (321f: fixed.)
 - **Gates** (on dbc760e; the docs commit follows):
   - The CTest under the profile (`kernel/build.ps1 -Test`,
     `IGNIS_GPU_PROFILE=1`): 124/124.
@@ -1098,3 +1104,106 @@ Status, one line per AC (the AC 11 run, below, on dbc760e):
     `image_runner_gpu` (3), `image_leaf_timing_gpu`.
   - The 27B's vision tests 7/7 under the profile.
   - `npm test` in `web/`: 860 passed.
+
+## As built (321f, 2026-10-14: the review-321d close-out)
+
+Status: no AC changes status. ACs 1-11 stay done as 321e left them. AC 1's
+plan line is now the message of a named event (L3, below). The work is
+review-321d's F1, F2, L1-L3 and its two information items
+(`.scratch/orchestra/reviews/review-321d.md`), and 322g's note on a runner
+that panics. Commits 05b6c7c..HEAD on `image-leaf-321`.
+
+- **F1: the count carries a reason.** `ImageRunner::condition_tokens`
+  returns `Result<u64, ConditionUnfit>` (`ignis_core::image`). The magic
+  `budget + 1` (321d's default 3) is gone. The three outcomes:
+  - `Ok`: the prefix's tokens, also past the budget (the fit scales for
+    that);
+  - `NoRoom(why)`: within the budget, but past a limit beside it, the
+    arena (`ImageLeaf::condition_fits`) or the RoPE table (L1). Smaller
+    images may fit, so `budget::fit` scales them;
+  - `Refused(why)`: a size the processor would not keep
+    (`ImageProcessor::keeps`: past 200:1, off the grid, under its floor), a
+    prompt the template refuses, or a limit beside the budget with no image
+    to scale. The answer is `400 image_refused` in those words, before
+    anything is encoded. A 250:1 source now reads "condition image 0 is
+    16192x64: the encoder's processor refuses it (... at most 200:1)", not
+    a budget message with the wrong advice.
+- **The fit (spec 05).** `budget::fit` returns `NotFitted`:
+  - `OverBudget` and `NoRoom { floor, why }` are `400
+    condition_budget_exceeded`; `Refused` is `400 image_refused`.
+  - A refusal at 1024² is final: those are diffusers' own sizes.
+  - Below 1024², the fit bisects without reading the floor first. It
+    remembers the largest side it saw fit, and a refused size counts as one
+    that does not fit.
+  - So 321d's corner is fixed. Ten 16380x100 panoramas over a 30,000-token
+    budget land on 11968x64 (CPU test), where the floor's own 6560x32 is
+    past 200:1. On the 40 GiB budget the GPU test fits them from the default
+    512 floor.
+  - Where 200:1 is not monotone in the area, the fit may land below the
+    largest side that fits, never on one that does not.
+- **L1: the RoPE table.** The count runs the kernel's own rule
+  (`image_dit::rope_positions`, host-side) over the prefix laid out in a
+  fixed order: text first, then each image's block, then a one-cell target
+  (`target_rope_layout`).
+  - The order moves no position the rule checks: a text token moves the
+    position by one, an image block by its longer side.
+  - A target's shape moves only its own rows. `image.sizes` keeps its sides
+    within the table (F2).
+  - Past the table, the count is `NoRoom` with images and `Refused` with
+    none. So a 9,000-word prompt is refused at the fit, before the encode.
+  - GPU: five 12800x64 images take 4,000 positions. With ~4,300 more words
+    the count is `NoRoom`, and the fit scales the images until the target
+    has a position.
+- **F2: the arena's cap.** `image.max_target_cells` is a new field:
+  - latent cells, 1..=2^20, default 16,800 (`MAX_TARGET_TOKENS`);
+  - `[Visible, Patchable]`, read by the load as `image.sizes` is.
+
+  `max_target_cells(sizes, cap)` is the largest size within the cap, or the
+  cap when none is. An oversized `image.sizes` entry no longer grows the
+  arena or refuses the next load, an idle unload's reload included. It is
+  not served, and `ignis.image.sizes_not_served` fires at load.
+  `image.sizes` refuses a side past 16,384 pixels (`MAX_IMAGE_SIDE`): at
+  most 2^20 cells, and a target's RoPE block within the table. Without
+  `cuda` the fake plans what the leaf would, so a CPU test covers the
+  warning.
+- **L2.** The `Send` comment says the runner is sound for device 0 only.
+  Kernel launches and the GEMM's `require_prepared` run on the thread's
+  current device.
+- **L3.** `images::leaf::log_plan` emits the load's plan as one
+  `ignis.image.plan` event. Its fields are `mode`, `free_at_start_bytes`,
+  `budget_bytes`, `weights_bytes`, `arena_bytes`, `condition_budget_tokens`,
+  `condition_budget_bytes`, `max_target_cells` and `load_s`; its message is
+  the plan's line. The leaf's own unnamed line is gone; core's GPU tests
+  print the line themselves.
+- **Information items.**
+  - One on-white blend (`image_encoder_input::blend_on_white`) serves the
+    opaque answer and the encoder's copy. It is checked against the
+    nearest-byte formula for every colour at every alpha.
+  - `image_runner_gpu` adds n = 2 through HTTP: image 1 of seed 7 is image 0
+    of seed 8, byte for byte.
+- **322g's note: a runner that panics fails its model.**
+  - `job::spawn` catches the panic on its blocking thread. The prefix was
+    already released as the job unwound.
+  - The queue closes, so no job behind it reaches the runner, and the
+    runner is dropped. Both happen before the job stops counting. The
+    request still gets `500 engine_error`.
+  - `model_switch::unload_failed` then unloads the model as the idle clock
+    does. It acts only while that model is still the one serving, under the
+    switch's slot. The status reads `unloaded`, `ignis.model.unloaded`
+    carries the reason, and the next request loads the model again
+    (`model_kind.rs`).
+  - Without a switcher (tests only) the model stays closed: `503
+    model_stopped`.
+- **Defaults taken** (the owner may revisit):
+  1. **A refusal at 1024² is final**, even where a smaller common area
+     would pass 200:1: diffusers refuses those sizes too.
+  2. **No room even at the floor is `condition_budget_exceeded`**, with the
+     runner's words, not `image_refused`. The remedy is the budget's: fewer
+     or smaller images, or a shorter prompt.
+  3. **The fit bisects** and does not scan every side.
+  4. **With no `image.sizes` entry within the cap, the arena is the cap.**
+  5. **A runner that panics unloads its model** (status `unloaded`, not
+     `failed`), so the next request loads it again. The job's
+     `ignis.image.job_panicked` names the panic.
+  6. **The RoPE check's target block is one cell.** `MAX_IMAGE_SIDE` keeps
+     every served target's rows within the table.
