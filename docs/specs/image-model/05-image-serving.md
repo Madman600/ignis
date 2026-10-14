@@ -738,7 +738,10 @@ e74a0e6..HEAD.
   - **L1, scaled images.** An image the budget scales is resized again from
     its 1024²-area copy, not from the source: two Lanczos passes where there
     was one. diffusers has no scaled case to match. The unscaled case is the
-    single pass from the source it always was.
+    single pass from the source it always was. A source smaller than 1024² of
+    area is upscaled at once too (a 64x32 PNG is held as 1440x736, about
+    4 MiB): what an edit holds while it waits is bounded by 10 such images,
+    not 10 frames of up to 64 MiB.
   - **L2, the records.** Each leg is recorded with its own ends, not one
     record from the first model to the last, so that a restored or failed
     outcome names the model actually loaded again.
