@@ -16,9 +16,10 @@
 //! `encode_condition` (the condition images' VAE encodes, the vision tower and the text encoder,
 //! `txt_in` and `img_in`, and the DiT over the prefix tokens at t = 0, storing the condition
 //! prefix's K/V in 8 bits), `denoise_step` (the DiT over the target tokens, attending to the stored
-//! prefix, then the Euler update on the device) and `vae_encode`. The DiT's program is the kernel
-//! leaf's (`kernel/include/ignis_image_transformer.h`, [`crate::image_transformer`]); the VAE
-//! encoder is [`crate::image_autoencoder`]'s.
+//! prefix, then the Euler update on the device), `vae_decode` (the image's latents to RGBA bytes,
+//! in the arena, in bands) and `vae_encode`. The DiT's program is the kernel leaf's
+//! (`kernel/include/ignis_image_transformer.h`, [`crate::image_transformer`]); the VAE is
+//! [`crate::image_autoencoder`]'s.
 
 use crate::vram::VramMode;
 
@@ -157,6 +158,16 @@ impl LatentNorm {
         for (i, z) in latents.iter_mut().enumerate() {
             let c = i % channels;
             *z = (*z - self.mean[c]) / self.std[c];
+        }
+    }
+
+    /// Packed latents `[tokens][channels]`, in place: `z · std + mean`, the decode's input, the
+    /// product rounded, then the sum, as the pipeline's fp32 path computes them.
+    pub fn denormalize(&self, latents: &mut [f32]) {
+        let channels = self.mean.len();
+        for (i, z) in latents.iter_mut().enumerate() {
+            let c = i % channels;
+            *z = *z * self.std[c] + self.mean[c];
         }
     }
 }
@@ -387,7 +398,7 @@ mod device {
     use ignis_artifact::{materialize, CudaDevice, Device, DeviceBuffer, MaterializedArtifact, ObjectHandle, Reader};
 
     use super::{ImagePlan, ImagePlanError, ImagePlanRequest, LatentNorm, PrefixLayout, Sampler, MAX_TARGET_TOKENS};
-    use crate::image_autoencoder::{self as autoencoder, VaeConfig, VaeEncoderWeights};
+    use crate::image_autoencoder::{self as autoencoder, VaeConfig, VaeDecoderWeights, VaeEncoderWeights};
     use crate::image_encoder::{self, embed_rows, TextEncoderConfig, TextEncoderWeights};
     use crate::image_transformer::{self as transformer, ffi as tffi, TransformerConfig, TransformerWeights};
     use crate::image_vision::{self, vision_call, VisionCall, VisionTowerConfig, VisionWeights};
@@ -705,6 +716,48 @@ mod device {
         }
     }
 
+    /// `vae_decode`'s phase of the sequential region, from where it starts: the decoder's input (the
+    /// denormalized latents in BF16), its fp32 output image, then its workspace for bands of
+    /// `band_rows` image rows.
+    struct DecodePhase {
+        input: u64,
+        image: u64,
+        workspace: u64,
+        workspace_bytes: u64,
+        bytes: u64,
+        band_rows: u32,
+    }
+
+    impl DecodePhase {
+        fn new(geometry: &ignis_artifact::qwen_image::VaeGeometry, width: u32, height: u32, band_rows: u32) -> Self {
+            let pixels = width as u64 * height as u64;
+            let input = 0;
+            let image = input + align(pixels / 256 * LATENT as u64 * 2);
+            let workspace = image + align(pixels * geometry.out_channels * 4);
+            let workspace_bytes = autoencoder::decode_workspace_bytes(geometry, height, width, band_rows);
+            Self { input, image, workspace, workspace_bytes, bytes: workspace + workspace_bytes, band_rows }
+        }
+
+        /// The phase in bands of the most image rows (a multiple of 16, at most the image's height)
+        /// whose bytes fit `region`; Err when not even 16 rows do.
+        fn fitting(geometry: &ignis_artifact::qwen_image::VaeGeometry, width: u32, height: u32, region: u64) -> Result<Self, String> {
+            let mut rows = height;
+            loop {
+                let phase = Self::new(geometry, width, height, rows);
+                if phase.bytes <= region {
+                    return Ok(phase);
+                }
+                if rows <= 16 {
+                    return Err(format!(
+                        "the VAE decode of a {width} x {height} image needs {} bytes of arena in bands of 16 rows, the arena holds {region}",
+                        phase.bytes
+                    ));
+                }
+                rows -= 16;
+            }
+        }
+    }
+
     fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
         unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     }
@@ -723,13 +776,14 @@ mod device {
         vision: VisionWeights,
         transformer: TransformerWeights,
         vae: VaeEncoderWeights,
+        decoder: VaeDecoderWeights,
         sampler: Sampler,
         latent_norm: LatentNorm,
         plan: ImagePlan,
         layout: Layout,
         arena: Option<DeviceBuffer>,
-        /// The started image's target tokens.
-        image: Option<u32>,
+        /// The started image's shape, (height, width) in latent tokens.
+        image: Option<(u32, u32)>,
         dev: CudaDevice,
     }
 
@@ -782,10 +836,11 @@ mod device {
                 let vision = VisionWeights::new(&artifact, &bound.handles, &geometry.vision, &tower_config).map_err(failed("the vision tower"))?;
                 let transformer = TransformerWeights::new(&artifact, &bound.handles, &geometry.dit, transformer_config).map_err(failed("the DiT"))?;
                 let vae = VaeEncoderWeights::new(&artifact, &bound.handles, &geometry.vae).map_err(failed("the VAE encoder"))?;
+                let decoder = VaeDecoderWeights::new(&artifact, &bound.handles, &geometry.vae).map_err(failed("the VAE decoder"))?;
                 image_gemm::prepare().map_err(failed("image_gemm::prepare"))?;
-                Ok((text, vision, transformer, vae, sampler, latent_norm))
+                Ok((text, vision, transformer, vae, decoder, sampler, latent_norm))
             })();
-            let (text, vision, transformer, vae, sampler, latent_norm) = match built {
+            let (text, vision, transformer, vae, decoder, sampler, latent_norm) = match built {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = artifact.release_arena(&mut dev);
@@ -807,6 +862,7 @@ mod device {
                 vision,
                 transformer,
                 vae,
+                decoder,
                 sampler,
                 latent_norm,
                 plan,
@@ -825,6 +881,13 @@ mod device {
         /// The denoising schedule.
         pub fn sampler(&self) -> &Sampler {
             &self.sampler
+        }
+
+        /// The device's free memory (cudaMemGetInfo) once the legacy stream has drained: what a job's
+        /// calls leave behind is measured against it (spec image-model/04 acceptance 8).
+        pub fn device_free_bytes(&mut self) -> Result<u64, ImageLeafError> {
+            sync()?;
+            self.dev.free_bytes().ok_or_else(|| ImageLeafError::Failed("the device reports no free memory".into()))
         }
 
         /// The vision tower's descriptors (for `encode_condition`'s condition images).
@@ -846,10 +909,14 @@ mod device {
         }
 
         fn download_f32(&mut self, offset: u64, count: usize) -> Result<Vec<f32>, ImageLeafError> {
+            let arena = *self.arena();
+            self.download_f32_from(&arena, offset, count)
+        }
+
+        fn download_f32_from(&mut self, buffer: &DeviceBuffer, offset: u64, count: usize) -> Result<Vec<f32>, ImageLeafError> {
             sync()?;
             let mut bytes = vec![0u8; count * 4];
-            let arena = *self.arena();
-            self.dev.copy_d2h(&arena, offset, &mut bytes).map_err(|e| failed("a download")(e.to_string()))?;
+            self.dev.copy_d2h(buffer, offset, &mut bytes).map_err(|e| failed("a download")(e.to_string()))?;
             self.dev.synchronize().map_err(|e| failed("a download")(e.to_string()))?;
             Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
         }
@@ -1223,7 +1290,7 @@ mod device {
             unsafe { image_dit::rope_table(self.at(self.layout.positions) as *const i32, tokens, self.at(self.layout.rope) as *mut f32, std::ptr::null_mut()) }
                 .map_err(failed("the target's RoPE table"))?;
             sync()?;
-            self.image = Some(tokens);
+            self.image = Some((height, width));
             Ok(())
         }
 
@@ -1237,7 +1304,7 @@ mod device {
         /// block of `taps`.
         pub fn denoise_step_tapped(&mut self, condition: &Condition, step: usize, taps: &[u32]) -> Result<Vec<Vec<f32>>, ImageLeafError> {
             self.check_taps(taps)?;
-            let tokens = self.image.ok_or_else(|| ImageLeafError::Refused("denoise_step before start_image".into()))?;
+            let tokens = self.image.map(|(h, w)| h * w).ok_or_else(|| ImageLeafError::Refused("denoise_step before start_image".into()))?;
             if step >= self.sampler.steps() {
                 return Err(ImageLeafError::Refused(format!("step {step} of a {}-step schedule", self.sampler.steps())));
             }
@@ -1279,7 +1346,7 @@ mod device {
         /// Overwrites the started image's latents (packed fp32 `[tokens][64]`): a teacher-forced
         /// step's input.
         pub fn set_latents(&mut self, latents: &[f32]) -> Result<(), ImageLeafError> {
-            let tokens = self.image.ok_or_else(|| ImageLeafError::Refused("set_latents before start_image".into()))?;
+            let tokens = self.image.map(|(h, w)| h * w).ok_or_else(|| ImageLeafError::Refused("set_latents before start_image".into()))?;
             if latents.len() != tokens as usize * LATENT {
                 return Err(ImageLeafError::Refused(format!("{} latents for {tokens} tokens of 64", latents.len())));
             }
@@ -1290,14 +1357,81 @@ mod device {
 
         /// The started image's latents, packed fp32 `[tokens][64]`.
         pub fn latents(&mut self) -> Result<Vec<f32>, ImageLeafError> {
-            let tokens = self.image.ok_or_else(|| ImageLeafError::Refused("latents before start_image".into()))?;
+            let tokens = self.image.map(|(h, w)| h * w).ok_or_else(|| ImageLeafError::Refused("latents before start_image".into()))?;
             self.download_f32(self.layout.latents, tokens as usize * LATENT)
         }
 
         /// The last step's velocity, packed fp32 `[tokens][64]`.
         pub fn velocity(&mut self) -> Result<Vec<f32>, ImageLeafError> {
-            let tokens = self.image.ok_or_else(|| ImageLeafError::Refused("velocity before start_image".into()))?;
+            let tokens = self.image.map(|(h, w)| h * w).ok_or_else(|| ImageLeafError::Refused("velocity before start_image".into()))?;
             self.download_f32(self.layout.velocity, tokens as usize * LATENT)
+        }
+
+        /// `vae_decode` (spec image-model/04): the started image's latents (the image slot), `z · std
+        /// + mean`, the VAE decoder, the clamp: RGBA8 bytes `[16 h][16 w][4]` on the host. The decoder
+        /// runs in the arena's sequential region, after the mid block in bands of the most image
+        /// rows (a multiple of 16) that fit it; it allocates nothing.
+        pub fn vae_decode(&mut self) -> Result<Vec<u8>, ImageLeafError> {
+            let (h, w) = self.image.ok_or_else(|| ImageLeafError::Refused("vae_decode before start_image".into()))?;
+            let phase = DecodePhase::fitting(self.decoder.geometry(), 16 * w, 16 * h, self.layout.seq_bytes).map_err(ImageLeafError::Refused)?;
+            let arena = *self.arena();
+            self.decode_in(&arena, self.layout.seq, &phase)
+        }
+
+        /// [`ImageLeaf::vae_decode`] in bands of `band_rows` image rows (the image's height: unbanded),
+        /// and the rows a band of [`ImageLeaf::vae_decode`] would take. When the phase does not fit
+        /// the arena's sequential region, its memory is allocated for the call, outside the plan: a
+        /// test's or a diagnosis' reference (spec image-model/04 acceptance 6), never the server's
+        /// path.
+        pub fn vae_decode_in_bands(&mut self, band_rows: u32) -> Result<(Vec<u8>, u32), ImageLeafError> {
+            let (h, w) = self.image.ok_or_else(|| ImageLeafError::Refused("vae_decode before start_image".into()))?;
+            let geometry = self.decoder.geometry().clone();
+            let planned = DecodePhase::fitting(&geometry, 16 * w, 16 * h, self.layout.seq_bytes).map_err(ImageLeafError::Refused)?.band_rows;
+            if band_rows == 0 || band_rows > 16 * h {
+                return Err(ImageLeafError::Refused(format!("bands of {band_rows} rows for an image of {} rows", 16 * h)));
+            }
+            let phase = DecodePhase::new(&geometry, 16 * w, 16 * h, band_rows);
+            let rgba = if phase.bytes <= self.layout.seq_bytes {
+                let arena = *self.arena();
+                self.decode_in(&arena, self.layout.seq, &phase)
+            } else {
+                let buffer = self.dev.allocate(phase.bytes).map_err(|e| failed("the decode's workspace")(e.to_string()))?;
+                let rgba = self.decode_in(&buffer, 0, &phase);
+                let _ = sync();
+                let _ = self.dev.deallocate(buffer);
+                rgba
+            }?;
+            Ok((rgba, planned))
+        }
+
+        /// The decode with its phase at `at` in `buffer`: the latents denormalized on the host (fp32,
+        /// two roundings, the pipeline's) and rounded to BF16 once, the decoder, conv_out's fp32
+        /// output to the host, then the pipeline's clamp and rounding to bytes.
+        fn decode_in(&mut self, buffer: &DeviceBuffer, at: u64, phase: &DecodePhase) -> Result<Vec<u8>, ImageLeafError> {
+            let (h, w) = self.image.ok_or_else(|| ImageLeafError::Refused("vae_decode before start_image".into()))?;
+            let (height, width) = (16 * h, 16 * w);
+            let mut latents = self.download_f32(self.layout.latents, (h * w) as usize * LATENT)?;
+            self.latent_norm.denormalize(&mut latents);
+            self.dev.copy_h2d(buffer, at + phase.input, bytes_of(&autoencoder::latents_bf16(&latents))).map_err(|e| failed("the latents' upload")(e.to_string()))?;
+            self.dev.synchronize().map_err(|e| failed("the latents' upload")(e.to_string()))?;
+            let base = buffer.base_ptr() as *mut u8;
+            let ptr = |offset: u64| unsafe { base.add((at + offset) as usize) as *mut c_void };
+            unsafe {
+                autoencoder::decode(
+                    &self.decoder,
+                    ptr(phase.input),
+                    height,
+                    width,
+                    phase.band_rows,
+                    ptr(phase.image) as *mut f32,
+                    ptr(phase.workspace),
+                    phase.workspace_bytes,
+                )
+            }
+            .map_err(failed("the VAE decoder"))?;
+            let channels = self.decoder.geometry().out_channels as usize;
+            let image = self.download_f32_from(buffer, at + phase.image, height as usize * width as usize * channels)?;
+            Ok(autoencoder::rgba8(&image))
         }
     }
 
@@ -1406,6 +1540,16 @@ mod tests {
         assert!(LatentNorm::parse(&json(serde_json::json!([0.0]), serde_json::json!([1.0, 1.0])), 2).unwrap_err().contains("1 latents_mean"));
         assert!(LatentNorm::parse(&json(serde_json::json!([0.0, 0.0]), serde_json::json!([1.0, 0.0])), 2).unwrap_err().contains("not positive"));
         assert!(LatentNorm::parse(b"{}", 2).unwrap_err().contains("no latents_mean"));
+    }
+
+    #[test]
+    fn the_latents_are_denormalized_per_channel_with_two_roundings() {
+        let norm = LatentNorm { mean: vec![0.25, -1.0], std: vec![3.5, 1.0 + f32::EPSILON] };
+        // Channel 0: 2 x 3.5 + 0.25 = 7.25 exactly. Channel 1: (1 + 2^-23)^2 = 1 + 2^-22 + 2^-46
+        // rounds to 1 + 2^-22, minus 1 is 2^-22; a fused multiply-add would keep the 2^-46.
+        let mut z = [2.0f32, 1.0 + f32::EPSILON, 1.0, 1.0];
+        norm.denormalize(&mut z);
+        assert_eq!(z, [7.25, 2f32.powi(-22), 3.75, f32::EPSILON]);
     }
 
     #[test]
