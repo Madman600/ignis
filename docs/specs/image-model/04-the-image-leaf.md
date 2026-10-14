@@ -909,8 +909,15 @@ Status, one line per AC (the AC 11 run, below, on dbc760e):
     `Sampler::dit_timestep`: fl(fl(1000σ) · fl(1/1000)). That is torch's
     `timestep / 1000` on the GPU, a product by the reciprocal. It equals
     the recorded `dit_timesteps` bit for bit; σ and a true division by 1000
-    are each 1 ulp off at steps 1, 2, 3 and 6 (CPU test). The AC 3/4
-    numbers moved by at most 0.1 point.
+    are each 1 ulp off at steps 1, 2, 3 and 6 (CPU test). Only those steps'
+    velocities moved against 321a/321b's tables. Steps 0, 4, 5 and 7 read
+    as before, so the move is the timestep's, not a kernel's:
+    - edit step 1: 5.90 → **6.60%**, now above the sim's 6.27% (bound
+      12.53%). 321b's "under the sim at steps 0-3" no longer holds for
+      step 1;
+    - t2i-2k step 1: 5.45 → 5.19% (sim 5.65%);
+    - t2i steps 1-3: 5.29 / 4.76 / 3.57 → 5.19 / 4.68 / 3.48%;
+    - the rest within 0.1 point.
   - **Review-321ab M1, chunked against whole on real weights.**
     `ImageLeafOptions::prefix_chunk` is a test knob, and the server passes
     None. In chunks of 1,024, the edit's image block is cut in four. The

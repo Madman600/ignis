@@ -54,8 +54,8 @@ The DiT loop's run-to-run spread is about ±3%:
 - a dry run 40 minutes earlier: 1.18 s and 5.94 s;
 - the free runs of AC 9 in the same hold: 1.18 s and 5.91 s.
 
-The 2048² steps drift up by about 5% across the 8 steps as the board holds
-its power limit.
+The 2048² steps drift up by up to 7% across the 8 steps (747 to 802 ms in
+the t2i run) as the board holds its power limit.
 
 **The kernel classes.** The kernel leaf's benches ran in the same hold:
 - `ignis_image_gemm_bench --tokens 4096|16384`;

@@ -312,7 +312,8 @@ enhancement and the Playground are the agents after it.
   and defaults, each with flag and env var, `[Visible, Patchable]`, every
   family taking them (they matter while a text model is loaded too). Bounds:
   `queue_depth` 0..=64, `max_n` 1..=64, `max_condition_images` 1..=10 (the
-  encoder's), `condition_floor_px` 32..=1024; `sizes` is its own list kind,
+  encoder's), `condition_floor_px` 32..=1024,
+  `min_condition_budget_tokens` 0..=2^20 (321e); `sizes` is its own list kind,
   each side a multiple of 32; `condition_budget_tokens` and the enhancement
   fields have no bound. The live knobs carry the group
   (`server.live().image`). No `qwenimage21` family scope.
