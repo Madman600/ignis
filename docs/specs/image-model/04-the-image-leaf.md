@@ -1207,3 +1207,31 @@ that panics. Commits 05b6c7c..HEAD on `image-leaf-321`.
      `ignis.image.job_panicked` names the panic.
   6. **The RoPE check's target block is one cell.** `MAX_IMAGE_SIDE` keeps
      every served target's rows within the table.
+- **For the live run (spec 05 AC 14).**
+  - Build first: the server running holds its exe, so stop, `make build`,
+    start.
+  - Through HTTP on this run: the load takes 8.6 s (condition budget 43,840
+    tokens); a 1024² generation 1.71 s, n = 2 3.37 s; a 1024² edit 2.24 s.
+    From 321e's AC 10, a 2-image edit at 2048² should land between 7.6 s
+    (one image) and 10.7 s (four).
+  - The plan is the `ignis.image.plan` line at load.
+  - A condition image past 200:1 answers `400 image_refused`. If a job
+    panics, the model unloads, and the next request loads it again
+    (~9 s).
+- **Gates** (code on 31ed17b):
+  - The CTest under the profile (`kernel/build.ps1 -Test`,
+    `IGNIS_GPU_PROFILE=1`): 124/124.
+  - `CARGO_INCREMENTAL=0 cargo test --workspace`: 2980 passed, 0 failed,
+    6 ignored.
+  - `cargo check -p ignis-server -p ignis-core --features cuda --tests`:
+    ok, with only the old warnings.
+  - Under the profile, the image GPU tests 23/23: core's 16 (as 321e's)
+    and the server's `image_encoder_edit_gpu` (2),
+    `image_leaf_ten_images_gpu`, `image_runner_gpu` (3),
+    `image_leaf_timing_gpu`.
+    - `image_runner_gpu`'s runner-drop check failed once at +84.6 MiB
+      against a 64 MiB tolerance. Run alone, it passed at -46.5 MiB. NVML's
+      free memory includes the desktop's own use, so the tolerance is now
+      256 MiB; a prefix left behind reads about -1,042 MiB.
+  - The 27B's vision tests 7/7 under the profile.
+  - `npm test` in `web/`: 860 passed.
