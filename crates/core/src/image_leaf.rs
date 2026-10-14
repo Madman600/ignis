@@ -2,7 +2,7 @@
 //! one call at a time (ADR 0009). This module holds what the leaf decides on the host:
 //!
 //! - [`Sampler`]: the denoising schedule, from the artifact's `frontend/image_model.json`: the
-//!   `sample_sigmas` followed by a terminal 0, the DiT's timestep σ, and the Euler update
+//!   `sample_sigmas` followed by a terminal 0, the DiT's timestep (within an ulp of σ), and the Euler update
 //!   `x += (σ_next − σ) · v` ([`euler_step`], the host's form of the device update). A scheduler
 //!   config that would change the schedule is refused.
 //! - [`ImagePlan`]: the load's device-memory plan: the weights, one sequential arena, and the
@@ -34,7 +34,8 @@ pub struct Sampler {
     /// The sigmas, each the f32 of the config's number (numpy's `astype(float32)` of the Python
     /// float), then the terminal 0: one more than the steps.
     pub sigmas: Vec<f32>,
-    /// `num_train_timesteps`: a timestep is σ times it, and the DiT reads timestep / it, σ.
+    /// `num_train_timesteps`: a timestep is σ times it, and the DiT reads timestep / it
+    /// ([`Sampler::dit_timestep`]).
     pub train_timesteps: u32,
 }
 
@@ -105,6 +106,15 @@ impl Sampler {
     /// The scheduler's timesteps, σ · `num_train_timesteps` in f32 (one per step).
     pub fn timesteps(&self) -> Vec<f32> {
         self.sigmas[..self.steps()].iter().map(|&s| s * self.train_timesteps as f32).collect()
+    }
+
+    /// The timestep the DiT reads at step `step`: the pipeline's `timestep / 1000`, which torch
+    /// computes on the GPU as the product by the reciprocal, fl(fl(σ · 1000) · fl(1 / 1000)) (the
+    /// recorded `dit_timesteps`). It is σ but at four of the checkpoint's eight steps, 1 ulp off.
+    pub fn dit_timestep(&self, step: usize) -> f32 {
+        let train = self.train_timesteps as f32;
+        let timestep = self.sigmas[step] * train;
+        timestep * (1.0 / train)
     }
 }
 
@@ -258,6 +268,9 @@ pub struct ImagePlanRequest<'a> {
     /// `image.condition_budget_tokens` (spec image-model/05), when named: it can only lower the
     /// budget.
     pub condition_budget_cap: Option<u64>,
+    /// `image.min_condition_budget_tokens`: a load whose condition budget (before the cap) is below
+    /// it is refused, since requests it would serve would be refused one by one.
+    pub min_condition_budget_tokens: u64,
 }
 
 /// The plan the load carries out (spec image-model/04, load and plan).
@@ -281,6 +294,8 @@ pub enum ImagePlanError {
     BudgetAboveFree { budget_bytes: u64, free_bytes: u64 },
     /// The weights and the arena do not fit the budget.
     DoesNotFit { mode: VramMode, budget_bytes: u64, weights_bytes: u64, arena_bytes: u64 },
+    /// The condition budget the weights and the arena leave is below the minimum.
+    BelowMinCondition { mode: VramMode, budget_bytes: u64, left_bytes: u64, tokens: u64, min_tokens: u64, min_bytes: u64 },
 }
 
 impl std::fmt::Display for ImagePlanError {
@@ -312,6 +327,24 @@ impl std::fmt::Display for ImagePlanError {
                     VramMode::Explicit { .. } => f.write_str("raise the VRAM budget (or allow oversubscription)"),
                 }
             }
+            Self::BelowMinCondition { mode, budget_bytes, left_bytes, tokens, min_tokens, min_bytes } => {
+                let short = min_bytes.saturating_sub(left_bytes);
+                write!(
+                    f,
+                    "the image model's condition budget would be {tokens} condition-prefix tokens, below \
+                     image.min_condition_budget_tokens ({min_tokens} tokens, {min_bytes} bytes, {:.2} GiB): the weights and \
+                     arena leave {left_bytes} bytes ({:.2} GiB) of the {budget_bytes}-byte VRAM budget, short by {short} bytes \
+                     ({:.2} GiB); ",
+                    min_bytes as f64 / GIB,
+                    left_bytes as f64 / GIB,
+                    short as f64 / GIB
+                )?;
+                match mode {
+                    VramMode::Derived { .. } => f.write_str("free device memory, lower the VRAM headroom")?,
+                    VramMode::Explicit { .. } => f.write_str("raise the VRAM budget")?,
+                }
+                f.write_str(", or lower image.min_condition_budget_tokens")
+            }
         }
     }
 }
@@ -321,7 +354,8 @@ impl std::error::Error for ImagePlanError {}
 impl ImagePlan {
     /// Lays the plan out: the budget from `mode`, the weights and the arena first, then the
     /// condition budget, the largest prefix whose bytes fit in what they leave (and within the
-    /// cap). Refuses a load whose weights and arena do not fit.
+    /// cap). Refuses a load whose weights and arena do not fit, or leave a condition budget below
+    /// the minimum.
     pub fn new(request: &ImagePlanRequest<'_>) -> Result<Self, ImagePlanError> {
         let free = request.free_at_start_bytes;
         let budget_bytes = match request.mode {
@@ -354,6 +388,16 @@ impl ImagePlan {
             let mid = lo + (hi - lo) / 2;
             if fits(mid) { lo = mid } else { hi = mid }
         }
+        if lo < request.min_condition_budget_tokens {
+            return Err(ImagePlanError::BelowMinCondition {
+                mode: request.mode,
+                budget_bytes,
+                left_bytes: left,
+                tokens: lo,
+                min_tokens: request.min_condition_budget_tokens,
+                min_bytes: (request.prefix_bytes)(request.min_condition_budget_tokens),
+            });
+        }
         let tokens = request.condition_budget_cap.map_or(lo, |cap| cap.min(lo));
         Ok(Self {
             mode: request.mode,
@@ -383,8 +427,14 @@ impl ImagePlan {
 }
 
 /// The largest target the arena is sized for, in latent tokens: 2400 x 1792 pixels (150 x 112),
-/// the largest preset by cells (spec image-model/04's 2752 x 1536 is 16,512).
+/// the largest preset by cells (2752 x 1536 is 16,512).
 pub const MAX_TARGET_TOKENS: u32 = 16_800;
+
+/// The least condition budget a load accepts by default (`image.min_condition_budget_tokens`):
+/// the longest text-to-image prefix the DiT's positions admit, 8,191 tokens. A prompt's text takes
+/// positions 0 .. P and the target's block starts at P, which must be below 8,192
+/// (`ignis_image_dit_rope_positions`), so a load at this budget serves every text-to-image prompt.
+pub const DEFAULT_MIN_CONDITION_BUDGET_TOKENS: u32 = 8_191;
 
 /// Why a call did not run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,7 +472,7 @@ mod device {
     use ignis_artifact::qwen_image::{self, QwenImageGeometry};
     use ignis_artifact::{materialize, CudaDevice, Device, DeviceBuffer, MaterializedArtifact, ObjectHandle, Reader};
 
-    use super::{ImageLeafError, ImagePlan, ImagePlanRequest, LatentNorm, PrefixLayout, Sampler, MAX_TARGET_TOKENS};
+    use super::{ImageLeafError, ImagePlan, ImagePlanRequest, LatentNorm, PrefixLayout, Sampler, DEFAULT_MIN_CONDITION_BUDGET_TOKENS, MAX_TARGET_TOKENS};
     use crate::image_autoencoder::{self as autoencoder, VaeConfig, VaeDecoderWeights, VaeEncoderWeights};
     use crate::image_encoder::{self, embed_rows, TextEncoderConfig, TextEncoderWeights};
     use crate::image_transformer::{self as transformer, ffi as tffi, TransformerConfig, TransformerWeights};
@@ -455,6 +505,12 @@ mod device {
         pub condition_budget_cap: Option<u64>,
         /// The largest target, in latent tokens, the arena is sized for.
         pub max_target_tokens: u32,
+        /// `image.min_condition_budget_tokens`: the least condition budget the load accepts.
+        pub min_condition_budget_tokens: u32,
+        /// A test knob: the prefix pass in chunks of this many tokens (a positive multiple of 128)
+        /// wherever the prefix is longer, even when the whole pass would fit the arena. None: whole
+        /// when it fits, else the largest chunk that does.
+        pub prefix_chunk: Option<u32>,
     }
 
     /// A condition's text: the text encoder's input (the server's `EncoderFrontend` builds it).
@@ -608,7 +664,10 @@ mod device {
         /// The phase of an encoder sequence of `tokens` rows with `pads` image pads (the tower's
         /// merged tokens over the condition images of `sizes`, (width, height) in pixels, one
         /// segment each; none, no tower) and a prefix of `prefix` tokens, in a region of `region`
-        /// bytes; Err names what does not fit. Host-side: it sizes, it allocates nothing.
+        /// bytes; Err names what does not fit. `forced`: the prefix pass in chunks of it when the
+        /// prefix is longer ([`ImageLeafOptions::prefix_chunk`]). Host-side: it sizes, it
+        /// allocates nothing.
+        #[allow(clippy::too_many_arguments)]
         fn new(
             vae: &ignis_artifact::qwen_image::VaeGeometry,
             tokens: u32,
@@ -616,6 +675,7 @@ mod device {
             sizes: &[(u32, u32)],
             prefix: u32,
             region: u64,
+            forced: Option<u32>,
         ) -> Result<Self, String> {
             let (l, p) = (tokens as u64, prefix as u64);
             let mut latents = Vec::with_capacity(sizes.len());
@@ -658,7 +718,10 @@ mod device {
             need("prefix", workspace)?;
             let left = region - workspace;
             let whole = transformer::workspace_bytes(prefix);
-            let chunk = if whole <= left {
+            let chunk = if let Some(chunk) = forced.filter(|&c| c < prefix) {
+                need(&format!("prefix pass in chunks of {chunk}"), workspace + transformer::workspace_bytes(chunk))?;
+                Some(chunk)
+            } else if whole <= left {
                 None
             } else {
                 // The largest multiple of 128 whose workspace fits: the workspace grows with the chunk.
@@ -761,6 +824,31 @@ mod device {
         }
     }
 
+    /// The image rows a band of [`ImageLeaf::vae_decode`] takes for a `width` x `height` image (in
+    /// pixels) in the arena a load sizes for `max_target_tokens` ([`ImageLeafOptions`]); Err when not
+    /// even bands of 16 rows fit it, which `vae_decode` refuses. Host-side, from the shapes alone: a
+    /// load's caller checks with it that every size it serves decodes (spec image-model/05's sizes).
+    pub fn decode_band_rows(max_target_tokens: u32, width: u32, height: u32) -> Result<u32, String> {
+        let geometry = QwenImageGeometry::qwen_image_21_turbo();
+        DecodePhase::fitting(&geometry.vae, width, height, step_bytes(max_target_tokens)).map(|phase| phase.band_rows)
+    }
+
+    /// What `encode_condition`'s phases took (spec image-model/04 acceptance 10), wall time on the
+    /// host with the stream drained after each phase ([`ImageLeaf::encode_condition_timed`]).
+    #[derive(Debug, Clone, Copy, Default, PartialEq)]
+    pub struct EncodeTimes {
+        /// The condition images' VAE encodes, each with its latents' trip through the host.
+        pub vae_s: f64,
+        /// The vision tower on every condition image, its mergers and DeepStack's.
+        pub tower_s: f64,
+        /// The text encoder, with the tower's rows and DeepStack's hooked in.
+        pub encoder_s: f64,
+        /// txt_in on the text rows and img_in on the condition latents.
+        pub projections_s: f64,
+        /// The prefix pass: its RoPE table, the t = 0 modulation and the DiT's 32 blocks.
+        pub prefix_s: f64,
+    }
+
     fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
         unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     }
@@ -787,6 +875,8 @@ mod device {
         arena: Option<DeviceBuffer>,
         /// The started image's shape, (height, width) in latent tokens.
         image: Option<(u32, u32)>,
+        /// [`ImageLeafOptions::prefix_chunk`].
+        prefix_chunk: Option<u32>,
         dev: CudaDevice,
     }
 
@@ -797,6 +887,9 @@ mod device {
         pub fn load(reader: &Reader, mut dev: CudaDevice, options: &ImageLeafOptions) -> Result<Self, ImageLeafError> {
             if options.max_target_tokens == 0 || options.max_target_tokens > 1 << 20 {
                 return Err(ImageLeafError::Refused(format!("max_target_tokens {} is not 1 .. 2^20", options.max_target_tokens)));
+            }
+            if let Some(chunk) = options.prefix_chunk.filter(|&c| c == 0 || c % 128 != 0) {
+                return Err(ImageLeafError::Refused(format!("a prefix chunk of {chunk} tokens is not a positive multiple of 128")));
             }
             let geometry = QwenImageGeometry::qwen_image_21_turbo();
             let bound = qwen_image::bind(reader, &geometry).map_err(|e| failed("the artifact does not bind")(e.to_string()))?;
@@ -819,6 +912,7 @@ mod device {
                 arena_bytes: layout.total(),
                 prefix_bytes: &prefix_bytes,
                 condition_budget_cap: options.condition_budget_cap,
+                min_condition_budget_tokens: options.min_condition_budget_tokens as u64,
             })
             .map_err(ImageLeafError::Plan)?;
 
@@ -872,6 +966,7 @@ mod device {
                 layout,
                 arena: Some(arena),
                 image: None,
+                prefix_chunk: options.prefix_chunk,
                 dev,
             })
         }
@@ -893,18 +988,13 @@ mod device {
             self.dev.free_bytes().ok_or_else(|| ImageLeafError::Failed("the device reports no free memory".into()))
         }
 
-        /// The vision tower's descriptors (for `encode_condition`'s condition images).
-        pub fn vision(&self) -> &VisionWeights {
-            &self.vision
-        }
-
         /// Whether `encode_condition` has room in the arena for a condition of `tokens` encoder
         /// rows, `pads` of them image pads, condition images of `sizes` ((width, height) in
         /// pixels) and a prefix of `prefix` tokens: the limit on a condition beside the condition
         /// budget (ten condition images near 1024² take most of the region in the tower and the
         /// encoder). Host-side, from the shapes alone; Err is `encode_condition`'s refusal.
         pub fn condition_fits(&self, tokens: u32, pads: u32, sizes: &[(u32, u32)], prefix: u32) -> Result<(), String> {
-            EncodePhase::new(self.vae.geometry(), tokens, pads, sizes, prefix, self.layout.seq_bytes).map(|_| ())
+            EncodePhase::new(self.vae.geometry(), tokens, pads, sizes, prefix, self.layout.seq_bytes, self.prefix_chunk).map(|_| ())
         }
 
         fn arena(&self) -> &DeviceBuffer {
@@ -1001,6 +1091,28 @@ mod device {
             images: &[ConditionImage<'_>],
             taps: &[u32],
         ) -> Result<(Condition, Vec<Vec<f32>>), ImageLeafError> {
+            self.encode(text, images, taps, None)
+        }
+
+        /// [`ImageLeaf::encode_condition`], timed phase by phase: the stream is drained after
+        /// each, which the untimed call does not do (spec image-model/04 acceptance 10).
+        pub fn encode_condition_timed(
+            &mut self,
+            text: &ConditionText<'_>,
+            images: &[ConditionImage<'_>],
+        ) -> Result<(Condition, EncodeTimes), ImageLeafError> {
+            let mut times = EncodeTimes::default();
+            let (condition, _) = self.encode(text, images, &[], Some(&mut times))?;
+            Ok((condition, times))
+        }
+
+        fn encode(
+            &mut self,
+            text: &ConditionText<'_>,
+            images: &[ConditionImage<'_>],
+            taps: &[u32],
+            times: Option<&mut EncodeTimes>,
+        ) -> Result<(Condition, Vec<Vec<f32>>), ImageLeafError> {
             self.check_taps(taps)?;
             let tokens = text.input_ids.len();
             if text.positions.len() != 3 * tokens {
@@ -1036,8 +1148,16 @@ mod device {
             };
             // The tower's call is one segment an image (one frame each, checked above), over the pads.
             let sizes: Vec<(u32, u32)> = images.iter().map(|i| (i.width, i.height)).collect();
-            let phase = EncodePhase::new(self.vae.geometry(), tokens as u32, text.image_pad_rows.len() as u32, &sizes, prefix, self.layout.seq_bytes)
-                .map_err(ImageLeafError::Refused)?;
+            let phase = EncodePhase::new(
+                self.vae.geometry(),
+                tokens as u32,
+                text.image_pad_rows.len() as u32,
+                &sizes,
+                prefix,
+                self.layout.seq_bytes,
+                self.prefix_chunk,
+            )
+            .map_err(ImageLeafError::Refused)?;
             let x0 = embed_rows(self.artifact.host_tensor_bytes(self.embed_tokens).map_err(|e| failed("the embedding")(e.to_string()))?, HIDDEN, text.input_ids)
                 .map_err(ImageLeafError::Refused)?;
 
@@ -1063,7 +1183,7 @@ mod device {
                     }
                 },
             };
-            let ran = self.run_prefix(text, images, call.as_ref(), &layout, &x0, &prefix_positions, &phase, &condition, kv.as_ref(), taps);
+            let ran = self.run_prefix(text, images, call.as_ref(), &layout, &x0, &prefix_positions, &phase, &condition, kv.as_ref(), taps, times);
             if let Some(kv) = kv {
                 let _ = sync();
                 let _ = self.dev.deallocate(kv);
@@ -1090,11 +1210,22 @@ mod device {
             condition: &Condition,
             kv: Option<&DeviceBuffer>,
             taps: &[u32],
+            mut times: Option<&mut EncodeTimes>,
         ) -> Result<Vec<Vec<f32>>, ImageLeafError> {
             let seq = self.layout.seq;
             let tokens = text.input_ids.len() as u32;
             let prefix = condition.tokens;
             let null = std::ptr::null_mut();
+            // Timed, each phase ends with the stream drained.
+            let mut clock = Instant::now();
+            let mut lap = |slot: fn(&mut EncodeTimes) -> &mut f64| -> Result<(), ImageLeafError> {
+                if let Some(times) = times.as_deref_mut() {
+                    sync()?;
+                    *slot(times) = clock.elapsed().as_secs_f64();
+                    clock = Instant::now();
+                }
+                Ok(())
+            };
             // The condition images' latents, each VAE encode in the region after them.
             for (k, image) in images.iter().enumerate() {
                 let latents = self.vae_latents(image.width, image.height, image.rgba, seq + phase.vae)?;
@@ -1102,6 +1233,7 @@ mod device {
                 self.dev.synchronize().map_err(|e| failed("the latents' upload")(e.to_string()))?;
             }
             sync()?;
+            lap(|t| &mut t.vae_s)?;
             let pad_rows: Vec<i32> = text.image_pad_rows.iter().map(|&r| r as i32).collect();
             self.upload(seq + phase.x, bytes_of(x0))?;
             self.upload(seq + phase.positions, bytes_of(text.positions))?;
@@ -1120,6 +1252,7 @@ mod device {
                 unsafe { image_vision::forward(&desc, call, embeds[0], Some(&[embeds[1], embeds[2], embeds[3]]), encoder_ws, phase.encoder_workspace_bytes, null) }
                     .map_err(failed("the vision tower"))?;
             }
+            lap(|t| &mut t.tower_s)?;
             let vision = call.map(|_| image_encoder::ffi::ignis_image_encoder_vision {
                 rows: pad_rows.len() as u32,
                 row_index: self.at(seq + phase.pad_rows) as *const i32,
@@ -1142,6 +1275,7 @@ mod device {
                 )
             }
             .map_err(failed("the text encoder"))?;
+            lap(|t| &mut t.encoder_s)?;
 
             // txt_in on each run of text rows, img_in on each image's latents, at their prefix rows;
             // both row by row, so in pieces of at most the pass's rows.
@@ -1184,6 +1318,7 @@ mod device {
                     .map_err(failed("img_in"))?;
                 }
             }
+            lap(|t| &mut t.projections_s)?;
             unsafe { image_dit::rope_table(self.at(seq + phase.prefix_positions) as *const i32, prefix, self.at(seq + phase.rope) as *mut f32, null) }
                 .map_err(failed("the prefix's RoPE table"))?;
             unsafe {
@@ -1212,6 +1347,7 @@ mod device {
                 taps,
             )?;
             sync()?;
+            lap(|t| &mut t.prefix_s)?;
             Ok(tapped)
         }
 
@@ -1302,7 +1438,8 @@ mod device {
         }
 
         /// Denoising step `step` of the started image: the DiT over the target tokens at the
-        /// step's σ, attending to `condition`, then the Euler update of the latents on the device.
+        /// step's timestep ([`Sampler::dit_timestep`]), attending to `condition`, then the Euler
+        /// update of the latents on the device from the step's σ to the next.
         pub fn denoise_step(&mut self, condition: &Condition, step: usize) -> Result<(), ImageLeafError> {
             self.denoise_step_tapped(condition, step, &[]).map(|_| ())
         }
@@ -1323,8 +1460,9 @@ mod device {
             let desc = self.transformer.descriptor();
             let null = std::ptr::null_mut();
             let l = self.layout;
+            let timestep = self.sampler.dit_timestep(step);
             unsafe {
-                transformer::modulation(&desc, sigma, self.at(l.modulation) as *mut f32, self.at(l.out_scale) as *mut f32, self.at(workspace), workspace_bytes, null)
+                transformer::modulation(&desc, timestep, self.at(l.modulation) as *mut f32, self.at(l.out_scale) as *mut f32, self.at(workspace), workspace_bytes, null)
             }
             .map_err(failed("the modulation"))?;
             unsafe { transformer::img_in(&desc, self.at(l.latents) as *const f32, tokens, self.at(x) as *mut f32, self.at(workspace), workspace_bytes, null) }
@@ -1456,9 +1594,16 @@ mod device {
     }
 
     impl ImageLeafOptions {
-        /// The server's VRAM mode, no cap, the arena sized for [`MAX_TARGET_TOKENS`].
+        /// The server's VRAM mode, no cap, the arena sized for [`MAX_TARGET_TOKENS`], the default
+        /// minimum condition budget, the prefix pass whole when it fits.
         pub fn new(vram: VramMode) -> Self {
-            Self { vram, condition_budget_cap: None, max_target_tokens: MAX_TARGET_TOKENS }
+            Self {
+                vram,
+                condition_budget_cap: None,
+                max_target_tokens: MAX_TARGET_TOKENS,
+                min_condition_budget_tokens: DEFAULT_MIN_CONDITION_BUDGET_TOKENS,
+                prefix_chunk: None,
+            }
         }
     }
 }
@@ -1503,6 +1648,14 @@ mod tests {
         assert_eq!(t.len(), 8);
         assert_eq!(t[0], 1000.0);
         assert_eq!(t[1], 0.978453f32 * 1000.0);
+        // The DiT's timesteps: the oracle's dit_timesteps.npy (diffusers on the GPU), bit for bit.
+        let recorded = [0x3f800000u32, 0x3f7a7be6, 0x3f744525, 0x3f6d375e, 0x3f6523f6, 0x3f585b9f, 0x3f345c58, 0x3ed44242];
+        assert_eq!((0..8).map(|i| s.dit_timestep(i).to_bits()).collect::<Vec<_>>(), recorded);
+        // σ itself is 1 ulp off at steps 1, 2, 3 and 6, and so is a true division by 1000: the
+        // reciprocal's product is what tells them apart.
+        let differs = |f: &dyn Fn(usize) -> f32| (0..8).filter(|&i| f(i).to_bits() != recorded[i]).collect::<Vec<_>>();
+        assert_eq!(differs(&|i| s.sigmas[i]), vec![1, 2, 3, 6]);
+        assert_eq!(differs(&|i| t[i] / 1000.0), vec![1, 2, 3, 6]);
     }
 
     #[test]
@@ -1600,6 +1753,7 @@ mod tests {
             // 256 KiB a token plus 1 MiB of per-run constants.
             prefix_bytes: &|n| if n == 0 { 0 } else { (1 << 20) + n * (256 << 10) },
             condition_budget_cap: cap,
+            min_condition_budget_tokens: 0,
         }
     }
 
@@ -1643,8 +1797,36 @@ mod tests {
         );
         let allowed = VramMode::Explicit { budget_bytes: 40 * GIB, allow_oversubscription: true };
         assert_eq!(ImagePlan::new(&request(allowed, 30 * GIB, None)).unwrap().budget_bytes, 40 * GIB);
-        // Exactly the weights and the arena: it loads, with no condition budget.
-        let tight = ImagePlan::new(&request(VramMode::Derived { headroom_bytes: 0 }, 18 * GIB, None)).unwrap();
+    }
+
+    #[test]
+    fn a_condition_budget_below_the_minimum_is_refused_naming_it() {
+        let min = DEFAULT_MIN_CONDITION_BUDGET_TOKENS as u64;
+        let at_least = |request: ImagePlanRequest<'static>| ImagePlanRequest { min_condition_budget_tokens: min, ..request };
+        let exact = VramMode::Derived { headroom_bytes: 0 };
+        // Exactly the weights and the arena: no condition budget, so every request would be
+        // refused. The load is, naming what it lacks.
+        let min_bytes = (1 << 20) + min * (256 << 10);
+        let err = ImagePlan::new(&at_least(request(exact, 18 * GIB, None))).unwrap_err();
+        assert_eq!(
+            err,
+            ImagePlanError::BelowMinCondition { mode: exact, budget_bytes: 18 * GIB, left_bytes: 0, tokens: 0, min_tokens: min, min_bytes }
+        );
+        let message = err.to_string();
+        for part in [format!("short by {min_bytes} bytes"), "lower the VRAM headroom".into(), "lower image.min_condition_budget_tokens".into()] {
+            assert!(message.contains(&part), "{message}");
+        }
+        // A token below the minimum is refused, the minimum loads.
+        let free = |tokens: u64| 18 * GIB + (1 << 20) + tokens * (256 << 10);
+        assert!(matches!(
+            ImagePlan::new(&at_least(request(exact, free(min - 1), None))),
+            Err(ImagePlanError::BelowMinCondition { tokens, .. }) if tokens == min - 1
+        ));
+        assert_eq!(ImagePlan::new(&at_least(request(exact, free(min), None))).unwrap().condition_budget_tokens, min);
+        let explicit = VramMode::Explicit { budget_bytes: 18 * GIB, allow_oversubscription: false };
+        assert!(ImagePlan::new(&at_least(request(explicit, 30 * GIB, None))).unwrap_err().to_string().contains("raise the VRAM budget"));
+        // A minimum of 0: a load with no condition budget, as an explicit choice.
+        let tight = ImagePlan::new(&request(exact, 18 * GIB, None)).unwrap();
         assert_eq!((tight.condition_budget_tokens, tight.condition_budget_bytes), (0, 0));
     }
 }

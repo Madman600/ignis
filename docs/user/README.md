@@ -998,6 +998,7 @@ running or queued job counts as use for [idle unload](#idle-unload).
 | `max_condition_decodes` | `1` | The most edits that decode their condition images at once (1..16); the others wait their turn. |
 | `sizes` | the eight above | The sizes a request may ask for. The load sizes the image model's working memory for the largest, so a larger size added live is served after the next load. |
 | `condition_budget_tokens` | `0` | Lowers the condition budget (0 is the whole budget the load planned). |
+| `min_condition_budget_tokens` | `8191` | The least condition budget the image model's load accepts (0..1048576); a load whose VRAM leaves less is refused, naming the shortfall. 8,191 is the longest text-to-image prompt the model's positions admit; 0 takes any. Read by the load, so a change holds from the next one. |
 | `condition_floor_px` | `512` | The smallest a condition image may be scaled to, as the side of a square of the same area (32..1024). |
 | `prompt_enhancement` | `false` | Whether a request that does not say has its prompt rewritten first. |
 | `prompt_enhancer` | `qwen3.8-27b` | The text model that rewrites prompts. |

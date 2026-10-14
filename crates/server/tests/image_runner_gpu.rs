@@ -14,6 +14,8 @@
 //! - **The arena beside the budget** (review-321ab I3): on a budget larger than this card's, ten
 //!   condition images at the worst aspect ratio fit the budget but not the arena, and the count
 //!   says so, so the fit scales them.
+//! - **Every default size decodes** (review-321c L2) within the arena the load sizes for the
+//!   largest of them: the leaf's own band plan, host-side.
 //!
 //! The PNGs are written beside the free runs' (`<oracle>/../freerun/http/`) for the eye. The
 //! artifact is `$IGNIS_IMAGE_ARTIFACT`, else
@@ -332,4 +334,20 @@ async fn the_count_holds_the_arena_beside_the_budget() {
     let counted = image.with_runner(|runner| runner.condition_tokens(prompt, &fitted.sizes)).unwrap();
     assert!(counted <= budget, "the fitted sizes count within the budget, so within the arena and the processor: {counted}");
     tokio::task::spawn_blocking(move || model.shut_down()).await.unwrap();
+}
+
+/// Review-321c L2: `vae_decode` refuses a size whose bands do not fit the arena, and the load
+/// sizes the arena for the largest of `image.sizes` (`max_target_cells`). Every default size must
+/// then decode in it. Host-side, the kernel leaf's sizes: no GPU call.
+#[test]
+#[ignore = "the kernel leaf (cuda): run under scripts/gpu-profile.ps1"]
+fn every_default_size_decodes_within_the_arena_the_load_sizes() {
+    let sizes = ignis_server::config::DEFAULT_IMAGE_SIZES;
+    let max_target = u32::try_from(ignis_server::images::leaf::max_target_cells(&sizes)).unwrap();
+    for size in sizes {
+        match ignis_core::image_leaf::decode_band_rows(max_target, size.width, size.height) {
+            Ok(rows) => println!("{size}: decodes in bands of {rows} rows in an arena for {max_target} cells"),
+            Err(e) => panic!("{size}: {e}"),
+        }
+    }
 }

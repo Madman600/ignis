@@ -154,6 +154,8 @@ mod device {
                 // request (`images::budget`), so a PATCH of it holds live.
                 condition_budget_cap: None,
                 max_target_tokens: u32::try_from(max_target).unwrap_or(u32::MAX),
+                min_condition_budget_tokens: config.settings().image.min_condition_budget_tokens,
+                prefix_chunk: None,
             };
             let dev = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
             let leaf = ImageLeaf::load(&reader, dev, &options).map_err(|e| e.to_string())?;

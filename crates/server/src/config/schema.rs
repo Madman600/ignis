@@ -501,6 +501,14 @@ config_group! {
         /// 1024x1024 condition image 4,096 of them). 0 is the whole budget the
         /// load planned; a value can only lower it.
         condition_budget_tokens: Tokens = 0, NO_RULE, ALL, [Visible, Patchable];
+        /// The least condition budget the image model's load accepts, in
+        /// condition-prefix tokens: a load whose VRAM plan leaves less is
+        /// refused, naming the shortfall, rather than refuse its requests one
+        /// by one. 8,191, the longest text-to-image prompt the image model's
+        /// positions admit; 0 takes any. Read by the load, so a change holds
+        /// from the next one.
+        min_condition_budget_tokens: Tokens = ignis_core::image_leaf::DEFAULT_MIN_CONDITION_BUDGET_TOKENS, between(0, 1 << 20), ALL,
+            [Visible, Patchable];
         /// The smallest the budget may scale a condition image down to, as
         /// the side of a square of the same area, in pixels; a request whose
         /// images would go below it is refused, naming the budget.

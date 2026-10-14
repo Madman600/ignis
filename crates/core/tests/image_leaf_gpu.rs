@@ -1,12 +1,15 @@
 //! The image leaf on the real artifact against spec 01's recordings (spec image-model/04, GitHub
-//! #321): acceptance 1, 2, 3 at 1024² and 2048², 4, 5, 6, 7, 8 and 9.
+//! #321): acceptance 1, 2, 3 at 1024² and 2048², 4, 5, 6, 7, 8 and 9, and the close-out's checks
+//! (321e): the chunked prefix pass against the whole one, a non-square VAE encode, and the widest
+//! preset run free and decoded.
 //!
 //! - **Load and plan (AC 1).** The family loads from the artifact (`ImageLeaf::load`: the full
 //!   bind, the text encoder, the vision tower and the DiT's descriptors, the arena) and prints its
 //!   plan line: weights, arena, condition budget. A load whose weights and arena do not fit an
 //!   explicit budget is refused before anything is placed, naming the shortfall.
 //! - **The sampler (AC 2).** Its sigmas and timesteps equal the recorded `sigmas.npy` and
-//!   `timesteps.npy` bit for bit; the Euler update of each step's recorded input latents by the
+//!   `timesteps.npy` bit for bit, and so do the timesteps the DiT reads (`dit_timesteps.npy`); the
+//!   Euler update of each step's recorded input latents by the
 //!   recorded velocity is the recorded output, bit for bit; and in every step below, the leaf's own
 //!   update on the device equals the host's on the leaf's velocity, bit for bit.
 //! - **t2i, step by step, at 1024² and 2048² (AC 3; the cases `t2i` and `t2i-2k`, one test each).** `encode_condition` runs ignis's own text encoder on the
@@ -20,13 +23,21 @@
 //!   the 8 steps as in AC 3, against the edit case's bound.
 //! - **VAE encode (AC 7).** `vae_encode` of the condition image (its bytes from the recorded VAE
 //!   input) against the recorded condition latents, within `thresholds.json`'s bound (5 x bf16's).
+//!   A non-square crop of it (1024 x 768) encodes too: finite, and near the square's latents where
+//!   it holds the same pixels.
 //! - **The diagnosis (AC 5).** The residual stream after blocks 0, 15 and 31 beside the recorded
 //!   ones, no threshold: the prefix's rows after `encode_condition` against step 0's first rows,
 //!   step 0's target rows against the rest of step 0's dumps, step 1's against step 1's.
 //! - **VAE decode (AC 6).** `vae_decode` of each case's recorded final latents (step 7's output)
 //!   against the recorded `image.png` (diffusers' fp32 decode), at least 40 dB PSNR per channel,
 //!   alpha included. At 1024² the arena's banded decode equals the unbanded one bit for bit; at
-//!   2048² the decode runs in the arena, and two band heights give the same image bit for bit.
+//!   2048² the decode runs in the arena, and two band heights with no common edge give the same
+//!   image bit for bit.
+//! - **The chunked prefix pass (review-321ab M1).** The edit's prefix pass cut in chunks of 1,024
+//!   tokens (`ImageLeafOptions::prefix_chunk`, the image block cut in four) equals the whole pass
+//!   bit for bit: the residual stream after blocks 0, 15 and 31, and step 0's velocity over it.
+//! - **The widest preset (review-321c L2).** 2752 x 1536, a non-square target, runs free from the
+//!   server's noise and decodes within the arena; the PNG goes beside the free runs.
 //! - **n = 3, release and cancel (AC 8).** One condition, three images (the second from other
 //!   noise, the third from the first's noise: the same bytes as the first, so the prefix outlived
 //!   the image between them unchanged); then a job cancelled after three steps. Releasing each leaves
@@ -50,7 +61,10 @@ use std::time::Instant;
 
 use ignis_artifact::{CudaDevice, Reader};
 use ignis_core::gpu_profile;
-use ignis_core::image_leaf::{euler_step, Condition, ConditionImage, ConditionText, ImageLeaf, ImageLeafError, ImageLeafOptions, ImagePlanError};
+use ignis_core::image::{ImageSize, TargetLatents};
+use ignis_core::image_leaf::{
+    self, euler_step, Condition, ConditionImage, ConditionText, ImageLeaf, ImageLeafError, ImageLeafOptions, ImagePlanError, MAX_TARGET_TOKENS,
+};
 use ignis_core::vision::Grid;
 use ignis_core::vram::VramMode;
 
@@ -240,6 +254,9 @@ fn teacher_forced(
     assert_eq!(bits(&leaf.sampler().timesteps()), bits(&timesteps), "the timesteps are the recorded ones");
     let steps = leaf.sampler().steps();
     assert_eq!(steps, 8);
+    let dit_timesteps = npy_f32(&dir.join("dit_timesteps.npy"), &[8]);
+    let ours: Vec<f32> = (0..steps).map(|i| leaf.sampler().dit_timestep(i)).collect();
+    assert_eq!(bits(&ours), bits(&dit_timesteps), "the timesteps the DiT reads are the recorded ones");
 
     // The target is the last of img_shapes; the joint sequence is [prefix ; target].
     let last = case["img_shapes"].as_array().unwrap().last().unwrap().clone();
@@ -385,6 +402,19 @@ fn the_edit_condition_image_encodes_within_the_oracle_bound() {
         err / bf16
     );
     assert!(err <= bound, "edit: the condition latents' error {:.3}% is over the bound {:.3}%", err * 100.0, bound * 100.0);
+
+    // Review-321ab L4: a non-square image, the condition's top 768 rows (1024 x 768, the alpha
+    // band below them cut off). Its latents are finite; in the top half of its rows, away from
+    // the cut, they are the square's but for what the VAE's mid-block attention, which sees the
+    // whole image, makes of the missing band.
+    let rows = 768;
+    let crop = &rgba[..(width * rows * 4) as usize];
+    let Some(cropped) = ran(leaf.vae_encode(width, rows, crop), "vae_encode of a 1024 x 768 crop") else { return };
+    assert_eq!(cropped.len(), (width / 16 * rows / 16) as usize * 64, "a 64 x 48 latent grid");
+    assert!(cropped.iter().all(|v| v.is_finite()), "a non-finite latent of the 1024 x 768 crop");
+    let top = (width / 16 * rows / 32) as usize * 64;
+    let near = rel_l2(&cropped[..top], &got[..top]);
+    println!("edit: vae_encode of its top {width} x {rows}: the top 24 latent rows {:.3}% from the square's", near * 100.0);
 }
 
 #[test]
@@ -434,12 +464,17 @@ fn packed_noise(dir: &Path, h: u32, w: u32) -> Vec<f32> {
 /// A case's condition through `encode_condition`: ignis's encoder on the recorded sequence, and
 /// for the edit case the recorded tower input and the VAE input's bytes, as AC 4 builds it.
 fn encode_case(leaf: &mut ImageLeaf, dir: &Path) -> Option<Condition> {
+    encode_case_tapped(leaf, dir, &[]).map(|(condition, _)| condition)
+}
+
+/// [`encode_case`], with the prefix's residual stream after the blocks of `taps`.
+fn encode_case_tapped(leaf: &mut ImageLeaf, dir: &Path, taps: &[u32]) -> Option<(Condition, Vec<Vec<f32>>)> {
     let case = read_case(dir);
     let drop = case["drop_idx"].as_u64().unwrap() as usize;
     let (ids, positions) = recorded_sequence(dir);
     if !dir.join("condition_vae_input.npy").is_file() {
         let text = ConditionText { input_ids: &ids, positions: &positions, drop_idx: drop, image_pad_rows: &[] };
-        return ran(leaf.encode_condition(&text, &[]), "encode_condition");
+        return ran(leaf.encode_condition_tapped(&text, &[], taps), "encode_condition");
     }
     let types = i64s(&load_npy(&dir.join("mm_token_type_ids.npy")).1);
     let pad_rows: Vec<u32> = (0..).zip(types).filter(|&(_, t)| t == 1).map(|(r, _)| r).collect();
@@ -449,7 +484,7 @@ fn encode_case(leaf: &mut ImageLeaf, dir: &Path) -> Option<Condition> {
     let (width, height, rgba) = condition_rgba(dir);
     let image = ConditionImage { grid, pixels: &pixels, width, height, rgba: &rgba };
     let text = ConditionText { input_ids: &ids, positions: &positions, drop_idx: drop, image_pad_rows: &pad_rows };
-    ran(leaf.encode_condition(&text, &[image]), "encode_condition")
+    ran(leaf.encode_condition_tapped(&text, &[image], taps), "encode_condition")
 }
 
 /// An 8-bit RGBA PNG's width, height and pixels.
@@ -486,6 +521,9 @@ fn psnr(got: &[u8], want: &[u8]) -> [f64; 4] {
     let pixels = (got.len() / 4) as f64;
     se.map(|s| if s == 0.0 { f64::INFINITY } else { 10.0 * (255.0f64.powi(2) / (s / pixels)).log10() })
 }
+
+/// Spec image-model/04 acceptance 6: the decode's PSNR per channel against diffusers' fp32 image.
+const AC6_MIN_PSNR_DB: f64 = 40.0;
 
 /// The bytes where two decodes differ.
 fn mismatches(a: &[u8], b: &[u8]) -> usize {
@@ -531,7 +569,7 @@ fn the_vae_decode_of_the_final_latents_is_the_recorded_png() {
             db[2],
             db[3]
         );
-        if db.iter().any(|&d| d < 40.0) {
+        if db.iter().any(|&d| d < AC6_MIN_PSNR_DB) {
             low.push(name);
         }
         if name == "t2i" {
@@ -541,13 +579,21 @@ fn the_vae_decode_of_the_final_latents_is_the_recorded_png() {
             assert_eq!(mismatches(&rgba, &unbanded), 0, "t2i: the decode in {planned}-row bands equals the unbanded one bit for bit");
         }
         if name == "t2i-2k" {
-            let other = (planned / 2).div_ceil(16) * 16;
+            // Review-321c L1: bands whose edges never meet below the image's height, so each
+            // decode's band edges are checked against the other's interiors.
+            let other = 208;
+            let lcm = planned / gcd(planned, other) * other;
+            assert!(lcm >= 16 * h, "t2i-2k: {planned}- and {other}-row bands share an edge at row {lcm}");
             let Some(half) = ran(leaf.vae_decode_in_bands(other), "the decode in other bands") else { return };
             assert_eq!(mismatches(&rgba, &half), 0, "t2i-2k: the decode in {planned}-row bands equals the one in {other}-row bands bit for bit");
         }
     }
     ran(leaf.release_condition(condition), "release_condition");
-    assert!(low.is_empty(), "the cases {low:?} decode below 40 dB in a channel");
+    assert!(low.is_empty(), "the cases {low:?} decode below {AC6_MIN_PSNR_DB} dB in a channel");
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 #[test]
@@ -677,4 +723,84 @@ fn each_case_runs_free_from_its_noise_file() {
             db[3]
         );
     }
+}
+
+#[test]
+#[ignore = "GPU: run under scripts/gpu-profile.ps1"]
+fn the_chunked_prefix_pass_equals_the_whole_one_on_the_edit() {
+    let Some((reader, oracle, _)) = fixtures() else { return };
+    let dir = oracle.join("edit");
+    let (h, w) = target_shape(&read_case(&dir));
+    let noise = packed_noise(&dir, h, w);
+    // Each leaf in turn (two do not fit the card): the edit's prefix with taps, then step 0 over it.
+    let run = |chunk: Option<u32>| -> Option<(Option<u32>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>)> {
+        let options = ImageLeafOptions { prefix_chunk: chunk, ..ImageLeafOptions::new(VramMode::Derived { headroom_bytes: HEADROOM }) };
+        let mut leaf = ran(ImageLeaf::load(&reader, device()?, &options), "the load")?;
+        let (condition, prefix_taps) = encode_case_tapped(&mut leaf, &dir, &TAPS)?;
+        let ran_chunk = condition.prefix_chunk();
+        ran(leaf.start_image(&condition, h, w, &noise), "start_image")?;
+        let target_taps = ran(leaf.denoise_step_tapped(&condition, 0, &TAPS), "denoise_step")?;
+        let velocity = ran(leaf.velocity(), "velocity")?;
+        ran(leaf.release_condition(condition), "release_condition")?;
+        Some((ran_chunk, prefix_taps, target_taps, velocity))
+    };
+    let Some(whole) = run(None) else { return };
+    let Some(chunked) = run(Some(1024)) else { return };
+    assert_eq!(whole.0, None, "the edit's 4122-token prefix runs whole by default");
+    assert_eq!(chunked.0, Some(1024), "the knob cuts the prefix pass in chunks of 1024 (the image block in four)");
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for (i, &b) in TAPS.iter().enumerate() {
+        assert!(bits(&chunked.1[i]) == bits(&whole.1[i]), "the prefix's rows after block {b}: the chunked pass differs from the whole one");
+        assert!(bits(&chunked.2[i]) == bits(&whole.2[i]), "step 0's target rows after block {b}: the chunked prefix differs from the whole one");
+    }
+    assert!(bits(&chunked.3) == bits(&whole.3), "step 0's velocity over the chunked prefix differs from the whole one's");
+    println!("edit: the prefix pass in chunks of 1024 equals the whole pass bit for bit (blocks {TAPS:?}, step 0's target rows and velocity)");
+}
+
+#[test]
+#[ignore = "GPU: run under scripts/gpu-profile.ps1"]
+fn the_widest_preset_runs_free_and_decodes_within_the_arena() {
+    let Some((reader, oracle, _)) = fixtures() else { return };
+    let Some(mut leaf) = load(&reader) else { return };
+    let size = ImageSize::new(2752, 1536);
+    let (h, w) = (size.height / 16, size.width / 16);
+    // Every spec 05 preset fits this arena (the server's test checks each); this one is the widest.
+    let Ok(band_rows) = image_leaf::decode_band_rows(MAX_TARGET_TOKENS, size.width, size.height) else {
+        panic!("{size}: its decode does not fit the arena")
+    };
+    let Some(condition) = encode_case(&mut leaf, &oracle.join("t2i")) else { return };
+    // The server's noise for seed 7, packed.
+    let noise = TargetLatents::noise(size, 7);
+    let cells = size.latent_cells();
+    let packed: Vec<f32> = (0..cells * 64).map(|i| noise.values[(i % 64) * cells + i / 64]).collect();
+    if ran(leaf.start_image(&condition, h, w, &packed), "start_image").is_none() {
+        return;
+    }
+    let t = Instant::now();
+    for step in 0..leaf.sampler().steps() {
+        if ran(leaf.denoise_step(&condition, step), "denoise_step").is_none() {
+            return;
+        }
+    }
+    let steps_ms = t.elapsed().as_secs_f64() * 1e3;
+    let Some(latents) = ran(leaf.latents(), "latents") else { return };
+    assert!(latents.iter().all(|v| v.is_finite()), "{size}: a non-finite latent");
+    let Some(free) = ran(leaf.device_free_bytes(), "the free memory") else { return };
+    let t = Instant::now();
+    let Some(rgba) = ran(leaf.vae_decode(), "vae_decode") else { return };
+    let decode_ms = t.elapsed().as_secs_f64() * 1e3;
+    let Some(free_after) = ran(leaf.device_free_bytes(), "the free memory") else { return };
+    ran(leaf.release_condition(condition), "release_condition");
+    assert_eq!(free_after, free, "{size}: vae_decode allocates nothing (it runs in the arena)");
+    assert_eq!(rgba.len(), (size.width * size.height * 4) as usize);
+    // Not a blank or saturated frame: the RGB channels spread.
+    let mean = |c: usize| rgba.iter().skip(c).step_by(4).map(|&v| v as f64).sum::<f64>() / (size.width * size.height) as f64;
+    let spread = |c: usize| (rgba.iter().skip(c).step_by(4).map(|&v| (v as f64 - mean(c)).powi(2)).sum::<f64>() / (size.width * size.height) as f64).sqrt();
+    assert!((0..3).all(|c| spread(c) > 10.0), "{size}: a flat image (RGB spread {:.1} {:.1} {:.1})", spread(0), spread(1), spread(2));
+    let out = machine_local("IGNIS_IMAGE_FREERUN", "F:/ai/models/ignis-image-2.1-turbo/freerun").join("t2i-2752x1536").join("ignis.png");
+    write_png(&out, size.width, size.height, &rgba);
+    println!(
+        "{size}: 8 steps {steps_ms:.0} ms, vae_decode {decode_ms:.0} ms in bands of {band_rows} rows; {} (the t2i prompt, seed 7)",
+        out.display()
+    );
 }

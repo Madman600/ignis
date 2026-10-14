@@ -43,7 +43,7 @@ first denoising step; the result is the same up to rounding.
 - **Load and plan.** The plan has three parts:
   - the weights (DiT 7.1 GB and encoder 7.0 GB in FP8, the vision tower and
     VAE, about 16 GB in all);
-  - one sequential arena, sized for the largest preset (2752 × 1536, 16,512
+  - one sequential arena, sized for the largest preset (2400 × 1792, 16,800
     target tokens) plus the largest prefix segment;
   - the **condition budget**, which is whatever the VRAM plan leaves, counted
     in condition-prefix tokens of ~256 KiB.
@@ -77,7 +77,9 @@ first denoising step; the result is the same up to rounding.
   every block uses.
 - **The sampler** (Rust):
   - the sigmas are the artifact's `sample_sigmas` followed by a terminal 0;
-  - the DiT's timestep is σ;
+  - the DiT's timestep is the scheduler's divided by `num_train_timesteps`,
+    as the pipeline's `timestep / 1000` computes it on the GPU:
+    fl(fl(1000σ) · fl(1/1000)), within an ulp of σ (321e);
   - the update is `x += (σ_next − σ) · v`.
   For this checkpoint the scheduler config has `use_dynamic_shifting: false`
   and `shift: 1.0`, so the schedule is the same at every size. The loader
@@ -292,7 +294,7 @@ to all of them.
      - The angles fl32(fl32(1000 σ) · f) and CUDA's cosf/sinf are computed
        on the device, as torch's CUDA path does.
   5. **The DiT's timestep is σ**, not `dit_timesteps` (1 ulp off at steps
-     1, 2, 3 and 6).
+     1, 2, 3 and 6). Superseded by 321e: the DiT reads `dit_timesteps`.
   6. **The prefix pass runs whole blocks**, block 31's MLP included,
      though only the K/V runs are kept. That is 1/32 of the pass, and it
      keeps the prefix's rows available for AC 5.

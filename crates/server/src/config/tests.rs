@@ -2064,6 +2064,7 @@ fn every_image_field_resolves_from_flag_env_and_file_by_precedence() {
         ("max_condition_decodes", "2", "3", "4"),
         ("sizes", "1024x1024", "2048x2048;1024x1024", "2752x1536"),
         ("condition_budget_tokens", "8192", "16384", "4096"),
+        ("min_condition_budget_tokens", "0", "4096", "16384"),
         ("condition_floor_px", "256", "384", "640"),
         ("prompt_enhancement", "true", "false", "true"),
         ("prompt_enhancer", "qwen3.8-flash-next", "my-27b", "qwen3.8-27b"),
@@ -2104,6 +2105,7 @@ fn an_image_field_past_its_bounds_is_refused_naming_it() {
         ("max_condition_images", 1, 10),
         ("max_condition_mipx", 1, 64),
         ("max_condition_decodes", 1, 16),
+        ("min_condition_budget_tokens", 0, 1 << 20),
         ("condition_floor_px", 32, 1024),
         ("prompt_enhancer_max_tokens", 16, 8192),
     ] {

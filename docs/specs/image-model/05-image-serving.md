@@ -188,6 +188,7 @@ not told to.
   | `max_condition_images` | 10 |
   | `sizes` | above |
   | `condition_budget_tokens` | 0 = the plan's |
+  | `min_condition_budget_tokens` | 8191 (321e: read by the load) |
   | `condition_floor_px` | 512 |
   | `prompt_enhancement` | false |
   | `prompt_enhancer` | `qwen3.8-27b` |
