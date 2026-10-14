@@ -1862,9 +1862,9 @@ pub(crate) fn switch_refused(refusal: crate::model_switch::SwitchRefusal) -> Res
         crate::model_switch::SwitchRefusal::WarmingUp => {
             unavailable("server_not_ready", "the loaded model's first traversal has not finished; retry shortly")
         }
-        // Only the load a request begins is refused so, and that refusal is
-        // never answered: the request looks at the status again.
-        crate::model_switch::SwitchRefusal::NotUnloaded => error_response(
+        // Only the load a request begins and a visit are refused so, and
+        // neither refusal is answered: the request goes on without them.
+        crate::model_switch::SwitchRefusal::NotUnloaded | crate::model_switch::SwitchRefusal::NotServing => error_response(
             StatusCode::CONFLICT,
             "invalid_request_error",
             "switch_in_progress",

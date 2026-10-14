@@ -14,8 +14,8 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use ignis_core::compute::ModelKind;
-use ignis_server::model_switch::Switcher;
-use ignis_server::Server;
+use ignis_server::model_switch::{visit, LastSwitch, SwitchOutcome, SwitchRefusal, SwitchStarted, SwitchStep, Switcher};
+use ignis_server::{ModelStatus, Server};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -147,4 +147,104 @@ async fn send_chat(app: &axum::Router) -> (StatusCode, Value) {
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+// ── the visit (model_switch::visit) ───────────────────────────────────────
+
+/// What a visit's switches told, in order.
+fn recording_steps() -> (ignis_server::model_switch::Steps, Arc<std::sync::Mutex<Vec<SwitchStep>>>) {
+    let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&told);
+    (Arc::new(move |step| sink.lock().unwrap().push(step)), told)
+}
+
+/// A server on the image model, its `last_switch` set by an explicit switch
+/// to it from `mock-b`, so that "left as it was" is a real assertion.
+async fn on_the_image_model(loader: &Arc<MockLoader>) -> Server {
+    let server = implicit_on(loader, "mock-b", &["mock-a", "mock-b", IMAGE]);
+    let (_, task) = ignis_server::model_switch::begin(&server, source(IMAGE)).expect("a switch begins");
+    assert_eq!(task.await.unwrap(), SwitchOutcome::Switched);
+    assert_eq!(server.active().model_id(), IMAGE);
+    server
+}
+
+fn the_switch_to_the_image_model() -> Option<LastSwitch> {
+    Some(LastSwitch { from: "mock-b".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched })
+}
+
+/// Spec image-model/05 §Prompt enhancement: a visit is two switches in one
+/// hold — to the visited model, handed over with the gate still closed
+/// (every other request `503 model_switching`, a switch `409`), then back —
+/// each model off the card before the next loads, and `last_switch` left as
+/// it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_goes_to_the_visited_model_and_back_with_the_gate_closed_throughout() {
+    let loader = MockLoader::new();
+    let server = on_the_image_model(&loader).await;
+    let app = server.app();
+    let (steps, told) = recording_steps();
+    let mut visit = visit(&server, source("mock-a"), source(IMAGE), Some(steps)).expect("a visit begins");
+    let visited = visit.arrived().await.expect("the visited model serves");
+    assert_eq!((visited.active().model_id(), visited.active().kind()), ("mock-a".to_owned(), ModelKind::Text));
+    assert_eq!(*server.status(), ModelStatus::Switching { from: "mock-a".into(), to: IMAGE.into() });
+    let (status, refused) = send_chat(&app).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("model_switching")), "{refused}");
+    let response = app.clone().oneshot(generation(json!({ "prompt": "x", "size": "1024x1024" }))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    let explicit = ignis_server::model_switch::begin(&server, source("mock-b")).map(|(started, _)| started);
+    assert_eq!(explicit, Err(SwitchRefusal::InProgress(SwitchStarted { from: "mock-a".into(), to: IMAGE.into() })));
+
+    assert_eq!(visit.on().await, SwitchOutcome::Switched);
+    assert_eq!((server.status().as_str(), server.active().model_id()), ("serving", IMAGE.to_owned()));
+    assert_eq!(loader.loads(), [IMAGE, "mock-a", IMAGE]);
+    assert_eq!(loader.resident_at_load(), [0, 0, 0], "each model left the card before the next loaded");
+    assert_eq!(*told.lock().unwrap(), [SwitchStep::Switching, SwitchStep::Loading, SwitchStep::Switching, SwitchStep::Loading]);
+    assert_eq!(server.switcher.as_ref().unwrap().last_switch(), the_switch_to_the_image_model());
+}
+
+/// A visit whose way there fails is over: refused before anything stopped,
+/// the image model never stopped serving; failed on the card, the image
+/// model is loaded again. A visit whose way back fails leaves the visited
+/// model serving. A visit its beginner leaves goes back on its own. None of
+/// them writes `last_switch`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_that_fails_either_way_ends_with_a_model_serving_and_writes_no_last_switch() {
+    let loader = MockLoader::new();
+    let server = on_the_image_model(&loader).await;
+    let last = || server.switcher.as_ref().unwrap().last_switch();
+
+    loader.refuse("mock-a");
+    let mut refused = visit(&server, source("mock-a"), source(IMAGE), None).unwrap();
+    assert!(refused.arrived().await.is_none());
+    assert!(matches!(refused.on().await, SwitchOutcome::Refused { .. }));
+    assert_eq!((server.status().as_str(), server.active().model_id(), loader.loads().len()), ("serving", IMAGE.to_owned(), 1));
+    assert_eq!(last(), the_switch_to_the_image_model());
+
+    loader.break_load("mock-b");
+    let mut broken = visit(&server, source("mock-b"), source(IMAGE), None).unwrap();
+    assert!(broken.arrived().await.is_none());
+    assert!(matches!(broken.on().await, SwitchOutcome::Restored { .. }));
+    assert_eq!((server.status().as_str(), server.active().model_id()), ("serving", IMAGE.to_owned()));
+    assert_eq!(loader.loads(), [IMAGE, "mock-b", IMAGE]);
+    assert_eq!(last(), the_switch_to_the_image_model());
+
+    loader.mend("mock-b");
+    loader.break_load(IMAGE);
+    let mut back_broken = visit(&server, source("mock-b"), source(IMAGE), None).unwrap();
+    assert!(back_broken.arrived().await.is_some());
+    assert!(matches!(back_broken.on().await, SwitchOutcome::Restored { .. }));
+    assert_eq!((server.status().as_str(), server.active().model_id()), ("serving", "mock-b".to_owned()));
+    assert_eq!(last(), the_switch_to_the_image_model());
+
+    // From mock-b again: an explicit switch, which writes `last_switch`.
+    loader.mend(IMAGE);
+    let (_, task) = ignis_server::model_switch::begin(&server, source(IMAGE)).unwrap();
+    assert_eq!(task.await.unwrap(), SwitchOutcome::Switched);
+    let loads = loader.loads().len();
+    drop(visit(&server, source("mock-b"), source(IMAGE), None).unwrap());
+    until(&server, "serving", PATIENT).await;
+    assert_eq!(server.active().model_id(), IMAGE, "a visit left by its beginner goes back");
+    assert_eq!(loader.loads()[loads..], ["mock-b", IMAGE]);
+    assert_eq!(last(), the_switch_to_the_image_model());
 }
