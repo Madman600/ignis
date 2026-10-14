@@ -105,6 +105,8 @@ pub struct ImageJobs {
     /// left, the queue closed.
     changed: tokio::sync::Notify,
     closed: AtomicBool,
+    /// Where the queue's depth is published ([`ImageJobs::report_to`]).
+    gauge: std::sync::OnceLock<Arc<crate::metrics::Metrics>>,
 }
 
 /// The queue under its lock.
@@ -120,6 +122,20 @@ struct Queue {
 impl ImageJobs {
     fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
         self.state.lock().expect("image queue lock")
+    }
+
+    /// From now, every change of the queue sets `metrics`' image queue
+    /// gauge, under the queue's lock: the last change to land is the last
+    /// the gauge shows, whichever way a job leaves (GitHub #324).
+    pub fn report_to(&self, metrics: &Arc<crate::metrics::Metrics>) {
+        let _ = self.gauge.set(Arc::clone(metrics));
+    }
+
+    /// The queue as it stands, to the gauge. Called with the lock held.
+    fn publish(&self, queue: &Queue) {
+        if let Some(metrics) = self.gauge.get() {
+            metrics.set_image_queue(queue.waiting.len() as u32, queue.running);
+        }
     }
 
     /// One job counted as waiting, at the back of the queue, whatever the
@@ -141,6 +157,7 @@ impl ImageJobs {
         let ticket = queue.next;
         queue.next += 1;
         queue.waiting.push_back(ticket);
+        self.publish(&queue);
         Some(Waiting { jobs: Some(Arc::clone(self)), ticket })
     }
 
@@ -193,6 +210,7 @@ impl Waiting {
                 if queue.running == 0 && queue.waiting.front() == Some(&self.ticket) {
                     queue.waiting.pop_front();
                     queue.running += 1;
+                    jobs.publish(&queue);
                     self.jobs = None;
                     drop(queue);
                     return Some(Running(Arc::clone(&jobs)));
@@ -206,7 +224,10 @@ impl Waiting {
 impl Drop for Waiting {
     fn drop(&mut self) {
         if let Some(jobs) = &self.jobs {
-            jobs.queue().waiting.retain(|&ticket| ticket != self.ticket);
+            let mut queue = jobs.queue();
+            queue.waiting.retain(|&ticket| ticket != self.ticket);
+            jobs.publish(&queue);
+            drop(queue);
             jobs.changed.notify_waiters();
         }
     }
@@ -218,7 +239,10 @@ pub struct Running(Arc<ImageJobs>);
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.0.queue().running -= 1;
+        let mut queue = self.0.queue();
+        queue.running -= 1;
+        self.0.publish(&queue);
+        drop(queue);
         self.0.changed.notify_waiters();
     }
 }

@@ -143,7 +143,6 @@ impl Rejection {
     }
 }
 
-/// Which of the two counting routes a call reached:
 /// How an image job ended: `ignis_image_jobs_total`'s fixed `outcome` label
 /// (GitHub #324, ADR 0017's amendment of 2026-10-15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,8 +187,12 @@ pub struct ImageJobEnd {
     /// Waiting for its turn, then encoding, denoising and decoding, in
     /// [`IMAGE_PHASES`]' order.
     pub phases: [std::time::Duration; 4],
+    /// From its turn to its last image, the PNG encodes and the sends
+    /// included: what the duration histogram observes.
+    pub ran: std::time::Duration,
 }
 
+/// Which of the two counting routes a call reached:
 /// `ignis_tokenize_requests_total`'s fixed `route` label (GitHub #285).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenizeRoute {
@@ -833,7 +836,7 @@ impl Metrics {
         }
         if ended.outcome == ImageOutcome::Completed {
             // From its turn to its last image: the wait is its own phase.
-            self.image_duration.observe(ended.phases[1..].iter().map(|phase| phase.as_millis() as u64).sum());
+            self.image_duration.observe(ended.ran.as_millis() as u64);
         }
     }
 
@@ -1651,8 +1654,8 @@ mod tests {
         let metrics = Metrics::new();
         assert!(!metrics.render().contains("ignis_image_"));
         let ms = Duration::from_millis;
-        metrics.record_image_job(&ImageJobEnd { outcome: ImageOutcome::Completed, images: 2, phases: [ms(500), ms(100), ms(2_000), ms(400)] });
-        metrics.record_image_job(&ImageJobEnd { outcome: ImageOutcome::Cancelled, images: 1, phases: [ms(0), ms(100), ms(1_000), ms(0)] });
+        metrics.record_image_job(&ImageJobEnd { outcome: ImageOutcome::Completed, images: 2, phases: [ms(500), ms(100), ms(2_000), ms(400)], ran: ms(2_700) });
+        metrics.record_image_job(&ImageJobEnd { outcome: ImageOutcome::Cancelled, images: 1, phases: [ms(0), ms(100), ms(1_000), ms(0)], ran: ms(1_200) });
         metrics.set_image_queue(3, 1);
         let text = metrics.render();
         assert_eq!(value(&text, "ignis_image_jobs_total", "outcome=\"completed\""), "1", "{text}");
@@ -1662,7 +1665,7 @@ mod tests {
         assert_eq!(value(&text, "ignis_image_job_phase_seconds_total", "phase=\"queued\""), "0.5", "{text}");
         assert_eq!(value(&text, "ignis_image_job_phase_seconds_total", "phase=\"denoising\""), "3", "{text}");
         assert_eq!(value(&text, "ignis_image_job_duration_seconds_count", ""), "1", "only the completed job: {text}");
-        assert_eq!(value(&text, "ignis_image_job_duration_seconds_sum", ""), "2.5", "{text}");
+        assert_eq!(value(&text, "ignis_image_job_duration_seconds_sum", ""), "2.7", "{text}");
         assert_eq!(value(&text, "ignis_image_queue_jobs", "state=\"waiting\""), "3", "{text}");
         assert_eq!(value(&text, "ignis_image_queue_jobs", "state=\"running\""), "1", "{text}");
     }

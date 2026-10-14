@@ -10,14 +10,13 @@
 //! job's [`JobEvent`]s off a channel and, by dropping it, cancels the job:
 //! while it waits for its turn, or at the next call once it runs.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ignis_core::image::{ImageCondition, ImageError, ImageRunner, ImageSize, RgbaImage, TargetLatents};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use utoipa::ToSchema;
-
-use std::sync::Arc;
 
 use super::{ImageModel, Waiting};
 use crate::metrics::{ImageJobEnd, ImageOutcome};
@@ -174,6 +173,8 @@ pub struct JobContext {
     pub enhancement: &'static str,
     /// When the request began its admission: the log line's total runs from here.
     pub began: Instant,
+    /// When the job was admitted to the queue: it has queued from here.
+    pub queued_at: Instant,
     /// Prompt enhancement's time, and that of the loads and switches before the job.
     pub enhance: Duration,
     pub switch: Duration,
@@ -190,11 +191,12 @@ static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// ([`JobEnd::Stopped`]) or when `events` has no reader, its request gone
 /// ([`JobEnd::Cancelled`]). The prefix is released whichever way it ends.
 /// Blocking: it runs on a blocking thread.
-pub fn run<E: From<JobEvent>>(model: &ImageModel, job: &ImageJob, events: &mpsc::UnboundedSender<E>) -> Result<(), JobEnd> {
+#[cfg(test)]
+fn run<E: From<JobEvent>>(model: &ImageModel, job: &ImageJob, events: &mpsc::UnboundedSender<E>) -> Result<(), JobEnd> {
     run_timed(model, job, events, &mut Phases::default())
 }
 
-/// [`run`], adding where its time went to `phases`, whichever way it ends.
+/// Run `job`, adding where its time went to `phases`, whichever way it ends.
 pub fn run_timed<E: From<JobEvent>>(
     model: &ImageModel,
     job: &ImageJob,
@@ -241,7 +243,7 @@ pub fn run_timed<E: From<JobEvent>>(
 }
 
 /// Queue `job`, admitted as `waiting`, on `model`: in its turn it runs
-/// ([`run`]) on a blocking thread, its events sent to `events`, and a job
+/// ([`run_timed`]) on a blocking thread, its events sent to `events`, and a job
 /// that ends early sends why, unless its request is gone. Dropping the
 /// channel's receiver cancels the job: while it waits it leaves the queue at
 /// once; once it runs, at its next call.
@@ -264,15 +266,15 @@ pub fn spawn<E: From<JobEvent> + Send + 'static>(
     context: JobContext,
 ) {
     let id = format!("img-{}", NEXT_JOB.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-    let queued_at = Instant::now();
+    let queued_at = context.queued_at;
     let finish = {
-        let (server, jobs) = (Arc::clone(&server), Arc::clone(&model.jobs));
+        let server = Arc::clone(&server);
         let (id, model_id, job, context) = (id.clone(), model.model_id(), job.clone(), context.clone());
         move |outcome: ImageOutcome, queued: Duration, ran: Duration, phases: Phases| {
             let ms = |d: Duration| d.as_millis() as u64;
             tracing::info!(
                 name: "ignis.image.job",
-                request_id = %id,
+                job_id = %id,
                 model = %model_id,
                 kind = context.kind,
                 outcome = outcome.label(),
@@ -296,9 +298,8 @@ pub fn spawn<E: From<JobEvent> + Send + 'static>(
                     outcome,
                     images: phases.images,
                     phases: [queued, phases.encoding, phases.denoising, phases.decoding],
+                    ran,
                 });
-                let queue = jobs.in_flight();
-                metrics.set_image_queue(queue.waiting, queue.running);
             }
         }
     };
@@ -316,10 +317,6 @@ pub fn spawn<E: From<JobEvent> + Send + 'static>(
             finish(ImageOutcome::Stopped, queued, Duration::ZERO, Phases::default());
             return;
         };
-        if let Some(metrics) = &server.metrics {
-            let queue = model.jobs.in_flight();
-            metrics.set_image_queue(queue.waiting, queue.running);
-        }
         let failed = model.clone();
         let ran = tokio::task::spawn_blocking(move || {
             let mut phases = Phases::default();

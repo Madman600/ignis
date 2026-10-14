@@ -682,15 +682,23 @@ async fn admit(
     if status.is_unloaded() || matches!(*status, ModelStatus::Loading) {
         let _ = events.send(progress(Phase::Loading, 1, 1));
     }
-    // A request to be rewritten on the unloaded enhancer loads the enhancer
+    // A request to be rewritten on an unloaded text model loads the enhancer
     // rather than the image model it names: the rewrite on it, then one
-    // switch — two loads, not three.
+    // switch — two loads, not three. The unloaded model itself when it is
+    // the enhancer; else, naming an image model, the enhancer the server can
+    // switch to.
     let unloaded = server.active();
-    let enhancer_unloaded = request.enhance
-        && status.is_unloaded()
-        && unloaded.kind() == ModelKind::Text
-        && unloaded.model_id() == server.live().image.prompt_enhancer;
-    let load = if enhancer_unloaded { None } else { named.as_deref() };
+    let enhancer = server.live().image.prompt_enhancer.clone();
+    let rewrites_first = request.enhance && status.is_unloaded() && unloaded.kind() == ModelKind::Text;
+    let load = match rewrites_first {
+        true if unloaded.model_id() == enhancer => None,
+        true if named.as_deref().is_some_and(|named| !named.is_empty())
+            && server.switcher.as_ref().is_some_and(|switcher| switcher.text_model(&enhancer).is_some()) =>
+        {
+            Some(enhancer.as_str())
+        }
+        _ => named.as_deref(),
+    };
     let loading = std::time::Instant::now();
     crate::model_switch::ensure_loaded(&server, load).await.map_err(|reason| load_failed(&server, &reason))?;
     let mut switch = loading.elapsed();
@@ -737,11 +745,10 @@ async fn admit(
             None => return Err(bad_request_param("size auto has no size to pick: image.sizes names none this image model makes", "size")),
         },
     };
-    let waiting = admitted(&model, limits.queue_depth)?;
     if let Some(metrics) = &unpinned.metrics {
-        let queue = model.jobs.in_flight();
-        metrics.set_image_queue(queue.waiting, queue.running);
+        model.jobs.report_to(metrics);
     }
+    let waiting = admitted(&model, limits.queue_depth)?;
     let context = JobContext {
         kind: match route {
             Route::Generations => "generation",
@@ -754,6 +761,7 @@ async fn admit(
             (true, false) => "as_sent",
         },
         began,
+        queued_at: std::time::Instant::now(),
         enhance: enhance_time,
         switch,
     };

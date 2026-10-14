@@ -194,6 +194,25 @@ async fn an_enhanced_request_on_the_unloaded_enhancer_loads_it_and_switches_once
     assert_eq!(loader.loads(), ["mock-a", IMAGE, IMAGE]);
 }
 
+/// Review-324serving F2: the idle clock unloaded a text model that is not the
+/// enhancer; an enhanced request naming the image model loads the enhancer
+/// first, the rewrite on it, then one switch: two loads, not the image
+/// model, a visit to the enhancer and back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enhanced_request_on_another_unloaded_text_model_loads_the_enhancer_first() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, "mock-b", &["mock-a", "mock-b", IMAGE]).with_idle_unload(IDLE);
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+    until(&server, "unloaded", IDLE * 5).await;
+    let body = json!({ "prompt": "a red fox", "model": IMAGE, "size": "1024x1024", "seed": 4, "prompt_enhancement": true, "stream": true });
+    let events = events_of(&app, body).await;
+    assert_eq!(phases(&events), then_the_job(&["loading 1/1", "enhancing 1/1", "switching 1/1", "loading 1/1"]));
+    assert!(events.last().unwrap().1["revised_prompt"].is_string(), "{:?}", events.last());
+    assert_eq!(loader.loads(), ["mock-a", IMAGE], "the enhancer, then the image model");
+}
+
 // ── the visit (model_switch::visit) ───────────────────────────────────────
 
 /// What a visit's switches told, in order.

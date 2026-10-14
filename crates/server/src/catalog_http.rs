@@ -132,10 +132,13 @@ fn rows(server: &Server) -> Vec<CatalogRow> {
             seen.insert(found.entry.id.clone());
             // A listed model of the same id wins over `download.path`, as it
             // does for a switch (`Switcher::resolve`): its file is where the
-            // server would load it from.
-            let there = listed.get(&found.entry.id).and_then(|artifact| size_of(artifact).map(|bytes| (artifact, bytes)));
-            let (on_disk, bytes, family) = match there {
-                Some((artifact, bytes)) => (OnDisk::Complete, bytes, family_of(artifact).map(scope)),
+            // server would load it from, and gone it is absent, whatever
+            // `download.path` holds.
+            let (on_disk, bytes, family) = match listed.get(&found.entry.id) {
+                Some(artifact) => match size_of(artifact) {
+                    Some(bytes) => (OnDisk::Complete, bytes, family_of(artifact).map(scope)),
+                    None => (OnDisk::Absent, found.entry.total_bytes(), None),
+                },
                 None => (found.on_disk, found.entry.total_bytes(), found.family.map(scope)),
             };
             rows.push(row(&found.entry.id, found.entry.layer.into(), on_disk, Some(bytes), family));
