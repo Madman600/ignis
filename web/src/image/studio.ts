@@ -1,4 +1,6 @@
 import { generate, generateStreaming, type ImageOutcome, type ImageParams, type ImageProgress, isEdit, type MadeImage, STOPPED } from "../api/images.ts";
+import { imageLoaded, type LastSwitch, type ModelState } from "../api/model.ts";
+import { lastSwitchLine } from "../server/outcome.ts";
 import { type CatalogRow, type ConfigDocument, switchTo } from "../server/routes.ts";
 
 // The image view's pure parts (spec image-model/05 §Playground, GitHub #322):
@@ -14,7 +16,7 @@ export type Limits = { sizes: string[]; maxN: number; maxImages: number; enhance
 
 export const DEFAULT_LIMITS: Limits = {
   sizes: ["2048x2048", "2400x1792", "1792x2400", "2528x1696", "1696x2528", "2752x1536", "1536x2752", "1024x1024"],
-  maxN: 4,
+  maxN: 10,
   maxImages: 10,
   enhance: false,
 };
@@ -85,7 +87,8 @@ export function refusalLine(outcome: Extract<ImageOutcome, { ok: false }>): stri
 /** One picture in the gallery. */
 export type GalleryItem = {
   id: number;
-  b64: string;
+  /** The PNG as a data URL, built once when the picture arrives: the gallery re-renders on every progress event. */
+  url: string;
   prompt: string;
   revisedPrompt?: string;
   size: string;
@@ -100,7 +103,7 @@ export const dataUrl = (b64: string) => `data:image/png;base64,${b64}`;
 export function galleryItem(image: MadeImage, meta: { id: number; prompt: string; size: string; edit: boolean }): GalleryItem {
   return {
     id: meta.id,
-    b64: image.b64,
+    url: dataUrl(image.b64),
     prompt: meta.prompt,
     ...(image.revisedPrompt ? { revisedPrompt: image.revisedPrompt } : {}),
     size: image.size ?? meta.size,
@@ -114,7 +117,7 @@ export const downloadName = (item: GalleryItem) => `ignis-${item.seed ?? `image-
 /** Saves one gallery picture as a PNG file: the browser's own download, from the picture's data URL. */
 export function downloadImage(item: GalleryItem, doc: Pick<Document, "createElement"> = document): void {
   const anchor = doc.createElement("a");
-  anchor.href = dataUrl(item.b64);
+  anchor.href = item.url;
   anchor.download = downloadName(item);
   anchor.click();
 }
@@ -177,4 +180,29 @@ export async function performRun(
 export function switchToImageModel(catalog: CatalogRow[] | null, fetcher: typeof fetch = fetch) {
   const row = imageModelRow(catalog);
   return row ? switchTo(row.id, fetcher) : Promise.resolve(null);
+}
+
+/** The record of the last switch or reload the server reports, if the page has read one. */
+export const lastSwitchOf = (model: ModelState) => (model.state === "reading" ? undefined : model.lastSwitch);
+
+const sameSwitch = (a: LastSwitch | undefined, b: LastSwitch | undefined) => JSON.stringify(a) === JSON.stringify(b);
+
+/** Where the owner's switch stands: still to follow, or over — with what to say when it did not land. */
+export type SwitchSettled = { kind: "wait" } | { kind: "done"; line: string | null };
+
+/**
+ * Where the owner's switch stands, from the model state the page reads each second and `before`, the record it
+ * read when the button was pressed (as the Server view follows "Load"). Over once the image model serves, or once
+ * the record changes: a switch refused at prepare shows only there, since the text model never stopped serving and
+ * the `failed` it reports for one tick is missed between two reads. Through `failed` it waits while the text model
+ * is loaded again, unless the record already says how it ended.
+ */
+export function settleSwitch(before: LastSwitch | undefined, model: ModelState): SwitchSettled {
+  if (imageLoaded(model)) return { kind: "done", line: null };
+  const last = lastSwitchOf(model);
+  if (last !== undefined && !sameSwitch(last, before)) {
+    return { kind: "done", line: last.outcome === "switched" ? null : lastSwitchLine(last).text };
+  }
+  if (model.state === "error" && !model.failed) return { kind: "done", line: null };
+  return { kind: "wait" };
 }

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { ImageParams } from "../api/images.ts";
+import type { LastSwitch, ModelState } from "../api/model.ts";
 import type { CatalogRow } from "../server/routes.ts";
 import {
+  DEFAULT_LIMITS,
   downloadImage,
   downloadName,
   type GalleryItem,
@@ -13,6 +15,7 @@ import {
   progressShare,
   refusalLine,
   type RunSink,
+  settleSwitch,
   switchToImageModel,
 } from "./studio.ts";
 
@@ -73,9 +76,9 @@ describe("performRun", () => {
     const { log, s } = sink();
     await performRun(params, false, s, nextId, undefined, fetcher);
     expect(calls.map((c) => c.path)).toEqual(["/v1/images/generations"]);
-    expect(log.items.map((i) => [i.b64, i.seed, i.size, i.revisedPrompt, i.edit])).toEqual([
-      ["AAA", 10, "2048x2048", "a brass lantern", false],
-      ["BBB", 11, "2048x2048", undefined, false],
+    expect(log.items.map((i) => [i.url, i.seed, i.size, i.revisedPrompt, i.edit])).toEqual([
+      ["data:image/png;base64,AAA", 10, "2048x2048", "a brass lantern", false],
+      ["data:image/png;base64,BBB", 11, "2048x2048", undefined, false],
     ]);
     expect(log.end).toEqual({ notes: ["w"], error: null, reread: false });
   });
@@ -189,10 +192,45 @@ describe("the switch to the image model", () => {
     expect(await switchToImageModel(catalog.slice(0, 1), fetcher)).toBeNull();
     expect(calls).toEqual([]);
   });
+
+  const earlier: LastSwitch = { from: "ignis-image-2.1-turbo", to: "qwen3.8-27b", outcome: "switched" };
+  const text = (lastSwitch?: LastSwitch): ModelState => ({ state: "ready", id: "qwen3.8-27b", contextLimit: 786432, kind: "text", ...(lastSwitch ? { lastSwitch } : {}) });
+
+  it("follows the switch until the image model serves", () => {
+    expect(settleSwitch(earlier, text(earlier))).toEqual({ kind: "wait" });
+    expect(settleSwitch(earlier, { state: "switching", from: "qwen3.8-27b", to: "ignis-image-2.1-turbo", since: 0, lastSwitch: earlier })).toEqual({ kind: "wait" });
+    const served: ModelState = { state: "ready", id: "ignis-image-2.1-turbo", contextLimit: null, kind: "image" };
+    expect(settleSwitch(earlier, { ...served, lastSwitch: { from: "qwen3.8-27b", to: "ignis-image-2.1-turbo", outcome: "switched" } })).toEqual({ kind: "done", line: null });
+    expect(settleSwitch(earlier, { state: "error", message: "GET /v1/models: 502" })).toEqual({ kind: "done", line: null });
+  });
+
+  it("ends on a switch refused at prepare, which only the record shows: the text model never stopped serving", () => {
+    const refused: LastSwitch = { from: "qwen3.8-27b", to: "ignis-image-2.1-turbo", outcome: "refused", reason: "the checksum is not clean" };
+    expect(settleSwitch(undefined, text(refused))).toEqual({
+      kind: "done",
+      line: "The switch to ignis-image-2.1-turbo was refused, qwen3.8-27b kept serving: the checksum is not clean",
+    });
+    expect(settleSwitch(earlier, text(refused))).toMatchObject({ kind: "done" });
+  });
+
+  it("waits through the reload of the text model after a failed load, and ends when nothing serves", () => {
+    const failing: ModelState = { state: "error", message: "Switch failed: out of memory", failed: true, lastSwitch: earlier };
+    expect(settleSwitch(earlier, failing)).toEqual({ kind: "wait" });
+    const failed: LastSwitch = { from: "qwen3.8-27b", to: "ignis-image-2.1-turbo", outcome: "failed", reason: "out of memory" };
+    expect(settleSwitch(earlier, { ...failing, lastSwitch: failed })).toEqual({
+      kind: "done",
+      line: "The switch to ignis-image-2.1-turbo failed and no model is serving: out of memory",
+    });
+    const restored: LastSwitch = { ...failed, outcome: "restored" };
+    expect(settleSwitch(earlier, text(restored))).toEqual({
+      kind: "done",
+      line: "The switch to ignis-image-2.1-turbo failed, qwen3.8-27b was loaded again: out of memory",
+    });
+  });
 });
 
 describe("the gallery's download", () => {
-  const item: GalleryItem = { id: 3, b64: "AAA", prompt: "a lantern", size: "1024x1024", seed: 12, edit: false };
+  const item: GalleryItem = { id: 3, url: "data:image/png;base64,AAA", prompt: "a lantern", size: "1024x1024", seed: 12, edit: false };
 
   it("saves a PNG named for the seed and the size, from the picture's data URL", () => {
     const made: { href?: string; download?: string; clicked: boolean }[] = [];
@@ -228,6 +266,15 @@ describe("the form's limits and words", () => {
     });
     expect(limitsOf(null).sizes).toContain("2752x1536");
     expect(limitsOf(null).maxImages).toBe(10);
+  });
+
+  it("falls back to the server's own defaults for image.* while the configuration is unread", () => {
+    expect(DEFAULT_LIMITS).toEqual({
+      sizes: ["2048x2048", "2400x1792", "1792x2400", "2528x1696", "1696x2528", "2752x1536", "1536x2752", "1024x1024"],
+      maxN: 10,
+      maxImages: 10,
+      enhance: false,
+    });
   });
 
   it("reads a seed: blank is the server's draw, a whole number is itself, anything else is refused", () => {
