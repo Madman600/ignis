@@ -495,3 +495,10 @@ Where the tower chose what the sections above leave open.
     - not run: the two `attn-tap`-feature tests
       (`attention_head_point_gpu`, `attn_tap_hq_consumed_gpu`), which need
       their own build.
+  - `CARGO_INCREMENTAL=0 cargo test --workspace`: 2,862 passed, 0 failed,
+    6 ignored. `cargo check -p ignis-server --features cuda --tests` passes
+    (two earlier warnings, in `openapi.rs` and `classify_pointing_gpu.rs`).
+  - AC 5 rests on those tests passing, the canary's teacher-forced floor
+    among them. The 27B's embedding was not compared bit for bit before and
+    after the change: "the same ops in the same order" holds by
+    construction.
