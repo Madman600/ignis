@@ -235,6 +235,10 @@ When output names a domain concept, use the term as defined here.
   them before the target image; computed once per image job and reused by
   every denoising step of every image the job makes.
   _Avoid_: prefix, shared prefix (those are a text model's).
+- **K/V run** — a span of keys and values stored in 8 bits for the DiT's
+  attention and quantized as one unit: keys smoothed by one mean, values
+  scaled per channel over the whole span. The condition prefix is one run,
+  the target image another.
 - **Condition budget** — how many condition-prefix tokens the image model can
   hold, set at load from the VRAM the rest of the plan leaves. Condition
   images beyond it are scaled down, never refused.
