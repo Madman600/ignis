@@ -133,8 +133,13 @@ mod device {
     // The leaf, its device and each prefix wrap raw device pointers with no
     // synchronization of their own. Sound because every call comes through
     // `ImageModel::with_runner`'s one `Mutex`, never two at once (as
-    // `ignis_runtime::CudaModel` under the engine's), and each leaf call
-    // selects the device on the thread it runs on (`ignis_device`).
+    // `ignis_runtime::CudaModel` under the engine's). The calls run on
+    // whichever blocking thread holds the lock: the leaf's `ignis_device`
+    // ops select the device there, but its kernel launches (and the FP8
+    // GEMM's `require_prepared`) run on the thread's current device, device
+    // 0 on a thread that never chose one. Sound for device 0 only, which is
+    // the one `load` takes; another device would have to be selected at
+    // every call first.
     unsafe impl Send for LeafRunner {}
 
     impl LeafRunner {
