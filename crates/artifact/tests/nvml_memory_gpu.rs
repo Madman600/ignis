@@ -1,6 +1,7 @@
 //! GPU coverage for `CudaDevice::nvml_memory` (GitHub #210): the free memory
 //! a VRAM budget is derived from counts what this process holds, its CUDA
-//! context included, the way nvidia-smi and Task Manager do.
+//! context included, the way nvidia-smi and Task Manager do -- and the
+//! context outlives the device that made it (GitHub #324).
 
 #![cfg(feature = "cuda")]
 
@@ -23,7 +24,10 @@ fn nvml_free_memory_counts_the_context_and_every_allocation() {
     };
     assert!(free_before > 0 && free_before <= total, "{free_before} of {total}");
 
+    // This binary's one test: nothing has made the context yet.
+    assert!(!CudaDevice::context_created(), "a context before the first device");
     let mut device = CudaDevice::create(0).expect("CUDA device");
+    assert!(CudaDevice::context_created(), "the first device made the context");
     let (free_with_context, _) = CudaDevice::nvml_memory(0).expect("NVML after the context");
     // The context holds hundreds of MiB; `cudaMemGetInfo` would not see it.
     assert!(
@@ -39,4 +43,14 @@ fn nvml_free_memory_counts_the_context_and_every_allocation() {
         free_with_context - free_with_buffer
     );
     device.deallocate(buffer).expect("free");
+
+    // GitHub #324: dropping the device keeps the context, so the next load's
+    // free reading does not count it -- what `context_created` tells a plan.
+    drop(device);
+    let (free_after_drop, _) = CudaDevice::nvml_memory(0).expect("NVML after the drop");
+    assert!(
+        free_before.saturating_sub(free_after_drop) >= 256 << 20,
+        "the dropped device gave its context back: NVML free {free_after_drop}, {free_before} before the context"
+    );
+    assert!(CudaDevice::context_created(), "the context outlives the device");
 }

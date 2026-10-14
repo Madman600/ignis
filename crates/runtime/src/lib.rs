@@ -93,8 +93,51 @@ pub fn auto_kv_pool_bytes(format: ignis_core::KvFormat, max_context: u32) -> u64
 ///
 /// A plan line: the budget starts from the free memory NVML reports before
 /// the context exists (`CudaDevice::nvml_memory`), so the context is one more
-/// thing the process holds inside it.
+/// thing the process holds inside it. A later load in the same process reads
+/// NVML with the context held and adds [`held_before_load`] back (GitHub #324).
 pub const CUDA_CONTEXT_BYTES: u64 = 452_595_712;
+
+/// What a 27B load leaves on the device beside the CUDA context once it is
+/// torn down (GitHub #324): state its kernels set up once per process, which
+/// the plan charges as part of [`LOAD_RESIDUAL_BYTES`]. Read from the same
+/// WDDM counter as [`CUDA_CONTEXT_BYTES`], on the RTX 5090 on 2026-10-15: an
+/// idle-unloaded server that has loaded the 27B holds 536,485,888 B (the same
+/// to the byte at every unload, an image model's in between included), one
+/// that has only loaded the image model holds 452,595,712 B, the context
+/// alone.
+pub const QWEN27B_PROCESS_STATE_BYTES: u64 = 83_890_176;
+
+/// Set once a 27B load has run in this process (GitHub #324).
+static QWEN27B_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records that a 27B load ran in this process: from then on the process
+/// holds [`QWEN27B_PROCESS_STATE_BYTES`], whatever it loads next.
+pub fn note_qwen27b_loaded() {
+    QWEN27B_LOADED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a 27B load has run in this process ([`note_qwen27b_loaded`]).
+pub fn qwen27b_loaded() -> bool {
+    QWEN27B_LOADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The device bytes a load's VRAM plan adds back to the free memory NVML
+/// reads (GitHub #324): what the process already holds and the plan's lines
+/// charge again. None on the process's first load, which reads before its
+/// context exists; the context, its `cuda_context` line, once it exists; and,
+/// on a plan whose `residual` line charges it, the 27B's per-process state
+/// once a 27B load has run. A model switch or the reload after an idle unload
+/// then plans what its cold start planned, since ADR 0030's budget starts
+/// from what was free before the process held anything. Flash-Next's plan has
+/// no residual line, and its own per-process state is not measured: neither is
+/// added back, so its budget is never more than the card has.
+pub fn held_before_load(context_created: bool, qwen27b_state_charged: bool) -> u64 {
+    match (context_created, qwen27b_state_charged) {
+        (false, _) => 0,
+        (true, false) => CUDA_CONTEXT_BYTES,
+        (true, true) => CUDA_CONTEXT_BYTES + QWEN27B_PROCESS_STATE_BYTES,
+    }
+}
 
 /// What a load holds beyond every reservation the VRAM plan names (GitHub
 /// #210): allocator rounding, the decode graph captures, handles the kernel
