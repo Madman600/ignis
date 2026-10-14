@@ -741,6 +741,28 @@ async fn a_prefix_the_runner_refuses_past_the_budget_is_a_400() {
     assert_eq!(harness.held.load(Ordering::SeqCst), 0);
 }
 
+/// Spec image-model/05 §Prompt enhancement: on a server that cannot switch
+/// models and has no enhancer loaded, an enhanced request is made from its
+/// prompt as sent, the answer saying so — streamed too, in each completed
+/// event.
+#[tokio::test]
+async fn an_enhanced_request_on_a_server_that_cannot_switch_uses_its_prompt_as_sent() {
+    let harness = Harness::new(Gate::opened());
+    let body = json!({ "prompt": "a heron", "size": "64x64", "prompt_enhancement": true });
+    let (status, answer) = send(&harness.app, json_request("/v1/images/generations", &body)).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer["data"][0].get("revised_prompt").is_none(), "{answer}");
+    let warning = answer["warnings"][0].as_str().unwrap_or_default();
+    assert!(warning.contains("qwen3.8-27b did not rewrite the prompt") && warning.contains("cannot switch models"), "{answer}");
+    let mut streamed = body.clone();
+    streamed["stream"] = json!(true);
+    let events = events_of(harness.app.clone().oneshot(json_request("/v1/images/generations", &streamed)).await.unwrap()).await;
+    let (last, completed) = events.last().expect("events");
+    assert_eq!(last, "image_generation.completed");
+    assert_eq!(completed["warnings"][0], warning, "{completed}");
+    assert_eq!(harness.encodes(), ["a heron", "a heron"]);
+}
+
 /// The image routes are model routes: with a text model loaded and no
 /// `model` naming the image model, `409 model_kind_mismatch`; they count as
 /// the model's use for idle unload. The edit's body limit is the media one
