@@ -205,7 +205,8 @@ The artifact is published on Hugging Face as `gpillon/ignis-image-2.1-turbo`.
 ## As built (2026-10-13, branch `image-artifact-318`: AC 1-4)
 
 Where the implementation chose what the sections above leave open. AC 5, 6
-and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
+and 8 (the recorder) are in the next section; AC 7 (publication) is in the
+last one.
 
 - **Who writes the container.** `tools/image-converter/convert.py run`
   writes work units (`frontend`, `text_encoder`, `vision`, `transformer`,
@@ -534,3 +535,27 @@ and 8 (the recorder) are in the next section; AC 7 (publication) is not done.
 - **The venv** gains torchvision 0.28.0+cu130: the checkpoint's processor
   (`Qwen2VLImageProcessorFast`, `Qwen3VLVideoProcessor`) does not build
   without it.
+
+## As built (2026-10-14: AC 7, the publication)
+
+- **Repo.** `gpillon/ignis-image-2.1-turbo`, public since 2026-10-14 (the
+  owner's call: public at once, not after spec 04). Hub commit
+  `d6912417aa47320cd71c78e19d99872faa5cb63b`: the repo's creation, then one
+  upload commit. Spec 05's catalog entry pins it.
+- **Files.** The container (16,721,644,544 bytes, sha256 `4205dd19...6050af`;
+  the hub's LFS sha256 equals the local one), the `.conversion.json` with
+  `converter.command`'s paths replaced by `<checkpoint>` and `<work-dir>`
+  (617,924 bytes, sha256 `a97f0491...0f33ca`; the local record keeps its
+  paths), a `.sha256` file, the upstream LICENSE (Qwen RESEARCH LICENSE), a
+  NOTICE with the licence's attribution line, and the card: measured values
+  only, non-commercial use, "Built with Qwen", the files marked as modified
+  (quantized).
+- **Privacy scan.** The container and every published text file were scanned
+  byte for byte, and the published text was scanned again after
+  downloading it back. The user-name hits are the tokenizer's vocabulary and
+  random weight bytes. The `/cpfs02/...` path in the frontend's VAE config is
+  byte-identical to the upstream `vae/config.json`, so it was kept.
+- **Upload.** ~25 min at 12-13 MB/s with `hf upload-large-folder`, from a
+  staging folder of hardlinks (`F:/ai/models/hf-upload-ignis-image/`). An
+  anonymous request for the container resolves (302 to the CDN), and the hub
+  reports the repo public.
