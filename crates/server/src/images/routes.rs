@@ -34,7 +34,7 @@ use utoipa::ToSchema;
 
 use super::budget::{self, Fitted};
 use super::enhance::Rewritten;
-use super::job::{self, Background, ImageJob, JobEnd, JobEvent, Phase, Progress};
+use super::job::{self, Background, ImageJob, JobContext, JobEnd, JobEvent, Phase, Progress};
 use super::{ImageModel, Running, Waiting};
 use crate::api::{
     bad_request_param, check_kind, check_served_kind, error_response, error_response_naming, implicit_switch_refused,
@@ -675,6 +675,7 @@ async fn admit(
     events: &mpsc::UnboundedSender<Streamed>,
 ) -> Result<(), Response> {
     let named = split_model_lane(request.model.clone()).0;
+    let began = std::time::Instant::now();
     // What `ensure_loaded` waits on: the load of an unloaded model, or the
     // one another request began.
     let status = server.status();
@@ -690,16 +691,22 @@ async fn admit(
         && unloaded.kind() == ModelKind::Text
         && unloaded.model_id() == server.live().image.prompt_enhancer;
     let load = if enhancer_unloaded { None } else { named.as_deref() };
+    let loading = std::time::Instant::now();
     crate::model_switch::ensure_loaded(&server, load).await.map_err(|reason| load_failed(&server, &reason))?;
+    let mut switch = loading.elapsed();
     // Drawn now, so that the rewrite is seeded with it too.
     let seed = request.seed.or(server.seedless_seed).unwrap_or_else(crate::api::fresh_seed);
+    let enhancing = std::time::Instant::now();
     let enhanced = match request.enhance {
         true => enhance(&server, request.prompt.clone(), &conditions.images, named.as_deref(), seed, events).await?,
         false => Enhanced::sent(request.prompt.clone()),
     };
+    let enhance_time = enhancing.elapsed();
+    let switching = std::time::Instant::now();
     crate::model_switch::implicit_switch_telling(&server, named.as_deref(), Some(switch_steps(events.clone(), 1)))
         .await
         .map_err(implicit_switch_refused)?;
+    switch += switching.elapsed();
     // One model for the rest of the request (spec model-switch/01), the
     // image model (spec image-model/05); the server itself for the job,
     // which unloads its model should it fail.
@@ -731,6 +738,25 @@ async fn admit(
         },
     };
     let waiting = admitted(&model, limits.queue_depth)?;
+    if let Some(metrics) = &unpinned.metrics {
+        let queue = model.jobs.in_flight();
+        metrics.set_image_queue(queue.waiting, queue.running);
+    }
+    let context = JobContext {
+        kind: match route {
+            Route::Generations => "generation",
+            Route::Edits => "edit",
+        },
+        condition_images: conditions.sources.len() as u32,
+        enhancement: match (request.enhance, enhanced.revised.is_some()) {
+            (false, _) => "off",
+            (true, true) => "rewritten",
+            (true, false) => "as_sent",
+        },
+        began,
+        enhance: enhance_time,
+        switch,
+    };
     let ImageRequest { n, background, .. } = request;
     let Enhanced { prompt, revised, warnings } = enhanced;
     let prepared = {
@@ -750,7 +776,7 @@ async fn admit(
         revised_prompt: revised,
         warnings,
     }));
-    job::spawn(unpinned, model, job, waiting, events.clone());
+    job::spawn(unpinned, model, job, waiting, events.clone(), context);
     Ok(())
 }
 

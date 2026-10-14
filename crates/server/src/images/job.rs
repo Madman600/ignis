@@ -10,12 +10,17 @@
 //! job's [`JobEvent`]s off a channel and, by dropping it, cancels the job:
 //! while it waits for its turn, or at the next call once it runs.
 
+use std::time::{Duration, Instant};
+
 use ignis_core::image::{ImageCondition, ImageError, ImageRunner, ImageSize, RgbaImage, TargetLatents};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use utoipa::ToSchema;
 
+use std::sync::Arc;
+
 use super::{ImageModel, Waiting};
+use crate::metrics::{ImageJobEnd, ImageOutcome};
 
 /// What the client's `background` asks of the images' alpha.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +144,44 @@ impl Drop for Held<'_> {
     }
 }
 
+/// Where a job's time went while it ran, and what it made (GitHub #324).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Phases {
+    pub encoding: Duration,
+    pub denoising: Duration,
+    pub decoding: Duration,
+    /// Images sent so far.
+    pub images: u32,
+}
+
+/// `calls`, its time added to `slot`.
+fn timed<T>(slot: &mut Duration, calls: impl FnOnce() -> T) -> T {
+    let began = Instant::now();
+    let out = calls();
+    *slot += began.elapsed();
+    out
+}
+
+/// What the log line of a finished job says of its request, known before
+/// the job runs (GitHub #324).
+#[derive(Debug, Clone)]
+pub struct JobContext {
+    /// `generation` or `edit`.
+    pub kind: &'static str,
+    /// The condition images the request carried.
+    pub condition_images: u32,
+    /// `off`, `rewritten`, or `as_sent` (asked for, the prompt went unchanged).
+    pub enhancement: &'static str,
+    /// When the request began its admission: the log line's total runs from here.
+    pub began: Instant,
+    /// Prompt enhancement's time, and that of the loads and switches before the job.
+    pub enhance: Duration,
+    pub switch: Duration,
+}
+
+/// The next job's id in the log, `img-<n>`.
+static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Run `job` on `model` now: the condition prefix, then each image from its
 /// noise through every denoising step and the decode, sent to `events` as a
 /// PNG, every unit announced there as it starts ([`Progress`]). The runner
@@ -148,6 +191,16 @@ impl Drop for Held<'_> {
 /// ([`JobEnd::Cancelled`]). The prefix is released whichever way it ends.
 /// Blocking: it runs on a blocking thread.
 pub fn run<E: From<JobEvent>>(model: &ImageModel, job: &ImageJob, events: &mpsc::UnboundedSender<E>) -> Result<(), JobEnd> {
+    run_timed(model, job, events, &mut Phases::default())
+}
+
+/// [`run`], adding where its time went to `phases`, whichever way it ends.
+pub fn run_timed<E: From<JobEvent>>(
+    model: &ImageModel,
+    job: &ImageJob,
+    events: &mpsc::UnboundedSender<E>,
+    phases: &mut Phases,
+) -> Result<(), JobEnd> {
     let go_on = || {
         if model.jobs.is_closed() {
             Err(JobEnd::Stopped)
@@ -163,7 +216,8 @@ pub fn run<E: From<JobEvent>>(model: &ImageModel, job: &ImageJob, events: &mpsc:
     };
     go_on()?;
     progress(Phase::Encoding, 0, 1, 1);
-    let held = Held { model, id: call(model, |runner| runner.encode_condition(&job.condition))? };
+    let encoded = timed(&mut phases.encoding, || call(model, |runner| runner.encode_condition(&job.condition)));
+    let held = Held { model, id: encoded? };
     let sigmas = &model.plan().sample_sigmas;
     let total = sigmas.len() as u32;
     for index in 0..job.n {
@@ -172,15 +226,16 @@ pub fn run<E: From<JobEvent>>(model: &ImageModel, job: &ImageJob, events: &mpsc:
             go_on()?;
             progress(Phase::Denoising, index, step as u32 + 1, total);
             let next = sigmas.get(step + 1).copied().unwrap_or(0.0);
-            call(model, |runner| runner.denoise_step(held.id, &mut latents, sigma, next, None))?;
+            timed(&mut phases.denoising, || call(model, |runner| runner.denoise_step(held.id, &mut latents, sigma, next, None)))?;
         }
         go_on()?;
         progress(Phase::Decoding, index, 1, 1);
-        let mut image = call(model, |runner| runner.vae_decode(&latents))?;
+        let mut image = timed(&mut phases.decoding, || call(model, |runner| runner.vae_decode(&latents)))?;
         if job.background == Background::Opaque {
             on_white(&mut image);
         }
         let _ = events.send(JobEvent::Image { index, png: encode_png(&image) }.into());
+        phases.images += 1;
     }
     Ok(())
 }
@@ -197,25 +252,79 @@ pub fn run<E: From<JobEvent>>(model: &ImageModel, job: &ImageJob, events: &mpsc:
 /// dropped, both before the job stops counting; then `server` unloads the
 /// model, so the next request loads it again
 /// ([`crate::model_switch::unload_failed`]).
+///
+/// A job that ends, whichever way, logs one `ignis.image.job` line and, with
+/// metrics on, moves the image families (GitHub #324).
 pub fn spawn<E: From<JobEvent> + Send + 'static>(
     server: std::sync::Arc<crate::Server>,
     model: ImageModel,
     job: ImageJob,
     waiting: Waiting,
     events: mpsc::UnboundedSender<E>,
+    context: JobContext,
 ) {
+    let id = format!("img-{}", NEXT_JOB.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let queued_at = Instant::now();
+    let finish = {
+        let (server, jobs) = (Arc::clone(&server), Arc::clone(&model.jobs));
+        let (id, model_id, job, context) = (id.clone(), model.model_id(), job.clone(), context.clone());
+        move |outcome: ImageOutcome, queued: Duration, ran: Duration, phases: Phases| {
+            let ms = |d: Duration| d.as_millis() as u64;
+            tracing::info!(
+                name: "ignis.image.job",
+                request_id = %id,
+                model = %model_id,
+                kind = context.kind,
+                outcome = outcome.label(),
+                n = job.n,
+                images = phases.images,
+                size = %job.size,
+                condition_images = context.condition_images,
+                enhancement = context.enhancement,
+                enhance_ms = ms(context.enhance),
+                switch_ms = ms(context.switch),
+                queued_ms = ms(queued),
+                encode_ms = ms(phases.encoding),
+                denoise_ms = ms(phases.denoising),
+                decode_ms = ms(phases.decoding),
+                run_ms = ms(ran),
+                total_ms = ms(context.began.elapsed()),
+                "image job ended"
+            );
+            if let Some(metrics) = &server.metrics {
+                metrics.record_image_job(&ImageJobEnd {
+                    outcome,
+                    images: phases.images,
+                    phases: [queued, phases.encoding, phases.denoising, phases.decoding],
+                });
+                let queue = jobs.in_flight();
+                metrics.set_image_queue(queue.waiting, queue.running);
+            }
+        }
+    };
     tokio::spawn(async move {
         let running = tokio::select! {
             running = waiting.turn() => running,
-            () = events.closed() => return,
+            () = events.closed() => {
+                finish(ImageOutcome::Cancelled, queued_at.elapsed(), Duration::ZERO, Phases::default());
+                return;
+            }
         };
+        let queued = queued_at.elapsed();
         let Some(running) = running else {
             let _ = events.send(JobEvent::Ended(JobEnd::Stopped).into());
+            finish(ImageOutcome::Stopped, queued, Duration::ZERO, Phases::default());
             return;
         };
+        if let Some(metrics) = &server.metrics {
+            let queue = model.jobs.in_flight();
+            metrics.set_image_queue(queue.waiting, queue.running);
+        }
         let failed = model.clone();
         let ran = tokio::task::spawn_blocking(move || {
-            let ended = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&model, &job, &events))) {
+            let mut phases = Phases::default();
+            let began = Instant::now();
+            let ended = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_timed(&model, &job, &events, &mut phases))) {
                 Ok(ended) => ended,
                 Err(panic) => {
                     // The prefix went as the job unwound (`Held`); the
@@ -223,12 +332,21 @@ pub fn spawn<E: From<JobEvent> + Send + 'static>(
                     model.jobs.close();
                     model.shut_down();
                     drop(running);
+                    finish(ImageOutcome::Failed, queued, began.elapsed(), phases);
                     return Err(panic_message(panic.as_ref()));
                 }
             };
             // No longer counted before its request hears the end: a request
             // answered is never a job in flight.
             drop(running);
+            let outcome = match &ended {
+                Ok(()) => ImageOutcome::Completed,
+                Err(JobEnd::Cancelled) => ImageOutcome::Cancelled,
+                Err(JobEnd::Stopped) => ImageOutcome::Stopped,
+                Err(JobEnd::Failed(ImageError::Refused(_))) => ImageOutcome::Refused,
+                Err(JobEnd::Failed(_)) => ImageOutcome::Failed,
+            };
+            finish(outcome, queued, began.elapsed(), phases);
             match ended {
                 Ok(()) | Err(JobEnd::Cancelled) => {}
                 Err(end) => {
