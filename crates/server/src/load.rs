@@ -369,7 +369,6 @@ fn load_image_model(
     let runner = cuda_image_runner(&artifact, config)?;
     #[cfg(not(feature = "cuda"))]
     let runner: Box<dyn ImageRunner> = {
-        let _ = config;
         tracing::warn!(
             name: "ignis.model.fake_image_runner",
             "built without --features cuda — the fake image runner despite --model-artifact (its images are deterministic noise, not the prompt's)"
@@ -382,8 +381,21 @@ fn load_image_model(
         kind = ModelKind::Image.as_str(),
         condition_budget_tokens = runner.plan().condition_budget_tokens,
         sample_sigmas = runner.plan().sample_sigmas.len(),
+        max_target_cells = runner.plan().max_target_cells,
         "image model loaded"
     );
+    // A size this load cannot make is dropped from what it serves, and said
+    // so; the config keeps it, for a load that can.
+    let past: Vec<String> =
+        config.settings().image.sizes.iter().filter(|&&size| !runner.plan().takes(size)).map(ToString::to_string).collect();
+    if !past.is_empty() {
+        tracing::warn!(
+            name: "ignis.image.sizes_not_served",
+            sizes = %past.join(", "),
+            max_target_cells = runner.plan().max_target_cells,
+            "image.sizes names sizes past the largest image this load makes: they are not served"
+        );
+    }
     let image = crate::images::ImageModel::new(model.clone(), runner);
     let active = crate::ActiveModel::image(image).with_source(crate::ModelSource { artifact, model });
     Ok(LoadedModel { model: active, reservations: None })

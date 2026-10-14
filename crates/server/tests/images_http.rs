@@ -85,8 +85,8 @@ impl ImageRunner for Recording {
         self.inner.plan()
     }
 
-    fn prompt_tokens(&self, prompt: &str, images: usize) -> u64 {
-        self.inner.prompt_tokens(prompt, images)
+    fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> u64 {
+        self.inner.condition_tokens(prompt, images)
     }
 
     fn encode_condition(&mut self, condition: &ImageCondition) -> Result<ConditionId, ImageError> {
@@ -133,7 +133,12 @@ struct Harness {
 
 impl Harness {
     fn new(gate: Arc<Gate>) -> Self {
-        let inner = FakeImageRunner::default();
+        Self::planning(gate, ignis_core::image::fake_plan())
+    }
+
+    /// [`Harness::new`], its load planning `plan`.
+    fn planning(gate: Arc<Gate>, plan: ImagePlan) -> Self {
+        let inner = FakeImageRunner::new(plan);
         let held = inner.held_conditions();
         let log = Arc::default();
         let runner = Recording { inner, log: Arc::clone(&log), gate };
@@ -353,6 +358,32 @@ async fn sizes_auto_and_the_refused_fields() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["size"], "2048x2048");
     assert_eq!(png_of(&body["data"][0]["b64_json"]).size, ImageSize::new(2048, 2048));
+}
+
+/// Spec image-model/05 §Sizes against the load's plan: a size in
+/// `image.sizes` past the largest target the load makes is a 400 listing the
+/// sizes it serves, before anything is queued; `auto` picks among those.
+#[tokio::test]
+async fn a_size_past_the_loads_largest_target_is_refused_and_auto_never_picks_it() {
+    // 96x64 is 24 latent cells; 128x64, 32, is past it.
+    let plan = ImagePlan { max_target_cells: ImageSize::new(96, 64).latent_cells(), ..ignis_core::image::fake_plan() };
+    let harness = Harness::planning(Gate::opened(), plan);
+    let (status, refused) = send(&harness.app, json_request("/v1/images/generations", &json!({ "prompt": "x", "size": "128x64" }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"]["param"], "size");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("past the largest image") && message.contains("24 latent cells") && message.contains("64x64, 96x64 (image.sizes)"), "{message}");
+    assert!(harness.calls().is_empty() && harness.jobs().in_flight().is_idle(), "nothing queued for it");
+
+    // A 2:1 last condition image would get 128x64; 96x64 is the nearest served.
+    let wide = encode(&RgbaImage { size: ImageSize::new(200, 100), pixels: vec![255; 200 * 100 * 4] });
+    let (status, body) = send(&harness.app, form_request(&[("prompt", Part::Text("x")), ("image[]", Part::File(&wide))])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["size"], "96x64");
+    harness.server.update_live(|live| live.image.sizes = vec![ImageSize::new(128, 64)]);
+    let (status, refused) = send(&harness.app, json_request("/v1/images/generations", &json!({ "prompt": "x" }))).await;
+    assert_eq!((status, refused["error"]["param"].as_str()), (StatusCode::BAD_REQUEST, Some("size")), "{refused}");
+    assert!(refused["error"]["message"].as_str().unwrap().contains("none this image model makes"), "{refused}");
 }
 
 /// An RGBA image as a PNG.
@@ -607,7 +638,9 @@ async fn a_stopped_model_ends_its_job_with_model_stopped() {
 
 /// The image routes are model routes: with a text model loaded and no
 /// `model` naming the image model, `409 model_kind_mismatch`; they count as
-/// the model's use for idle unload.
+/// the model's use for idle unload. The edit's body limit is the media one
+/// on a text load without vision too: a form past 16 MiB is read, and
+/// refused for the kind.
 #[tokio::test]
 async fn with_a_text_model_loaded_an_image_request_is_a_kind_mismatch() {
     let scheduler = ignis_core::ConcreteScheduler::with_config(
@@ -622,4 +655,8 @@ async fn with_a_text_model_loaded_an_image_request_is_a_kind_mismatch() {
     assert_eq!(refused["error"]["code"], "model_kind_mismatch");
     let (status, refused) = send(&app, form_request(&[("prompt", Part::Text("x")), ("image[]", Part::File(JPEG))])).await;
     assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("model_kind_mismatch")));
+    let padding = "p".repeat(ignis_server::api::TEXT_REQUEST_BODY_LIMIT + 1);
+    let parts = [("prompt", Part::Text("x")), ("image[]", Part::File(JPEG)), ("padding", Part::Text(&padding))];
+    let (status, refused) = send(&app, form_request(&parts)).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("model_kind_mismatch")), "{refused}");
 }

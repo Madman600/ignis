@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ignis_core::image::{ImagePlan, ImageRunner};
+use ignis_core::image::{ImagePlan, ImageRunner, ImageSize};
 
 use crate::active::InFlight;
 
@@ -53,7 +53,8 @@ impl ImageModel {
         self.model.clone()
     }
 
-    /// What its load planned: the condition budget and the sampler sigmas.
+    /// What its load planned: the condition budget, the sampler sigmas and
+    /// the largest target.
     pub fn plan(&self) -> &ImagePlan {
         &self.plan
     }
@@ -71,6 +72,14 @@ impl ImageModel {
     pub fn shut_down(&self) {
         drop(self.runner.lock().expect("image runner lock").take());
     }
+}
+
+/// Of `sizes` (`image.sizes`), the ones a load that planned `plan` makes
+/// ([`ImagePlan::takes`]): a size past its largest target is not served,
+/// whatever the config names — its load warns of it, and a request for it is
+/// refused.
+pub fn served_sizes(sizes: &[ImageSize], plan: &ImagePlan) -> Vec<ImageSize> {
+    sizes.iter().copied().filter(|&size| plan.takes(size)).collect()
 }
 
 /// The image jobs waiting and running on the loaded image model: what tells
@@ -302,6 +311,19 @@ mod tests {
         assert!(closed.await.unwrap(), "a waiting job gets no turn once closed");
         drop(running);
         assert!(jobs.in_flight().is_idle());
+    }
+
+    /// Spec image-model/05 §Sizes: the fake's plan makes every default size,
+    /// the checkpoint's largest preset included; a smaller plan drops what is
+    /// past it and keeps the order of the rest.
+    #[test]
+    fn the_sizes_served_are_the_configs_that_the_plan_takes() {
+        let defaults = crate::config::DEFAULT_IMAGE_SIZES;
+        assert_eq!(served_sizes(&defaults, &ignis_core::image::fake_plan()), defaults);
+        let square = ImagePlan { max_target_cells: ImageSize::new(2048, 2048).latent_cells(), ..ignis_core::image::fake_plan() };
+        assert_eq!(served_sizes(&defaults, &square), [ImageSize::new(2048, 2048), ImageSize::new(1024, 1024)]);
+        let huge = [ImageSize::new(8192, 8192), ImageSize::new(1024, 1024)];
+        assert_eq!(served_sizes(&huge, &ignis_core::image::fake_plan()), [ImageSize::new(1024, 1024)]);
     }
 
     /// The shutdown drops the runner, and a call after it finds none.

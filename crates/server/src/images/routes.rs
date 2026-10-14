@@ -314,7 +314,7 @@ One job runs at a time and up to `image.queue_depth` wait, in order; past that t
             (ImagesResponse = "application/json"),
             (ImageStreamEvent = "text/event-stream"),
         )),
-        (status = 400, description = "A field outside its rule: no `prompt`, `n` outside 1..`image.max_n`, a `size` not in `image.sizes` (the message lists them), `response_format: url`, an `output_format` other than `png`, an unknown `background`; or a prompt longer than the condition budget (`condition_budget_exceeded`).", body = ApiError),
+        (status = 400, description = "A field outside its rule: no `prompt`, `n` outside 1..`image.max_n`, a `size` not in `image.sizes`, or past the largest image the loaded model makes (the message lists the sizes), `response_format: url`, an `output_format` other than `png`, an unknown `background`; or a prompt longer than the condition budget (`condition_budget_exceeded`).", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 409, description = "The model that would serve the request is a text model (`model_kind_mismatch`, naming both kinds and the loaded id).", body = ApiError),
@@ -438,8 +438,9 @@ fn set_field(fields: &mut GenerationRequest, name: &str, text: String) -> Result
 }
 
 /// Serve a checked request on the image model: the kind check and the
-/// implicit switch, the queue's admission, the condition budget and the
-/// resize, then the job — answered whole, or streamed.
+/// implicit switch, the size against what the load makes (`auto` resolved
+/// among those), the queue's admission, the condition budget and the resize,
+/// then the job — answered whole, or streamed.
 async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage>, route: Route) -> Response {
     if let Err(refused) = switch_to_named_model(&server, ModelKind::Image, request.model.as_deref()).await {
         return refused;
@@ -452,6 +453,28 @@ async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage
     }
     let model = server.active().image_model().expect("the kind check passed: the image model").clone();
     let limits = server.live().image.clone();
+    // `image.sizes` less what this load cannot make: what `auto` picks from.
+    let sizes = super::served_sizes(&limits.sizes, model.plan());
+    let ratio = images.last().map_or(1.0, |image| f64::from(image.size.width) / f64::from(image.size.height));
+    let size = match request.size {
+        Some(size) if !model.plan().takes(size) => {
+            let served: Vec<String> = sizes.iter().map(ToString::to_string).collect();
+            return bad_request_param(
+                &format!(
+                    "size `{size}` is past the largest image {} makes ({} latent cells of 16x16 pixels): it must be auto or one of {} (image.sizes)",
+                    model.model_id(),
+                    model.plan().max_target_cells,
+                    served.join(", ")
+                ),
+                "size",
+            );
+        }
+        Some(size) => size,
+        None => match auto_size(&sizes, ratio) {
+            Some(size) => size,
+            None => return bad_request_param("size auto has no size to pick: image.sizes names none this image model makes", "size"),
+        },
+    };
     let Some(waiting) = model.jobs.admit(limits.queue_depth) else {
         if model.jobs.is_closed() {
             return model_stopped();
@@ -461,10 +484,6 @@ async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage
             "engine_full",
             format!("the image queue is full: one job runs and {} wait (image.queue_depth); retry", limits.queue_depth),
         );
-    };
-    let ratio = images.last().map_or(1.0, |image| f64::from(image.size.width) / f64::from(image.size.height));
-    let Some(size) = request.size.or_else(|| auto_size(&limits.sizes, ratio)) else {
-        return bad_request_param("size auto has no size to pick: image.sizes is empty", "size");
     };
     let seed = request.seed.or(server.seedless_seed).unwrap_or_else(crate::api::fresh_seed);
     let ImageRequest { prompt, n, background, stream, .. } = request;
@@ -496,8 +515,9 @@ async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage
 }
 
 /// The condition budget and the resize, then the job: blocking, since the
-/// prompt's tokens are the runner's to count — it holds the image model's
-/// tokenizer — and the resize is per pixel.
+/// prefix's tokens are the runner's to count — it holds the image model's
+/// tokenizer — and the resize is per pixel. The fit holds the runner for its
+/// few host-side counts (a bisection's), behind the call a running job is in.
 #[allow(clippy::too_many_arguments)]
 fn prepare(
     model: ImageModel,
@@ -509,12 +529,15 @@ fn prepare(
     seed: u64,
     background: Background,
 ) -> Result<Prepared, Response> {
-    let Some(prompt_tokens) = model.with_runner(|runner| runner.prompt_tokens(&prompt, images.len())) else {
-        return Err(model_stopped());
-    };
     let budget = budget::budget(model.plan(), limits.condition_budget_tokens);
     let sources: Vec<ImageSize> = images.iter().map(|image| image.size).collect();
-    let fitted = budget::fit(prompt_tokens, &sources, budget, limits.condition_floor_px).map_err(|over| {
+    let fitted = model.with_runner(|runner| {
+        budget::fit(|sizes| runner.condition_tokens(&prompt, sizes), &sources, budget, limits.condition_floor_px)
+    });
+    let Some(fitted) = fitted else {
+        return Err(model_stopped());
+    };
+    let fitted = fitted.map_err(|over| {
         let param = if images.is_empty() { "prompt" } else { "image" };
         error_response_naming(StatusCode::BAD_REQUEST, "invalid_request_error", "condition_budget_exceeded", over.to_string(), Some(param))
     })?;

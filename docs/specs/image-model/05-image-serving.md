@@ -333,18 +333,18 @@ docs and the Playground are the agents after it.
   drawn one, and it is returned.
 - **The condition budget** (`images/budget.rs`). `condition_size` is
   diffusers' `calculate_dimensions` (halves to even; a side is never 0).
-  A prefix holds `ImageRunner::prompt_tokens(prompt, images)` plus
-  `(W / 16) · (H / 16)` per image. Over the budget
+  A prefix holds what `ImageRunner::condition_tokens(prompt, sizes)`
+  counts: the prompt as templated plus `(W / 16) · (H / 16)` per image
+  (322c's call, below). Over the budget
   (`min(plan, image.condition_budget_tokens)`), every image gets the same
   area s², s the largest in [floor, 1024] that fits (bisected: the tokens
   only grow with s); below the floor `400 condition_budget_exceeded`
   (`param` `image`, or `prompt` for a generation). The resize is
   `media::resize_rgba`, Pillow's Lanczos on `RGBa` in Pillow's fixed point,
   byte-equal to Pillow 12.3 on three committed fixtures.
-- **A new runner call:** `ImageRunner::prompt_tokens`. The runner holds the
-  image model's tokenizer, so the server asks it for the prompt's tokens
-  around the images. #321 implements it with the template's count without
-  the image pads, the same count `encode_condition` refuses by.
+- **A new runner call:** `ImageRunner::prompt_tokens`, which 322c widened
+  into `condition_tokens` (below). The runner holds the image model's
+  tokenizer, so the server asks it for the prefix's tokens.
 - **The queue** (`images/mod.rs`). `ImageJobs` is a ticket queue under a
   lock. `admit(depth)` admits while waiting + running ≤ `image.queue_depth`;
   past it the answer is `503 engine_full` with `Retry-After: 1`, and on a
@@ -379,5 +379,35 @@ docs and the Playground are the agents after it.
     model loaded, and the edit's body limit.
   - Unit tests in `images::{budget, job, routes}`, the queue's in `images`,
     `media` (the Pillow fixtures), `vision::decode` (RGBA), and `core::image`
-    (the noise and `prompt_tokens`).
+    (the noise and the prefix count).
   - `tests/openapi_http.rs`: AC 13's OpenAPI part.
+
+## As built (322c, 2026-10-14, branch `image-serving-322`: the 322a review's fixes)
+
+The findings of `.scratch/orchestra/reviews/review-322a.md` (F1-F8), on
+322a's and 322b's work.
+
+- **The prefix count (F1).** `ImageRunner::condition_tokens(prompt,
+  &[ImageSize]) -> u64` replaces 322b's `prompt_tokens(prompt, n)`: the
+  whole condition prefix, the prompt as the runner's template and tokenizer
+  lay it out plus `latent_cells` per image. `budget::fit` takes the count as
+  a function of the images' sizes; `prepare` holds the runner for the fit's
+  few host-side counts (a bisection). **#321 implements it with the very
+  count `encode_condition` refuses by**: the fit trusts it, so an
+  `OverBudget` from the encode is a server bug (`500 engine_error`).
+- **The largest target (F4).** `ImagePlan.max_target_cells`, what the load
+  sized its arena for, and `ImagePlan::takes(size)`. The fake plans 2400x1792
+  (16,800 cells), the largest default preset in latent cells. Once pinned, a
+  requested size past it is `400` (`param: size`), naming the cells and
+  listing the sizes served; `auto` picks only among the served sizes
+  (`images::served_sizes`), and with none of them is `400`. The load warns
+  (`ignis.image.sizes_not_served`) of each `image.sizes` entry past its plan.
+  **Default taken:** such an entry is dropped from what this load serves,
+  not from the config — `GET /v1/config` still lists it, a load that can
+  make it serves it, and a `PATCH` adding one is refused per request, not at
+  the patch.
+- **For #321, the arena.** Spec 04 sizes the arena for "the largest preset
+  (2752 × 1536, 16,512 target tokens)", but in latent cells 2400x1792
+  (16,800) and 2528x1696 (16,748) are larger: an arena for 16,512 drops both
+  defaults at load. Size it for 16,800, and plan `max_target_cells` as what
+  it holds.

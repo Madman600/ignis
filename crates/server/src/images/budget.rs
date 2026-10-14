@@ -6,10 +6,12 @@
 //! own aspect ratio, each side a multiple of 32 ([`condition_size`]). A
 //! condition prefix holds the prompt's tokens plus, per image, one token per
 //! latent cell ([`ImageSize::latent_cells`]: one image-pad slot of the
-//! encoder becomes 2 × 2 latent tokens, so a 1024² image is 4,096):
+//! encoder becomes 2 × 2 latent tokens, so a 1024² image is 4,096) — the
+//! runner counts it, holding the tokenizer
+//! ([`ignis_core::image::ImageRunner::condition_tokens`]):
 //!
 //! ```text
-//! prefix tokens = prompt_tokens(prompt, images) + Σ (W_i / 16) · (H_i / 16)
+//! prefix tokens = tokens(prompt as templated) + Σ (W_i / 16) · (H_i / 16)
 //! ```
 //!
 //! When that is over the budget, every image is scaled by one factor — all
@@ -77,18 +79,17 @@ impl std::fmt::Display for OverBudget {
 }
 
 /// The sizes `sources` (each condition image's own size, in order) are
-/// encoded at, with a prompt of `prompt_tokens` and `budget` tokens of
-/// condition prefix: each at 1024² of area when they all fit, else all at the
-/// largest common area, at least `floor`² (`image.condition_floor_px`), that
-/// fits. The tokens only grow with the area — each side is a rounded
-/// multiple of its square root — so the largest fitting area is a bisection
-/// over the square's side.
-pub fn fit(prompt_tokens: u64, sources: &[ImageSize], budget: u64, floor: u32) -> Result<Fitted, OverBudget> {
+/// encoded at, `tokens` counting a prefix of the prompt with images of those
+/// sizes and `budget` the tokens it may hold: each at 1024² of area when they
+/// all fit, else all at the largest common area, at least `floor`²
+/// (`image.condition_floor_px`), that fits. The tokens only grow with the
+/// area — each side is a rounded multiple of its square root — so the
+/// largest fitting area is a bisection over the square's side.
+pub fn fit(tokens: impl Fn(&[ImageSize]) -> u64, sources: &[ImageSize], budget: u64, floor: u32) -> Result<Fitted, OverBudget> {
     let sizes_at = |side: u32| -> Vec<ImageSize> {
         let area = f64::from(side) * f64::from(side);
         sources.iter().map(|source| condition_size(area, f64::from(source.width) / f64::from(source.height))).collect()
     };
-    let tokens = |sizes: &[ImageSize]| prompt_tokens + sizes.iter().map(|size| size.latent_cells() as u64).sum::<u64>();
     let full = sizes_at(CONDITION_SIDE);
     if tokens(&full) <= budget {
         return Ok(Fitted { sizes: full, scaled: false });
@@ -115,6 +116,11 @@ pub fn fit(prompt_tokens: u64, sources: &[ImageSize], budget: u64, floor: u32) -
 mod tests {
     use super::*;
 
+    /// The fake runner's count: `prompt` tokens and the images' cells.
+    fn with_prompt(prompt: u64) -> impl Fn(&[ImageSize]) -> u64 {
+        move |sizes| prompt + sizes.iter().map(|size| size.latent_cells() as u64).sum::<u64>()
+    }
+
     /// diffusers' numbers, from Python: `calculate_dimensions(1024 * 1024, r)`
     /// for 1:1, 16:9, 9:16, 4:3 and a 2:1000 sliver, and the halves Python
     /// rounds to even.
@@ -135,7 +141,7 @@ mod tests {
 
     #[test]
     fn the_budget_is_the_plans_unless_the_config_lowers_it() {
-        let plan = ImagePlan { condition_budget_tokens: 10_000, sample_sigmas: vec![1.0] };
+        let plan = ImagePlan { condition_budget_tokens: 10_000, ..ignis_core::image::fake_plan() };
         assert_eq!(budget(&plan, 0), 10_000);
         assert_eq!(budget(&plan, 4_000), 4_000);
         assert_eq!(budget(&plan, 50_000), 10_000, "a value can only lower it");
@@ -150,13 +156,13 @@ mod tests {
         let sources = [ImageSize::new(1920, 1080), ImageSize::new(600, 800), ImageSize::new(500, 500)];
         // 86 x 48, 56 x 74 and 64 x 64 latent cells.
         let exactly = 20 + 4128 + 4144 + 4096;
-        let full = fit(20, &sources, exactly, 512).unwrap();
+        let full = fit(with_prompt(20), &sources, exactly, 512).unwrap();
         assert_eq!(full, Fitted { sizes: vec![ImageSize::new(1376, 768), ImageSize::new(896, 1184), ImageSize::new(1024, 1024)], scaled: false });
-        assert!(fit(20, &sources, exactly - 1, 512).unwrap().scaled, "one token short");
+        assert!(fit(with_prompt(20), &sources, exactly - 1, 512).unwrap().scaled, "one token short");
         let tokens = |sizes: &[ImageSize]| 20 + sizes.iter().map(|s| s.latent_cells() as u64).sum::<u64>();
 
         let budget = 2 * 4096;
-        let scaled = fit(20, &sources, budget, 512).unwrap();
+        let scaled = fit(with_prompt(20), &sources, budget, 512).unwrap();
         assert!(scaled.scaled);
         assert!(tokens(&scaled.sizes) <= budget);
         // One common area: each image is its own aspect ratio at it.
@@ -173,8 +179,8 @@ mod tests {
         // and 512 x 512, as Python computes them.
         let at_floor = bigger(512);
         assert_eq!(at_floor, [ImageSize::new(672, 384), ImageSize::new(448, 576), ImageSize::new(512, 512)]);
-        assert_eq!(fit(20, &sources, tokens(&at_floor), 512), Ok(Fitted { sizes: at_floor.clone(), scaled: true }), "the floor itself fits");
-        let refused = fit(20, &sources, tokens(&at_floor) - 1, 512).unwrap_err();
+        assert_eq!(fit(with_prompt(20), &sources, tokens(&at_floor), 512), Ok(Fitted { sizes: at_floor.clone(), scaled: true }), "the floor itself fits");
+        let refused = fit(with_prompt(20), &sources, tokens(&at_floor) - 1, 512).unwrap_err();
         assert_eq!(refused, OverBudget { tokens: tokens(&at_floor), budget: tokens(&at_floor) - 1, floor: 512 });
         assert!(refused.to_string().contains("condition budget of 3059 tokens"), "{refused}");
     }
@@ -183,7 +189,7 @@ mod tests {
     /// budget.
     #[test]
     fn a_generation_fits_its_prompt_alone() {
-        assert_eq!(fit(30, &[], 100, 512), Ok(Fitted { sizes: Vec::new(), scaled: false }));
-        assert_eq!(fit(130, &[], 100, 512), Err(OverBudget { tokens: 130, budget: 100, floor: 512 }));
+        assert_eq!(fit(with_prompt(30), &[], 100, 512), Ok(Fitted { sizes: Vec::new(), scaled: false }));
+        assert_eq!(fit(with_prompt(130), &[], 100, 512), Err(OverBudget { tokens: 130, budget: 100, floor: 512 }));
     }
 }

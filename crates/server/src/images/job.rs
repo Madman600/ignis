@@ -267,12 +267,12 @@ pub fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ignis_core::image::{FakeImageRunner, ImagePlan};
+    use ignis_core::image::{fake_plan, FakeImageRunner, ImagePlan};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     fn model(steps: usize) -> (ImageModel, Arc<std::sync::atomic::AtomicUsize>) {
-        let plan = ImagePlan { condition_budget_tokens: 1 << 20, sample_sigmas: (0..steps).map(|k| 1.0 - k as f32 / steps as f32).collect() };
+        let plan = ImagePlan { condition_budget_tokens: 1 << 20, sample_sigmas: (0..steps).map(|k| 1.0 - k as f32 / steps as f32).collect(), ..fake_plan() };
         let runner = FakeImageRunner::new(plan);
         let held = runner.held_conditions();
         (ImageModel::new("ignis-image-2.1-turbo", Box::new(runner)), held)
@@ -380,7 +380,7 @@ mod tests {
     }
 
     fn model_with_budget(budget: u64) -> (ImageModel, Arc<std::sync::atomic::AtomicUsize>) {
-        let runner = FakeImageRunner::new(ImagePlan { condition_budget_tokens: budget, sample_sigmas: vec![1.0] });
+        let runner = FakeImageRunner::new(ImagePlan { condition_budget_tokens: budget, sample_sigmas: vec![1.0], ..fake_plan() });
         let held = runner.held_conditions();
         (ImageModel::new("ignis-image-2.1-turbo", Box::new(runner)), held)
     }
