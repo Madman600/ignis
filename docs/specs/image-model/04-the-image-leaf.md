@@ -345,3 +345,190 @@ to all of them.
   - `cargo check -p ignis-server --features cuda --tests` and `-p
     ignis-core --features cuda --tests`: ok, with only the old warnings.
   - `image_leaf_gpu` under the profile: 1/1.
+
+## As built (321b, 2026-10-14: ACs 3 at 2048², 4, 5 for 2K and edit, 7; the condition images, the chunked prefix pass)
+
+Status: **AC 3 at 2048² done**, all 8 steps within the bound. **AC 4 done**,
+all 8 steps within the bound. **AC 5** written for t2i-2k and edit (below).
+**AC 7 done**. ACs 6, 8, 9 and 10 are not done; AC 11 still applies.
+
+- **Where.**
+  - `crates/core/src/image_autoencoder.rs` (new): the VAE encoder, driven op
+    by op over spec 02's VAE ops. It holds `VaeConfig::parse` (refuses a
+    non-residual VAE, a patch size above 1, attention in the down blocks, a
+    ladder other than the inventory's), `VaeEncoderWeights`,
+    `encode_workspace_bytes`, `encode`, `input_bf16` and `check_size`.
+  - `crates/core/src/image_leaf.rs`:
+    - CPU: `LatentNorm` (`latents_mean`, `latents_std`) and `PrefixLayout`
+      (below);
+    - device: `ConditionImage` { grid, pixels, width, height, rgba };
+      `ConditionText` gains `image_pad_rows`; `encode_condition(text,
+      images)` and `encode_condition_tapped(text, images, taps)`;
+      `vae_encode(width, height, rgba)`; `Condition::segments`, `blocks`
+      and `prefix_chunk`.
+  - The kernel leaf: `ignis_image_transformer_prefix_blocks` and
+    `_prefix_kv_bytes` (the chunked prefix pass), with Rust's
+    `transformer::prefix_blocks` and `prefix_kv_bytes`.
+  - `qwen_image::VAE_CONFIG` names the resource.
+  - Tests:
+    - `crates/core/tests/image_leaf_gpu.rs`: four tests, t2i at 1024²
+      (with AC 1), t2i-2k, edit (AC 4), and the VAE encode (AC 7);
+    - `crates/server/tests/image_leaf_ten_images_gpu.rs`: ten condition
+      images through `EncoderFrontend`;
+    - the CTest's program case: the chunked pass against the whole one;
+    - CPU: `image_autoencoder::tests` and `image_leaf::tests`.
+- **The condition prefix with images** (`PrefixLayout`, diffusers'
+  `forward`, `build_token_metadata` and `_qwenimage21_prefix_segments`).
+  - The encoder's rows from `drop_idx` on, in order. A text row is one
+    prefix token through `txt_in`; each image's pad rows become its block of
+    latent tokens through `img_in`, 4 a pad, in the VAE's raster order.
+  - Each text run is a causal segment, each image block a bidirectional
+    one. Two images with no text between them stay two blocks.
+  - The edit case's segments equal `case.json`'s, checked:
+    [0, 8) text, [8, 4104) image, [4104, 4122) text.
+  - Refused (400): pads that do not add up to the images' (height x width
+    / 4 each), an image whose pads are not consecutive, a grid that is not
+    the image's pixels in 16-pixel patches, one frame.
+- **`encode_condition`'s order, in the arena's sequential region.**
+  1. Each image's VAE encode. Its normalized latents stay at the region's
+     start until img_in; the VAE's own phase runs after them and is
+     reused by the next image.
+  2. The tower on all the images (spec 03's `vision_call`).
+  3. The text encoder with the hooks: the merger's rows over the pads,
+     DeepStack after the first text layers (320c's order).
+  4. txt_in per text run and img_in per image, at their prefix rows, in
+     pieces of at most the pass's rows (both are row-independent, bit for
+     bit).
+  5. The RoPE table, the t = 0 modulation, the prefix pass.
+- **The chunked prefix pass.**
+  - Whole when its workspace fits what the region leaves after the
+    prefix's residual stream and table. Otherwise in chunks: the largest
+    multiple of 128 whose workspace fits.
+  - Per block:
+    - phase A, chunk by chunk: img_norm1, K (with its norm and RoPE) and
+      V, into a BF16 K/V buffer for the whole prefix; then one store of
+      the block's run. A run's K mean and V scales are over all its tokens,
+      so #319's run semantics are kept as they are;
+    - phase B, chunk by chunk of whole segments: img_norm1 again, Q, the
+      attention, to_out, the MLP. A segment longer than the chunk is cut
+      every `chunk` queries, so its pieces' quantized-query blocks and
+      query tiles fall as in one call; a causal piece's keys end at its
+      own end.
+  - The CTest: 834 tokens (text | image | text | image | 300 text), chunks
+    of 128 and 384, whole and one block a call. x and both runs equal the
+    whole pass bit for bit.
+  - **Ten 1024² images** (through `EncoderFrontend`): 10,335 encoder
+    tokens, a 41,041-token prefix (10.03 GiB of runs) in chunks of 7,040.
+    `encode_condition` took 6.1 s (the first call: ten VAE encodes, the
+    tower on 40,960 patches, the encoder, the prefix pass). A 64 x 64 step
+    over it took 306 ms, with a finite velocity.
+- **The plan line now reads** `condition budget 45824 tokens (11.89 GiB)`.
+  The budget counts the chunked pass's BF16 K/V (16 KiB a token) beside
+  the 32 runs, so a token is about 272 KiB. It was 48,640 on the same free
+  memory.
+- **AC 3 at 2048² (t2i-2k), teacher-forced.** The velocity's relative L2,
+  in %:
+
+  | step | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+  |---|---|---|---|---|---|---|---|---|
+  | **ignis** | **4.97** | **5.45** | **3.19** | **2.92** | **2.77** | **2.70** | **2.70** | **3.44** |
+  | bound | 10.99 | 23.49 | 9.54 | 5.90 | 5.57 | 5.39 | 5.36 | 6.79 |
+  | sim | 4.68 | 5.65 | 3.19 | 2.95 | 2.79 | 2.70 | 2.68 | 3.40 |
+  | bf16 | 2.20 | 4.70 | 1.91 | 1.18 | 0.58 | 0.63 | 0.62 | 0.60 |
+
+  No code was needed: `start_image(.., 128, 128, ..)` fits the arena.
+- **AC 4 (edit), teacher-forced.** The condition prefix comes from
+  `encode_condition` (the recorded sequence and tower input, the VAE input
+  from the recorded bytes). The velocity's relative L2, in %:
+
+  | step | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+  |---|---|---|---|---|---|---|---|---|
+  | **ignis** | **6.49** | **5.90** | **2.99** | **2.89** | **2.74** | **2.66** | **2.65** | **3.83** |
+  | bound | 13.79 | 12.53 | 7.42 | 5.97 | 5.48 | 5.31 | 5.29 | 7.63 |
+  | sim | 6.89 | 6.27 | 3.09 | 2.99 | 2.74 | 2.65 | 2.65 | 3.81 |
+  | bf16 | 2.08 | 1.78 | 1.48 | 1.16 | 0.69 | 0.61 | 0.64 | 0.73 |
+
+  Every step is at the sim yardstick's level, and under it at steps 0-3.
+  As for t2i, the K-mean alternative (above) is not needed.
+- **AC 5, relative L2 of the residual stream after the block, in %**
+  (diagnostic, no threshold):
+
+  | after block | 0 | 15 | 31 |
+  |---|---|---|---|
+  | t2i-2k prefix rows | 1.09 | 2.39 | 2.59 |
+  | t2i-2k target, step 0 | 1.20 | 8.97 | 4.45 |
+  | t2i-2k target, step 1 | 1.25 | 10.25 | 5.24 |
+  | edit prefix rows | 1.18 | 11.27 | 11.04 |
+  | of them, the image block's | 0.71 | 26.30 | 12.42 |
+  | of them, the text rows | 2.70 | 3.38 | 3.95 |
+  | edit target, step 0 | 1.09 | 13.75 | 6.81 |
+  | edit target, step 1 | 1.04 | 13.82 | 6.48 |
+
+  - The condition image's rows peak at block 15, as the target's do, and
+    the velocity is at the sim's level.
+  - No step is over its bound, so nothing was diagnosed further. Whether
+    the image block's 26% at block 15 is the W8A8 linears' own is open
+    (the sim has no block dumps); it is here for information.
+- **AC 7, the VAE encode.** The edit case's condition image (1024², its
+  bytes from `condition_vae_input.npy`) against the recorded fp32
+  `condition_latents`:
+  - **1.07%**, 0.73 x bf16's own 1.48%, in 27 ms (the first call).
+  - **The bound is `thresholds.json`'s `condition_latents.bound`,
+    7.38%:** 5 x bf16's error, the v4 rule every quantity follows. The sim
+    is 0 here: its VAE is the fp32 one on the same BF16 weights.
+  - The encoder rounds less often than diffusers' BF16 path (the fused
+    epilogues, one rounding per norm), so bf16's own error is the level to
+    expect; it came in under it.
+- **Timing (information only, not AC 10).** Warm steps: 733 ms at 2048²
+  (5.9 s for the 8, against the ~6 s bar) and 163 ms for edit at 1024²
+  (over its 4,122-token prefix). Edit's `encode_condition` took 542 ms
+  with 3 taps.
+- **Defaults taken** (the owner may revisit):
+  1. **The chunked pass holds the prefix's BF16 K/V** in an allocation
+     from the condition budget, freed when `encode_condition` returns. It
+     costs about 6% of the budget's tokens. The alternative, two passes
+     that gather the K mean and V scales across chunks, would recompute K
+     and V (about 15% of the pass) and add entry points to the 8-bit
+     attention; it was not built.
+  2. **In the chunked pass the MLP's add is not fused with the next
+     block's img_norm1**: phases A and B each recompute img_norm1 from x
+     (the same values).
+  3. **The VAE encoder is Rust over spec 02's ops, not a kernel program.**
+     - The 3x3 weights are packed per call into a scratch region: no
+       packed copy is kept and the plan does not change.
+     - The activations use four slots of the widest activation (768 bytes
+       a pixel, 805 MB at 1024²).
+     - Only quant_conv's first 64 output rows (the posterior's mean) are
+       computed, in fp32.
+  4. **The downsampler adds the AvgDown shortcut as its convolution's
+     residual**: one BF16 rounding fewer than diffusers.
+  5. **The VAE's input** is the bytes' `2 (u / 255) - 1` in f32, rounded to
+     BF16. The normalization `(z - mean) / std` is done on the host in fp32
+     (two roundings, the pipeline's), so the latents make one trip through
+     the host per image (1 MiB at 1024²).
+  6. **`encode_condition` checks its own prefix against the budget, not
+     the sum of the live conditions.**
+  7. **The arena is unchanged.** The ten-image phases fit its 1.22 GiB
+     region; the tower and encoder phase needs about 1.15 GiB of it.
+- **For 321c.**
+  - **The banded decode** goes in `image_autoencoder.rs`, beside the
+    encoder: the `Run` slots and the pack scratch are the pattern, and
+    `VaePhase` is the arena's.
+    - `LatentNorm` holds the mean and std. The decode's `z x std + mean` is
+      not written yet.
+    - The decode reads the image slot's fp32 latents (packed `[h x w][64]`).
+  - **n = 3, release and cancel:** a `Condition` is independent of the
+    image slot. `release_condition` frees its runs; the chunked pass's K/V
+    never outlives `encode_condition`.
+  - **The runner adapter** builds `ConditionImage` from `EncoderFrontend`'s
+    `VisionPatches` and the RGBA at the condition size (sides multiples of
+    32, so the grid is the pixels in 16-pixel patches).
+- **Gates.**
+  - The CTest under the profile (`kernel/build.ps1 -Test`,
+    `IGNIS_GPU_PROFILE=1`): 124/124, with no flake.
+  - `CARGO_INCREMENTAL=0 cargo test --workspace`: 2874 passed, 0 failed,
+    6 ignored.
+  - `cargo check -p ignis-server --features cuda --tests` and `-p
+    ignis-core --features cuda --tests`: ok, with only the old warnings.
+  - Under the profile: `image_leaf_gpu` 4/4 and `image_leaf_ten_images_gpu`
+    1/1.
