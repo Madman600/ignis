@@ -339,8 +339,9 @@ impl Refusal {
     /// saying why, a panic: `503 model_stopped` for a stopped model, `400
     /// condition_budget_exceeded` for a prefix the runner found past the
     /// budget (the fit trusts the runner's count, so a drift between the two
-    /// is still the request's size, not an engine fault), `500 engine_error`
-    /// otherwise.
+    /// is still the request's size, not an engine fault), `400 image_refused`
+    /// in the runner's words for a request it refuses (spec image-model/04),
+    /// `500 engine_error` otherwise.
     fn of(end: Option<JobEnd>, route: Route) -> Self {
         match end {
             Some(JobEnd::Stopped) => Self {
@@ -350,6 +351,10 @@ impl Refusal {
             Some(JobEnd::Failed(over @ ImageError::OverBudget { .. })) => Self {
                 status: StatusCode::BAD_REQUEST,
                 error: ApiError::naming("invalid_request_error", "condition_budget_exceeded", &over.to_string(), Some(route.condition_param())),
+            },
+            Some(JobEnd::Failed(ImageError::Refused(why))) => Self {
+                status: StatusCode::BAD_REQUEST,
+                error: ApiError::new("invalid_request_error", "image_refused", &why),
             },
             Some(JobEnd::Failed(_) | JobEnd::Cancelled) | None => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -400,11 +405,11 @@ Prompt enhancement (`prompt_enhancement: true`, or `image.prompt_enhancement` wh
             (ImagesResponse = "application/json"),
             (ImageStreamEvent = "text/event-stream"),
         )),
-        (status = 400, description = "A field outside its rule: no `prompt`, `n` outside 1..`image.max_n`, a `size` not in `image.sizes`, or past the largest image the loaded model makes (the message lists the sizes), `response_format: url`, an `output_format` other than `png`, an unknown `background`, `partial_images` above 0; or a prompt longer than the condition budget (`condition_budget_exceeded`).", body = ApiError),
+        (status = 400, description = "A field outside its rule: no `prompt`, `n` outside 1..`image.max_n`, a `size` not in `image.sizes`, or past the largest image the loaded model makes (the message lists the sizes), `response_format: url`, an `output_format` other than `png`, an unknown `background`, `partial_images` above 0; or a prompt longer than the condition budget (`condition_budget_exceeded`); or a request the image model refuses as it encodes it, in its words (`image_refused`: a prompt whose positions run past the model's RoPE table).", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 409, description = "The model that would serve the request is a text model (`model_kind_mismatch`, naming both kinds and the loaded id).", body = ApiError),
-        (status = 500, description = "The image model refused a call (`engine_error`).", body = ApiError),
+        (status = 500, description = "The image model failed a call (`engine_error`).", body = ApiError),
         (status = 503, description = "The queue is full (`engine_full`, with `Retry-After`); a model switch is under way (`model_switching`, with `Retry-After`) or did not land (`model_switch_failed`, also when a prompt enhancement visit could not switch back to the image model); the image model was stopped before the job finished (`model_stopped`, with `Retry-After`); or the model was unloaded while idle and loading it again failed (`model_load_failed`).", body = ApiError),
     ),
 )]
@@ -433,11 +438,11 @@ Each condition image is resized to 1024x1024 pixels of area at its own aspect ra
             (ImagesResponse = "application/json"),
             (ImageStreamEvent = "text/event-stream"),
         )),
-        (status = 400, description = "As for a generation; or no condition image, more than `image.max_condition_images`, one that is not a PNG, JPEG or WebP, a `mask`, or condition images that do not fit the condition budget even at `image.condition_floor_px` (`condition_budget_exceeded`).", body = ApiError),
+        (status = 400, description = "As for a generation; or no condition image, more than `image.max_condition_images`, one that is not a PNG, JPEG or WebP, a `mask`, or condition images that do not fit the condition budget even at `image.condition_floor_px` (`condition_budget_exceeded`); or a condition image the image model refuses (`image_refused`).", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 409, description = "The model that would serve the request is a text model (`model_kind_mismatch`).", body = ApiError),
-        (status = 500, description = "The image model refused a call (`engine_error`).", body = ApiError),
+        (status = 500, description = "The image model failed a call (`engine_error`).", body = ApiError),
         (status = 503, description = "As for a generation: `engine_full`, `model_switching`, `model_switch_failed`, `model_stopped`, `model_load_failed`.", body = ApiError),
     ),
 )]

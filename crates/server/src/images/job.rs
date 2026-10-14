@@ -208,8 +208,15 @@ pub fn spawn<E: From<JobEvent> + Send + 'static>(model: ImageModel, job: ImageJo
             match ended {
                 Ok(()) | Err(JobEnd::Cancelled) => {}
                 Err(end) => {
-                    if let JobEnd::Failed(error) = &end {
-                        tracing::error!(name: "ignis.image.job_failed", model = %model.model_id(), %error, "the image runner refused a call; the job ended");
+                    match &end {
+                        // The request's fault: its answer says why.
+                        JobEnd::Failed(error @ ImageError::Refused(_)) => {
+                            tracing::info!(name: "ignis.image.job_refused", model = %model.model_id(), %error, "the image runner refused the request; the job ended");
+                        }
+                        JobEnd::Failed(error) => {
+                            tracing::error!(name: "ignis.image.job_failed", model = %model.model_id(), %error, "the image runner refused a call; the job ended");
+                        }
+                        _ => {}
                     }
                     let _ = events.send(JobEvent::Ended(end).into());
                 }

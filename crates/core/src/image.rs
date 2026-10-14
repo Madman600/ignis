@@ -170,7 +170,12 @@ pub enum ImageError {
     OverBudget { tokens: u64, budget: u64 },
     /// No prefix by that id: never encoded, or released already.
     NoSuchCondition(ConditionId),
-    /// The leaf refused the call, in its own words.
+    /// The runner refused the request as one the model cannot make, in its
+    /// own words: a prompt that writes an image pad, a condition image the
+    /// encoder's processor will not take, a RoPE position past the table
+    /// (spec image-model/04). The request's fault, never the server's.
+    Refused(String),
+    /// The leaf failed the call, in its own words.
     Leaf(String),
 }
 
@@ -181,7 +186,7 @@ impl std::fmt::Display for ImageError {
                 write!(f, "the condition prefix holds {tokens} tokens, past the condition budget of {budget}")
             }
             Self::NoSuchCondition(id) => write!(f, "no condition prefix {}", id.0),
-            Self::Leaf(message) => write!(f, "{message}"),
+            Self::Refused(message) | Self::Leaf(message) => write!(f, "{message}"),
         }
     }
 }
@@ -205,7 +210,9 @@ pub trait ImageRunner: Send {
     /// the count [`ImageRunner::encode_condition`] refuses past the budget.
     /// Host-side and cheap: the server, which holds no tokenizer for the
     /// image model, fits the condition images to the budget with it before it
-    /// encodes them.
+    /// encodes them. A condition within the budget that the runner has no
+    /// room to encode (the leaf's arena) counts one token past the plan's
+    /// budget, so the fit scales the images down for that limit too.
     fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> u64;
 
     /// The encoder over the prompt and the condition images, the VAE encode

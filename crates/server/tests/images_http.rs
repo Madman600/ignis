@@ -83,6 +83,8 @@ struct Faults {
     /// How many tokens `condition_tokens` counts short of the prefix
     /// `encode_condition` refuses by: a runner whose count drifted.
     undercount: AtomicUsize,
+    /// What the next `encode_condition` answers instead of encoding, once.
+    encode_error: Mutex<Option<ImageError>>,
 }
 
 /// `FakeImageRunner`, logging each call, each step behind `gate`.
@@ -109,6 +111,9 @@ impl ImageRunner for Recording {
             sizes: condition.images.iter().map(|image| image.size).collect(),
             alpha: condition.images.iter().map(|image| image.pixels.chunks_exact(4).any(|px| px[3] != 255)).collect(),
         });
+        if let Some(error) = self.faults.encode_error.lock().unwrap().take() {
+            return Err(error);
+        }
         self.inner.encode_condition(condition)
     }
 
@@ -739,6 +744,39 @@ async fn a_prefix_the_runner_refuses_past_the_budget_is_a_400() {
     assert_eq!(last, "error", "{events:?}");
     assert_eq!(error["error"]["code"], "condition_budget_exceeded", "{error}");
     assert_eq!(harness.held.load(Ordering::SeqCst), 0);
+}
+
+/// Spec image-model/04: what the image leaf refuses is the request's — a
+/// prompt whose RoPE positions run past the table, a condition image the
+/// encoder's processor would resize — `400 image_refused` in the leaf's
+/// words, whole or streamed; what it fails at is the server's, `500
+/// engine_error`. Neither leaves a prefix held.
+#[tokio::test]
+async fn what_the_leaf_refuses_is_a_400_and_what_it_fails_at_a_500() {
+    let harness = Harness::new(Gate::opened());
+    let body = json!({ "prompt": "a very long prompt", "size": "64x64", "seed": 2 });
+    let refusal = "the condition's RoPE positions run past [-1024, 8192)";
+    *harness.faults.encode_error.lock().unwrap() = Some(ImageError::Refused(refusal.into()));
+    let (status, refused) = send(&harness.app, json_request("/v1/images/generations", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!((refused["error"]["type"].as_str(), refused["error"]["code"].as_str()), (Some("invalid_request_error"), Some("image_refused")));
+    assert_eq!(refused["error"]["message"], refusal);
+
+    *harness.faults.encode_error.lock().unwrap() = Some(ImageError::Refused(refusal.into()));
+    let mut streamed = body.clone();
+    streamed["stream"] = json!(true);
+    let events = events_of(harness.app.clone().oneshot(json_request("/v1/images/generations", &streamed)).await.unwrap()).await;
+    let (last, error) = events.last().expect("events");
+    assert_eq!(last, "error", "{events:?}");
+    assert_eq!((error["error"]["code"].as_str(), error["error"]["message"].as_str()), (Some("image_refused"), Some(refusal)), "{error}");
+
+    *harness.faults.encode_error.lock().unwrap() = Some(ImageError::Leaf("the DiT's blocks: an illegal address".into()));
+    let (status, failed) = send(&harness.app, json_request("/v1/images/generations", &body)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{failed}");
+    assert_eq!(failed["error"]["code"], "engine_error");
+    assert_eq!(harness.held.load(Ordering::SeqCst), 0);
+    let (status, _) = send(&harness.app, json_request("/v1/images/generations", &body)).await;
+    assert_eq!(status, StatusCode::OK, "the model serves on");
 }
 
 /// Spec image-model/05 §Prompt enhancement: on a server that cannot switch
