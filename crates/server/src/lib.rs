@@ -34,6 +34,8 @@ pub mod download;
 pub mod engine;
 pub mod expose;
 pub mod idle;
+pub mod image_encoder_input;
+pub mod image_prompt;
 pub mod instruction;
 pub mod load;
 pub mod locate;
