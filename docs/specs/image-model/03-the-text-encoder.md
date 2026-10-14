@@ -174,3 +174,131 @@ Where the CPU front end chose what the sections above leave open.
   oracle checks skip without the artifact or the oracle
   (`IGNIS_IMAGE_ARTIFACT`, `IGNIS_IMAGE_ORACLE`, else the owner's layout).
   Both modules also carry unit tests on a word-level tokenizer.
+
+## As built (320a, 2026-10-14: AC 3, AC 7 for t2i, the text model on the GPU)
+
+Where the text model chose what the sections above leave open. AC 4 (the
+tower and DeepStack on the edit case) and AC 7's 10-image edit are 320b's;
+the hooks they fill are below.
+
+- **Where.**
+  - ABI `kernel/include/ignis_image_encoder.h`, code
+    `kernel/src/image/encoder.cu`, ours (ADR 0051 tier 1).
+    `ignis_image_encoder_forward` runs decoder layers
+    `[first_layer, end_layer)` in place on the residual stream x, fp32
+    `[tokens][4096]`. Beside it: `_workspace_bytes` (about 60 KiB a token,
+    0.71 GiB at 12,400 tokens) and three ops of its own, `_residual_norm`,
+    `_qk_norm_mrope` and `_rows`. The linears and the attention are spec
+    02's ops; the GEMM needs `ignis_image_gemm_prepare` first.
+  - Rust: `crates/core/src/image_encoder.rs` (`TextEncoderConfig::parse`,
+    `embed_rows`, the bindings, `TextEncoderWeights` over a materialized
+    artifact) and `qwen_image::bind_text_encoder`, a scoped bind of the text
+    config and the `text_encoder/` tensors.
+  - Tests: the CTest `ignis_kernel_image_encoder_test` (the ops and the
+    hooks); the Rust `--ignored` `crates/core/tests/image_encoder_gpu.rs`
+    (AC 3 on the real artifact, and the bindings); on the CPU, the config's
+    parse and the embedding rows (`image_encoder::tests`) and the scoped bind
+    (`crates/artifact/tests/qwen_image.rs`).
+- **The layer.**
+  - RMSNorm to E4M3; q, k and v as three GEMMs on the payloads as stored;
+    the QK RMSNorm with the mrope; the causal GQA attention at scale
+    fl32(128^-1/2).
+  - The attention output quantized, then `o_proj`; the residual add fused
+    with the next RMSNorm.
+  - Gate and up as two GEMMs, #319's SwiGLU with E4M3 output, `down_proj`;
+    the add after a layer's MLP fused with the next layer's input norm.
+  - The weights are the artifact's objects where the materializer put
+    them, with no fused copy, so spec 04's full bind points the descriptors
+    at the same objects.
+- **Defaults taken** (the owner may revisit):
+  1. The residual stream is fp32, as in the fp32 pipeline the oracle and
+     the sim yardstick ran; `o_proj` and `down_proj` write fp32.
+  2. The norms quantize their fp32 output to E4M3 directly, with spec 02's
+     steps and no BF16 rounding between (the sim quantizes the fp32
+     activation).
+  3. q and k leave their GEMMs in fp32 and are rounded once to BF16 for the
+     attention, after the QK norm and the mrope; v, gate and up are BF16.
+  4. **The output is all of x, fp32**: the last layer before the final norm,
+     every row. The caller takes the rows from `drop_idx` on, so the
+     forward needs no `drop_idx` and a layer range composes. No BF16 output
+     was built: `txt_in`'s norm op (spec 02) reads BF16, so #321 adds a cast
+     or an fp32 input to it.
+  5. **The mrope frequencies** are fl32(1 / fl32(θ^fl32(2i / 128))), each
+     step correctly rounded.
+     - torch's `powf`, which transformers' `inv_freq` comes from, is one ulp
+       up at i = 19 for θ = 5e6 (0x1.504622p-7 against 0x1.50462p-7,
+       measured in the venv). That moves an angle by under 4e-5 rad at
+       41,000 positions, so the formula stays.
+     - The slot's axis is transformers' interleaved rule: h for i % 3 = 1
+       and w for i % 3 = 2 below 3 × 20 = 60, t otherwise. Channels d and
+       d + 64 are slot d's rotate_half pair.
+     - The positions are int32 [3][tokens], rows t, h, w (the oracle's
+       `mrope_position_ids`).
+  6. **eps, θ and the section come from `frontend/text_encoder_config.json`**,
+     read in either key form: the checkpoint's `rope_theta` and
+     `rope_scaling`, or transformers 5's `rope_parameters`. Its dimensions
+     are checked against the artifact's inventory. A rope that is not the
+     default interleaved mrope, or a section that does not cover the head,
+     is refused by name.
+- **The hooks.** `ignis_image_encoder_vision` holds:
+  - the vision rows' sequence positions, device int32 and distinct; feature
+    row j goes to row `row_index[j]` (transformers' masked order);
+  - `embeds`, BF16 [rows][4096], written over x's rows when the forward
+    starts at layer 0;
+  - `deepstack[3]`, BF16 [rows][4096] each, added after layers 0, 1 and 2
+    (NULL for none).
+- **The CTest** checks the ops against fp64 references that track their
+  roundings, as spec 02's elementwise test does:
+  - **the residual add with the RMSNorm**, 1, 45 and 2,049 tokens: the sums
+    are the host's fp32 adds, bit for bit; the norm uses 0.09-0.18 of its
+    bound; the E4M3 output is the host's quantization of the fp32 output,
+    bit for bit;
+  - **the QK norm with the mrope**, 1, 45 and 1,100 tokens, with t, h and w
+    positions all different (w up to 40,000): 0.97-0.99 of the bound,
+    which the BF16 output's rounding sets.
+    - Two wrong layouts fail as negative controls. The axes in chunks
+      [24 | 20 | 20] put 63-65% of the outputs over the bound; adjacent
+      pairs (2i, 2i + 1) put 87-90% over.
+    - The t2i case cannot tell the layouts apart (its three position rows
+      are equal), so this is the only check of the axes until AC 4;
+  - **the rows**, written over and added, exactly, an index past the
+    sequence skipped;
+  - **the hooks**, on synthetic FP8 weights (layers A, B, A; 37 tokens, 9
+    vision rows):
+    - the forward with the embeddings and the three DeepStack adds equals,
+      bit for bit, the same additions made on the host between one-layer
+      calls. That also checks that a layer range equals its layers run in
+      consecutive calls;
+    - a second run is identical; without DeepStack every vision value
+      changes.
+- **AC 3.** The Rust test feeds the recorded `input_ids` and
+  `mrope_position_ids` and measures spec 01's encoder metric (text rows from
+  row 1 on, per-row relative L2, RMS):
+
+  | case | tokens | encoder | bound | bf16 / sim | encoder_row0 | bf16 / sim |
+  |---|---|---|---|---|---|---|
+  | t2i | 45 (`drop_idx` 14, 30 text rows) | **9.61%** | 19.50% | 2.03% / 9.75% | 28.77% | 53.72% / 93.86% |
+  | t2i-2k | the same prompt | **9.61%** | 19.50% | 2.03% / 9.75% | 28.77% | 53.72% / 93.86% |
+
+  - The error is the sim yardstick's (9.75%): W8A8 quantization, as
+    expected, not a bug.
+  - **Per layer**, against transformers' text model run layer by layer in
+    fp32 on the CPU, on the checkpoint's bf16 weights
+    (`.scratch/320a/ref/ref_layers.py`). That reference's last layer is
+    within 1.1e-5 of the oracle per row, so it is the oracle's computation.
+    - Over the text rows from row 1: 2.4% after layer 0, 3.0-4.9% through
+      layer 33, then 5.9% and 9.6% after layers 34 and 35.
+    - Row 0: 2.4-4.5% through layer 33, then 21.6% and 28.8%.
+    - The growth is smooth, with no step; the last two layers carry most of
+      it, as they do for the yardsticks.
+    - The test prints this table when `IGNIS_IMAGE_ENCODER_LAYERS` names the
+      reference's directory.
+- **AC 7, t2i.** The GPU lock in normal mode, nothing else on the card; wall
+  clock around the forward's launches and a stream sync.
+  - **The forward: 21.7 ms** for 36 layers on 45 tokens, the median of 5
+    warm runs (min 21.7 ms; the first run 22.1 ms).
+  - The host's embedding rows and uploads: 1-2 ms. The text encoder's
+    6.47 GiB materialize in 4.4 s from a warm page cache.
+  - At 45 tokens the GEMM is SM-bound: its 128-token tile gives 4 to 48
+    CTAs on 170 SMs, each computing a full tile. A split-K or a narrower
+    token tile would help; neither was built (speed is information here).
