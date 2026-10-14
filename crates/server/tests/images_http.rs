@@ -6,7 +6,8 @@
 //! past its depth, a disconnect cancelling its job (AC 7).
 //!
 //! The runner is [`Recording`]: `FakeImageRunner`'s numbers, every call
-//! logged, and each denoising step behind a [`Gate`] a test can hold shut.
+//! logged, each denoising step behind a [`Gate`] a test can hold shut, and
+//! the [`Faults`] a test may arm.
 
 use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -73,11 +74,24 @@ enum Call {
     Release,
 }
 
+/// What a test may make the runner do wrong.
+#[derive(Default)]
+struct Faults {
+    /// The denoising step, counted from 1 across the runner's life, that
+    /// panics, once; 0 is none.
+    panic_at_step: AtomicUsize,
+    /// How many tokens `condition_tokens` counts short of the prefix
+    /// `encode_condition` refuses by: a runner whose count drifted.
+    undercount: AtomicUsize,
+}
+
 /// `FakeImageRunner`, logging each call, each step behind `gate`.
 struct Recording {
     inner: FakeImageRunner,
     log: Arc<Mutex<Vec<Call>>>,
     gate: Arc<Gate>,
+    faults: Arc<Faults>,
+    steps: usize,
 }
 
 impl ImageRunner for Recording {
@@ -86,7 +100,7 @@ impl ImageRunner for Recording {
     }
 
     fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> u64 {
-        self.inner.condition_tokens(prompt, images)
+        self.inner.condition_tokens(prompt, images).saturating_sub(self.faults.undercount.load(Ordering::SeqCst) as u64)
     }
 
     fn encode_condition(&mut self, condition: &ImageCondition) -> Result<ConditionId, ImageError> {
@@ -107,6 +121,10 @@ impl ImageRunner for Recording {
         velocity: Option<&mut Vec<f32>>,
     ) -> Result<(), ImageError> {
         self.gate.pass();
+        self.steps += 1;
+        if self.faults.panic_at_step.compare_exchange(self.steps, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            panic!("a leaf fault at step {}", self.steps);
+        }
         self.log.lock().unwrap().push(Call::Step);
         self.inner.denoise_step(condition, latents, sigma, sigma_next, velocity)
     }
@@ -129,6 +147,7 @@ struct Harness {
     app: axum::Router,
     log: Arc<Mutex<Vec<Call>>>,
     held: Arc<AtomicUsize>,
+    faults: Arc<Faults>,
 }
 
 impl Harness {
@@ -141,11 +160,12 @@ impl Harness {
         let inner = FakeImageRunner::new(plan);
         let held = inner.held_conditions();
         let log = Arc::default();
-        let runner = Recording { inner, log: Arc::clone(&log), gate };
+        let faults = Arc::<Faults>::default();
+        let runner = Recording { inner, log: Arc::clone(&log), gate, faults: Arc::clone(&faults), steps: 0 };
         let server = Server::from_active(ActiveModel::image(ImageModel::new(IMAGE, Box::new(runner))));
         server.update_live(|live| live.image.sizes = vec![ImageSize::new(64, 64), ImageSize::new(128, 64), ImageSize::new(96, 64)]);
         let app = server.app();
-        Self { server, app, log, held }
+        Self { server, app, log, held, faults }
     }
 
     fn calls(&self) -> Vec<Call> {
@@ -634,6 +654,63 @@ async fn a_stopped_model_ends_its_job_with_model_stopped() {
     let body: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["error"]["code"], "model_stopped");
     until("the prefix released", || harness.held.load(Ordering::SeqCst) == 0).await;
+}
+
+/// Review-322b F1: a runner call that panics mid-job neither aborts the
+/// process nor keeps the job's prefix — the lock it poisoned still releases
+/// it — and its request is answered `500 engine_error`; streamed, with an
+/// `error` event in place of the images it never got (L7). The same model
+/// then serves the next request. (That a shutdown still drops a runner whose
+/// call panicked is `images::tests::a_runner_call_that_panics_neither_keeps_its_prefix_nor_survives_the_shutdown`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runner_that_panics_mid_job_is_an_engine_error_and_the_model_serves_on() {
+    let harness = Harness::new(Gate::opened());
+    let body = json!({ "prompt": "a fault", "n": 2, "size": "64x64", "seed": 4 });
+    harness.faults.panic_at_step.store(3, Ordering::SeqCst);
+    let (status, refused) = send(&harness.app, json_request("/v1/images/generations", &body)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{refused}");
+    assert_eq!(refused["error"]["code"], "engine_error");
+    until("the prefix released", || harness.held.load(Ordering::SeqCst) == 0 && harness.jobs().in_flight().is_idle()).await;
+    assert_eq!(harness.calls().last(), Some(&Call::Release));
+
+    // Streamed: the first image is sent, then the step of the second panics.
+    // The first request took steps 1 to 3; this one's first image 4 to 11.
+    harness.faults.panic_at_step.store(3 + 8 + 3, Ordering::SeqCst);
+    let mut streamed = body.clone();
+    streamed["stream"] = json!(true);
+    let events = events_of(harness.app.clone().oneshot(json_request("/v1/images/generations", &streamed)).await.unwrap()).await;
+    let completed = events.iter().filter(|(event, _)| event == "image_generation.completed").count();
+    let (last, error) = events.last().expect("events");
+    assert_eq!((completed, last.as_str()), (1, "error"), "{events:?}");
+    assert_eq!(error["error"]["code"], "engine_error", "{error}");
+    until("the prefix released", || harness.held.load(Ordering::SeqCst) == 0 && harness.jobs().in_flight().is_idle()).await;
+
+    let (status, body) = send(&harness.app, json_request("/v1/images/generations", &body)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"].as_array().map(Vec::len), Some(2));
+}
+
+/// Review-322b L2: a runner whose prefix count drifted below the one its
+/// encode refuses by — the fit passes, the encode refuses `OverBudget` — is
+/// still the request's size: `400 condition_budget_exceeded`, streamed as the
+/// `error` event's code, the prefix never held.
+#[tokio::test]
+async fn a_prefix_the_runner_refuses_past_the_budget_is_a_400() {
+    // The JPEG at 1024² of area is 1184x896, 4,144 cells, and the prompt one
+    // token: 4,145, counted as 4,144 — the plan's whole budget.
+    let plan = ImagePlan { condition_budget_tokens: 4144, ..ignis_core::image::fake_plan() };
+    let harness = Harness::planning(Gate::opened(), plan);
+    harness.faults.undercount.store(1, Ordering::SeqCst);
+    let parts = [("prompt", Part::Text("x")), ("image[]", Part::File(JPEG))];
+    let (status, refused) = send(&harness.app, form_request(&parts)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!((refused["error"]["code"].as_str(), refused["error"]["param"].as_str()), (Some("condition_budget_exceeded"), Some("image")), "{refused}");
+    let streamed = [("prompt", Part::Text("x")), ("image[]", Part::File(JPEG)), ("stream", Part::Text("true"))];
+    let events = events_of(harness.app.clone().oneshot(form_request(&streamed)).await.unwrap()).await;
+    let (last, error) = events.last().expect("events");
+    assert_eq!(last, "error", "{events:?}");
+    assert_eq!(error["error"]["code"], "condition_budget_exceeded", "{error}");
+    assert_eq!(harness.held.load(Ordering::SeqCst), 0);
 }
 
 /// The image routes are model routes: with a text model loaded and no

@@ -379,6 +379,90 @@ mod tests {
         assert_eq!(events_of(&model, &job(1, 1, Background::Auto)).0, Err(JobEnd::Stopped));
     }
 
+    /// `FakeImageRunner`, running `at_step` once its `step`-th denoising
+    /// step is done.
+    struct AfterStep {
+        inner: FakeImageRunner,
+        step: usize,
+        steps: usize,
+        at_step: Option<Box<dyn FnOnce() + Send>>,
+    }
+
+    impl ImageRunner for AfterStep {
+        fn plan(&self) -> &ImagePlan {
+            self.inner.plan()
+        }
+
+        fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> u64 {
+            self.inner.condition_tokens(prompt, images)
+        }
+
+        fn encode_condition(&mut self, condition: &ImageCondition) -> Result<ignis_core::image::ConditionId, ImageError> {
+            self.inner.encode_condition(condition)
+        }
+
+        fn denoise_step(
+            &mut self,
+            condition: ignis_core::image::ConditionId,
+            latents: &mut TargetLatents,
+            sigma: f32,
+            sigma_next: f32,
+            velocity: Option<&mut Vec<f32>>,
+        ) -> Result<(), ImageError> {
+            self.inner.denoise_step(condition, latents, sigma, sigma_next, velocity)?;
+            self.steps += 1;
+            if self.steps == self.step {
+                if let Some(at_step) = self.at_step.take() {
+                    at_step();
+                }
+            }
+            Ok(())
+        }
+
+        fn vae_decode(&mut self, latents: &TargetLatents) -> Result<RgbaImage, ImageError> {
+            self.inner.vae_decode(latents)
+        }
+
+        fn release_condition(&mut self, condition: ignis_core::image::ConditionId) {
+            self.inner.release_condition(condition);
+        }
+    }
+
+    /// Review-322b L6: a job whose request goes away, or whose model is
+    /// closed, while its prefix is held — after step `k` of 4 — stops at its
+    /// next call with nothing more made, and the prefix is released.
+    #[test]
+    fn a_job_stopped_mid_run_releases_the_prefix_it_holds() {
+        for closes_queue in [false, true] {
+            let inner = FakeImageRunner::new(ImagePlan { sample_sigmas: vec![1.0, 0.75, 0.5, 0.25], ..fake_plan() });
+            let held = inner.held_conditions();
+            let (events, receiver) = mpsc::unbounded_channel();
+            let receiver = Arc::new(std::sync::Mutex::new(Some(receiver)));
+            let queue: Arc<std::sync::OnceLock<Arc<super::super::ImageJobs>>> = Arc::default();
+            let at_step: Box<dyn FnOnce() + Send> = if closes_queue {
+                let queue = Arc::clone(&queue);
+                Box::new(move || queue.get().expect("the model's queue").close())
+            } else {
+                let receiver = Arc::clone(&receiver);
+                Box::new(move || drop(receiver.lock().unwrap().take()))
+            };
+            let runner = AfterStep { inner, step: 2, steps: 0, at_step: Some(at_step) };
+            let model = ImageModel::new("ignis-image-2.1-turbo", Box::new(runner));
+            queue.set(Arc::clone(&model.jobs)).unwrap();
+            let ended = run(&model, &job(1, 1, Background::Auto), &events);
+            assert_eq!(ended, Err(if closes_queue { JobEnd::Stopped } else { JobEnd::Cancelled }), "closes the queue: {closes_queue}");
+            assert_eq!(held.load(Ordering::SeqCst), 0, "the prefix released (closes the queue: {closes_queue})");
+            if let Some(mut receiver) = receiver.lock().unwrap().take() {
+                let mut steps = 0;
+                while let Ok(event) = receiver.try_recv() {
+                    assert!(!matches!(event, JobEvent::Image { .. } | JobEvent::Progress(Progress { phase: Phase::Decoding, .. })), "{event:?}");
+                    steps += usize::from(matches!(event, JobEvent::Progress(Progress { phase: Phase::Denoising, .. })));
+                }
+                assert_eq!(steps, 2, "no step announced past the close");
+            }
+        }
+    }
+
     fn model_with_budget(budget: u64) -> (ImageModel, Arc<std::sync::atomic::AtomicUsize>) {
         let runner = FakeImageRunner::new(ImagePlan { condition_budget_tokens: budget, sample_sigmas: vec![1.0], ..fake_plan() });
         let held = runner.held_conditions();

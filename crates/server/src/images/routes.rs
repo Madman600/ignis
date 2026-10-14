@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_core::Stream;
 use ignis_core::compute::ModelKind;
-use ignis_core::image::{ImageCondition, ImageSize, RgbaImage};
+use ignis_core::image::{ImageCondition, ImageError, ImageSize, RgbaImage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use utoipa::ToSchema;
@@ -177,6 +177,15 @@ enum Route {
 }
 
 impl Route {
+    /// The field a prefix past the condition budget is laid to: an edit's
+    /// images, a generation's prompt.
+    fn condition_param(self) -> &'static str {
+        match self {
+            Self::Generations => "prompt",
+            Self::Edits => "image",
+        }
+    }
+
     fn progress(self) -> &'static str {
         match self {
             Self::Generations => "image_generation.progress",
@@ -279,9 +288,46 @@ fn model_stopped() -> Response {
     unavailable("server_error", "model_stopped", MODEL_STOPPED_MESSAGE)
 }
 
-/// The runner refused a call: `500 engine_error`.
-fn engine_error() -> Response {
-    error_response(StatusCode::INTERNAL_SERVER_ERROR, "engine_error", "engine_error", ENGINE_ERROR_MESSAGE)
+/// Why a job that ended before its last image did, as its request is told:
+/// a status and a body for a whole answer, the body alone for a stream that
+/// already answered `200`.
+struct Refusal {
+    status: StatusCode,
+    error: ApiError,
+}
+
+impl Refusal {
+    /// A job that ended as `end` — `None` when its thread went away without
+    /// saying why, a panic: `503 model_stopped` for a stopped model, `400
+    /// condition_budget_exceeded` for a prefix the runner found past the
+    /// budget (the fit trusts the runner's count, so a drift between the two
+    /// is still the request's size, not an engine fault), `500 engine_error`
+    /// otherwise.
+    fn of(end: Option<JobEnd>, route: Route) -> Self {
+        match end {
+            Some(JobEnd::Stopped) => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error: ApiError::new("server_error", "model_stopped", MODEL_STOPPED_MESSAGE),
+            },
+            Some(JobEnd::Failed(over @ ImageError::OverBudget { .. })) => Self {
+                status: StatusCode::BAD_REQUEST,
+                error: ApiError::naming("invalid_request_error", "condition_budget_exceeded", &over.to_string(), Some(route.condition_param())),
+            },
+            Some(JobEnd::Failed(_) | JobEnd::Cancelled) | None => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                error: ApiError::new("engine_error", "engine_error", ENGINE_ERROR_MESSAGE),
+            },
+        }
+    }
+
+    fn into_response(self) -> Response {
+        let retry = self.status == StatusCode::SERVICE_UNAVAILABLE;
+        let mut response = (self.status, Json(self.error)).into_response();
+        if retry {
+            response.headers_mut().insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
+    }
 }
 
 /// What a request carries past its checks into the job.
@@ -500,18 +546,18 @@ async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage
     let created = crate::api::now();
     let answer = Answer {
         route,
+        n,
         created,
         seed,
         size: size.to_string(),
         background: background.as_str(),
         condition_sizes: fitted.scaled.then(|| fitted.sizes.iter().map(ToString::to_string).collect()),
     };
-    let n = job.n;
     let events = job::spawn(model, job, waiting);
     if stream {
-        return Sse::new(ImageSse { events, answer, ended: false }).into_response();
+        return Sse::new(ImageSse { events, answer, made: 0, ended: false }).into_response();
     }
-    collect(events, answer, n).await
+    collect(events, answer).await
 }
 
 /// The condition budget and the resize, then the job: blocking, since the
@@ -549,6 +595,8 @@ fn prepare(
 /// What every answer to one request says beside its images.
 struct Answer {
     route: Route,
+    /// The images the job makes.
+    n: u32,
     created: u64,
     seed: u64,
     size: String,
@@ -558,19 +606,18 @@ struct Answer {
 
 /// A request that did not stream: the job's `n` images, collected, or why
 /// it ended without them.
-async fn collect(mut events: mpsc::UnboundedReceiver<JobEvent>, answer: Answer, n: u32) -> Response {
-    let mut data = Vec::with_capacity(n as usize);
+async fn collect(mut events: mpsc::UnboundedReceiver<JobEvent>, answer: Answer) -> Response {
+    let mut data = Vec::with_capacity(answer.n as usize);
     while let Some(event) = events.recv().await {
         match event {
             JobEvent::Progress(_) => {}
             JobEvent::Image { png, .. } => data.push(ImageData { b64_json: job::base64(&png), revised_prompt: None }),
-            JobEvent::Ended(JobEnd::Stopped) => return model_stopped(),
-            JobEvent::Ended(_) => return engine_error(),
+            JobEvent::Ended(end) => return Refusal::of(Some(end), answer.route).into_response(),
         }
     }
-    if data.len() != n as usize {
+    if data.len() != answer.n as usize {
         // The job's thread went away without saying why: it panicked.
-        return engine_error();
+        return Refusal::of(None, answer.route).into_response();
     }
     Json(ImagesResponse {
         created: answer.created,
@@ -589,6 +636,8 @@ async fn collect(mut events: mpsc::UnboundedReceiver<JobEvent>, answer: Answer, 
 struct ImageSse {
     events: mpsc::UnboundedReceiver<JobEvent>,
     answer: Answer,
+    /// The images sent so far.
+    made: u32,
     /// The last event was sent.
     ended: bool,
 }
@@ -617,31 +666,34 @@ impl Stream for ImageSse {
             Poll::Ready(Some(JobEvent::Progress(progress))) => {
                 ImageStreamEvent::Progress(ProgressEvent { r#type: this.answer.route.progress(), progress })
             }
-            Poll::Ready(Some(JobEvent::Image { index, png })) => ImageStreamEvent::Completed(CompletedEvent {
-                r#type: this.answer.route.completed(),
-                image: index,
-                b64_json: job::base64(&png),
-                created_at: this.answer.created,
-                size: this.answer.size.clone(),
-                background: this.answer.background,
-                output_format: "png",
-                seed: this.answer.seed,
-                revised_prompt: None,
-                condition_sizes: this.answer.condition_sizes.clone(),
-            }),
-            Poll::Ready(Some(JobEvent::Ended(end))) => {
-                // What the request would have been answered had it not
-                // streamed: the status is already 200.
-                this.ended = true;
-                let error = match end {
-                    JobEnd::Stopped => ApiError::new("server_error", "model_stopped", MODEL_STOPPED_MESSAGE),
-                    _ => ApiError::new("engine_error", "engine_error", ENGINE_ERROR_MESSAGE),
-                };
-                ImageStreamEvent::Error(ErrorEvent { r#type: "error", error })
+            Poll::Ready(Some(JobEvent::Image { index, png })) => {
+                this.made += 1;
+                ImageStreamEvent::Completed(CompletedEvent {
+                    r#type: this.answer.route.completed(),
+                    image: index,
+                    b64_json: job::base64(&png),
+                    created_at: this.answer.created,
+                    size: this.answer.size.clone(),
+                    background: this.answer.background,
+                    output_format: "png",
+                    seed: this.answer.seed,
+                    revised_prompt: None,
+                    condition_sizes: this.answer.condition_sizes.clone(),
+                })
             }
-            // The job made its images, or its thread went away: the stream
-            // ends either way, and a client counts the images it got.
-            Poll::Ready(None) => return Poll::Ready(None),
+            // The job made its images: the stream ends.
+            Poll::Ready(None) if this.made == this.answer.n => return Poll::Ready(None),
+            // What the request would have been answered had it not streamed:
+            // the status is already 200. A job whose thread went away before
+            // its last image without saying why panicked.
+            Poll::Ready(end) => {
+                let end = match end {
+                    Some(JobEvent::Ended(end)) => Some(end),
+                    _ => None,
+                };
+                this.ended = true;
+                ImageStreamEvent::Error(ErrorEvent { r#type: "error", error: Refusal::of(end, this.answer.route).error })
+            }
         };
         Poll::Ready(Some(Ok(Self::event(&event))))
     }

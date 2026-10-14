@@ -3016,7 +3016,7 @@ fn engine_error_chunk() -> Event {
 
 /// The OpenAI error body (`{"error": {...}}`). Every failure on this
 /// surface answers in this shape, `/v1/decide` included.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ApiError {
     error: ErrorBody,
 }
@@ -3025,11 +3025,17 @@ impl ApiError {
     /// The body naming no field: what a stream that already answered `200`
     /// ends with.
     pub(crate) fn new(type_: &str, code: &str, message: &str) -> Self {
-        Self { error: ErrorBody { message: message.into(), r#type: type_.into(), code: code.into(), param: None } }
+        Self::naming(type_, code, message, None)
+    }
+
+    /// [`ApiError::new`], naming the one request field at fault when there
+    /// is one.
+    pub(crate) fn naming(type_: &str, code: &str, message: &str, param: Option<&str>) -> Self {
+        Self { error: ErrorBody { message: message.into(), r#type: type_.into(), code: code.into(), param: param.map(str::to_owned) } }
     }
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ErrorBody {
     message: String,
     r#type: String,
