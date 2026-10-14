@@ -207,6 +207,9 @@ P1-10 (GitHub #46) vendors the BF16 and W8G32 linear families:
   launch table spans geometries beyond this model's own (it is the
   reference's one dispatcher for the whole W8 family), so the family is
   vendored whole rather than picking out only the shapes G1 needs.
+  `w8_dispatch.cpp` is **patched** (and `tests/ops/linear/test_w8_a16.cpp`,
+  below): the six W8 problems of the image model's vision tower, see the
+  patch policy above.
 - **their reference op tests** — `tests/ops/linear/test_bf16_a16.cpp` +
   `tests/ops/direct_bf16_weight.h`, and `tests/ops/linear/test_w8_a16.cpp` +
   `tests/ops/linear/linear_test_common.{h,cpp}` + `tests/ops/quantized_weight.h`,
