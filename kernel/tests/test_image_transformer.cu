@@ -16,7 +16,9 @@
 //               tokens) run whole equal the same blocks run one call each, bit for bit, runs
 //               included; a second run is identical; the target pass reads the prefix (another
 //               prefix changes it); the head's Euler update against the host's on its own velocity,
-//               bit for bit.
+//               bit for bit; the prefix pass in chunks (834 tokens: text | image | text | image |
+//               a long text, chunks of 128 and 384) equals the whole pass, bit for bit, runs
+//               included.
 //   refusals    the calls' argument checks.
 //
 // The bound (test_image_elementwise.cu's error-tracking reference): each value v (exact, in fp64)
@@ -651,6 +653,56 @@ void case_program() {
         "program: the target pass barely changes over another prefix (it must read it)");
   check(vel_diff == 0, "program: the velocity depends on the update");
   check(euler_diff == 0, "program: the Euler update differs from the host's two roundings");
+
+  // The prefix pass in chunks equals the whole pass, bit for bit, x and runs: 834 tokens, text 37 |
+  // image 12 x 24 | text 9 | image 10 x 20 | text 300, in chunks of 128 (both images and the long
+  // text cut into pieces, the short segments packed) and of 384, in one call and one block a call.
+  const uint32_t L = 834;
+  const ignis_image_transformer_segment long_segments[5] = {{0, 37, 1}, {37, 325, 0}, {325, 334, 1}, {334, 534, 0}, {534, 834, 1}};
+  const uint32_t long_starts[2] = {37, 334}, long_heights[2] = {12, 10}, long_widths[2] = {24, 20};
+  std::vector<int32_t> long_positions(3 * L);
+  TF_RC(ignis_image_dit_rope_positions(L, 2, long_starts, long_heights, long_widths, long_positions.data()));
+  DeviceBytes dlong_pos(long_positions.size() * 4), long_rope(L * 512ull);
+  upload(dlong_pos, long_positions);
+  TF_RC(ignis_image_dit_rope_table(dlong_pos.as<int32_t>(), L, long_rope.as<float>(), nullptr));
+  const uint64_t long_run = ignis_image_attn_kv8_bytes(L);
+  DeviceBytes whole0(long_run), whole1(long_run), chunk0(long_run), chunk1(long_run);
+  void *whole_runs[2] = {whole0.p, whole1.p}, *chunk_runs[2] = {chunk0.p, chunk1.p};
+  const ignis_image_transformer_prefix whole{L, whole_runs, long_segments, 5}, chunked{L, chunk_runs, long_segments, 5};
+  const std::vector<float> xl0 = uniform(88, L * kHidden, 0.0f, 1.7f);
+  DeviceBytes xl(xl0.size() * 4), ws_whole(ignis_image_transformer_workspace_bytes(L)),
+      kv(ignis_image_transformer_prefix_kv_bytes(L));
+  // Every byte of a run starts as 0xFF on both sides, so the comparison covers the whole buffer.
+  MOE_CUDA(cudaMemset(whole0.p, 0xFF, long_run));
+  MOE_CUDA(cudaMemset(whole1.p, 0xFF, long_run));
+  upload(xl, xl0);
+  TF_RC(ignis_image_transformer_blocks(&weights, 0, 2, xl.as<float>(), L, 0, long_rope.as<float>(), dmod0.as<float>(),
+                                       &whole, ws_whole.p, ws_whole.bytes, nullptr));
+  MOE_CUDA(cudaDeviceSynchronize());
+  const std::vector<float> long_whole = download<float>(xl.p, xl0.size());
+  const std::vector<uint8_t> runs0 = download<uint8_t>(whole0.p, long_run), runs1 = download<uint8_t>(whole1.p, long_run);
+  long long long_nonfinite = 0;
+  for (float v : long_whole) long_nonfinite += !std::isfinite(v);
+  check(long_nonfinite == 0, "program: the long prefix's whole pass is not finite");
+  for (uint32_t chunk : {128u, 384u}) {
+    DeviceBytes ws_chunk(ignis_image_transformer_workspace_bytes(chunk));
+    for (int split = 0; split < 2; ++split) {
+      MOE_CUDA(cudaMemset(chunk0.p, 0xFF, long_run));
+      MOE_CUDA(cudaMemset(chunk1.p, 0xFF, long_run));
+      upload(xl, xl0);
+      for (uint32_t b = 0; b < 2; b += split ? 1 : 2) {
+        TF_RC(ignis_image_transformer_prefix_blocks(&weights, b, split ? b + 1 : 2, xl.as<float>(), long_rope.as<float>(),
+                                                    dmod0.as<float>(), &chunked, kv.p, chunk, ws_chunk.p, ws_chunk.bytes,
+                                                    nullptr));
+      }
+      MOE_CUDA(cudaDeviceSynchronize());
+      const long long x_diff = differ(long_whole, download<float>(xl.p, xl0.size()));
+      const bool runs_differ = runs0 != download<uint8_t>(chunk0.p, long_run) || runs1 != download<uint8_t>(chunk1.p, long_run);
+      std::printf("    prefix 834 tokens in chunks of %u%s: %lld of %zu x values differ from the whole pass, runs %s\n", chunk,
+                  split ? ", one block a call" : "", x_diff, long_whole.size(), runs_differ ? "differ" : "equal");
+      check(x_diff == 0 && !runs_differ, "program: the prefix pass in chunks differs from the whole pass");
+    }
+  }
 }
 
 // ---- refusals -----------------------------------------------------------------------------------
@@ -695,7 +747,20 @@ void refusals() {
           "a NULL model weight");
   refused(ignis_image_transformer_modulation(&weights, -1.0f, x, s, ws.p, ws.bytes, nullptr), "a negative sigma");
   refused(ignis_image_transformer_head(&weights, x, 4, s, s, x, NAN, 0.0f, ws.p, ws.bytes, nullptr), "a NaN sigma");
+  const ignis_image_transformer_segment one[1] = {{0, 4, 1}};
+  const ignis_image_transformer_prefix whole_prefix{4, runs, one, 1};
+  refused(ignis_image_transformer_prefix_blocks(&weights, 0, 0, x, s, s, &bad_segments, b.p, 128, ws.p, ws.bytes, nullptr),
+          "chunked: segments with a gap");
+  refused(ignis_image_transformer_prefix_blocks(&weights, 0, 0, x, s, s, &whole_prefix, b.p, 100, ws.p, ws.bytes, nullptr),
+          "chunked: a chunk not a multiple of 128");
+  refused(ignis_image_transformer_prefix_blocks(&weights, 0, 0, x, s, s, &whole_prefix, a.as<uint8_t>() + 16, 128, ws.p,
+                                                ws.bytes, nullptr),
+          "chunked: kv not 256-byte aligned");
+  refused(ignis_image_transformer_prefix_blocks(&weights, 0, 0, x, s, s, &whole_prefix, b.p, 128, ws.p, ws.bytes, nullptr),
+          "chunked: a workspace short of the chunk's");
   check(ignis_image_transformer_workspace_bytes(0) == 0, "workspace_bytes(0) is 0");
+  check(ignis_image_transformer_prefix_kv_bytes(0) == 0 && ignis_image_transformer_prefix_kv_bytes(3) == 2 * 24576,
+        "prefix_kv_bytes: 0 for 0 tokens, K and V of 4096 BF16 a token, each 256-byte aligned");
 }
 
 }  // namespace

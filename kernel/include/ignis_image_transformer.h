@@ -154,6 +154,28 @@ int32_t ignis_image_transformer_blocks(const struct ignis_image_transformer_weig
                                        const struct ignis_image_transformer_prefix *prefix, void *workspace,
                                        uint64_t workspace_bytes, void *stream);
 
+/* The prefix pass in chunks, for a prefix whose whole pass does not fit a workspace: blocks
+ * [first_block, end_block) on the prefix's x (prefix->tokens rows) as ignis_image_transformer_blocks
+ * with target 0 computes them, bit for bit, the runs included, through a workspace for `chunk`
+ * tokens (ignis_image_transformer_workspace_bytes(chunk); chunk a positive multiple of 128) and
+ * `kv`, the BF16 K and V of every prefix token (ignis_image_transformer_prefix_kv_bytes(tokens),
+ * 256-byte aligned). Per block:
+ *   phase A, chunk by chunk of `chunk` tokens: img_norm1, K (its norm and RoPE) and V into kv;
+ *            then the block's run from all of them, one store (a run's K mean and V scales are
+ *            over all its tokens);
+ *   phase B, chunk by chunk of whole segments (a segment longer than `chunk` cut every `chunk`
+ *            queries, so its pieces' query blocks fall as in one call): img_norm1 again, Q, the
+ *            attention of each segment or piece over the run (a causal piece's keys end at its own
+ *            end), to_out and the MLP.
+ * The MLP's add is not fused with the next block's img_norm1, which phase A recomputes from x:
+ * the same values. rope: the prefix's table; mod: the t = 0 modulation row. */
+uint64_t ignis_image_transformer_prefix_kv_bytes(uint32_t tokens);
+int32_t ignis_image_transformer_prefix_blocks(const struct ignis_image_transformer_weights *weights,
+                                              uint32_t first_block, uint32_t end_block, float *x, const float *rope,
+                                              const float *mod, const struct ignis_image_transformer_prefix *prefix,
+                                              void *kv, uint32_t chunk, void *workspace, uint64_t workspace_bytes,
+                                              void *stream);
+
 /* The head: velocity fp32 [tokens][64] = proj_out(LayerNorm(x) * (1 + out_scale)). Then, when
  * `latents` (fp32 [tokens][64]) is not NULL, the Euler update latents += (sigma_next - sigma) *
  * velocity: dt = fl32(sigma_next - sigma), then fl32(latents + fl32(dt * velocity)). x is read,

@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 namespace ignis_image {
 namespace {
@@ -377,6 +378,38 @@ std::string check_weights(const ignis_image_transformer_weights *w) {
   return "";
 }
 
+// The prefix pass's segments: in order, each non-empty, covering [0, prefix->tokens).
+std::string check_segments(const ignis_image_transformer_prefix *prefix) {
+  if (prefix->segments == nullptr || prefix->segment_count == 0) return "the prefix pass needs the prefix's segments";
+  uint32_t at = 0;
+  for (uint32_t i = 0; i < prefix->segment_count; ++i) {
+    const ignis_image_transformer_segment &g = prefix->segments[i];
+    if (g.start != at || g.end <= g.start) {
+      return "segment " + std::to_string(i) + " [" + std::to_string(g.start) + ", " + std::to_string(g.end) +
+             ") does not continue the prefix at " + std::to_string(at);
+    }
+    at = g.end;
+  }
+  if (at != prefix->tokens) return "the segments do not cover the prefix";
+  return "";
+}
+
+// Blocks [first, end): every weight present and aligned, and the prefix's run of each block.
+std::string check_blocks(const ignis_image_transformer_weights *weights, uint32_t first, uint32_t end,
+                         const ignis_image_transformer_prefix *prefix) {
+  for (uint32_t b = first; b < end; ++b) {
+    const ignis_image_transformer_block &B = weights->blocks[b];
+    const void *all[] = {B.to_q, B.to_k, B.to_v, B.to_out, B.norm_q, B.norm_k, B.mlp_gate, B.mlp_up, B.mlp_down};
+    for (const void *p : all) {
+      if (p == nullptr || !aligned(p, 16)) return "block " + std::to_string(b) + " has a NULL or unaligned weight";
+    }
+    if (prefix->runs[b] == nullptr || !aligned(prefix->runs[b], 16)) {
+      return "the prefix's run of block " + std::to_string(b) + " is NULL or unaligned";
+    }
+  }
+  return "";
+}
+
 std::string check_workspace(void *workspace, uint64_t bytes, std::size_t need) {
   if (workspace == nullptr || !aligned(workspace, 256)) return "the workspace must be 256-byte aligned";
   if (bytes < need) {
@@ -548,35 +581,11 @@ extern "C" int32_t ignis_image_transformer_blocks(const struct ignis_image_trans
     if (tokens != prefix->tokens) {
       why = "the prefix pass runs the prefix's " + std::to_string(prefix->tokens) + " tokens, not " +
             std::to_string(tokens);
-    } else if (prefix->segments == nullptr || prefix->segment_count == 0) {
-      why = "the prefix pass needs the prefix's segments";
     } else {
-      uint32_t at = 0;
-      for (uint32_t i = 0; i < prefix->segment_count; ++i) {
-        const ignis_image_transformer_segment &g = prefix->segments[i];
-        if (g.start != at || g.end <= g.start) {
-          why = "segment " + std::to_string(i) + " [" + std::to_string(g.start) + ", " + std::to_string(g.end) +
-                ") does not continue the prefix at " + std::to_string(at);
-          break;
-        }
-        at = g.end;
-      }
-      if (why.empty() && at != prefix->tokens) why = "the segments do not cover the prefix";
+      why = check_segments(prefix);
     }
   }
-  if (why.empty()) {
-    for (uint32_t b = first_block; b < end_block; ++b) {
-      const ignis_image_transformer_block &B = weights->blocks[b];
-      const void *all[] = {B.to_q, B.to_k, B.to_v, B.to_out, B.norm_q, B.norm_k, B.mlp_gate, B.mlp_up, B.mlp_down};
-      for (const void *p : all) {
-        if (p == nullptr || !aligned(p, 16)) why = "block " + std::to_string(b) + " has a NULL or unaligned weight";
-      }
-      if (prefix->runs[b] == nullptr || !aligned(prefix->runs[b], 16)) {
-        why = "the prefix's run of block " + std::to_string(b) + " is NULL or unaligned";
-      }
-      if (!why.empty()) break;
-    }
-  }
+  if (why.empty()) why = check_blocks(weights, first_block, end_block, prefix);
   if (why.empty()) why = check_workspace(workspace, workspace_bytes, workspace_size(tokens));
   if (!why.empty()) return fail(op + ": " + why);
   if (first_block == end_block) return 0;
@@ -653,6 +662,161 @@ extern "C" int32_t ignis_image_transformer_blocks(const struct ignis_image_trans
     if (launch_residual_norm(x, w.delta, tanh_gate2, tokens, kHidden, next, eps, w.codes, w.scales, 0, stream) != 0) {
       return failed(op, at + (next != nullptr ? "the MLP's residual and the next img_norm1" : "the MLP's residual"),
                     last_error_cstr());
+    }
+  }
+  return 0;
+}
+
+extern "C" uint64_t ignis_image_transformer_prefix_kv_bytes(uint32_t tokens) {
+  if (tokens == 0 || tokens > kMaxTokens) return 0;
+  return 2 * align256(static_cast<std::size_t>(tokens) * kHidden * 2);
+}
+
+extern "C" int32_t ignis_image_transformer_prefix_blocks(const struct ignis_image_transformer_weights *weights,
+                                                         uint32_t first_block, uint32_t end_block, float *x,
+                                                         const float *rope, const float *mod,
+                                                         const struct ignis_image_transformer_prefix *prefix, void *kv,
+                                                         uint32_t chunk, void *workspace, uint64_t workspace_bytes,
+                                                         void *stream) {
+  const std::string op = "ignis_image_transformer_prefix_blocks";
+  std::string why = check_weights(weights);
+  if (why.empty() && (first_block > end_block || end_block > weights->block_count)) {
+    why = "the blocks [" + std::to_string(first_block) + ", " + std::to_string(end_block) +
+          ") are not within the model's " + std::to_string(weights->block_count);
+  }
+  if (why.empty() && (x == nullptr || rope == nullptr || mod == nullptr || !aligned(x, 16) || !aligned(rope, 16) ||
+                      !aligned(mod, 16))) {
+    why = "x, rope and mod must be 16-byte aligned";
+  }
+  if (why.empty() && (prefix == nullptr || prefix->tokens == 0 || prefix->tokens > kMaxTokens || prefix->runs == nullptr)) {
+    why = "a prefix of 1 .. 2^20 tokens, with its runs";
+  }
+  if (why.empty()) why = check_segments(prefix);
+  if (why.empty() && (chunk == 0 || chunk % 128 != 0 || chunk > kMaxTokens)) {
+    why = "chunk must be a positive multiple of 128, at most 2^20";
+  }
+  if (why.empty() && (kv == nullptr || !aligned(kv, 256))) why = "kv must be 256-byte aligned";
+  if (why.empty()) why = check_blocks(weights, first_block, end_block, prefix);
+  if (why.empty()) why = check_workspace(workspace, workspace_bytes, workspace_size(chunk));
+  if (!why.empty()) return fail(op + ": " + why);
+  if (first_block == end_block) return 0;
+
+  const uint32_t P = prefix->tokens;
+  // The pieces the attention runs: each segment, or a segment longer than `chunk` cut every `chunk`
+  // queries (a multiple of 128 from its start, so the quantized queries' row blocks and the
+  // attention's query tiles fall as in one call; a causal text piece ends its keys at its own end).
+  // Phase B's chunks: consecutive pieces of at most `chunk` tokens in all, a cut segment's pieces
+  // in chunks of their own.
+  struct Piece {
+    uint32_t start, end, keys, causal;
+  };
+  struct Chunk {
+    uint32_t start, end;
+    std::size_t first, last;
+  };
+  std::vector<Piece> pieces;
+  std::vector<Chunk> chunks;
+  uint32_t open = 0;
+  auto close = [&](uint32_t at) {
+    if (at > open) chunks.push_back({open, at, chunks.empty() ? 0 : chunks.back().last, pieces.size()});
+    open = at;
+  };
+  for (uint32_t i = 0; i < prefix->segment_count; ++i) {
+    const ignis_image_transformer_segment &g = prefix->segments[i];
+    if (g.end - open > chunk) close(g.start);
+    for (uint32_t s = g.start; s < g.end; s += chunk) {
+      const uint32_t e = std::min(g.end, s + chunk);
+      if (s > g.start) close(s);
+      pieces.push_back({s, e, g.text != 0 ? e : g.end, g.text != 0 ? 1u : 0u});
+    }
+  }
+  close(P);
+
+  const Workspace w = carve(workspace, chunk);
+  const float eps = weights->eps;
+  const float *scale1 = mod, *scale2 = mod + 2 * kHidden;
+  const float *tanh_gate1 = w.gates, *tanh_gate2 = w.gates + kHidden;
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  __nv_bfloat16 *kv_k = static_cast<__nv_bfloat16 *>(kv);
+  __nv_bfloat16 *kv_v = reinterpret_cast<__nv_bfloat16 *>(static_cast<uint8_t *>(kv) +
+                                                          align256(static_cast<std::size_t>(P) * kHidden * 2));
+  tanh_gates_kernel<<<(2 * kHidden + 255) / 256, 256, 0, s>>>(mod, w.gates);
+  if (check_launch("the gates") != 0) return failed(op, "the gates", last_error_cstr());
+  for (uint32_t b = first_block; b < end_block; ++b) {
+    const ignis_image_transformer_block &B = weights->blocks[b];
+    const std::string at = "block " + std::to_string(b) + ", ";
+    void *run = prefix->runs[b];
+    // Phase A: every token's K (normed and turned) and V into kv, then the block's run from all.
+    for (uint32_t c0 = 0; c0 < P; c0 += chunk) {
+      const uint32_t n = std::min(chunk, P - c0);
+      const std::size_t row = static_cast<std::size_t>(c0) * kHidden;
+      if (launch_residual_norm(x + row, nullptr, nullptr, n, kHidden, scale1, eps, w.codes, w.scales, 0, stream) != 0) {
+        return failed(op, at + "img_norm1", last_error_cstr());
+      }
+      if (ignis_image_gemm_w8a8(B.to_k, kHidden, kHidden, w.codes, w.scales, n, w.k, 0, stream) != 0 ||
+          ignis_image_gemm_w8a8(B.to_v, kHidden, kHidden, w.codes, w.scales, n, kv_v + row, 0, stream) != 0) {
+        return failed(op, at + "to_k / to_v", ignis_image_gemm_last_error());
+      }
+      // The k heads' norm and RoPE into kv; the call's q side reads the same keys into scratch.
+      if (ignis_image_dit_qk_norm_rope(w.k, w.k, n, kHidden, B.norm_k, B.norm_k, eps,
+                                       rope + static_cast<std::size_t>(c0) * 128, w.q, kv_k + row, kHidden, 0,
+                                       stream) != 0) {
+        return failed(op, at + "the K norm and RoPE", ignis_image_dit_last_error());
+      }
+    }
+    if (ignis_image_attn_store_kv(kv_k, kv_v, P, kHidden, nullptr, 0, run, stream) != 0) {
+      return failed(op, at + "the prefix's K/V run", ignis_image_attn_last_error());
+    }
+    // Phase B, chunk by chunk: Q, the attention of its pieces over the run, to_out and the MLP.
+    for (const Chunk &c : chunks) {
+      const uint32_t n = c.end - c.start;
+      float *xc = x + static_cast<std::size_t>(c.start) * kHidden;
+      if (launch_residual_norm(xc, nullptr, nullptr, n, kHidden, scale1, eps, w.codes, w.scales, 0, stream) != 0) {
+        return failed(op, at + "img_norm1", last_error_cstr());
+      }
+      if (ignis_image_gemm_w8a8(B.to_q, kHidden, kHidden, w.codes, w.scales, n, w.q, 0, stream) != 0) {
+        return failed(op, at + "to_q", ignis_image_gemm_last_error());
+      }
+      // The q heads' norm and RoPE into w.k; the call's k side writes scratch.
+      if (ignis_image_dit_qk_norm_rope(w.q, w.q, n, kHidden, B.norm_q, B.norm_q, eps,
+                                       rope + static_cast<std::size_t>(c.start) * 128, w.k, w.v, kHidden, 0,
+                                       stream) != 0) {
+        return failed(op, at + "the Q norm and RoPE", ignis_image_dit_last_error());
+      }
+      for (std::size_t i = c.first; i < c.last; ++i) {
+        const Piece &g = pieces[i];
+        const std::size_t off = static_cast<std::size_t>(g.start - c.start) * kHidden;
+        if (ignis_image_attn_quantize_q(w.k + off, g.end - g.start, kHidden, w.q8, stream) != 0 ||
+            ignis_image_attn(w.q8, g.end - g.start, run, P, g.keys, nullptr, 0, g.causal, kAttnScale, w.o + off,
+                             kHidden, 0, stream) != 0) {
+          return failed(op, at + "the attention of tokens [" + std::to_string(g.start) + ", " + std::to_string(g.end) + ")",
+                        ignis_image_attn_last_error());
+        }
+      }
+      if (ignis_image_quantize_tokens(w.o, n, kHidden, w.codes, w.scales, stream) != 0) {
+        return failed(op, at + "the attention output's quantization", ignis_image_gemm_last_error());
+      }
+      if (ignis_image_gemm_w8a8(B.to_out, kHidden, kHidden, w.codes, w.scales, n, w.delta, 1, stream) != 0) {
+        return failed(op, at + "to_out", ignis_image_gemm_last_error());
+      }
+      if (launch_residual_norm(xc, w.delta, tanh_gate1, n, kHidden, scale2, eps, w.codes, w.scales, 0, stream) != 0) {
+        return failed(op, at + "the attention's residual and img_norm2", last_error_cstr());
+      }
+      if (ignis_image_gemm_w8a8(B.mlp_gate, kMlp, kHidden, w.codes, w.scales, n, w.gate, 0, stream) != 0 ||
+          ignis_image_gemm_w8a8(B.mlp_up, kMlp, kHidden, w.codes, w.scales, n, w.up, 0, stream) != 0) {
+        return failed(op, at + "gate_layer / proj", ignis_image_gemm_last_error());
+      }
+      if (ignis_image_dit_act(IGNIS_IMAGE_DIT_SWIGLU, w.gate, w.up, n, kMlp, kMlp, w.codes, w.scales,
+                              IGNIS_IMAGE_DIT_OUT_E4M3, stream) != 0) {
+        return failed(op, at + "SwiGLU", ignis_image_dit_last_error());
+      }
+      if (ignis_image_gemm_w8a8(B.mlp_down, kHidden, kMlp, w.codes, w.scales, n, w.delta, 1, stream) != 0) {
+        return failed(op, at + "out", ignis_image_gemm_last_error());
+      }
+      // The MLP's residual alone: the next block's img_norm1 runs in its phase A.
+      if (launch_residual_norm(xc, w.delta, tanh_gate2, n, kHidden, nullptr, eps, nullptr, nullptr, 0, stream) != 0) {
+        return failed(op, at + "the MLP's residual", last_error_cstr());
+      }
     }
   }
   return 0;

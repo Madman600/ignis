@@ -184,6 +184,21 @@ mod device {
                 workspace_bytes: u64,
                 stream: *mut c_void,
             ) -> i32;
+            pub fn ignis_image_transformer_prefix_kv_bytes(tokens: u32) -> u64;
+            pub fn ignis_image_transformer_prefix_blocks(
+                weights: *const ignis_image_transformer_weights,
+                first_block: u32,
+                end_block: u32,
+                x: *mut f32,
+                rope: *const f32,
+                modulation: *const f32,
+                prefix: *const ignis_image_transformer_prefix,
+                kv: *mut c_void,
+                chunk: u32,
+                workspace: *mut c_void,
+                workspace_bytes: u64,
+                stream: *mut c_void,
+            ) -> i32;
             pub fn ignis_image_transformer_head(
                 weights: *const ignis_image_transformer_weights,
                 x: *const f32,
@@ -213,6 +228,11 @@ mod device {
     /// The workspace a call over `tokens` needs, in bytes (0 for 0 or more than 2^20 tokens).
     pub fn workspace_bytes(tokens: u32) -> u64 {
         unsafe { ffi::ignis_image_transformer_workspace_bytes(tokens) }
+    }
+
+    /// The chunked prefix pass's BF16 K and V of `tokens` prefix tokens, in bytes (0 for 0 tokens).
+    pub fn prefix_kv_bytes(tokens: u32) -> u64 {
+        unsafe { ffi::ignis_image_transformer_prefix_kv_bytes(tokens) }
     }
 
     /// The DiT's descriptors over a materialized artifact: every `transformer/` tensor where the
@@ -362,6 +382,32 @@ mod device {
                 workspace_bytes,
                 stream,
             )
+        })
+    }
+
+    /// The prefix pass in chunks of at most `chunk` tokens (a multiple of 128): blocks `[first,
+    /// end)` on the prefix's `x`, bit for bit what [`blocks`] computes, through a workspace for
+    /// `chunk` tokens and `kv` ([`prefix_kv_bytes`] of the prefix's tokens).
+    ///
+    /// # Safety
+    /// As [`blocks`]; `kv` is a 256-byte aligned device buffer of [`prefix_kv_bytes`]`(prefix.tokens)`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn prefix_blocks(
+        weights: &ffi::ignis_image_transformer_weights,
+        first: u32,
+        end: u32,
+        x: *mut f32,
+        rope: *const f32,
+        modulation: *const f32,
+        prefix: &ffi::ignis_image_transformer_prefix,
+        kv: *mut c_void,
+        chunk: u32,
+        workspace: *mut c_void,
+        workspace_bytes: u64,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        check(unsafe {
+            ffi::ignis_image_transformer_prefix_blocks(weights, first, end, x, rope, modulation, prefix, kv, chunk, workspace, workspace_bytes, stream)
         })
     }
 
