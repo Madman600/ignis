@@ -320,3 +320,178 @@ the hooks they fill are below.
   under the profile (2 of 2). `CARGO_INCREMENTAL=0 cargo test --workspace`:
   2,857 passed, 0 failed, 6 ignored. `cargo check -p ignis-server --features
   cuda --tests` passes (one earlier warning, in `openapi.rs`).
+
+## As built (320c, 2026-10-14: ACs 4, 5, 7, the tower and DeepStack)
+
+**Status of #320, one line per acceptance item:**
+1. Done (320f): token ids and `drop_idx` bit for bit on every case of
+   spec 01, and the CPU tests.
+2. Done (320f): the edit case's `pixel_values` and `image_grid_thw` bit for
+   bit (bound 0), and the CPU tests.
+3. Done (320a): t2i 9.61% against the 19.50% bound.
+4. Done (320c): edit 12.78% after the first image pad against the 25.76%
+   bound; with DeepStack off 29.68%, over it.
+5. Done (320c): the 27B's vision tests pass unchanged (7 GPU tests under
+   the profile, and the CTest).
+6. Done (320f): mrope positions bit for bit on the t2i and 3-image tables.
+7. Done, for information: t2i 21.6-22.0 ms (320a); a 10-image edit, tower
+   2.84 s and text model 0.48 s (320c).
+
+Where the tower chose what the sections above leave open.
+- **Where.**
+  - ABI `kernel/include/ignis_image_vision.h`, code
+    `kernel/src/vision_encode.cu`: the 27B's tower program, parametrised.
+    One call's description (`VisionEncodeCall`) carries the host arrays,
+    the merger's output width, its output pages, and the DeepStack
+    mergers with their taps and outputs.
+  - The 27B's `ignis_media_encode` builds its call with the model's hidden,
+    its pool pages and no DeepStack, so it runs the same ops in the same
+    order as before. The image model's call has one page, its whole
+    output, 4096 wide.
+  - `ignis_image_vision_forward` takes the weights as device pointers
+    (every matrix W8G32 `row-split-k128-v1`: codes, then the scale plane)
+    and up to 10 segments. It writes the merger's output and each DeepStack
+    output asked for (NULL: not run), BF16 `[tokens][4096]` each.
+    `ignis_image_vision_workspace_bytes` is the 27B's layout: 56.8 MB at
+    1,024 merged tokens, 568 MB at 10 × 1,024.
+  - Rust: `crates/core/src/image_vision.rs` (`VisionTowerConfig::parse`,
+    `vision_call`, the bindings, `VisionWeights` over a materialized
+    artifact) and `qwen_image::bind_vision`, a scoped bind of the config and
+    the `vision/` tensors.
+  - Tests: the CTest `ignis_kernel_image_vision_test`; the Rust `--ignored`
+    `crates/server/tests/image_encoder_edit_gpu.rs` (AC 4 and AC 7); on the
+    CPU, `image_vision::tests` and the scoped bind
+    (`crates/artifact/tests/qwen_image.rs`).
+- **DeepStack.** Merger i taps the residual after tower block
+  `deepstack_layers[i]` (0-based, transformers' `deepstack_visual_indexes`:
+  8, 16 and 24). Its LayerNorm runs over the merged 4608 after the 2×2 view
+  (`use_postshuffle_norm`); the merger's runs over each patch's 1152 before
+  it. Then fc1, GELU-exact and fc2, as in the merger. Between blocks nothing
+  in the workspace is live but the residual, so the DeepStack mergers run in
+  the merger's own regions: no extra workspace.
+- **The vendor patch** (a90699a, recorded in `kernel/vendor/manifest.json`
+  and `VENDOR.md`). The W8 dispatch is a finite registry of (N, K) shapes.
+  The patch registers the tower's shapes:
+  - qkv `[3456, 1152]`, output `[1152, 1152]` and fc1 `[4304, 1152]` on the
+    SIMT routes at every T. The MMA kernels copy eight groups' scales as one
+    16-byte `cp.async`, which needs a row of scales (padded K / 16 bytes) to
+    be a multiple of 16 bytes. K 1152 gives 72: routed to `mma_r64_c128`,
+    they gave wrong outputs at T 17 and a misaligned-address fault at T
+    4096.
+  - the patch embedding `[1152, 1536]`, fc2 `[1152, 4304]` (stored K 4352)
+    and the mergers' fc2 `[4096, 4608]` on SIMT up to T 16, then
+    `mma_r64_c128`.
+
+  It is neither an ADR 0031 bottleneck nor an ADR 0037 bug, and its record
+  says so: whether registry extensions become a standing reason is the
+  owner's call. `ignis_kernel_w8_linear_tests` covers the six shapes from T
+  1 up to 40,960 (qkv) or 10,240 (the mergers' fc2), and throws without the
+  patch.
+- **Defaults taken** (the owner may revisit):
+  1. **No per-image token bound**, only the 10 segments (and 2^20
+     patches). A condition image near 1024² at an aspect ratio can exceed
+     1,024 merged tokens: 1376 × 768 is 1,032. The caller's workspace bounds
+     the call.
+  2. **`pixel_values` are rounded to BF16 on the host**, to nearest even
+     (`vision_call`), since the 27B's tower reads BF16 patches.
+  3. **The DeepStack taps come from the config's `vision_config`**, not
+     from the header. Its dimensions are checked against the artifact's
+     inventory (depth, widths, patch, merge, positions, GELU-tanh). The
+     descriptor also refuses a geometry other than the leaf's, or a head
+     count other than 16.
+  4. **The arithmetic is the 27B tower's**: BF16 activations and residual,
+     W8 weights through the vendored A16 linear.
+  5. **The bilinear table coordinates are the 27B's**
+     (`vision_item_control`: fl32(i · 47 / (side − 1))), not
+     `torch.linspace`'s two-sided formula. The corner weights can differ by
+     an ulp; that is inside the tower's error and was not measured apart.
+  6. **The text model reads the tower's outputs as they are.** The hook's
+     `embeds` and `deepstack[i]` are the tower's own buffers, and its
+     `row_index` the image-pad rows in order. Merged token j is the j-th
+     2×2 block of the patch rows, so the rows follow the pads.
+- **The CTest** (synthetic W8G32 weights, 1.6 s):
+  - **The mergers against fp64.** A neutral block (every code and bias 0)
+    adds exactly 0 to the residual. With all 27 neutral, x after the tower
+    is the patch embedding plus its bias plus the position table. On a 4 ×
+    4-patch image whose four patches per token differ in scale, the merger
+    and the three DeepStack mergers are within 8.5e-4 to 9.6e-4 relative L2
+    of fp64 that rounds where the device stores BF16 (bound 1e-2). With the
+    norm placements swapped, each is 0.42 off: the negative control.
+  - **The taps.** With block 9 live, DeepStack 0 (after block 8) equals the
+    all-neutral run's bit for bit, and DeepStack 1 and 2 do not. With block
+    8 live, DeepStack 0 does not. Taps at (9, 16, 24) move it. The merger's
+    output is the same without DeepStack, and one DeepStack output asked
+    alone equals the full run's.
+  - **Segments.** Images of 8 × 10 and 12 × 8 patches in one call equal each
+    alone, bit for bit, with a live block whose attention mixes patches. The
+    same call as one segment differs.
+  - **The refusals**, and the workspace equal to the 27B's layout.
+- **AC 4.** The test feeds the edit case's recorded inputs (`input_ids`,
+  `mrope_position_ids`, `pixel_values`, `image_grid_thw`, and the pad rows
+  where `mm_token_type_ids` is 1). It runs the tower, then the 36 layers:
+  the merger's rows are written over the 1,024 pad rows, and the DeepStack
+  rows added after layers 0, 1 and 2. Spec 01's metric against the recorded
+  fp32 output:
+
+  | DeepStack | after the first pad (18 rows) | bound | encoder (25 text rows) | bound | encoder_row0 |
+  |---|---|---|---|---|---|
+  | **on** | **12.78%** | 25.76% (sim 12.88, bf16 3.22) | 13.48% | 28.99% (sim 14.49, bf16 3.13) | 28.77% (sim 21.12, bf16 30.42) |
+  | off | 29.68% | | 26.43% | | 28.77% |
+
+  - **DeepStack on** sits at the sim yardstick, as t2i does: W8A8
+    quantization. Its worst row after the pad is 20.7% (" the", row 1056).
+  - **DeepStack off is over the bound**, and the test asserts it (spec 03's
+    check). It is as weak as spec 01 measured: rows 1046
+    (`<|vision_end|>`, 47.6%) and 1056 (" the", 58.9%) carry it. Without
+    both, the other 16 rows read 25.16%, under the bound. The text rows
+    from row 1 (26.43%) stay under their bound, as in fp32.
+  - **The two paths agree.** The same test runs through `EncoderFrontend`
+    from `condition.png`, decoded (it equals the VAE input read back, byte
+    for byte). Its sequence, positions, pad rows and pixels are the
+    recording's. The tower's outputs and the encoder's output equal the
+    recorded path's, bit for bit.
+- **The tower's stages against transformers** (the diagnosis, printed when
+  `IGNIS_IMAGE_VISION_REF` names the references). The references are
+  transformers' tower on the CPU in fp32, on the checkpoint's weights and on
+  the artifact's W8 weights decoded (`vision_probe.outputs`, through
+  agent-320b's `.scratch/320b/ref_vision.py`).
+
+  | output | vs fp32 weights | vs W8 weights | spec 01's bf16 yardstick |
+  |---|---|---|---|
+  | merger | 18.2% (per-row RMS 27.4%, worst row 299%) | 17.7% | 15.9% |
+  | DeepStack 0 (block 8) | 2.1% | 1.7% | 1.6% |
+  | DeepStack 1 (block 16) | 5.2% | 4.9% | 4.4% |
+  | DeepStack 2 (block 24) | 7.0% | 6.1% | 5.5% |
+
+  - The error is BF16 compute, the level of the checkpoint computing in
+    bf16. Against the W8 weights it barely drops, so the W8 weights add
+    little.
+  - The merger's error is outlier-dominated, as spec 01 found: a few rows
+    with small norms carry it.
+  - No bug was found, and AC 4 holds at the sim level.
+- **AC 7** (the GPU lock in normal mode, nothing else on the card; wall
+  clock around each stage's launches and a stream sync, the median of 3 warm
+  runs):
+  - **Ten condition images** (the edit image ten times, synthetic as spec 03
+    allows): 10,335 tokens, 10,240 image pads, 40,960 patches in 10
+    segments. Front end 80 ms (CPU), **tower 2.84 s, text model 0.48 s**.
+  - One image (the edit case, 1,064 tokens): tower 253 ms, text model
+    45 ms.
+  - The text model's 6.47 GiB and the tower's 0.57 GiB materialize in
+    4.7-5.1 s.
+  - The tower is 85% of the ten-image encode. The likely cause is its K-1152
+    linears on SIMT (qkv, output and fc1: about two thirds of its linear
+    work), the route the vendor patch takes because of the MMA's scale
+    copy. That is an estimate, not profiled: the tower's linears and
+    attention run at about 22 TFLOPS effective.
+- **Gates** (this section and its code, 4c7e3a1 to cae718e):
+  - `kernel/build.ps1 -Test` with `IGNIS_GPU_PROFILE=1`: 123 of 123.
+  - The Rust GPU tests under the profile:
+    - `image_encoder_edit_gpu` (2 of 2) and `image_encoder_gpu` (2 of 2);
+    - the 27B's vision tests (7 of 7): `vision_canary_gpu`,
+      `vision_dflash2_gpu`, `vision_mixed_load_gpu`,
+      `vision_prefix_reuse_gpu`, `classify_vision_readout_gpu`,
+      `classify_pointing_gpu` and core's `vision_load_gpu`;
+    - not run: the two `attn-tap`-feature tests
+      (`attention_head_point_gpu`, `attn_tap_hq_consumed_gpu`), which need
+      their own build.
