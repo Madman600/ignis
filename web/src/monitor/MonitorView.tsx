@@ -1107,7 +1107,7 @@ function SpeculationCard({ speculation, win }: { speculation: Speculation; win: 
 /** The image jobs (GitHub #324): what ended and how, how long the completed ones took, the queue, and where the time went. */
 function ImagesCard({ images, win }: { images: Images; win: string }) {
   const phases = images.phases.filter((p) => p.share !== null);
-  const refused = IMAGE_OUTCOMES.filter((outcome) => outcome !== "completed" && images.jobs.byOutcome[outcome].window).map(
+  const notCompleted = IMAGE_OUTCOMES.filter((outcome) => outcome !== "completed" && images.jobs.byOutcome[outcome].window).map(
     (outcome) => `${formatCount(images.jobs.byOutcome[outcome].window)} ${outcome}`,
   );
   return (
@@ -1122,7 +1122,7 @@ function ImagesCard({ images, win }: { images: Images; win: string }) {
           ["Since start", formatCount(images.jobs.total)],
         ]}
       />
-      {refused.length > 0 && <p className="mt-2 text-[11px] text-ash">Not completed: {refused.join(" · ")}</p>}
+      {notCompleted.length > 0 && <p className="mt-2 text-[11px] text-ash">Not completed: {notCompleted.join(" · ")}</p>}
       {phases.length > 0 && <Figures items={phases.map((p) => [`Time ${p.phase}`, asShare(p.share)] as [string, string])} />}
     </Card>
   );

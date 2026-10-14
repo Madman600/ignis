@@ -298,6 +298,14 @@ describe("what Generate and Edit do (GitHub #324)", () => {
     const other = runPlan({ ...text, id: "qwen3.8-flash-next" }, DEFAULT_LIMITS, row, true, false);
     expect(other).toMatchObject({ label: "Switch & generate", model: "ignis-image-2.1-turbo", ready: true });
     expect(other.note).toBe("Switches to qwen3.8-27b to rewrite the prompt, then to the image model.");
+    // Unloaded by the idle clock: the server loads the enhancer first, then the image model: two loads, not three.
+    const idle = (id: string): ModelState => ({ state: "unloaded", id, contextLimit: 1, kind: "text" });
+    expect(runPlan(idle("qwen3.8-flash-next"), DEFAULT_LIMITS, row, true, false).note).toBe(
+      "Loads qwen3.8-27b to rewrite the prompt, then switches to the image model.",
+    );
+    expect(runPlan(idle("qwen3.8-27b"), DEFAULT_LIMITS, row, true, false).note).toBe(
+      "Loads qwen3.8-27b to rewrite the prompt, then the image model replaces it.",
+    );
   });
 
   it("does not offer a switch the server would refuse, and says why", () => {
@@ -305,9 +313,11 @@ describe("what Generate and Edit do (GitHub #324)", () => {
     expect(off).toMatchObject({ label: "Generate", ready: false });
     expect(off.model).toBeUndefined();
     expect(off.note).toContain("switch.allow_implicit");
-    // `on_disk` counts only `download.path`: a known model elsewhere reads `absent` and switches all the same (AC 14).
+    // `on_disk` is ignored: it reads `absent` for a switchable model whose file is not under `download.path` (AC 14); `switchable` is the server's word.
     expect(runPlan(text, DEFAULT_LIMITS, { ...row, on_disk: "absent" }, false, false)).toMatchObject({ ready: true, model: "ignis-image-2.1-turbo" });
     expect(runPlan(text, DEFAULT_LIMITS, null, false, false)).toEqual({ label: "Generate", note: "Needs the image model.", ready: false });
+    // Under way, the model reads switching because of the request: no missing image model to report.
+    expect(runPlan({ state: "switching", from: "a", to: "b", since: 0 }, DEFAULT_LIMITS, row, false, false, true)).toEqual({ label: "Generate", note: null, ready: false });
     const busy: ModelState[] = [{ state: "switching", from: "a", to: "b", since: 0 }, { state: "loading", to: "b", since: 0 }, { state: "reading" }];
     for (const model of busy) expect(runPlan(model, DEFAULT_LIMITS, row, false, false)).toMatchObject({ ready: false });
   });

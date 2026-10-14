@@ -134,7 +134,7 @@ function Form({ model, state, actions }: { model: ModelState; state: StudioState
 
   const seed = parseSeed(seedText);
   const n = Math.min(limits.maxN, Math.max(1, count));
-  const plan = runPlan(model, limits, state.imageModel, enhance, conditions.length > 0);
+  const plan = runPlan(model, limits, state.imageModel, enhance, conditions.length > 0, busy);
   const canRun = plan.ready && !busy && prompt.trim() !== "" && seed !== undefined;
 
   function submit() {

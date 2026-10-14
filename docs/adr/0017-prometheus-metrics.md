@@ -137,7 +137,10 @@ take the decision family's exception: **absent until the image model has
 admitted a job**, then every series renders, zeros included. Fixed labels:
 `outcome=completed|cancelled|stopped|refused|failed`, `phase=queued|encoding|
 denoising|decoding`, `state=waiting|running`. A completed job's duration runs
-from its turn to its last image, so the wait is the `queued` phase's alone.
+from its turn to its last image (the PNG encodes and the sends included: the log's
+`run_ms`), so the wait is the `queued` phase's alone. The queue gauge is set by the
+queue itself, under its lock, at each admission, turn and departure, so the last
+change to land is the last one shown.
 Each ended job also writes one `ignis.image.job` log line (id, kind, model,
 `n`, size, condition images, enhancement, outcome, images made, and the
 milliseconds of enhancing, switching, queueing, encoding, denoising,

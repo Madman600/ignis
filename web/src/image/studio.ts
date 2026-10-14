@@ -52,24 +52,32 @@ export function imageModelRow(catalog: CatalogRow[] | null): CatalogRow | null {
  * What pressing Generate or Edit does with the model loaded now (GitHub #324): the button's words, a line on what
  * happens first or why it cannot, and whether it can. With a text model loaded the press is the owner's choice of the
  * image model: the request names it (`model`), and the server switches — after the rewrite, when enhancement is on and
- * the enhancer is the model loaded (spec image-model/05 §Prompt enhancement).
+ * the enhancer is the model loaded (spec image-model/05 §Prompt enhancement). `running`: the request is under way, and
+ * the model reads switching or loading because of it, which is not a missing image model.
  */
 export type RunPlan = { label: string; note: string | null; model?: string; ready: boolean };
 
-export function runPlan(model: ModelState, limits: Limits, imageModel: CatalogRow | null, enhance: boolean, edit: boolean): RunPlan {
+export function runPlan(model: ModelState, limits: Limits, imageModel: CatalogRow | null, enhance: boolean, edit: boolean, running = false): RunPlan {
   const verb = edit ? "edit" : "generate";
   const plain = edit ? "Edit" : "Generate";
   if (imageLoaded(model)) return { label: plain, note: null, ready: true };
-  if (!canSend(model) || !imageModel) return { label: plain, note: "Needs the image model.", ready: false };
+  if (!canSend(model) || !imageModel) return { label: plain, note: running ? null : "Needs the image model.", ready: false };
   if (!limits.allowImplicit) {
     return { label: plain, note: "switch.allow_implicit is off, so a request does not switch: switch to the image model first.", ready: false };
   }
   const switching = { model: imageModel.id, ready: true };
   if (enhance && model.id === limits.enhancer) {
-    return { label: `Enhance with ${model.id}, then switch & ${verb}`, note: `${model.id} rewrites the prompt, then the image model replaces it.`, ...switching };
+    const note =
+      model.state === "ready"
+        ? `${model.id} rewrites the prompt, then the image model replaces it.`
+        : `Loads ${model.id} to rewrite the prompt, then the image model replaces it.`;
+    return { label: `Enhance with ${model.id}, then switch & ${verb}`, note, ...switching };
   }
+  // Two loads whichever text model is there: the enhancer for the rewrite, then the image model.
   const note = enhance
-    ? `Switches to ${limits.enhancer} to rewrite the prompt, then to the image model.`
+    ? model.state === "ready"
+      ? `Switches to ${limits.enhancer} to rewrite the prompt, then to the image model.`
+      : `Loads ${limits.enhancer} to rewrite the prompt, then switches to the image model.`
     : model.state === "ready"
       ? `Unloads ${model.id} and loads the image model first.`
       : "Loads the image model first.";

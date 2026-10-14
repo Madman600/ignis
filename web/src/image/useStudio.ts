@@ -94,6 +94,8 @@ export function useStudio(model: ModelState, refreshModel: () => void, visible: 
     const controller = new AbortController();
     abort.current = controller;
     const switches = params.model !== undefined;
+    // The page reads the switch once, when the request begins it: the model follows from there (useModel).
+    let refreshed = false;
     setRun({ edit: isEdit(params), n: params.n, switches, progress: null });
     setError(null);
     setNotes([]);
@@ -104,8 +106,10 @@ export function useStudio(model: ModelState, refreshModel: () => void, visible: 
       {
         progress: (progress) => {
           setRun({ edit: isEdit(params), n: params.n, switches, progress });
-          // The page reads the switch the request began, and follows it from there as any switch (useModel).
-          if (switches && (progress.phase === "switching" || progress.phase === "loading")) refreshModel();
+          if (switches && !refreshed && (progress.phase === "switching" || progress.phase === "loading")) {
+            refreshed = true;
+            refreshModel();
+          }
         },
         image: (item) => {
           setGallery((current) => [item, ...current]);

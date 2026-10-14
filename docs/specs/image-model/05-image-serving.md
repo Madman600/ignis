@@ -1018,9 +1018,9 @@ three loads, where the server already had the text-first path (one load).
 - **Defaults taken** (owner may revisit).
   - "Known" is the catalog's image row (`GET /v1/models/catalog`), not
     `GET /v1/models`, which lists only the loaded model. `on_disk` is not
-    consulted: it counts only `download.path`, so a switchable known model
-    reads `absent` (AC 14's note); a model the server cannot find answers
-    the `404` above.
+    consulted: it read `absent` for a switchable known model when it counted
+    only `download.path` (AC 14's note; item 3 below made a listed id read
+    its own file); a model the server cannot find answers the `404` above.
   - The id sent is the catalog row's, the one the switch button sends.
   - With enhancement on and another text model loaded, the label is the
     plain "Switch & generate" with the two switches in the line beneath,
@@ -1040,16 +1040,17 @@ three loads, where the server already had the text-first path (one load).
   wins over `download.path`, exactly as `Switcher::resolve` lets it win for a
   switch. `bytes` is then that file's size and `family` its header's. The
   rule is one `metadata` call per row, no hash (the sha256 stays `model
-  verify`'s). A listed model whose file is missing keeps the
-  `download.path` reading, so a partial download still shows. Test:
-  `a_known_model_that_is_also_a_catalog_entry_is_one_row`.
+  verify`'s). A listed model whose file is missing reads `absent`, as
+  `resolve` refuses it (324 close-out F5). Tests:
+  `a_known_model_that_is_also_a_catalog_entry_is_one_row`,
+  `a_listed_model_whose_file_is_gone_reads_absent_though_download_path_has_the_entry`.
 - **324ui's default revisited, and kept.** The image view still takes "known"
   to mean the catalog row, not `on_disk` or `switchable`: the server's `404
   model_not_found` stays the one place that decides, and the row is right for
   a model the server cannot find yet. Nothing on the web side changed for
   item 3.
 - **Item 4, the log line.** One `ignis.image.job` INFO line per ended job,
-  every outcome: `request_id` (`img-<n>`), `model`, `kind`
+  every outcome: `job_id` (`img-<n>`), `model`, `kind`
   (`generation|edit`), `outcome`, `n`, `images` made, `size`,
   `condition_images`, `enhancement` (`off|rewritten|as_sent`), and in
   milliseconds `enhance_ms`, `switch_ms` (loads and switches before the job),
@@ -1060,7 +1061,7 @@ three loads, where the server already had the text-first path (one load).
   amendment of 2026-10-15): jobs by outcome, images, a duration histogram of
   the completed jobs, seconds per phase, and the queue gauge. Absent until
   the image model admitted a job. Recorded by `job::spawn` as the job ends;
-  the queue gauge is also set at admission and at the job's turn.
+  the queue gauge is set by the queue itself (see the close-out below).
 - **Item 4, the Monitor.** `snapshot.ts` reads the families (all in the
   contract, the restart check counts them), `derive.ts` gives `images` (the
   window's jobs by outcome, images, duration quantiles, each phase's share),
@@ -1075,3 +1076,36 @@ three loads, where the server already had the text-first path (one load).
   on the blocking thread, so it installs the process subscriber): one fake
   runner job, one line with its fields, the families on `/metrics`.
   Monitor: `snapshot.test.ts`, `derive.test.ts`, `MonitorView.test.tsx`.
+
+## As built (324 close-out, 2026-10-15, branch `followups-324-serving`: review-324serving F1 to F8)
+
+- **F1, the queue gauge.** `ImageJobs` publishes the gauge itself, under its
+  lock, at every admission, turn and departure (`Waiting`/`Running` drop):
+  a request refused after admission (condition budget, `model_stopped`)
+  leaves `waiting=0`, and a stale snapshot cannot land last. `admit` hands
+  the queue the metrics (`report_to`) before it asks for a place; the
+  enhancer's visit turn counts as any job in the queue does. Test: an
+  over-budget request, then `waiting 0`, in `tests/images_observability.rs`.
+- **F2, three loads to two.** An idle-unloaded text model that is not the
+  enhancer, enhancement on, a request naming the image model: `admit` loads
+  the enhancer first (the rewrite on it, then one switch). Test:
+  `an_enhanced_request_on_another_unloaded_text_model_loads_the_enhancer_first`
+  (`loads()` is `[enhancer, IMAGE]`). `runPlan` says "Loads X to rewrite
+  the prompt, then switches" for an unloaded model, "Switches to X" for a
+  loaded one: two loads either way.
+- **F3.** The observability test runs a job whose decode fails (a `Flaky`
+  wrapper of the fake runner): one more log line, `failed`, one more count.
+- **F4.** The duration histogram observes `ran` (turn to last image), as the
+  HELP and ADR 0017 say; `ImageJobEnd` carries it.
+- **F5.** See item 3 above. **F6.** `queued_ms` and the `queued` phase run
+  from admission (`JobContext::queued_at`), through `prepare`. **F7.**
+  `TokenizeRoute`'s doc line back. **F8.** The notes about `on_disk` above.
+- **Nits.** The Playground reads the model once per request that switches
+  (not on every event); while a request runs the form no longer flips to
+  "Needs the image model" (`runPlan`'s `running`); the Monitor's list of
+  non-completed outcomes is `notCompleted`; the log field is `job_id`
+  (ADR 0012's span field is `request_id`); `job::run` is test-only.
+- **Defaults taken.** The enhancer is loaded first only when the server can
+  switch to it (`Switcher::text_model`); otherwise the old path (the image
+  model loads, the rewrite is skipped with a warning). The view was not
+  looked at in a browser.
