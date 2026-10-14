@@ -1138,6 +1138,7 @@ void probe_summary(const std::string &what, const std::vector<ProbeHead> &heads,
   const std::size_t n = heads.size(), p1 = (n - 1) / 100, mid = n / 2;
   std::size_t below = 0;
   for (const ProbeHead &p : heads) below += p.cos < min_cosine;
+  check(below == 0, what + ": every head's cosine against fp64 is >= --min-cosine");
   std::printf("  %s, %zu heads: cosine min %.5f, p1 %.5f, median %.5f; centred min %.5f, p1 %.5f, median %.5f; "
               "rel RMS median %.4f, max %.4f; %zu below %.2f\n",
               what.c_str(), n, c[0], c[p1], c[mid], cc[0], cc[p1], cc[mid], r[mid], r[n - 1], below, min_cosine);
@@ -1248,7 +1249,7 @@ void case_qkv_probe(const Options &o, const std::string &dir) {
       }
     }
   }
-  std::printf("real Q/K/V, per head against fp64 on the unquantized inputs (reported, not gated):\n");
+  std::printf("real Q/K/V, per head against fp64 on the unquantized inputs (the cosine gated at --min-cosine, the rest reported):\n");
   probe_summary("target over [prefix ; target], the split (spec 04's layout)", split, o.min_cosine);
   probe_summary("target over [prefix ; target], one run", one, o.min_cosine);
   probe_summary("prefix segments (step 0)", segment, o.min_cosine);
@@ -1301,7 +1302,13 @@ int main(int argc, char **argv) {
     if (std::ifstream(probe + "/t2i/segments.txt").good()) {
       case_qkv_probe(o, probe);
     } else {
-      std::printf("SKIP: qkv-probe: no Q/K/V dump at %s (--qkv-probe DIR or IGNIS_IMAGE_QKV_PROBE)\n", probe.c_str());
+      // A skip is never green in the GPU profile (docs/agents/testing.md).
+      const char *profile = std::getenv("IGNIS_GPU_PROFILE");
+      if (profile != nullptr && std::string(profile) == "1") {
+        check(false, "qkv-probe: no Q/K/V dump at " + probe + " (--qkv-probe DIR or IGNIS_IMAGE_QKV_PROBE)");
+      } else {
+        std::printf("SKIP: qkv-probe: no Q/K/V dump at %s (--qkv-probe DIR or IGNIS_IMAGE_QKV_PROBE)\n", probe.c_str());
+      }
     }
   }
   if (want("refusals")) refusals();

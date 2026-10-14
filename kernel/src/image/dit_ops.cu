@@ -27,7 +27,7 @@ namespace ignis_image {
 namespace {
 
 constexpr int kRowThreads = 256;
-constexpr uint32_t kMaxRowCols = 24576;  // a BF16 row in 48 KiB of shared memory
+constexpr uint32_t kMaxRowCols = 24560;  // a BF16 row beside the 32-byte reduction in 48 KiB of shared memory
 constexpr uint32_t kMaxTokens = 1u << 20;
 constexpr int kHeads = 32;
 constexpr int kHeadDim = 128;
@@ -323,7 +323,7 @@ std::string row_checks(const char *op, const void *x, const void *up, uint32_t t
   const std::string o(op);
   if (x == nullptr || y == nullptr) return o + ": NULL pointer";
   if (tokens == 0 || tokens > kMaxTokens) return o + ": tokens must be 1 .. 2^20";
-  if (cols == 0 || cols % 16 != 0 || cols > kMaxRowCols) return o + ": cols must be a positive multiple of 16, at most 24576";
+  if (cols == 0 || cols % 16 != 0 || cols > kMaxRowCols) return o + ": cols must be a positive multiple of 16, at most 24560";
   if (row_stride < cols || row_stride % 8 != 0) return o + ": row_stride must be >= cols and a multiple of 8";
   if (y_kind > IGNIS_IMAGE_DIT_OUT_E4M3) return o + ": unknown y_kind";
   if ((y_kind == IGNIS_IMAGE_DIT_OUT_E4M3) != (y_scales != nullptr)) {
@@ -376,7 +376,8 @@ extern "C" int32_t ignis_image_dit_rope_positions(uint32_t tokens, uint32_t bloc
   for (uint32_t b = 0; b < blocks; ++b) {
     const int64_t h = block_height[b], w = block_width[b], start = block_start[b];
     if (h == 0 || w == 0) return fail(op + ": block " + std::to_string(b) + " is empty");
-    if (start < cursor || start + h * w > tokens) {
+    // h, w and start are caller-sized u32: bound each by tokens before the product can overflow.
+    if (h > tokens || w > tokens || start > tokens || start < cursor || start + h * w > tokens) {
       return fail(op + ": block " + std::to_string(b) + " overlaps the one before it or runs past the sequence");
     }
     if (!text(start)) return fail(op + ": a text position falls outside [-1024, 8192)");

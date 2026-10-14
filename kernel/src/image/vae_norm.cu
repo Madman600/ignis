@@ -5,7 +5,7 @@
 // sum of squares runs in a fixed order (each lane's channels in order, then the warp butterfly,
 // after which every lane holds the same sum), and every rounding step is an _rn intrinsic, as in
 // dit_ops.cu. The second pass reads the row again (from L1) and writes each lane's own chunks, so
-// y may be x.
+// y may be x, for BF16 output only.
 
 #include "ignis_image_vae.h"
 #include "image_common.cuh"

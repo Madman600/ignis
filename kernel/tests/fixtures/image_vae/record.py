@@ -19,7 +19,7 @@ It writes, next to itself:
       versions and the cases.
 
 The CTest (kernel/tests/test_image_vae.cu) holds the ops to these outputs: bit for bit in fp32,
-and in bf16 within one bf16 rounding. The inputs span a wide dynamic range (so a different
+and in bf16 bit for bit. The inputs span a wide dynamic range (so a different
 summation order shows) and hold signed zeros and subnormals.
 """
 
@@ -43,16 +43,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # (name, kind, in, out, factor_t, factor_s, height, width): the encoder's ResidualDownBlock
 # shortcuts, the decoder's ResidualUpBlock shortcuts (diffusers' config: temperal_downsample
 # [False, True, True, True], dim_mult [1, 2, 4, 8, 8], base 96 / decoder 144) and the resample's
-# upsample.
+# upsample. Heights and widths differ (and AvgDown has two output rows, DupUp two input rows), so
+# a row stride mixed up with a column stride, or a row index never above 0, shows.
 CASES = [
-    ("avg_96_96_t1_s2", 0, 96, 96, 1, 2, 2, 4),
-    ("avg_96_192_t2_s2", 0, 96, 192, 2, 2, 2, 4),
-    ("avg_192_384_t2_s2", 0, 192, 384, 2, 2, 2, 4),
-    ("avg_384_768_t2_s2", 0, 384, 768, 2, 2, 2, 4),
-    ("avg_768_768_t1_s1", 0, 768, 768, 1, 1, 1, 2),
-    ("dup_1152_1152_t2_s2", 1, 1152, 1152, 2, 2, 1, 2),
-    ("dup_1152_576_t2_s2", 1, 1152, 576, 2, 2, 1, 2),
-    ("dup_576_288_t1_s2", 1, 576, 288, 1, 2, 1, 2),
+    ("avg_96_96_t1_s2", 0, 96, 96, 1, 2, 4, 6),
+    ("avg_96_192_t2_s2", 0, 96, 192, 2, 2, 4, 6),
+    ("avg_192_384_t2_s2", 0, 192, 384, 2, 2, 4, 6),
+    ("avg_384_768_t2_s2", 0, 384, 768, 2, 2, 4, 6),
+    ("avg_768_768_t1_s1", 0, 768, 768, 1, 1, 2, 3),
+    ("dup_1152_1152_t2_s2", 1, 1152, 1152, 2, 2, 2, 3),
+    ("dup_1152_576_t2_s2", 1, 1152, 576, 2, 2, 2, 3),
+    ("dup_576_288_t1_s2", 1, 576, 288, 1, 2, 2, 3),
     ("upsample_8", 2, 8, 8, 1, 2, 3, 5),
 ]
 

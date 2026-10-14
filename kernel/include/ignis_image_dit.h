@@ -87,7 +87,8 @@ int32_t ignis_image_dit_rms_norm(const void *x, uint32_t tokens, uint32_t cols, 
 
 /* out = x + tanh(g) * y (one fma), g = gate_0 [cols] for tokens < first_target, else gate_t [cols]:
  * the block's two gated residual adds (diffusers: hidden_states + gate.tanh() * output). x and y
- * BF16 [tokens][cols]; out BF16, or fp32 when `out_f32`; out may be x. */
+ * BF16 [tokens][cols]; out BF16, or fp32 when `out_f32`; out may be x
+ * only with BF16 output (an fp32 row is twice as wide and would overwrite x rows not yet read). */
 int32_t ignis_image_dit_gated_residual(const void *x, const void *y, uint32_t tokens, uint32_t cols,
                                        const float *gate_t, const float *gate_0, uint32_t first_target, void *out,
                                        uint32_t out_f32, void *stream);
@@ -114,7 +115,8 @@ int32_t ignis_image_dit_qk_norm_rope(const void *q, const void *k, uint32_t toke
 int32_t ignis_image_dit_act(uint32_t kind, const void *x, const void *up, uint32_t tokens, uint32_t cols,
                             uint32_t row_stride, void *y, float *y_scales, uint32_t y_kind, void *stream);
 
-/* For the row ops above (norms, activations): cols a positive multiple of 16, at most 24576; x, up,
+/* For the row ops above (norms, activations): cols a positive multiple of 16, at most 24560 (the row sits in
+ * 48 KiB of shared memory); x, up,
  * y and codes 16-byte aligned, y_scales 4-byte aligned (NULL unless y_kind is E4M3); row_stride >=
  * cols and a multiple of 8; y overlaps no input. The gated residual takes cols a multiple of 8 and
  * 16-byte aligned x, y and out. */

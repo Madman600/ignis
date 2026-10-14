@@ -26,7 +26,7 @@ each with a reference test at the image model's real geometry.
 | VAE mid-block attention | one head, D = 768 (encoder) / 1152 (decoder), over the latent grid: row-tiled QKᵀ, softmax, PV on the bf16 GEMM, with a fixed workspace | — | our own |
 | DiT elementwise | LayerNorm without affine × (1 + scale), with the per-token choice of the t row or the t=0 row; `x + tanh(gate) · y`; QK RMSNorm + 3-axis RoPE (complex form, adjacent pairs); SwiGLU; GELU-tanh; zero-centred RMSNorm (w + 1); the norms and activations can emit the FP8 GEMM's E4M3 input | written new: the existing norm/RoPE ops are vendored with the text model's layouts. FlashInfer `fused_dit_layernorm.cuh` and `fused_qk_rmsnorm_rope.cuh` (Apache-2.0) were allowed, neither was used | our own |
 | VAE elementwise | channel RMS norm with its SiLU fused (AC 7); the nearest-exact 2× upsample (fused into the convolution's gather) and the AvgDown / DupUp shortcuts (AC 6) | — | our own |
-| sampler | Euler update `x += (σ_next − σ) · v` on the device | — | our own |
+| sampler | Euler update `x += (σ_next − σ) · v` | — | moved to #321: it is Rust (spec 04), not a kernel |
 
 **The GEMM's inner instruction is measured, not assumed.** One single source
 reports that FP8 `mma.sync kind::mxf8f6f4` with unit block scales runs at the
@@ -148,7 +148,8 @@ the sections below have the numbers):
    output's quantization stays the separate kernel: 0.012 ms per 1024²
    block, 0.3% of it.
 4. **Done.** 0 outputs over the bound in every call; cosine ≥ 0.99 per head
-   on DiT-like inputs and on the DiT's real Q, K and V (worst 0.99796); the
+   on DiT-like inputs and on the DiT's real Q, K and V (worst 0.99796, both
+   gated); the
    prefix seams tested; 489-573 TOPS against 618-643. The synthetic 20×
    outlier arm (0.918-0.96) is report-only, by the coordinator's call.
 5. **Done.** 0 outputs over a replay bound from 1 to 41,000 tokens; 196-207
@@ -165,8 +166,8 @@ the sections below have the numbers):
    headers and `kernel/NOTICE`; everything else is our own. Nothing comes
    from CUTLASS 3.x or FlashInfer's `csrc/fmha_v2`.
 9. **Done.** Five CTests at the image model's geometry, plus two that read
-   data outside the repo (the real Q/K/V probe, the RoPE oracle) and print
-   SKIP without it; five Rust `--ignored` tests drive every binding. The
+   data outside the repo (the real Q/K/V probe, the RoPE oracle), which print
+   SKIP without it outside the profile and fail inside it; five Rust `--ignored` tests drive every binding. The
    benches are tools.
 
 ### The instruction microbenchmark (AC 1)
@@ -668,8 +669,10 @@ Where it lives:
 - The test is `ignis_kernel_image_attn_qkv_probe_test`, 31 s. It reads the
   directory from `--qkv-probe`, else `$IGNIS_IMAGE_QKV_PROBE`, else that
   path.
-- Without the dump it prints SKIP and passes. That goes against ADR 0006,
-  by the coordinator's call: the data is outside the repo.
+- Without the dump it prints SKIP and passes, unless `IGNIS_GPU_PROFILE=1`:
+  in the profile a missing dump fails the test (a skip is never green there,
+  `docs/agents/testing.md`). The data is outside the repo, so only a machine
+  that has it can run the profile.
 
 Per head, against fp64 on the unquantized inputs:
 
@@ -684,8 +687,17 @@ to the rows checked: the cosines moved in the fourth decimal, and the
 low-spread heads below (whose centred cosine is noise) from 11 to 15.
 
 - Mechanics: 0 outputs over the bound in all 36 calls (worst 0.998 of
-  it). The BF16 output equals the fp32 output rounded in every call. Every
+  it, on a 31-key text segment at block 31; the 4096-row target calls reach
+  0.983 at most). A call with 31 keys has few terms, so its bound is mostly
+  the P-flip term, which is tight by construction: an output sitting where
+  P's BF16 rounding can go either way reaches it. The terms were not
+  measured one by one. A new dump may therefore land at 0.99-1.0 on such a
+  segment; read that as the flip term, and look at the centred and
+  fp64-on-unquantized numbers for a real regression. The BF16 output equals the fp32 output rounded in every call. Every
   run and q8 buffer matches its definition bit for bit.
+- **No head is below 0.99, and that is gated:** the test fails a head under
+  `--min-cosine` (0.99) on the real data, so it works as a regression test.
+  The centred cosine stays reported.
 - **No head is below 0.99.** The worst is 0.99796, an 8-token text segment
   (edit, block 15, head 13). On the target calls it is 0.99878 (t2i,
   step 4, block 0, head 28).
@@ -702,10 +714,10 @@ low-spread heads below (whose centred cosine is noise) from 11 to 15.
     block, head 30 of the image block at block 31, and head 3 of block 0
     on the target calls.
   - Which of these matter is for spec 04's end-to-end check.
-- **The split costs nothing measurable.** The target's K mean sits up to
+- **The split costs next to nothing.** The target's K mean sits up to
   27σ from the prefix's in single channels (block 31; ≤ 6.8σ RMS over
   channels), including t2i's 31-token prefix. In every call the split's
-  worst head is within 0.0003 of one run's. Spec 04's K-mean fallback is
+  worst head is within 0.0003 of one run's cosine. Spec 04's K-mean fallback is
   not needed here.
 - **Real Q has strong outlier channels; K's are milder.** Q is taken over
   the target rows, K over both runs after the prefix's mean.
@@ -1053,7 +1065,12 @@ temporal is left.
     convolution (and, unless cuDNN fuses it, the bias add) to BF16 before
     it adds the residual (`x + h`) in BF16; the fused epilogue skips those
     intermediate roundings.
-  - So spec 04's PSNR comparison sees this op's rounding, not diffusers'.
+  - Policy for the leaf: fewer BF16 roundings, toward the fp32 recording.
+    Spec 04's reference PNG is diffusers' fp32 decode, so skipping the
+    intermediate roundings moves ignis toward it, not away. The expected
+    PSNR floor is diffusers' own BF16 decode against that fp32 PNG, which
+    spec 04 measures (#321, or with the recorder); a miss of 40 dB can be
+    told from BF16's inherent loss only against that number.
 - **Weights** are packed once at load, from PyTorch's [out][in][ky][kx] (the
   artifact's BF16 tensors as they are) to [out][ky][kx][in]
   (`ignis_image_vae_pack_conv_weight`).
@@ -1078,7 +1095,7 @@ fp32 rounding for the bias add and one for the residual add.
   orientations, so a swapped height and width shows. They are `conv_in`,
   the up0 resample, a stride-2 downsample, a 1 × 1 shortcut and `conv_out`
   at 2752 × 1536.
-- **The `time_conv`s:** the eight 1 × 1 `time_conv` weights never run for
+- **The `time_conv`s:** the six 1 × 1 `time_conv` weights never run for
   one frame (diffusers' resample skips them on the first chunk). They are
   covered as shapes all the same.
 - **Pixels checked:** each call compares the corners, the edge midpoints and
@@ -1175,7 +1192,7 @@ frame; the header has the index formulas).
   - P's BF16 interval from ex2's 2^-20, its width counted where it holds two
     values;
   - PV per k16 step;
-  - the row sum with (n8 / 256 + 12) fp32 roundings;
+  - the row sum with ceil(n8 / 256) + 12 fp32 roundings;
   - 1 / D and the product, one rounding each.
 - **Guards:** qkv sits before rows of NaN, and the workspace and the outputs
   start as NaN, so the zero padding the kernels must write is checked.
@@ -1371,7 +1388,9 @@ BF16 output, bit for bit (tested over every output).
   `proj_out` (norm_out), `txt_in`'s two linears (the zero-centred norm,
   GELU), down (SwiGLU) and the timestep path's linears (SiLU).
 - **Not fused**: the attention output into `to_out` (AC 4's kernel; the
-  separate kernel costs 0.3% of a block) and `img_in`'s latents.
+  separate kernel costs 0.3% of a block), `img_in`'s latents and the
+  timestep sinusoid into `linear_1` (both quantized by the separate kernel
+  on [T][64] and [1][256] rows: negligible).
 
 **RoPE.**
 - **Positions**: a host call, from the blocks' starts and sizes. diffusers
@@ -1380,7 +1399,15 @@ BF16 output, bit for bit (tested over every output).
   the position, height and width on a grid centred on zero, then advances
   the position by max(h, w). Positions outside [−1024, 8192), diffusers'
   table rows, are refused: beyond them diffusers' indexing would read the
-  negative rows or fail.
+  negative rows or fail. So are a block taller or wider than the sequence,
+  or starting past it, checked before the height × width product (a u32 pair
+  could overflow it and write out of bounds). #321 maps these refusals to a
+  400, never a 500.
+- **The row ops' width**: cols at most 24560, not 24576: the row in shared
+  memory (2 B per column) plus the 32-byte reduction buffer must fit the
+  48 KiB a launch gets without an opt-in. The test launches at the cap.
+- **Aliasing**: `out` may be `x` (gated residual) and `y` may be `x` (the VAE
+  norm) for BF16 output only; an fp32 row is twice as wide.
 - **Frequencies**: PyTorch's fp32 values, f_i = fl32(1 / fl32(10000^fl32(2i
   / d))).
   - The exponent is rounded first, which puts f up to 5 ulp from
@@ -1490,8 +1517,9 @@ nothing to add.
 
 **AC 9.** The CTests run in the profile's kernel stage. The oracle case
 prints SKIP without the oracle (`--oracle DIR`, `$IGNIS_IMAGE_ORACLE`, or
-`F:/ai/models/ignis-image-2.1-turbo/oracle`), by the coordinator's call, as
-the real Q/K/V probe does. The Rust `--ignored` test drives every binding:
+`F:/ai/models/ignis-image-2.1-turbo/oracle`) and fails under
+`IGNIS_GPU_PROFILE=1`, as the real Q/K/V probe does; the Rust test's oracle
+part goes through `gpu_profile::skip_or_fail`. The Rust `--ignored` test drives every binding:
 - the positions worked by hand and the table, and the oracle's t2i table
   when it is there;
 - the modulated norm with its row choice in fp32, BF16 and E4M3 (against

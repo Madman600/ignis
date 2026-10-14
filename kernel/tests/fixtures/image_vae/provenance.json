@@ -1,5 +1,5 @@
 {
- "recorded": "2026-10-13T22:23:04+00:00",
+ "recorded": "2026-10-14T01:58:58+00:00",
  "torch": "2.13.0+cu130",
  "diffusers": "0.41.0",
  "device": "cpu, torch.set_num_threads(1)",
@@ -12,8 +12,8 @@
    "out": 96,
    "factor_t": 1,
    "factor_s": 2,
-   "height": 2,
-   "width": 4
+   "height": 4,
+   "width": 6
   },
   {
    "name": "avg_96_192_t2_s2",
@@ -22,8 +22,8 @@
    "out": 192,
    "factor_t": 2,
    "factor_s": 2,
-   "height": 2,
-   "width": 4
+   "height": 4,
+   "width": 6
   },
   {
    "name": "avg_192_384_t2_s2",
@@ -32,8 +32,8 @@
    "out": 384,
    "factor_t": 2,
    "factor_s": 2,
-   "height": 2,
-   "width": 4
+   "height": 4,
+   "width": 6
   },
   {
    "name": "avg_384_768_t2_s2",
@@ -42,8 +42,8 @@
    "out": 768,
    "factor_t": 2,
    "factor_s": 2,
-   "height": 2,
-   "width": 4
+   "height": 4,
+   "width": 6
   },
   {
    "name": "avg_768_768_t1_s1",
@@ -52,8 +52,8 @@
    "out": 768,
    "factor_t": 1,
    "factor_s": 1,
-   "height": 1,
-   "width": 2
+   "height": 2,
+   "width": 3
   },
   {
    "name": "dup_1152_1152_t2_s2",
@@ -62,8 +62,8 @@
    "out": 1152,
    "factor_t": 2,
    "factor_s": 2,
-   "height": 1,
-   "width": 2
+   "height": 2,
+   "width": 3
   },
   {
    "name": "dup_1152_576_t2_s2",
@@ -72,8 +72,8 @@
    "out": 576,
    "factor_t": 2,
    "factor_s": 2,
-   "height": 1,
-   "width": 2
+   "height": 2,
+   "width": 3
   },
   {
    "name": "dup_576_288_t1_s2",
@@ -82,8 +82,8 @@
    "out": 288,
    "factor_t": 1,
    "factor_s": 2,
-   "height": 1,
-   "width": 2
+   "height": 2,
+   "width": 3
   },
   {
    "name": "upsample_8",

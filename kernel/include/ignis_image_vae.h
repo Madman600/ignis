@@ -89,7 +89,11 @@ int32_t ignis_image_vae_pack_conv_weight(const void *w, uint32_t out_channels, u
 /* y = conv(x) + bias (+ residual) as above. in_channels is a multiple of 8, or 4 (RGBA);
  * out_channels is even. The stride-2 kind takes an even height and width; `upsample` takes the 3 x
  * 3 stride-1 kind only. x and weight are 16-byte aligned (8-byte when in_channels is 4), y 8-byte,
- * bias and residual 4-byte. `bias` and `residual` may be NULL; `y_f32` selects fp32 output. */
+ * bias and residual 4-byte. `bias` and `residual` may be NULL; `y_f32` selects fp32 output.
+ * Aliasing: x and weight must not overlap y. With BF16 output `residual == y` is allowed, an
+ * in-place add (the thread that writes an output element reads its residual element first, and no
+ * other thread touches it); any other overlap of residual and y is not, nor is residual == y with
+ * `y_f32` (the elements are then of different widths). */
 int32_t ignis_image_vae_conv(uint32_t kind, uint32_t upsample, const void *x, uint32_t height, uint32_t width,
                              uint32_t in_channels, uint32_t x_row0, uint32_t x_rows, const void *weight,
                              const void *bias, uint32_t out_channels, const void *residual, void *y, uint32_t y_row0,
@@ -122,7 +126,8 @@ int32_t ignis_image_vae_attn(const void *qkv, uint32_t tokens, uint32_t dim, flo
  * mid-block attention's norm is not. One rounding to the output type; diffusers' BF16 path rounds
  * the normalized x, the product with sqrt(channels) and the one with gamma, and then SiLU's output.
  * x BF16 NHWC [pixels][channels] (a band of rows is a range of pixels), gamma BF16 [channels]; y
- * BF16, or fp32 when `y_f32`; y may be x. channels a positive multiple of 8, pixels 1 .. 2^24; x,
+ * BF16, or fp32 when `y_f32`; y may be x only for BF16 output (fp32 rows are twice as
+ * wide and would overwrite x rows not yet read). channels a positive multiple of 8, pixels 1 .. 2^24; x,
  * gamma and y 16-byte aligned. */
 int32_t ignis_image_vae_rms_norm(const void *x, uint32_t pixels, uint32_t channels, const void *gamma, uint32_t silu,
                                  void *y, uint32_t y_f32, void *stream);

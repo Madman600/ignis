@@ -485,6 +485,16 @@ void run_bands(const ConvShape &s, int image_h, int image_w) {
   VAE_RC(ignis_image_vae_pack_conv_weight(d.w_raw.p, s.cout, s.cin, ksize_of(s.kind), d.w.p, nullptr));
   VAE_RC(ignis_image_vae_conv(s.kind, s.upsample, d.x_at, c.h, c.w, s.cin, 0, c.h, d.w.p, d.bias.p, s.cout,
                               s.residual ? d.res.p : nullptr, d.y16.p, 0, c.out_h, 0, nullptr));
+  if (s.residual) {
+    // residual == y (BF16 output): the in-place add equals the out-of-place one, bit for bit.
+    DeviceBytes inplace(d.res.bytes);
+    MOE_CUDA(cudaMemcpy(inplace.p, d.res.p, d.res.bytes, cudaMemcpyDeviceToDevice));
+    VAE_RC(ignis_image_vae_conv(s.kind, s.upsample, d.x_at, c.h, c.w, s.cin, 0, c.h, d.w.p, d.bias.p, s.cout, inplace.p,
+                                inplace.p, 0, c.out_h, 0, nullptr));
+    MOE_CUDA(cudaDeviceSynchronize());
+    const unsigned long long dd = diff_u16(d.y16.p, inplace.p, static_cast<std::size_t>(c.out_h) * c.out_w * s.cout);
+    check(dd == 0, what + ": the in-place residual (residual == y) equals the out-of-place add, bit for bit");
+  }
   // Three uneven bands of output rows, each from a copy of only the input rows it reads.
   const int cuts[4] = {0, c.out_h / 3 + 1, 2 * c.out_h / 3 - 3, c.out_h};
   const std::size_t in_row = static_cast<std::size_t>(c.w) * s.cin, out_row = static_cast<std::size_t>(c.out_w) * s.cout;
@@ -653,6 +663,7 @@ void run_shortcut_fixture() {
     check(restated == 0, name + ": the restated definition is PyTorch's (fp32 bit for bit, BF16 its rounding)");
     check(f32_diff == 0, name + ": fp32 output is PyTorch's, bit for bit");
     check(bf16_far == 0, name + ": BF16 output within one BF16 rounding of PyTorch's");
+    check(bf16_diff == 0, name + ": BF16 output is PyTorch's, bit for bit");
   }
 }
 

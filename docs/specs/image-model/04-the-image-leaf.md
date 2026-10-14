@@ -87,7 +87,7 @@ first denoising step; the result is the same up to rounding.
     and the job's seed, drawn on the host and uploaded;
   - in tests, read from spec 01's noise file.
 - **The VAE decode at 2K.** The decoder's widest activations at 2048² are
-  ~1.2 GB each. After the mid block, which is global, the decoder runs in
+  2.4 GB each (288 ch). After the mid block, which is global, the decoder runs in
   horizontal bands with exact halos. Its norms are per pixel, so banding
   changes nothing.
 - **Cancellation.** Between any two calls. The server releases the prefix of

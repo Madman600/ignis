@@ -39,7 +39,8 @@ int32_t vae_conv_launch(const VaeConvArgs &a, void *stream, const char *op);
 
 // The input rows [lo, hi) (in the input's own resolution, before the upsample, clamped to
 // [0, height)) that output rows [y_row0, y_row0 + y_rows) read: what x must hold. hi <= lo when
-// they read none.
+// they read none. Public in this header for the band planner (spec image-model/04, which sizes a
+// band's input from it); the launch itself refuses a short window with the same arithmetic.
 void vae_conv_input_rows(int ksize, int stride, int pad, int upsample, int height, int y_row0, int y_rows, int &lo,
                          int &hi);
 

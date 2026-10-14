@@ -1,5 +1,5 @@
 // ignis kernel leaf: the shared-memory plumbing of the image model's attention kernels (attn8.cu,
-// encoder_attn.cu; spec image-model/02, GitHub #319) -- ADAPTED (ADR 0051 tier 2).
+// encoder_attn.cu, vae_conv.cu, vae_attn.cu; spec image-model/02, GitHub #319) -- ADAPTED (ADR 0051 tier 2).
 //
 // Upstream: thu-ml/SageAttention, commit d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5, Apache-2.0:
 // csrc/permuted_smem.cuh, csrc/cp_async.cuh and csrc/mma.cuh, which say "Adapted from FlashInfer"

@@ -11,7 +11,7 @@
 //!
 //! The RoPE table of the oracle's t2i layout is compared with diffusers' own (`rope.npy`, spec
 //! 01's recordings) when the oracle is there: `$IGNIS_IMAGE_ORACLE`, else
-//! `F:/ai/models/ignis-image-2.1-turbo/oracle`; without it that part prints SKIP.
+//! `F:/ai/models/ignis-image-2.1-turbo/oracle`; without it that part prints SKIP (a failure under the profile).
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1` a missing GPU or a
 //! kernel error is a skip, under it a hard failure (`ignis_core::gpu_profile`). Run via
@@ -208,7 +208,7 @@ fn elementwise_ops_through_the_bindings_match_fp64() {
     dev.deallocate(d_pos).unwrap();
     dev.deallocate(d_table).unwrap();
 
-    // The oracle's t2i table, diffusers' own, within one ulp (2^-24 for values of magnitude <= 1).
+    // The oracle's t2i table, diffusers' own, within one ulp: 2^-24 absolute is one ulp only for magnitudes in [0.5, 1); the CTest's ulp_of is the exact check.
     let oracle = std::env::var("IGNIS_IMAGE_ORACLE").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "F:/ai/models/ignis-image-2.1-turbo/oracle".to_string());
     let case = std::path::Path::new(&oracle).join("t2i");
     match (load_npy(&case.join("rope.npy")), load_npy(&case.join("joint_image_mask.npy"))) {
@@ -240,7 +240,9 @@ fn elementwise_ops_through_the_bindings_match_fp64() {
             dev.deallocate(d_pos).unwrap();
             dev.deallocate(d_table).unwrap();
         }
-        _ => println!("SKIP: the oracle's RoPE comparison: no oracle at {oracle} (IGNIS_IMAGE_ORACLE)"),
+        _ => {
+            gpu_profile::skip_or_fail(&format!("the oracle's RoPE comparison: no oracle at {oracle} (IGNIS_IMAGE_ORACLE)"));
+        }
     }
 
     // ---- the modulated LayerNorm: 5 tokens of 64, the first 2 a prefix -----------------------

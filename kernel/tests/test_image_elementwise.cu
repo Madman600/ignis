@@ -606,6 +606,9 @@ void case_rope() {
   refused(20, {2, 5}, {2, 2}, {2, 2}, "overlapping blocks");
   refused(20, {16}, {2, 3}, {3, 2}, "a block past the end");
   refused(20, {4}, {0}, {3}, "an empty block");
+  refused(20, {0}, {0xFFFFFFFFu}, {0xFFFFFFFFu}, "a block whose h * w overflows 64 bits");
+  refused(20, {0xFFFFFFFFu}, {2}, {2}, "a block that starts past the sequence");
+  refused(20, {0}, {21}, {1}, "a block taller than the sequence");
   refused(8193, {}, {}, {}, "a text position at 8192");
   refused(2049 * 2, {0}, {2049}, {2}, "a block 2049 rows tall (height position -1025)");
 }
@@ -642,8 +645,8 @@ template <class Scale> std::vector<Err> ref_rms_norm(const std::vector<double> &
 }
 
 // The modulated norm at `tokens` with the prefix / target split at `first_target`.
-void case_modnorm(const Options &o, uint32_t tokens, uint32_t first_target, const std::string &name) {
-  const uint32_t cols = 4096;
+void case_modnorm(const Options &o, uint32_t tokens, uint32_t first_target, const std::string &name,
+                  uint32_t cols = 4096) {
   const std::size_t n = static_cast<std::size_t>(tokens) * cols;
   const std::string what = "modnorm " + name;
   DeviceBytes x(n * 2), st(cols * 4), s0(cols * 4);
@@ -907,7 +910,8 @@ void refusals() {
   };
   float *s = c.as<float>();
   refused(ignis_image_dit_modulated_norm(a.p, 4, 4104, s, s, 0, kEps, b.p, nullptr, kF32, nullptr), "cols % 16");
-  refused(ignis_image_dit_modulated_norm(a.p, 4, 24592, s, s, 0, kEps, b.p, nullptr, kF32, nullptr), "cols > 24576");
+  refused(ignis_image_dit_modulated_norm(a.p, 4, 24592, s, s, 0, kEps, b.p, nullptr, kF32, nullptr), "cols > 24560");
+  refused(ignis_image_dit_modulated_norm(a.p, 4, 24576, s, s, 0, kEps, b.p, nullptr, kF32, nullptr), "cols 24576 (row + reduction > 48 KiB)");
   refused(ignis_image_dit_modulated_norm(a.p, 4, 64, s, s, 5, kEps, b.p, nullptr, kF32, nullptr), "first_target > tokens");
   refused(ignis_image_dit_modulated_norm(a.p, 4, 64, nullptr, s, 2, kEps, b.p, nullptr, kF32, nullptr), "a NULL t row read");
   refused(ignis_image_dit_modulated_norm(a.p, 4, 64, s, s, 0, kEps, b.p, nullptr, kE4m3, nullptr), "E4M3 without scales");
@@ -1086,6 +1090,7 @@ int main(int argc, char **argv) {
     case_modnorm(o, 4127, 31, "4127 x 4096 (t2i: prefix 31)");
     case_modnorm(o, 8218, 4122, "8218 x 4096 (edit: prefix 4122)");
     case_modnorm(o, 16512, 0, "16512 x 4096 (the preset's target)");
+    case_modnorm(o, 3, 1, "3 x 24560 (the cols cap: the row fills 48 KiB of shared memory)", 24560);
   }
   if (want("rmsnorm")) {
     std::printf("zero-centred RMSNorm:\n");
@@ -1127,7 +1132,13 @@ int main(int argc, char **argv) {
     if (std::ifstream(oracle + "/t2i/rope.npy").good()) {
       case_rope_oracle(oracle);
     } else {
-      std::printf("SKIP: rope-oracle: no oracle at %s (--oracle DIR or IGNIS_IMAGE_ORACLE)\n", oracle.c_str());
+      // A skip is never green in the GPU profile (docs/agents/testing.md).
+      const char *profile = std::getenv("IGNIS_GPU_PROFILE");
+      if (profile != nullptr && std::string(profile) == "1") {
+        check(false, "rope-oracle: no oracle at " + oracle + " (--oracle DIR or IGNIS_IMAGE_ORACLE)");
+      } else {
+        std::printf("SKIP: rope-oracle: no oracle at %s (--oracle DIR or IGNIS_IMAGE_ORACLE)\n", oracle.c_str());
+      }
     }
   }
   if (want("refusals")) refusals();
