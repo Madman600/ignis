@@ -568,3 +568,49 @@ The workspace on 08c23b3, which 322c never recorded, was 2896/0/6.
   fallbacks, the edit without vision); `images::enhance` units (the CJK
   pick, the turns, the answer's reading); `tests/images_http.rs` (F1, F2,
   L2, L7, no switcher); `openai_fields`, `config` and `openapi_http`.
+
+## As built (322e, 2026-10-14, branch `image-serving-322`: AC 11, 13's user docs, the AC map)
+
+The baseline on 96db56b (322d never recorded one): `cargo test --workspace`
+2913/0/6, `cargo check -p ignis-server --features cuda --tests` clean.
+
+- **Catalog (AC 11).** `ignis-image-2.1-turbo` is the fourth built-in entry:
+  repo `gpillon/ignis-image-2.1-turbo`, the artifact
+  `ignis_image_2_1_turbo-v2.ninfer` (16,721,644,544 bytes, sha256
+  `4205dd19...6050af`) and its `.conversion.json` record (618,040 bytes,
+  sha256 `b96d32ef...13ce`), which the catalog's parser requires beside any
+  artifact and the loader verifies against. **The revision is `main`, with a
+  TODO in `catalog.yaml` and `catalog.rs`'s `RELEASES`:** the repository was
+  still private and held only `.gitattributes` when this was written, so no
+  commit could be pinned. Until it is, the sha256s alone guard the content;
+  pin the commit in both places when the upload lands. Tests: `RELEASES`
+  holds the four entries value for value, `entry("Ignis-Image-2.1-Turbo")`
+  resolves (what `model download` looks up), and the listing, `--all` and
+  operator-catalog tests count four. No test downloads the 15.6 GiB.
+- **Make (AC 11).** `MODEL=image` is family `image` in `mk/config.mk`: its
+  artifact path (`F:/ai/models/ignis-image-2.1-turbo/...`, `ARTIFACT` wins),
+  served id `ignis-image-2.1-turbo`, and the context, KV format, prefill
+  chunk, decode share, speculation, rope scaling, vision and KV-RAM knobs
+  defaulting to empty, so no text flag reaches the server. `make config`
+  prints a PLAN and MODEL line for it. `mk/flags-selftest.sh` asserts both the
+  flags that arrive and the thirteen that do not.
+- **User docs (AC 13).** `docs/user/README.md`: the catalog table, the two
+  routes in the API table, an "Image generation" section (licence, routes,
+  streaming, sizes, condition images, queue, the `image.*` table with
+  `max_condition_mipx` and `prompt_enhancer_max_tokens`, prompt enhancement
+  and its cost, the known-model rule) and a `MODEL=image` paragraph under make.
+- **The acceptance map.**
+  1. Done (322a, `model_kind_mismatch` and the implicit switch).
+  2. Done (322a).
+  3. Done (322b).
+  4. Done (322b).
+  5. Done (322b, with 322c's fixes).
+  6. Done (322b, 322d's phases).
+  7. Done (322b).
+  8. Done (322a).
+  9. Done (322d).
+  10. Done (322a).
+  11. Done (322e), but for the pinned revision above.
+  12. Remains: the Playground view.
+  13. Done: OpenAPI (322b) and the user docs (322e).
+  14. Remains: the live run needs spec 04's real leaf and runner adapter (#321).
