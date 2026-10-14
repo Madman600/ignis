@@ -1129,7 +1129,12 @@
     },
     {
       "path": "src/ops/linear/w8/w8_dispatch.cpp",
-      "sha256": "a19db206df9ea75bcda7506a43a39736cd18c16794a7304d1dbc6af047eddf45"
+      "sha256": "a19db206df9ea75bcda7506a43a39736cd18c16794a7304d1dbc6af047eddf45",
+      "patch": {
+        "diff": "patches/src/ops/linear/w8/w8_dispatch.cpp.diff",
+        "sha256": "3119e1c3a82d952d4353ec646c0ca4fced3890695ac489930f10ed118a951948",
+        "reason": "Spec image-model/03 (ignis GitHub #320): a registry extension sanctioned for the image model's W8 vision tower (Qwen3-VL-8B), not an ADR 0031 bottleneck nor an ADR 0037 bug. select_w8_a16_launch registers the tower's qkv [3456,1152], output [1152,1152] and fc1 [4304,1152] on the SIMT routes at every T (the MMA kernels copy eight groups' scales as one 16-byte cp.async, which misaligns when a row of scales, padded K / 16 bytes, is not a multiple of 16: K 1152 gives 72; routed to mma_r64_c128 they gave wrong outputs at T=17 and a misaligned-address fault at T=4096), and the patch embedding [1152,1536], fc2 [1152,4304] (stored K 4352, the padded path) and the merger's and DeepStack mergers' fc2 [4096,4608] on SIMT to T=16, then mma_r64_c128. Every existing arm is unchanged. linear_workspace_capacity_bytes (kernel/src/linear.cu) asks select_w8_launch, so it admits the same problems. Test: ignis_kernel_w8_linear_tests, the six new shapes (T 1 to 40960), which throw 'w8 linear: unsupported shape or T' without it."
+      }
     },
     {
       "path": "src/ops/linear/w8/w8_dispatch.h",
@@ -1505,7 +1510,12 @@
     },
     {
       "path": "tests/ops/linear/test_w8_a16.cpp",
-      "sha256": "7192ac0817c3aa2c39c8512c19b94d4c94cc51d898bca541d8c9e2c3e66bb18b"
+      "sha256": "7192ac0817c3aa2c39c8512c19b94d4c94cc51d898bca541d8c9e2c3e66bb18b",
+      "patch": {
+        "diff": "patches/tests/ops/linear/test_w8_a16.cpp.diff",
+        "sha256": "dd800a11485be20ca15e20495e2934ed7f6d212dc9c605df04a21f05fbf7836c",
+        "reason": "Spec image-model/03 (ignis GitHub #320): the cases of the six W8 vision-tower problems that src/ops/linear/w8/w8_dispatch.cpp's patch registers ([3456,1152], [1152,1152], [4304,1152], [1152,1536], [1152,4304], [4096,4608]; T 1, 4, 5, 16, 17, 129, then 4096 and 40960 patches or 1024 and 10240 merged tokens). Against the unpatched dispatch the first of them throws 'w8 linear: unsupported shape or T'."
+      }
     },
     {
       "path": "tests/ops/linear_add/linear_add_test_common.cpp",

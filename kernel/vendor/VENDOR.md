@@ -86,6 +86,12 @@ will not overwrite a patched file unless it is told to.
 A patch is admitted for one of two reasons, and its `reason` says which: a
 measured bottleneck (ADR 0031), or a demonstrated correctness bug (ADR 0037),
 in which case the `reason` also names the test that fails without the patch.
+One patch has neither reason and says so: the W8 dispatch's arms for the
+image model's vision tower (`src/ops/linear/w8/w8_dispatch.cpp` and its test
+cases, spec image-model/03, GitHub #320), a registry extension sanctioned as
+that ticket's one vendor edit. Its `reason` names the new problems and the
+test cases that throw without it; whether such extensions become a third
+standing reason is the owner's call.
 
 ### Ignis-patched behaviours
 

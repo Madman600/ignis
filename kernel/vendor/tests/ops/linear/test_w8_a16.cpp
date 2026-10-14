@@ -138,6 +138,46 @@ int w8_a16_conformance() {
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {2048, 16384, 283U, Comparison::Sampled, false, kN2048K16384});
 
+    // ignis #320: the image model's W8 vision tower (Qwen3-VL-8B). T is the patches (4096 for a
+    // 1024^2 image, 40960 for ten) at the tower's linears and the merged tokens (1024 for one
+    // image, 10240 for ten) at the merger's and the DeepStack mergers' fc2. 129 is a partial
+    // column tile (SIMT at K 1152, MMA elsewhere); K 4304 is stored at 4352, the padded path.
+    constexpr std::array kN3456K1152{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(129), a16(4096), a16(40960),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {3456, 1152, 293U, Comparison::Sampled, false, kN3456K1152});
+
+    constexpr std::array kN1152K1152{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(129), a16(4096),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {1152, 1152, 307U, Comparison::Sampled, false, kN1152K1152});
+
+    constexpr std::array kN4304K1152{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(129), a16(4096),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {4304, 1152, 311U, Comparison::Sampled, false, kN4304K1152});
+
+    constexpr std::array kN1152K1536{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(129), a16(4096),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {1152, 1536, 313U, Comparison::Sampled, false, kN1152K1536});
+
+    constexpr std::array kN1152K4304{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(129), a16(4096),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {1152, 4304, 317U, Comparison::Sampled, false, kN1152K4304});
+
+    constexpr std::array kN4096K4608{
+        a16(1), a16(4), a16(5), a16(16), a16(17), a16(129), a16(1024), a16(10240),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {4096, 4608, 331U, Comparison::Sampled, false, kN4096K4608});
+
     return failures;
 }
 
