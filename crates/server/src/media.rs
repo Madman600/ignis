@@ -853,6 +853,15 @@ pub fn decode_condition_image(bytes: &[u8]) -> Result<RgbaImage, String> {
     }
 }
 
+// `resize_rgba`, `clip8`, `lanczos_weights` and `PRECISION_BITS` are a port
+// of python-pillow/Pillow 12.3.0 (tag commit bb1d8e8), MIT-CMU licensed:
+// `src/libImaging/Resample.c` (`ImagingResample`, `precompute_coeffs`,
+// `normalize_coeffs_8bpc`, the 8-bit horizontal and vertical passes, `clip8`,
+// `PRECISION_BITS`), `src/libImaging/Convert.c` (`rgbA2rgba`, the
+// premultiply, and `rgba2rgbA`, its inverse) and
+// `src/libImaging/ImagingUtils.h` (`MULDIV255`). Pillow's copyright and
+// permission notice are in the repository's root NOTICE.
+
 /// `image` resampled to `size` the way diffusers' `VaeImageProcessor.resize`
 /// does it, through Pillow (spec image-model/03 §Image preprocessing):
 /// Pillow's `ImagingResample` with its Lanczos-3 filter, step for step —
@@ -867,7 +876,7 @@ pub fn resize_rgba(image: &RgbaImage, size: ImageSize) -> RgbaImage {
     if image.size == size {
         return image.clone();
     }
-    // Pillow's MULDIV255: c · a / 255, rounded.
+    // Pillow's `rgbA2rgba`, through its MULDIV255: c · a / 255, rounded.
     let premultiply = |c: u8, a: u8| {
         let t = u32::from(c) * u32::from(a) + 128;
         ((t + (t >> 8)) >> 8) as u8
@@ -900,7 +909,7 @@ pub fn resize_rgba(image: &RgbaImage, size: ImageSize) -> RgbaImage {
         }
         pixels = out;
     }
-    // Pillow's `rgbA2rgba`: c · 255 / a, truncated; alpha 0 and 255 kept.
+    // Pillow's `rgba2rgbA`: c · 255 / a, truncated; alpha 0 and 255 kept.
     for px in pixels.chunks_exact_mut(4) {
         let alpha = u32::from(px[3]);
         if alpha != 0 && alpha != 255 {
