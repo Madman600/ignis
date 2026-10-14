@@ -466,3 +466,105 @@ The findings of `.scratch/orchestra/reviews/review-322a.md` (F1-F8), on
   among the served sizes, the body limit on a text load), and
   `tests/model_kind.rs` (the unloaded refusal, the metrics after a switch,
   the drain), plus `tests/config_http.rs` and `tests/responses_socket.rs`.
+
+## As built (322d, 2026-10-14, branch `image-serving-322`: the 322b review's fixes, AC 9)
+
+The findings of `.scratch/orchestra/reviews/review-322b.md`, then prompt
+enhancement, against the mock loader's text models and `FakeImageRunner`.
+The workspace on 08c23b3, which 322c never recorded, was 2896/0/6.
+
+- **Review-322b.**
+  - **F1.** 322c's poisoned-lock fix (F5) already keeps `Held::drop` from
+    panicking while a runner's panic unwinds: no abort. A route test now
+    drives a runner whose step panics: `500 engine_error`, the prefix
+    released, the model serving the next request. The shutdown half is
+    322c's unit test.
+  - **F2.** The decode cap is `image.max_condition_mipx` (16 Mi pixels by
+    default, 1..=64, live), named in the 400; `Server.image_decodes`, one
+    permit, holds each edit's decode.
+  - **F3, F4.** §Streaming names the edit events (the coordinator's ruling).
+    `media.rs` names the Pillow 12.3.0 files its resize ports and root
+    `NOTICE` carries Pillow's notice; ADR 0051's licence list is the owner's
+    and is left as written.
+  - **L1-L7, N1, N4.** No doc claims a 400 never loads a model. A runner's
+    own `OverBudget` is `400 condition_budget_exceeded`. OpenAI's Images
+    fields go through `openai_fields` (`Surface::Images`: `partial_images`
+    above 0 refused, the rest inert), the validator and the OpenAPI alike.
+    `server.request_timeout`'s doc says it bounds text requests. `wait()` is
+    `admit` without its bound. A mid-run stop's released prefix is unit
+    tested. A stream short of its images sends `error`. `testing.md` records
+    the Pillow fixtures' recipe, checked against their pixels. The floor
+    holds before the sides are rounded.
+- **What a request waits on, streamed.** `serve` refuses the kind
+  mismatch and a name it cannot switch to as statuses, before anything
+  loads. `admit` then runs the load of an unloaded model, prompt
+  enhancement and the implicit switch, each sending its phases
+  (`loading`, `enhancing`, `switching` with `step`/`total`), before the pin,
+  the size, the queue, the fit and the job. A streamed request that waits
+  on any of them starts its stream at once, and a refusal past that point
+  is its `error` event; one the loaded image model takes as it is starts
+  once admitted, every refusal a status. `model_switch` tells its beginner
+  each step (`SwitchStep`, `implicit_switch_telling`).
+- **The visit** (`model_switch::visit`). Two switches in one hold of the
+  switch's slot (`Run::Visit`): to the visited model, which is handed over
+  pinned (`Visit::arrived`) with the status still `switching` (visited →
+  next), then on (`Visit::on`, or the beginner gone). Every other request
+  meets `503 model_switching` with `Retry-After`, and a switch `409`, from
+  the first step to the last. `last_switch` is never written: `run` and
+  `restore` record a switch or a reload only. A way there refused or failed
+  ends the visit with the old model serving, reloaded if need be; a way on
+  that fails reloads the visited model. `SwitchRefusal::NotServing` refuses
+  a visit with nothing serving.
+- **Prompt enhancement** (`images::enhance`, the routes' `enhance`).
+  - On when the request's `prompt_enhancement`, else
+    `image.prompt_enhancement`, says so. The enhancer serving: the rewrite on
+    it, then the request's own switch to the image model, one switch.
+    Otherwise a visit: from the image model and back, or from another text
+    model on to the image model the request names.
+  - `image.prompt_enhancer` resolves as an explicit switch by id does
+    (`Switcher::text_model`: the listed models, then a catalog entry on
+    disk), whatever `switch.allow_implicit` says, never to an image model.
+  - The rewrite: Qwen's system prompts in `images/prompts.rs`, generated
+    from QwenLM/Qwen-Image 6b5e1f5 (`prompt_utils_2512.py` for a
+    generation, Chinese when the prompt holds U+4E00..U+9FFF;
+    `prompt_utils.py`'s edit prompt), each literal trimmed, sent as the
+    system turn; upstream's user turn; root `NOTICE` names them. Reasoning
+    off, the instruct sampling seeded with the job's seed (the same seed, the
+    same rewrite), at most `image.prompt_enhancer_max_tokens` (new, 1024,
+    16..=8192), within `server.request_timeout`. Lines are joined as upstream
+    joins them; an edit's `{"Rewritten": ...}` is unwrapped.
+  - An edit's images go to an enhancer with a vision tower as PNG
+    `image_url` parts; without one it rewrites from the text, and says so.
+  - The rewrite is each image's `revised_prompt` and each completed event's;
+    `warnings`, new on the answer and the completed event, says why there
+    is none: an enhancer it cannot switch to, a visit that did not get
+    there, a rewrite that failed. The job then runs on the prompt as sent.
+    A visit that cannot get back to the image model is `503
+    model_switch_failed`. The condition budget is fitted to the final prompt.
+- **Defaults taken** (owner may revisit).
+  - An `image.prompt_enhancer` that names no switchable text model falls back
+    with a warning rather than refusing the request; a `PATCH` naming one is
+    accepted.
+  - A visit drains the image model as any switch does: a running or queued
+    job gets `switch.drain_timeout`, then ends `503 model_stopped`. Taking
+    the queue's turn first was considered and not built.
+  - An unloaded image model loads first and is then visited: three loads.
+    Loading the enhancer straight away would race the requests waiting on
+    the unloaded image model.
+  - The enhancer-serving path's switch to the image model is an ordinary
+    implicit switch, written to `last_switch`; a visit from another text
+    model is not.
+  - The rewrite is a client request on the enhancer (logged and counted),
+    not an internal one. Upstream's user turn is kept verbatim, its stray
+    space before `Rewritten Prompt:` included. An edit's answer that is not
+    the JSON object is taken as the prompt; a rewrite cut at the token cap
+    is used as it is.
+  - One decode permit, fixed: it mirrors the one-job queue rather than
+    being a tunable.
+- **Tests.** `tests/image_enhancement.rs` (the streamed phases, the visit
+  and its failures, AC 9: the enhancer-serving path's one switch and its
+  Chinese system prompt, the visit's two switches and untouched
+  `last_switch`, `503 model_switching` mid-visit, `revised_prompt`, the four
+  fallbacks, the edit without vision); `images::enhance` units (the CJK
+  pick, the turns, the answer's reading); `tests/images_http.rs` (F1, F2,
+  L2, L7, no switcher); `openai_fields`, `config` and `openapi_http`.
