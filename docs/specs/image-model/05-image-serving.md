@@ -614,3 +614,40 @@ The baseline on 96db56b (322d never recorded one): `cargo test --workspace`
   12. Remains: the Playground view.
   13. Done: OpenAPI (322b) and the user docs (322e).
   14. Remains: the live run needs spec 04's real leaf and runner adapter (#321).
+
+## As built (322f, 2026-10-14, branch `image-serving-322`: AC 12)
+
+The Playground's image view. Web only; no Rust touched.
+
+- **Files.** `web/src/api/images.ts` (the two routes, JSON and multipart, whole
+  and SSE, refusals with `Retry-After`), `web/src/image/studio.ts` (pure parts:
+  limits, `performRun`, `switchToImageModel`, download), `useStudio.ts` (state),
+  `ImageView.tsx`. The header's `View` gains `image`; the view stays mounted
+  from its first visit, like the Server view.
+- **The form.** Prompt; size (`auto` plus `image.sizes` read from
+  `GET /v1/config`, the server's defaults until read); `n` (`image.max_n`);
+  seed (blank is the server's draw); up to `image.max_condition_images`
+  condition images by drop or pick (PNG, JPEG, WebP), shown over a checkerboard
+  (`.checker`) so alpha reads; the enhancement toggle, which starts at
+  `image.prompt_enhancement` and is always sent explicitly; a "Show progress"
+  toggle (stream or whole answer). Any condition image makes it an edit.
+- **Progress.** The stream's phase, the image of `n` and the denoising step.
+  The revised prompt, the answer's `warnings` and `condition_sizes` show beside
+  it. A 409 names the way out, a 503 shows its `Retry-After`, an `error` event
+  keeps the pictures made before it.
+- **The switch.** With any model but the image model loaded, a band offers
+  "Switch to the image model": `POST /v1/models/switch` by catalog id
+  (the Server view's `switchTo`), then the page follows the model each second.
+  Generate stays disabled until the image model serves. No request of the view
+  names a `model` except that switch; tests assert it for all four
+  route/stream combinations.
+- **Model kind.** `ModelState` carries `kind` and `canChat` (chat and Decide
+  are not offered an image model: they would get a 409), so the context bar,
+  which reads `max_model_len`, gets `null` and draws no limit; the chat's empty
+  state says the image model is loaded.
+- **Defaults taken.** The gallery lives in the tab (data URLs, newest first,
+  removable, cleared on reload) and downloads a PNG named
+  `ignis-<seed+index>-<size>.png`. No auto-retry on 503: the line says when to
+  retry. The previews are object URLs, revoked on unmount.
+- **Gates.** `npm test` (855 tests) and `npm run build` pass. The view was not
+  looked at in a browser (the owner watches :5173).

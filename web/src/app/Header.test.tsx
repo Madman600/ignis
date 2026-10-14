@@ -25,6 +25,15 @@ describe("Header", () => {
     expect(withMetrics).toContain(">Monitor<");
   });
 
+  it("offers the Image view, and marks it current without the chat drawers", () => {
+    const plain = renderToStaticMarkup(<Header {...base} view="chat" onView={() => {}} />);
+    expect(plain).toContain(">Image<");
+    const image = renderToStaticMarkup(<Header {...base} view="image" onView={() => {}} />);
+    expect(image).toMatch(/aria-current="page"[^>]*>Image</);
+    expect(image).not.toContain('aria-label="Sessions"');
+    expect(image).not.toContain('aria-label="Settings"');
+  });
+
   it("marks the current view and hides the chat drawers outside the chat", () => {
     const chat = renderToStaticMarkup(<Header {...base} view="chat" onView={() => {}} monitorAvailable />);
     expect(chat).toMatch(/aria-current="page"[^>]*>Playground</);
@@ -49,9 +58,9 @@ describe("Header on a phone (spec playground/05, AC 10)", () => {
     const html = renderToStaticMarkup(<Header {...base} view="server" onView={() => {}} monitorAvailable />);
     const menu = select(html);
     expect(menu).toContain("sm:hidden");
-    expect(menu.match(/<option/g)).toHaveLength(4);
+    expect(menu.match(/<option/g)).toHaveLength(5);
     expect(menu).toMatch(/<option value="server" selected="">Server<\/option>/);
-    for (const label of ["Playground", "Decide", "Monitor"]) expect(menu).toContain(`>${label}</option>`);
+    for (const label of ["Playground", "Decide", "Image", "Monitor"]) expect(menu).toContain(`>${label}</option>`);
     // The tabs are what `sm` and up show.
     expect(html).toMatch(/<nav aria-label="View" class="hidden[^"]*sm:flex/);
   });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { afterRefresh, canSend, loadAwaited, loadUnderWay, readModel, switchFollowed, type ModelState } from "./model.ts";
+import { afterRefresh, canChat, canSend, imageLoaded, loadAwaited, loadUnderWay, readModel, switchFollowed, type ModelState } from "./model.ts";
 import { keyRequired, saveKey } from "./auth.ts";
 
 const listing = (id: string, max?: number) =>
@@ -157,5 +157,37 @@ describe("readModel with idle unload (spec model-switch/02)", () => {
     expect(afterRefresh(loading, { state: "error", message: "x" })).toBe(loading);
     expect(afterRefresh(loading, { state: "loading", to: "a", since: 4000 })).toEqual(loading);
     expect(afterRefresh(loading, { state: "loading", to: "b", since: 4000 })).toEqual({ state: "loading", to: "b", since: 4000 });
+  });
+});
+
+describe("the model's kind (spec image-model/05)", () => {
+  const imageListing = answering({ data: [{ id: "ignis-image-2.1-turbo", kind: "image" }] });
+
+  it("reads kind, and no context limit for the image model", async () => {
+    saveKey("sk");
+    expect(await readModel(imageListing)).toEqual({ state: "ready", id: "ignis-image-2.1-turbo", contextLimit: null, kind: "image" });
+    expect(await readModel(answering({ data: [{ id: "qwen3.8-27b", kind: "text", max_model_len: 5 }] }))).toEqual({
+      state: "ready",
+      id: "qwen3.8-27b",
+      contextLimit: 5,
+      kind: "text",
+    });
+  });
+
+  it("keeps the kind through an unloaded read, and ignores one it does not know", async () => {
+    saveKey("sk");
+    expect(await readModel(answering({ status: "unloaded", data: [{ id: "x", kind: "image" }] }))).toMatchObject({ state: "unloaded", kind: "image" });
+    expect(await readModel(answering({ data: [{ id: "x", kind: "audio" }] }))).not.toHaveProperty("kind");
+  });
+
+  it("lets the chat use any model but an image one, and the image view use only that", () => {
+    const text: ModelState = { state: "ready", id: "a", contextLimit: 1, kind: "text" };
+    const old: ModelState = { state: "ready", id: "a", contextLimit: 1 };
+    const image: ModelState = { state: "ready", id: "b", contextLimit: null, kind: "image" };
+    expect([canChat(text), canChat(old), canChat(image)]).toEqual([true, true, false]);
+    expect([imageLoaded(text), imageLoaded(old), imageLoaded(image)]).toEqual([false, false, true]);
+    expect(canSend(image)).toBe(true);
+    expect(imageLoaded({ state: "unloaded", id: "b", contextLimit: null, kind: "image" })).toBe(true);
+    expect(canChat({ state: "reading" })).toBe(false);
   });
 });
