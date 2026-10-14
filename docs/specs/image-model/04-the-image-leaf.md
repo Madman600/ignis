@@ -134,3 +134,214 @@ first denoising step; the result is the same up to rounding.
     in ACs 3-4 is a bug detector, not a gate (ADR 0050). A step over it goes
     to the owner with AC 5's report, and the ticket is not closed on it
     without the owner.
+
+## As built (321a, 2026-10-14: ACs 1, 2, 3 at 1024², 5; the DiT, the t2i prefix, the sampler)
+
+Status: **AC 1 done** (load, plan line, refusal naming the shortfall). **AC 2
+done** (bit for bit). **AC 3 at 1024² done**: all 8 steps within the bound,
+at the sim yardstick's level. **AC 5** written for t2i (below). AC 3 at
+2048², AC 4, 6-10 are not done. AC 11 (the end-of-phase run) still applies
+to all of them.
+
+- **Where.**
+  - The DiT's program: ABI `kernel/include/ignis_image_transformer.h`, code
+    `kernel/src/image/transformer.cu`, ours (ADR 0051 tier 1). It has
+    `_modulation`, `_txt_in`, `_img_in`, `_blocks` and `_head`, plus
+    `_workspace_bytes` (about 60 KiB a token).
+    - `_blocks` runs blocks `[first, end)` in place on the fp32 residual
+      stream. With `target` 0 it is the prefix pass: it writes block b's
+      K/V run and runs one attention call per segment. With `target` 1 it
+      is a target pass over the prefix's runs.
+    - `_head` is norm_out, proj_out, then the Euler update on the device.
+    - Its three ops of its own are exposed for the tests:
+      `_residual_norm` (the gated residual fused with the modulated
+      LayerNorm, E4M3 from fp32), `_linear_bf16` (the timestep path's BF16
+      linears) and `_quantize_f32`.
+    - Everything else is spec 02's ops: the GEMM, the 8-bit attention, the
+      QK norm with RoPE, the RoPE table, SwiGLU, GELU and the zero-centred
+      RMSNorm.
+  - Rust: `crates/core/src/image_transformer.rs` (`TransformerConfig::parse`,
+    the bindings, `TransformerWeights` over the full bind) and
+    `crates/core/src/image_leaf.rs`. The latter holds:
+    - `Sampler` and `euler_step`;
+    - `ImagePlan`;
+    - with `cuda`, `ImageLeaf`, whose calls are `load`, `encode_condition`,
+      `start_image`, `set_latents`, `denoise_step`, `latents`, `velocity`
+      and `release_condition`, plus `encode_condition_tapped` and
+      `denoise_step_tapped`, which copy the residual stream out after given
+      blocks.
+
+    Errors are `ImageLeafError::{Refused, Failed, Plan}`. A refusal (a RoPE
+    position, the condition budget, the arena, a token id) is the server's
+    400, never its 500. `qwen_image::TRANSFORMER_CONFIG` and `IMAGE_MODEL`
+    name the two resources.
+  - Tests:
+    - the CTest `ignis_kernel_image_transformer_test`;
+    - the Rust `--ignored` test `crates/core/tests/image_leaf_gpu.rs`
+      (ACs 1, 2, 3, 5 on the real artifact);
+    - CPU tests: `image_leaf::tests` (the sampler, the scheduler refusals,
+      the Euler rounding, the plan) and `image_transformer::tests` (the
+      config).
+- **The sequence.**
+  - `encode_condition` runs four things:
+    - the text encoder (spec 03) on the prompt's ids and mrope positions;
+    - `txt_in` on its rows `[drop_idx, L)`;
+    - the prefix's RoPE table from `ignis_image_dit_rope_positions`;
+    - the modulation at σ = 0, then the prefix pass over the 32 blocks.
+
+    The condition prefix is one allocation of 32 runs of `kv8_bytes(P)`,
+    each 256-byte aligned. It comes from the condition budget, not the
+    arena. For t2i the prefix is the text rows alone: one causal segment
+    `[0, P)`.
+  - `start_image` uploads the noise (packed, `[y·w + x][c]`). It computes
+    the joint sequence's positions with the target block at P, and the
+    table of the target's rows.
+  - `denoise_step(step)` runs, in order: the modulation at σ_step, img_in,
+    the target pass, the head with the Euler update from σ_step to
+    σ_step+1. The velocity stays in the image slot, readable.
+- **The plan (AC 1), as the test printed it.** `image plan: weights 14.40
+  GiB, arena 1.23 GiB, condition budget 48448 tokens (11.83 GiB); budget
+  27.48 GiB of 28.98 GiB free (derived)`. The load took 8.2 s.
+  - Weights: the full bind, every tensor of the artifact, the VAE's
+    included.
+  - Arena: the image slot (latents, velocity, target positions and table,
+    the modulation row; 17 MiB at the maximum), then one sequential region.
+    The region is sized for a denoising step at 16,800 target tokens: the
+    fp32 residual stream plus the DiT's workspace.
+  - Condition budget: the largest prefix whose 32 runs fit what the weights
+    and arena leave, about 256 KiB a token.
+  - An 8 GiB explicit budget is refused before anything is placed: `short
+    by 8196481032 bytes (7.63 GiB)`.
+- **AC 2.**
+  - The sampler's sigmas and timesteps equal `sigmas.npy` and
+    `timesteps.npy` bit for bit.
+  - For each of the 8 steps, `euler_step` of the recorded input latents by
+    the recorded velocity is the recorded output bit for bit. That is
+    dt = fl(σ' − σ), then fl(x + fl(dt·v)), with no FMA.
+  - In each step of AC 3, the device's update equals the host's on the
+    leaf's own velocity, bit for bit.
+- **AC 3 at 1024² (t2i), teacher-forced.** The velocity's relative L2, in %:
+
+  | step | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+  |---|---|---|---|---|---|---|---|---|
+  | **ignis** | **4.72** | **5.29** | **4.76** | **3.57** | **3.19** | **3.02** | **2.88** | **3.58** |
+  | bound | 11.01 | 22.47 | 11.78 | 7.04 | 6.28 | 6.04 | 5.75 | 7.06 |
+  | sim | 5.51 | 7.12 | 4.09 | 3.52 | 3.14 | 3.02 | 2.88 | 3.53 |
+  | bf16 | 1.17 | 4.49 | 2.36 | 1.22 | 0.76 | 0.73 | 0.73 | 0.67 |
+
+  - ignis is within 0.7 points of the sim yardstick at every step, and
+    under it at steps 0-1. The 8-bit attention, the 8-bit prefix and the
+    BF16 intermediates add almost nothing to the W8A8 linears' own error.
+    The K-mean alternative (above) is not needed for t2i, and the block-0
+    head-3 caveat (319d) costs nothing visible end to end.
+  - The DiT reads ignis's own encoder output (the recorded `input_ids` and
+    `mrope_position_ids` through spec 03's forward), never the recorded
+    `prompt_embeds`. The packed noise file equals step 0's input, checked.
+- **AC 5 (t2i), relative L2 of the residual stream after the block, in %.**
+  These are diagnostic numbers with no threshold.
+
+  | after block | 0 | 15 | 31 |
+  |---|---|---|---|
+  | prefix rows (encode_condition vs step 0's first 31 rows) | 1.09 | 2.39 | 2.59 |
+  | target rows, step 0 | 1.13 | 8.96 | 4.75 |
+  | target rows, step 1 | 1.06 | 10.42 | 6.23 |
+
+  The target's error peaks in the middle of the stack and falls by block
+  31. No step is over its bound, so nothing was diagnosed further.
+- **Timing (information only, not AC 10).** In the test, warm, steps 2-7:
+  144 ms a step at 1024², so 1.15 s for the 8 steps against the ~1.1 s bar.
+  Steps 0-1 took 228 ms, with 3 taps each, which copy 64 MiB out per tap.
+  `encode_condition` took 62 ms with its 3 taps.
+- **The CTest**, all against fp64 that tracks the kernels' roundings, or
+  bit for bit:
+  - the gated residual with the modulated LayerNorm, 1, 45 and 2,049 ×
+    4096: worst 0.131 of the bound; the sums equal the host's fma; the E4M3
+    output equals the host's quantization;
+  - the BF16 linear at `[4096×256]`, `[4096×4096]` and `[16384×4096]`:
+    worst 0.036;
+  - the fp32 quantization, bit for bit;
+  - the timestep chain at σ = 0, 0.978453 and 0.414568: 3.2e-7 relative L2
+    against an fp64 restatement of diffusers'; cos and sin swapped read
+    1.2 (the negative control);
+  - the program on synthetic FP8 weights (2 blocks, a 13-token prefix of
+    text | 2×3 image | text, a 70-token target):
+    - txt_in and img_in are row-independent bit for bit; img_in reads
+      0.007 of its bound against fp64;
+    - both passes split by block equal the whole bit for bit, runs
+      included, and a second run is identical;
+    - another prefix changes every target value;
+    - the Euler update equals the host's.
+- **Defaults taken** (the owner may revisit):
+  1. **The residual stream is fp32**, as in the fp32 pipeline and the
+     encoder (spec 03). 319g's default was BF16; this follows the rule of
+     fewer BF16 roundings.
+     - img_in, txt_in's out_layer, to_out and the MLP's down write fp32.
+     - The gated add `x = fma(tanh g, y, x)` is fused with the next
+       modulated LayerNorm, which quantizes its fp32 output to E4M3
+       directly.
+     - tanh(gate) is taken once per call, not once per token.
+  2. q, k, v, the attention output, the MLP's gate and up, and txt_in's
+     hidden are BF16, because the ops that read them take BF16.
+  3. txt_in rounds the encoder's fp32 rows to BF16 once for its
+     zero-centred norm (spec 02's op). The latents are quantized to E4M3
+     from fp32.
+  4. The timestep path is BF16 weights × fp32 with fp32 accumulation in a
+     fixed order (`_linear_bf16`), and the modulation rows are fp32.
+     - The sinusoid's frequencies are torch's: fl32(fl32(−ln 10⁴ · i) /
+       128) on the host, then exp correctly rounded.
+     - The angles fl32(fl32(1000 σ) · f) and CUDA's cosf/sinf are computed
+       on the device, as torch's CUDA path does.
+  5. **The DiT's timestep is σ**, not `dit_timesteps` (1 ulp off at steps
+     1, 2, 3 and 6).
+  6. **The prefix pass runs whole blocks**, block 31's MLP included,
+     though only the K/V runs are kept. That is 1/32 of the pass, and it
+     keeps the prefix's rows available for AC 5.
+  7. **One image slot.** A job's images run one after another; the VAE
+     decode will read the slot's latents.
+  8. **The plan.**
+     - Free memory is NVML's at load, with the context already counted.
+       The headroom is the caller's `VramMode`: the test used the server's
+       1.5 GiB default.
+     - The arena is the step phase at `MAX_TARGET_TOKENS` = 16,800 (2400 ×
+       1792). The prefix pass and the step never run together, so they
+       share it.
+     - `image.condition_budget_tokens` is a cap (`ImageLeafOptions`).
+  9. **Refusals.**
+     - The scheduler config: not `FlowMatchEulerDiscreteScheduler`;
+       dynamic shifting; a shift other than 1; `shift_terminal`; inverted,
+       Karras, exponential or beta sigmas; stochastic sampling; sigmas not
+       decreasing within (0, 1].
+     - The transformer config: dims other than the inventory's; a patch
+       size other than 1; RoPE axes other than (16, 56, 56);
+       `causal_condition` off.
+- **For 321b (2048², edit, the VAE encode).**
+  - **2048²** should need no code: `start_image(.., 128, 128, ..)` fits the
+    arena (16,384 ≤ 16,800). Run the test's loop on `t2i-2k`.
+  - **Edit's prefix:**
+    - Add the condition images to `encode_condition`: the tower and
+      DeepStack through the encoder's hooks (320c's order), the VAE encode,
+      `img_in` on the condition latents.
+    - Lay the prefix out in joint order. Text rows go to text segments,
+      each image-pad slot becomes its 2×2 latent tokens, and the segments
+      come from `build_token_metadata` and `_qwenimage21_prefix_segments`.
+    - Fill `Condition.blocks` with each image block's (start, (h, w)):
+      `start_image`'s RoPE positions already read it.
+  - **The arena for large prefixes.** The encode phase must fit the
+    sequential region (1.23 GiB). Otherwise `encode_condition` is refused,
+    naming both numbers.
+    - A 1024² condition image (P ≈ 4.1K) needs about 0.3 GiB.
+    - Prefixes above about 16K tokens (four or more 1,230-token images)
+      will not fit. They need a token-chunked prefix pass (the K/V runs
+      need every token before V's per-channel scale, so chunk the GEMMs
+      and the MLP, not the run) or a larger region.
+  - **The VAE.** Its phases (the decode bands, the encode) will share the
+    sequential region; `EncodePhase` and `step_bytes` are the pattern.
+- **Gates.**
+  - The CTest under the profile (`kernel/build.ps1 -Test`,
+    `IGNIS_GPU_PROFILE=1`): 124/124, with no flake (residency_trace
+    passed).
+  - `CARGO_INCREMENTAL=0 cargo test --workspace`: 2869 passed, 0 failed,
+    6 ignored.
+  - `cargo check -p ignis-server --features cuda --tests` and `-p
+    ignis-core --features cuda --tests`: ok, with only the old warnings.
+  - `image_leaf_gpu` under the profile: 1/1.
