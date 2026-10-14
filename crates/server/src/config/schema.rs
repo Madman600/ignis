@@ -511,7 +511,9 @@ config_group! {
         /// The text model that rewrites prompts: the served id of a model an
         /// explicit switch may name (`switch.known_models`, the start model,
         /// or a downloaded catalog entry), whatever `switch.allow_implicit`
-        /// says. An id that names none skips the rewrite, with a warning.
+        /// says, or the text model loaded. A `PATCH` naming any other is
+        /// refused, and a start warns of it; a request that meets one anyway
+        /// skips the rewrite, with a warning.
         prompt_enhancer: Text = ModelFamily::Qwen38_27b.model_id().to_owned(), NO_RULE, ALL, [Visible, Patchable];
         /// The most tokens one rewrite may take. Qwen's prompts ask for
         /// about 200 words; a longer answer is cut here and used as it is.

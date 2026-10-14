@@ -6,6 +6,10 @@
 //! see them. Reasoning is off. The switches that bring the text model in are
 //! the routes' ([`super::routes`]); this is the rewrite on it.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use ignis_core::compute::ModelKind;
 use ignis_core::image::RgbaImage;
 use ignis_core::{FinishReason, RequestClass};
 
@@ -104,6 +108,26 @@ impl Task {
         let text = text.trim().replace('\n', " ");
         (!text.is_empty()).then_some(text)
     }
+}
+
+/// Why `enhancer` (`image.prompt_enhancer`) names no text model a rewrite
+/// could run on, where the server knows its text models — it can switch:
+/// neither the loaded text model nor one an explicit switch by id may name
+/// ([`crate::model_switch::Switcher::text_model`]), `listing` (the known
+/// models a config change is about to set) listed too. `None` when it names
+/// one, or when the server cannot switch: a request then falls back, with a
+/// warning, as it does for any enhancer it cannot reach.
+pub fn unknown_enhancer(server: &Server, enhancer: &str, listing: &BTreeMap<String, PathBuf>) -> Option<String> {
+    let switcher = server.switcher.as_ref()?;
+    let loaded = server.active();
+    if loaded.kind() == ModelKind::Text && loaded.model_id() == enhancer {
+        return None;
+    }
+    switcher.text_model_among(enhancer, listing).is_none().then(|| {
+        format!(
+            "image.prompt_enhancer `{enhancer}` names no text model this server can switch to: list it in switch.known_models, start on it, or download it from the catalog"
+        )
+    })
 }
 
 /// A prompt the enhancer rewrote, and what the response says beside it.

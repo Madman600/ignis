@@ -512,7 +512,17 @@ impl Switcher {
     /// model. Whether a listed model's file is there is the visit's prepare
     /// to say.
     pub fn text_model(&self, model: &str) -> Option<ModelSource> {
-        let artifact = self.listed_models().remove(model).or_else(|| self.catalog.as_ref()?.artifact(model))?;
+        self.text_model_among(model, &BTreeMap::new())
+    }
+
+    /// [`Switcher::text_model`] with `listing` listed too, over the listed
+    /// models: what a config change about to list them would resolve.
+    pub fn text_model_among(&self, model: &str, listing: &BTreeMap<String, PathBuf>) -> Option<ModelSource> {
+        let artifact = listing
+            .get(model)
+            .cloned()
+            .or_else(|| self.listed_models().remove(model))
+            .or_else(|| self.catalog.as_ref()?.artifact(model))?;
         let source = ModelSource { artifact, model: model.to_owned() };
         (self.loader.kind_of(&source) != Some(ModelKind::Image)).then_some(source)
     }

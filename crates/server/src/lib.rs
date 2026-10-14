@@ -500,6 +500,14 @@ impl Server {
         self
     }
 
+    /// Serve images as `image` says (`image.*`, spec image-model/05): what
+    /// `main` resolved at start, until a live change or a switch applies
+    /// another configuration.
+    pub fn with_image(self, image: config::schema::ImageGroup) -> Self {
+        self.update_live(|live| live.image = image);
+        self
+    }
+
     /// Serve the Playground from `assets` under `/ui/` (`main` passes
     /// [`playground::EMBEDDED`] when `--server-ui` is set; tests inject their own
     /// table, including the empty one that selects the fallback page).
