@@ -94,3 +94,82 @@ because the text tokens after an image attend to it.
    (CPU test against a recorded table).
 7. The encoder's wall time for the t2i case and for a 10-image edit is
    written in "As built", for information.
+
+## As built (320f, 2026-10-14: ACs 1, 2, 6, the front end)
+
+Where the CPU front end chose what the sections above leave open.
+- **Where it lives.** `crates/server/src/image_prompt.rs` (tokens and
+  template) and `image_encoder_input.rs` (preprocessing, mrope, the whole
+  input), not `media.rs`: #322 owns that file, with the RGBA decode and the
+  Pillow-exact resize to the condition size. Preprocessing here starts from
+  that resized image.
+- **The API.** `EncoderFrontend::from_reader(&Reader)` reads
+  `frontend/tokenizer.json`, `chat_template.jinja` and `image_model.json`
+  (not through `FrontendSet`, whose six resources are the 27B's).
+  `input(prompt, &[ConditionImage { width, height, rgba }])` returns an
+  `EncoderInput`:
+  - `input_ids` (u32, the whole sequence) and `drop_idx`;
+  - `image_pad_rows` (u32);
+  - `positions` (i32, axis-major (3, L), the oracle's layout);
+  - `images`: per condition image its `grid` and f32 `pixel_values`, rows
+    of 1536. The 27B's tower reads BF16; the rounding is the uploader's.
+- **drop_idx.** `ChatTemplate::render` always adds the generation prompt, so
+  the system message is the render less `<|im_start|>assistant\n`: 14
+  tokens. The load refuses templates that do not open with it, or that lack
+  the prompt's `{}` or the first image slot.
+- **Image pads.** The template is tokenized with one pad per slot, then
+  each slot's pad is repeated for its image's merged tokens. That equals the
+  processor's string expansion, since the pad is a special token split out
+  before pre-tokenization; the fixture checks it. A prompt that writes
+  `<|image_pad|>` itself is refused: the pipeline would take it for an image.
+- **On white.** Pillow's `paste` is `((t >> 8) + t) >> 8` with
+  `t = 255·(255 − a) + v·a + 128`, exact for all 65,536 (value, alpha)
+  pairs (the recipe asserts it).
+- **Size and resample.** `smart_resize` is the 27B's
+  (`ignis_artifact::vision::smart_resize`, the same rule: round half to
+  even, then scale into [65,536, 16,777,216] pixels). When it changes the
+  size, the filter is torchvision's `resize(BICUBIC, antialias=True)` on
+  uint8, which runs ATen's integer path: Keys cubic a = −0.5, separable,
+  horizontal then vertical through a uint8 intermediate, the f64 weights
+  scaled to int16 at the largest precision that fits. The 27B's resize is
+  ninfer's float filter, a different one.
+- **Normalize.** The processor fuses rescale and normalize:
+  `(v − mean/r) / (std/r)` in f32, with `mean/r` and `std/r` taken in f32
+  (127.5 here).
+- **mrope.** The 27B's `assign_positions`, which is transformers' rule for
+  images: text advances all three axes, an image takes (p, p + y, p + x)
+  over its merged grid, then p advances by the longer merged side. A pad run
+  that is not the next grid's size is refused.
+- **Config.** `image_model.json`'s `image_processor` must have the 27B's
+  patch geometry (16, temporal 2, merge 2), `resample` 3 and `do_resize`,
+  `do_rescale` and `do_normalize` true. The pixel bounds, mean, std and
+  rescale factor are read from it. The synthetic fixture's config (patch 4,
+  no `size`) is refused.
+- **Results: bound 0 everywhere.**
+  - Against the oracle: `input_ids`, `drop_idx` and `mrope_position_ids`
+    for t2i and edit; edit's image-pad rows, `image_grid_thw` [1, 64, 64]
+    and `pixel_values` (4096 × 1536), all bit for bit.
+  - The edit image's RGBA is read back from `condition_vae_input`, and the
+    read-back is exact: `2·(u/255) − 1` of the recovered bytes is the
+    recording.
+  - Against the fixture: the 2-pixel-wide (2 × 64 → 64 × 1472) and odd-size
+    (450 × 250 → 448 × 256) resamples are bit for bit, as are 1:1, 16:9 and
+    9:16.
+- **The fixture.** `crates/server/tests/fixtures/image_encoder_input.json`
+  (107 kB) comes from `tools/image-converter/record_encoder_input.py`
+  (command in its docstring), run in the venv on the pinned processor. It
+  calls the pipeline's own `_get_qwen_prompt_embeds` with a tiny seeded
+  text encoder, hooking its inputs and its rotary embedding's positions. It
+  covers:
+  - prompts: empty, CJK, 2,035 tokens, and 1, 2, 3 and 10 condition images
+    (one with an empty prompt);
+  - the five preprocessing cases, each as the sha256 of its `pixel_values`;
+  - the composite rows for alpha 0, 128 and 255, and the sha256 of the
+    whole table.
+
+  Images are a procedural RGBA pattern that the test rebuilds.
+- **Tests.** `cargo test -p ignis-server --test image_encoder_input` runs
+  the composite, preprocessing and mrope checks everywhere. The token and
+  oracle checks skip without the artifact or the oracle
+  (`IGNIS_IMAGE_ARTIFACT`, `IGNIS_IMAGE_ORACLE`, else the owner's layout).
+  Both modules also carry unit tests on a word-level tokenizer.
