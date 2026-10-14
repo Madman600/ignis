@@ -1329,7 +1329,8 @@ these ops differ:
     and the product before the residual add, the normed q and k before RoPE
     (and RMSNorm's x · r before the weight), and SiLU's output before
     SwiGLU's product.
-  - The largest of these is `1 + scale`: up to 2^-9 of the modulated value.
+  - Each is one BF16 rounding, up to 2^-8 of its value; `1 + scale`'s
+    carries over whole to the modulated value.
   - The VAE norm skips three BF16 roundings (the normalized x, × √C, × γ)
     and SiLU's.
   - So spec 04's teacher-forced comparison sees these ops' rounding, not
