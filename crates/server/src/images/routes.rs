@@ -15,6 +15,7 @@
 
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -31,15 +32,16 @@ use tokio::sync::mpsc;
 use utoipa::ToSchema;
 
 use super::budget::{self, Fitted};
-use super::job::{self, Background, ImageJob, JobEnd, JobEvent, Progress};
+use super::job::{self, Background, ImageJob, JobEnd, JobEvent, Phase, Progress};
 use super::ImageModel;
 use crate::api::{
-    bad_request_param, check_served_kind, error_response, error_response_naming, refused_field, split_model_lane,
-    switch_to_named_model, ApiError, ENGINE_ERROR_MESSAGE,
+    bad_request_param, check_kind, check_served_kind, error_response, error_response_naming, implicit_switch_refused,
+    load_failed, refused_field, split_model_lane, unknown_model, unswitchable_named, ApiError, ENGINE_ERROR_MESSAGE,
 };
-use crate::openai_fields::{self, Surface};
 use crate::config::schema::ImageGroup;
-use crate::Server;
+use crate::model_switch::{Steps, SwitchStep};
+use crate::openai_fields::{self, Surface};
+use crate::{ModelStatus, Server};
 
 /// `POST /v1/images/generations`'s body, and the fields of an edit's form
 /// beside its images.
@@ -138,10 +140,11 @@ pub(crate) enum ImageStreamEvent {
     Error(ErrorEvent),
 }
 
-/// `image_generation.progress` / `image_edit.progress`: a unit of the job's
-/// work starting — `encoding` once, then per image each `denoising` step
-/// and its `decoding`. `enhancing`, `switching` and `loading` come first
-/// when the prompt is rewritten.
+/// `image_generation.progress` / `image_edit.progress`: a unit of the
+/// request's work starting — `encoding` once, then per image each
+/// `denoising` step and its `decoding`. `switching` and `loading` come first
+/// when the request waits on a switch or a load, `enhancing` when its prompt
+/// is rewritten.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ProgressEvent {
     r#type: &'static str,
@@ -503,20 +506,128 @@ fn set_field(fields: &mut GenerationRequest, name: &str, text: String) -> Result
     Ok(())
 }
 
-/// Serve a checked request on the image model: the kind check and the
-/// implicit switch, the size against what the load makes (`auto` resolved
-/// among those), the queue's admission, the condition budget and the resize,
-/// then the job — answered whole, or streamed.
+/// What a request's channel carries, in order: the progress of what comes
+/// before its job (a load, a switch), its answer once it is admitted, then
+/// the job's own events — or, once a stream has answered `200`, why it was
+/// refused.
+#[derive(Debug)]
+enum Streamed {
+    Admitted(Answer),
+    Job(JobEvent),
+    Refused(ApiError),
+}
+
+impl From<JobEvent> for Streamed {
+    fn from(event: JobEvent) -> Self {
+        Self::Job(event)
+    }
+}
+
+/// A progress event of what comes before the job: step `step` of `total`.
+fn progress(phase: Phase, step: u32, total: u32) -> Streamed {
+    Streamed::Job(JobEvent::Progress(Progress { phase, image: 0, step, total }))
+}
+
+/// What tells a request's channel the steps of the switches it waits on:
+/// `switching` as leg `k` of `legs` begins, `loading` as its load does.
+fn switch_steps(events: mpsc::UnboundedSender<Streamed>, legs: u32) -> Steps {
+    let leg = AtomicU32::new(0);
+    Arc::new(move |step| {
+        let event = match step {
+            SwitchStep::Switching => progress(Phase::Switching, leg.fetch_add(1, Ordering::SeqCst) + 1, legs),
+            SwitchStep::Loading => progress(Phase::Loading, leg.load(Ordering::SeqCst).max(1), legs),
+        };
+        let _ = events.send(event);
+    })
+}
+
+/// Serve a checked request on the image model: refused first, before
+/// anything loads or switches, when a text model would serve it
+/// ([`check_kind`]) or it names a model the server can neither serve nor
+/// switch to ([`unswitchable_named`]); then [`admit`]ted, and answered whole
+/// or streamed. A streamed request that waits on a load or a switch starts
+/// its stream at once, so that it hears those phases as they happen; what
+/// refuses it past that point is its `error` event. One the loaded image
+/// model takes as it is starts streaming once admitted, so every refusal
+/// before its job is still a status.
 async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage>, route: Route) -> Response {
-    if let Err(refused) = switch_to_named_model(&server, ModelKind::Image, request.model.as_deref()).await {
+    let named = split_model_lane(request.model.clone()).0;
+    if let Err(refused) = check_kind(&server, ModelKind::Image, named.as_deref()) {
         return refused;
     }
-    // One model for the whole request (spec model-switch/01), the image
-    // model (spec image-model/05).
+    if let Some(named) = unswitchable_named(&server, ModelKind::Image, named.as_deref()) {
+        return unknown_model(&server, named);
+    }
+    let (events, receiver) = mpsc::unbounded_channel();
+    let stream = request.stream;
+    if stream && waits_before_the_job(&server, named.as_deref()) {
+        tokio::spawn(async move {
+            let refused = tokio::select! {
+                admitted = admit(server, request, images, route, &events) => admitted.err(),
+                // The client went away: nobody is left to admit it for.
+                () = events.closed() => None,
+            };
+            if let Some(refused) = refused {
+                let _ = events.send(Streamed::Refused(error_of(refused).await));
+            }
+        });
+        return Sse::new(ImageSse::new(receiver, route)).into_response();
+    }
+    let admitted = admit(server, request, images, route, &events).await;
+    // The job holds a sender of its own: the channel closes once it ends.
+    drop(events);
+    if let Err(refused) = admitted {
+        return refused;
+    }
+    if stream {
+        return Sse::new(ImageSse::new(receiver, route)).into_response();
+    }
+    collect(receiver, route).await
+}
+
+/// Whether a request naming `named` waits on something before its job: a
+/// load (no model is serving) or a switch (the loaded model is not the image
+/// model it is served by).
+fn waits_before_the_job(server: &Server, named: Option<&str>) -> bool {
+    let loaded = server.active();
+    !matches!(*server.status(), ModelStatus::Serving)
+        || loaded.kind() != ModelKind::Image
+        || named.is_some_and(|named| !named.is_empty() && named != loaded.model_id())
+}
+
+/// The body of `refused`, a JSON error answer: what a stream that already
+/// answered `200` sends in its `error` event instead.
+async fn error_of(refused: Response) -> ApiError {
+    let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap_or_default();
+    serde_json::from_slice(&bytes).unwrap_or_else(|_| ApiError::new("engine_error", "engine_error", ENGINE_ERROR_MESSAGE))
+}
+
+/// A request past its first checks, to its job: the load of a model the idle
+/// clock unloaded and the implicit switch to the image model it names, each
+/// phase sent to `events` as it starts (ADR 0049's rules); then, on the
+/// image model, pinned for the rest of the request, the size against what
+/// its load makes (`auto` resolved among those), the queue's admission, the
+/// condition budget and the resize, and the job — its answer sent to
+/// `events` before any event of its own. `Err` is the refusal, sent instead.
+async fn admit(
+    server: Arc<Server>,
+    request: ImageRequest,
+    images: Vec<RgbaImage>,
+    route: Route,
+    events: &mpsc::UnboundedSender<Streamed>,
+) -> Result<(), Response> {
+    let named = split_model_lane(request.model.clone()).0;
+    if server.status().is_unloaded() {
+        let _ = events.send(progress(Phase::Loading, 1, 1));
+    }
+    crate::model_switch::ensure_loaded(&server, named.as_deref()).await.map_err(|reason| load_failed(&server, &reason))?;
+    crate::model_switch::implicit_switch_telling(&server, named.as_deref(), Some(switch_steps(events.clone(), 1)))
+        .await
+        .map_err(implicit_switch_refused)?;
+    // One model for the rest of the request (spec model-switch/01), the
+    // image model (spec image-model/05).
     let server = Arc::new(server.pinned());
-    if let Err(refused) = check_served_kind(&server, ModelKind::Image, split_model_lane(request.model.clone()).0.as_deref()) {
-        return refused;
-    }
+    check_served_kind(&server, ModelKind::Image, named.as_deref())?;
     let model = server.active().image_model().expect("the kind check passed: the image model").clone();
     let limits = server.live().image.clone();
     // `image.sizes` less what this load cannot make: what `auto` picks from.
@@ -525,7 +636,7 @@ async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage
     let size = match request.size {
         Some(size) if !model.plan().takes(size) => {
             let served: Vec<String> = sizes.iter().map(ToString::to_string).collect();
-            return bad_request_param(
+            return Err(bad_request_param(
                 &format!(
                     "size `{size}` is past the largest image {} makes ({} latent cells of 16x16 pixels): it must be auto or one of {} (image.sizes)",
                     model.model_id(),
@@ -533,51 +644,43 @@ async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage
                     served.join(", ")
                 ),
                 "size",
-            );
+            ));
         }
         Some(size) => size,
         None => match auto_size(&sizes, ratio) {
             Some(size) => size,
-            None => return bad_request_param("size auto has no size to pick: image.sizes names none this image model makes", "size"),
+            None => return Err(bad_request_param("size auto has no size to pick: image.sizes names none this image model makes", "size")),
         },
     };
     let Some(waiting) = model.jobs.admit(limits.queue_depth) else {
         if model.jobs.is_closed() {
-            return model_stopped();
+            return Err(model_stopped());
         }
-        return unavailable(
+        return Err(unavailable(
             "engine_full",
             "engine_full",
             format!("the image queue is full: one job runs and {} wait (image.queue_depth); retry", limits.queue_depth),
-        );
+        ));
     };
     let seed = request.seed.or(server.seedless_seed).unwrap_or_else(crate::api::fresh_seed);
-    let ImageRequest { prompt, n, background, stream, .. } = request;
+    let ImageRequest { prompt, n, background, .. } = request;
     let prepared = {
         let model = model.clone();
-        tokio::task::spawn_blocking(move || prepare(model, &limits, prompt, images, size, n, seed, background))
+        tokio::task::spawn_blocking(move || prepare(model, &limits, prompt, images, size, n, seed, background, route))
             .await
             .expect("fitting condition images does not panic")
     };
-    let Prepared { model, job, fitted } = match prepared {
-        Ok(prepared) => prepared,
-        Err(refused) => return refused,
-    };
-    let created = crate::api::now();
-    let answer = Answer {
-        route,
+    let Prepared { model, job, fitted } = prepared?;
+    let _ = events.send(Streamed::Admitted(Answer {
         n,
-        created,
+        created: crate::api::now(),
         seed,
         size: size.to_string(),
         background: background.as_str(),
         condition_sizes: fitted.scaled.then(|| fitted.sizes.iter().map(ToString::to_string).collect()),
-    };
-    let events = job::spawn(model, job, waiting);
-    if stream {
-        return Sse::new(ImageSse { events, answer, made: 0, ended: false }).into_response();
-    }
-    collect(events, answer).await
+    }));
+    job::spawn(model, job, waiting, events.clone());
+    Ok(())
 }
 
 /// The condition budget and the resize, then the job: blocking, since the
@@ -594,6 +697,7 @@ fn prepare(
     n: u32,
     seed: u64,
     background: Background,
+    route: Route,
 ) -> Result<Prepared, Response> {
     let budget = budget::budget(model.plan(), limits.condition_budget_tokens);
     let sources: Vec<ImageSize> = images.iter().map(|image| image.size).collect();
@@ -604,17 +708,22 @@ fn prepare(
         return Err(model_stopped());
     };
     let fitted = fitted.map_err(|over| {
-        let param = if images.is_empty() { "prompt" } else { "image" };
-        error_response_naming(StatusCode::BAD_REQUEST, "invalid_request_error", "condition_budget_exceeded", over.to_string(), Some(param))
+        error_response_naming(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "condition_budget_exceeded",
+            over.to_string(),
+            Some(route.condition_param()),
+        )
     })?;
     let images = images.iter().zip(&fitted.sizes).map(|(image, &size)| crate::media::resize_rgba(image, size)).collect();
     let job = ImageJob { condition: ImageCondition { prompt, images }, size, n, seed, background };
     Ok(Prepared { model, job, fitted })
 }
 
-/// What every answer to one request says beside its images.
+/// What every answer to one admitted request says beside its images.
+#[derive(Debug)]
 struct Answer {
-    route: Route,
     /// The images the job makes.
     n: u32,
     created: u64,
@@ -626,36 +735,42 @@ struct Answer {
 
 /// A request that did not stream: the job's `n` images, collected, or why
 /// it ended without them.
-async fn collect(mut events: mpsc::UnboundedReceiver<JobEvent>, answer: Answer) -> Response {
-    let mut data = Vec::with_capacity(answer.n as usize);
+async fn collect(mut events: mpsc::UnboundedReceiver<Streamed>, route: Route) -> Response {
+    let mut answer = None;
+    let mut data = Vec::new();
     while let Some(event) = events.recv().await {
         match event {
-            JobEvent::Progress(_) => {}
-            JobEvent::Image { png, .. } => data.push(ImageData { b64_json: job::base64(&png), revised_prompt: None }),
-            JobEvent::Ended(end) => return Refusal::of(Some(end), answer.route).into_response(),
+            Streamed::Admitted(admitted) => answer = Some(admitted),
+            Streamed::Job(JobEvent::Progress(_)) => {}
+            Streamed::Job(JobEvent::Image { png, .. }) => data.push(ImageData { b64_json: job::base64(&png), revised_prompt: None }),
+            Streamed::Job(JobEvent::Ended(end)) => return Refusal::of(Some(end), route).into_response(),
+            // A whole answer's refusals are statuses (`serve`): none comes here.
+            Streamed::Refused(error) => return Refusal { status: StatusCode::INTERNAL_SERVER_ERROR, error }.into_response(),
         }
     }
-    if data.len() != answer.n as usize {
+    match answer {
+        Some(answer) if data.len() == answer.n as usize => Json(ImagesResponse {
+            created: answer.created,
+            data,
+            seed: answer.seed,
+            size: answer.size,
+            background: answer.background,
+            output_format: "png",
+            condition_sizes: answer.condition_sizes,
+        })
+        .into_response(),
         // The job's thread went away without saying why: it panicked.
-        return Refusal::of(None, answer.route).into_response();
+        _ => Refusal::of(None, route).into_response(),
     }
-    Json(ImagesResponse {
-        created: answer.created,
-        data,
-        seed: answer.seed,
-        size: answer.size,
-        background: answer.background,
-        output_format: "png",
-        condition_sizes: answer.condition_sizes,
-    })
-    .into_response()
 }
 
-/// A streamed request: the job's events as Server-Sent Events. Dropped — the
+/// A streamed request: its channel as Server-Sent Events. Dropped — the
 /// client gone — it drops the channel, which cancels the job.
 struct ImageSse {
-    events: mpsc::UnboundedReceiver<JobEvent>,
-    answer: Answer,
+    events: mpsc::UnboundedReceiver<Streamed>,
+    route: Route,
+    /// The request's answer, once it is admitted.
+    answer: Option<Answer>,
     /// The images sent so far.
     made: u32,
     /// The last event was sent.
@@ -663,6 +778,10 @@ struct ImageSse {
 }
 
 impl ImageSse {
+    fn new(events: mpsc::UnboundedReceiver<Streamed>, route: Route) -> Self {
+        Self { events, route, answer: None, made: 0, ended: false }
+    }
+
     fn event(event: &ImageStreamEvent) -> Event {
         let kind = match event {
             ImageStreamEvent::Progress(progress) => progress.r#type,
@@ -678,44 +797,56 @@ impl Stream for ImageSse {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.ended {
-            return Poll::Ready(None);
+        loop {
+            if this.ended {
+                return Poll::Ready(None);
+            }
+            let event = match this.events.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Streamed::Admitted(answer))) => {
+                    this.answer = Some(answer);
+                    continue;
+                }
+                Poll::Ready(Some(Streamed::Job(JobEvent::Progress(progress)))) => {
+                    ImageStreamEvent::Progress(ProgressEvent { r#type: this.route.progress(), progress })
+                }
+                Poll::Ready(Some(Streamed::Job(JobEvent::Image { index, png }))) => {
+                    let answer = this.answer.as_ref().expect("a job's images come after its request's answer");
+                    this.made += 1;
+                    ImageStreamEvent::Completed(CompletedEvent {
+                        r#type: this.route.completed(),
+                        image: index,
+                        b64_json: job::base64(&png),
+                        created_at: answer.created,
+                        size: answer.size.clone(),
+                        background: answer.background,
+                        output_format: "png",
+                        seed: answer.seed,
+                        revised_prompt: None,
+                        condition_sizes: answer.condition_sizes.clone(),
+                    })
+                }
+                Poll::Ready(Some(Streamed::Refused(error))) => {
+                    this.ended = true;
+                    ImageStreamEvent::Error(ErrorEvent { r#type: "error", error })
+                }
+                // The job made its images: the stream ends.
+                Poll::Ready(None) if this.answer.as_ref().is_some_and(|answer| answer.n == this.made) => return Poll::Ready(None),
+                // What the request would have been answered had it not
+                // streamed: the status is already 200. A channel that closes
+                // before the last image without saying why is a job's thread
+                // that panicked.
+                Poll::Ready(end) => {
+                    let end = match end {
+                        Some(Streamed::Job(JobEvent::Ended(end))) => Some(end),
+                        _ => None,
+                    };
+                    this.ended = true;
+                    ImageStreamEvent::Error(ErrorEvent { r#type: "error", error: Refusal::of(end, this.route).error })
+                }
+            };
+            return Poll::Ready(Some(Ok(Self::event(&event))));
         }
-        let event = match this.events.poll_recv(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Some(JobEvent::Progress(progress))) => {
-                ImageStreamEvent::Progress(ProgressEvent { r#type: this.answer.route.progress(), progress })
-            }
-            Poll::Ready(Some(JobEvent::Image { index, png })) => {
-                this.made += 1;
-                ImageStreamEvent::Completed(CompletedEvent {
-                    r#type: this.answer.route.completed(),
-                    image: index,
-                    b64_json: job::base64(&png),
-                    created_at: this.answer.created,
-                    size: this.answer.size.clone(),
-                    background: this.answer.background,
-                    output_format: "png",
-                    seed: this.answer.seed,
-                    revised_prompt: None,
-                    condition_sizes: this.answer.condition_sizes.clone(),
-                })
-            }
-            // The job made its images: the stream ends.
-            Poll::Ready(None) if this.made == this.answer.n => return Poll::Ready(None),
-            // What the request would have been answered had it not streamed:
-            // the status is already 200. A job whose thread went away before
-            // its last image without saying why panicked.
-            Poll::Ready(end) => {
-                let end = match end {
-                    Some(JobEvent::Ended(end)) => Some(end),
-                    _ => None,
-                };
-                this.ended = true;
-                ImageStreamEvent::Error(ErrorEvent { r#type: "error", error: Refusal::of(end, this.answer.route).error })
-            }
-        };
-        Poll::Ready(Some(Ok(Self::event(&event))))
     }
 }
 

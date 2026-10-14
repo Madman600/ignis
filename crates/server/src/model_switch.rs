@@ -662,6 +662,21 @@ impl Drop for RunningGuard {
     }
 }
 
+/// A step of a switch under way, told to whoever began it as it starts
+/// ([`Steps`]): the image routes stream them (spec image-model/05
+/// §Streaming).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchStep {
+    /// The switch began: the gate is closed, and the old model drains and is
+    /// torn down.
+    Switching,
+    /// The target's load began, on a card the old model has left.
+    Loading,
+}
+
+/// What a switch tells its beginner of each [`SwitchStep`].
+pub type Steps = Arc<dyn Fn(SwitchStep) + Send + Sync>;
+
 /// Begin switching `server` to `target`: the gate closes now
 /// ([`ModelStatus::Switching`]), and the rest — prepare, drain, tear down,
 /// load — runs on the returned task, so an HTTP caller answers `202` without
@@ -670,7 +685,7 @@ pub fn begin(
     server: &Server,
     target: ModelSource,
 ) -> Result<(SwitchStarted, tokio::task::JoinHandle<SwitchOutcome>), SwitchRefusal> {
-    begin_with(server, target, Run::Switch)
+    begin_with(server, target, Run::Switch, None)
 }
 
 /// A reload asked for by a config change (spec config-v2/02 §`PATCH`).
@@ -700,7 +715,7 @@ pub fn reconfigure(
         return Err(SwitchRefusal::Unavailable);
     }
     let target = server.active().source.clone().ok_or(SwitchRefusal::NotReloadable)?;
-    begin_with(server, target, Run::Reload(Reconfigure { config, patch })).map(|(started, _task)| started)
+    begin_with(server, target, Run::Reload(Reconfigure { config, patch }), None).map(|(started, _task)| started)
 }
 
 /// What a run of the switch's slot was asked to do: what it logs, what it
@@ -750,14 +765,25 @@ struct Begun {
     /// model-switch/02): no drain, no teardown, and no previous model to
     /// reload when the load fails.
     unloaded: bool,
+    /// Who is told each step as it starts, if anyone.
+    steps: Option<Steps>,
+}
+
+impl Begun {
+    fn step(&self, step: SwitchStep) {
+        if let Some(steps) = &self.steps {
+            steps(step);
+        }
+    }
 }
 
 /// [`begin`], [`reconfigure`] and the load [`ensure_loaded`] begins, as
-/// `asked` says.
+/// `asked` says, each step told to `steps`.
 fn begin_with(
     server: &Server,
     target: ModelSource,
     asked: Run,
+    steps: Option<Steps>,
 ) -> Result<(SwitchStarted, tokio::task::JoinHandle<SwitchOutcome>), SwitchRefusal> {
     let switcher = server.switcher.clone().ok_or(SwitchRefusal::Unavailable)?;
     let on_demand = matches!(asked, Run::OnDemand);
@@ -791,7 +817,7 @@ fn begin_with(
         if asked.records() {
             switcher.settled.store(false, Ordering::SeqCst);
         }
-        (started, Begun { run: asked, back, unloaded })
+        (started, Begun { run: asked, back, unloaded, steps })
     };
     // Nothing resident, nothing to drain: every request is let through, and
     // the ones that need the model wait for this load (spec model-switch/02).
@@ -825,6 +851,9 @@ fn begin_with(
         ),
     }
     let guard = RunningGuard { switcher, status: Arc::clone(&server.status), records: begun.run.records() };
+    if !begun.unloaded {
+        begun.step(SwitchStep::Switching);
+    }
     let task = tokio::spawn(run(server.clone(), guard, target, started.clone(), begun));
     Ok((started, task))
 }
@@ -874,6 +903,12 @@ pub enum ImplicitRefusal {
 /// [`crate::Server::pinned`]: a pinned copy holds a model of its own, and a
 /// switch published into it would reach no one.
 pub async fn implicit_switch(server: &Server, requested: Option<&str>) -> Result<(), ImplicitRefusal> {
+    implicit_switch_telling(server, requested, None).await
+}
+
+/// [`implicit_switch`], telling `steps` each step of the switch it begins,
+/// if it begins one.
+pub async fn implicit_switch_telling(server: &Server, requested: Option<&str>, steps: Option<Steps>) -> Result<(), ImplicitRefusal> {
     let Some(requested) = requested.filter(|model| !model.is_empty()) else {
         return Ok(());
     };
@@ -884,7 +919,7 @@ pub async fn implicit_switch(server: &Server, requested: Option<&str>) -> Result
         return Ok(());
     }
     let target = ModelSource { artifact: artifact.clone(), model: requested.to_owned() };
-    let task = match begin(server, target) {
+    let task = match begin_with(server, target, Run::Switch, steps) {
         Ok((started, task)) => {
             tracing::info!(
                 name: "ignis.model.switch_requested",
@@ -970,7 +1005,7 @@ pub async fn ensure_loaded(server: &Server, requested: Option<&str>) -> Result<(
                 // unload, which needs one): the torn-down engine answers.
                 return Ok(());
             };
-            match begin_with(server, target, Run::OnDemand) {
+            match begin_with(server, target, Run::OnDemand, None) {
                 Ok(_) => waited = true,
                 // The slot is an unload's still tearing down, or another
                 // load or a switch got there first: its end wakes this.
@@ -1157,6 +1192,7 @@ async fn run(
     };
 
     let load_began = Instant::now();
+    begun.step(SwitchStep::Loading);
     match load_and_warm(&server, prepared).await {
         Ok((new, warm_up)) => {
             publish(&server, new);

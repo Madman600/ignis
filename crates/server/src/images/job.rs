@@ -147,7 +147,7 @@ impl Drop for Held<'_> {
 /// ([`JobEnd::Stopped`]) or when `events` has no reader, its request gone
 /// ([`JobEnd::Cancelled`]). The prefix is released whichever way it ends.
 /// Blocking: it runs on a blocking thread.
-pub fn run(model: &ImageModel, job: &ImageJob, events: &mpsc::UnboundedSender<JobEvent>) -> Result<(), JobEnd> {
+pub fn run<E: From<JobEvent>>(model: &ImageModel, job: &ImageJob, events: &mpsc::UnboundedSender<E>) -> Result<(), JobEnd> {
     let go_on = || {
         if model.jobs.is_closed() {
             Err(JobEnd::Stopped)
@@ -159,7 +159,7 @@ pub fn run(model: &ImageModel, job: &ImageJob, events: &mpsc::UnboundedSender<Jo
     };
     let progress = |phase, image, step, total| {
         // A send fails only once the request is gone, which `go_on` sees.
-        let _ = events.send(JobEvent::Progress(Progress { phase, image, step, total }));
+        let _ = events.send(JobEvent::Progress(Progress { phase, image, step, total }).into());
     };
     go_on()?;
     progress(Phase::Encoding, 0, 1, 1);
@@ -180,25 +180,24 @@ pub fn run(model: &ImageModel, job: &ImageJob, events: &mpsc::UnboundedSender<Jo
         if job.background == Background::Opaque {
             on_white(&mut image);
         }
-        let _ = events.send(JobEvent::Image { index, png: encode_png(&image) });
+        let _ = events.send(JobEvent::Image { index, png: encode_png(&image) }.into());
     }
     Ok(())
 }
 
 /// Queue `job`, admitted as `waiting`, on `model`: in its turn it runs
-/// ([`run`]) on a blocking thread, its events sent to the returned channel,
-/// and a job that ends early sends why, unless its request is gone.
-/// Dropping the channel cancels the job: while it waits it leaves the queue
-/// at once; once it runs, at its next call.
-pub fn spawn(model: ImageModel, job: ImageJob, waiting: Waiting) -> mpsc::UnboundedReceiver<JobEvent> {
-    let (events, receiver) = mpsc::unbounded_channel();
+/// ([`run`]) on a blocking thread, its events sent to `events`, and a job
+/// that ends early sends why, unless its request is gone. Dropping the
+/// channel's receiver cancels the job: while it waits it leaves the queue at
+/// once; once it runs, at its next call.
+pub fn spawn<E: From<JobEvent> + Send + 'static>(model: ImageModel, job: ImageJob, waiting: Waiting, events: mpsc::UnboundedSender<E>) {
     tokio::spawn(async move {
         let running = tokio::select! {
             running = waiting.turn() => running,
             () = events.closed() => return,
         };
         let Some(running) = running else {
-            let _ = events.send(JobEvent::Ended(JobEnd::Stopped));
+            let _ = events.send(JobEvent::Ended(JobEnd::Stopped).into());
             return;
         };
         let ran = tokio::task::spawn_blocking(move || {
@@ -212,7 +211,7 @@ pub fn spawn(model: ImageModel, job: ImageJob, waiting: Waiting) -> mpsc::Unboun
                     if let JobEnd::Failed(error) = &end {
                         tracing::error!(name: "ignis.image.job_failed", model = %model.model_id(), %error, "the image runner refused a call; the job ended");
                     }
-                    let _ = events.send(JobEvent::Ended(end));
+                    let _ = events.send(JobEvent::Ended(end).into());
                 }
             }
         })
@@ -223,7 +222,6 @@ pub fn spawn(model: ImageModel, job: ImageJob, waiting: Waiting) -> mpsc::Unboun
             tracing::error!(name: "ignis.image.job_panicked", error = %panicked, "an image job panicked");
         }
     });
-    receiver
 }
 
 /// `image` composited on white, alpha 255: each colour `(c·a + 255·(255 −
@@ -363,11 +361,11 @@ mod tests {
     #[test]
     fn a_job_stops_between_calls_and_releases_its_prefix() {
         let (model, held) = model(4);
-        let (events, receiver) = mpsc::unbounded_channel();
+        let (events, receiver) = mpsc::unbounded_channel::<JobEvent>();
         drop(receiver);
         assert_eq!(run(&model, &job(1, 1, Background::Auto), &events), Err(JobEnd::Cancelled));
         model.jobs.close();
-        let (events, _receiver) = mpsc::unbounded_channel();
+        let (events, _receiver) = mpsc::unbounded_channel::<JobEvent>();
         assert_eq!(run(&model, &job(1, 1, Background::Auto), &events), Err(JobEnd::Stopped));
         assert_eq!(held.load(Ordering::SeqCst), 0);
 
