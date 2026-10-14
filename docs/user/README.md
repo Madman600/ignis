@@ -133,7 +133,7 @@ an explicit `--switch-known-models` entry wins for its id). A request naming a
 catalog id that is not on disk is refused as an unknown model — a switch never
 starts a download.
 
-A client configured with two known models reloads the server back and forth: opencode sends its `small_model` requests (titles, summaries) to the id named by `small_model`, so a `model` and a `small_model` naming different ignis ids switch the server on alternate requests, 13-33 s each. Point both at the same id, or start with `--switch-allow-implicit false`. The Playground's chat never causes a switch: its requests name no model, so the server serves the one loaded, and the header and the context limit follow it, read again from `GET /v1/models` when a turn starts. The one switch the Playground makes is the explicit **Load** on its Server view.
+A client configured with two known models reloads the server back and forth: opencode sends its `small_model` requests (titles, summaries) to the id named by `small_model`, so a `model` and a `small_model` naming different ignis ids switch the server on alternate requests, 13-33 s each. Point both at the same id, or start with `--switch-allow-implicit false`. The Playground's chat and Decide never cause a switch: their requests name no model, so the server serves the one loaded, and the header and the context limit follow it, read again from `GET /v1/models` when a turn starts. The Playground switches only when pressed to: **Load** on its Server view, and on its Image view the switch button, or **Generate** and **Edit** with a text model loaded ([in the Playground](#image-generation)).
 
 ### Letting the server fetch it
 
@@ -1040,6 +1040,26 @@ It is not free:
   the response carries `warnings`.
 - An edit shows the enhancer its condition images only when its vision tower is
   loaded; otherwise it reads text only, with a warning.
+
+**In the Playground.** The **Image** view sends these requests. With a text
+model loaded, pressing **Generate** or **Edit** is the choice of the image
+model: the request names it, and the server switches as above (GitHub #324).
+The button says what will happen:
+
+- **Switch & generate**, with enhancement off: one switch, then the job.
+- **Enhance with qwen3.8-27b, then switch & generate**, with enhancement on and
+  the enhancer loaded: the rewrite runs on the model loaded, then one switch.
+  There is no need to load the image model first only for the server to visit
+  the enhancer from it: that is three loads, against one.
+- With enhancement on and another text model loaded, **Switch & generate**
+  says that the server goes to the enhancer first.
+
+With **Show progress** on, the phases stream as they happen: `enhancing`,
+`switching`, `loading`, then the job's. With `--switch-allow-implicit false`
+the button stays disabled and says so, and a refusal the server gives at run
+time (`404 model_not_found`) is shown as it is. **Switch to the image model**
+stays beside, for a switch on its own. The view's requests on the image model,
+and the chat's and Decide's on a text model, name no model.
 
 ### Canary check
 

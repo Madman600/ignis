@@ -167,7 +167,8 @@ A new `image` view (`web/src/app/Header.tsx`'s `View`). It has:
 
 When a text model is loaded, the view shows an explicit "switch to the image
 model" button. It never switches implicitly, and never sends a `model` it was
-not told to.
+not told to. (324: pressing Generate or Edit with a text model loaded is being
+told to: the request names the image model; see "As built (324 item 1)".)
 
 ## Seams
 
@@ -969,3 +970,61 @@ Steps a to f took 39.5 s end to end.
   requests log `admitted`/`ttft`/`done`. An image job logs only when refused,
   failed or panicked. `/metrics` has no image series, so the phase times
   above exist only in the stream.
+
+## As built (324 item 1, 2026-10-15, branch `followups-324-serving`: Generate with a text model loaded)
+
+The owner's report (2026-10-15): with the 27B loaded, Generate and Edit could
+not be pressed; with enhancement on, the only way was image → 27B → image,
+three loads, where the server already had the text-first path (one load).
+
+- **The press is the choice.** With a text model loaded (or unloaded while
+  idle) and the catalog listing the image model, Generate and Edit are on: the
+  request carries `model: <the image model's catalog id>`, so the server does
+  §Prompt enhancement's text-first path. `studio.ts` `runPlan` says what the
+  press does and the button reads it:
+  - enhancement off: "Switch & generate" (or "& edit"), "Unloads <id> and
+    loads the image model first." (just "Loads …" when it is unloaded);
+  - enhancement on, the enhancer loaded (`image.prompt_enhancer` read from
+    `GET /v1/config`): "Enhance with <id>, then switch & generate", the rewrite
+    on it, then one switch;
+  - enhancement on, another text model: "Switch & generate", "Switches to
+    <enhancer> to rewrite the prompt, then to the image model.";
+  - image model loaded: "Generate", no `model`, as before.
+- **Refusals.** `switch.allow_implicit` off (read from `GET /v1/config`): the
+  button stays disabled and says so. At run time, a `404 model_not_found` (the
+  server's answer when it will not switch for a request: implicit switching
+  off, or a model it cannot find) reads plainly and points to the switch
+  button. The standalone "Switch to the image model" stays; it is disabled
+  while a run is under way.
+- **Progress.** The phases are those the stream already sends (`enhancing`,
+  `switching`, `loading`, then the job's). On the first `switching` or
+  `loading` event the view reads `GET /v1/models` once, and `useModel`
+  follows the switch from there as any switch; a run that named a model reads
+  it again at its end. Without "Show progress" the line says the image model
+  loads first.
+- **Untouched.** The chat and Decide never send `model` (the #305 lesson); the
+  view's own requests on the image model send none either.
+- **Server.** No change: three router tests through the mock loader in
+  `tests/image_enhancement.rs` pin the path, and passed as written:
+  - enhancer loaded, enhancement on, streamed: `enhancing 1/1`, `switching
+    1/1`, `loading 1/1`, then the job; one load (the image model); the
+    rewrite prefilled once on the enhancer; `revised_prompt` on the completed
+    event; `last_switch` enhancer → image;
+  - enhancement off (the request's `false` over the setting's `true`): one
+    switch, nothing prefilled on the text model, no `revised_prompt`;
+  - `switch.allow_implicit` off: `404 model_not_found`, a status even when
+    streamed, before any rewrite or load; the text model serves on.
+- **Defaults taken** (owner may revisit).
+  - "Known" is the catalog's image row (`GET /v1/models/catalog`), not
+    `GET /v1/models`, which lists only the loaded model. `on_disk` is not
+    consulted: it counts only `download.path`, so a switchable known model
+    reads `absent` (AC 14's note); a model the server cannot find answers
+    the `404` above.
+  - The id sent is the catalog row's, the one the switch button sends.
+  - With enhancement on and another text model loaded, the label is the
+    plain "Switch & generate" with the two switches in the line beneath,
+    rather than a third, longer label.
+- **Gates** (on 4bd8923). `CARGO_INCREMENTAL=0 cargo test --workspace`
+  2983/0/6 (321f's 2980 plus the three tests above); in `web/`, `npm test`
+  870 and `npm run build` green. The view was not looked at in a browser (the
+  owner watches :5173).
