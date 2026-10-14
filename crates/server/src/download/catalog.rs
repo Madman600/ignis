@@ -395,16 +395,15 @@ mod tests {
                 ("qwen3_8_flash_next_trellis_a25-v2.ninfer", 71_760_711_680, "12e3b265b0678ba935a4b05d1b612ba4b68b3a96c3026d818ad65838985fd864"),
             ],
         ),
-        // TODO(#322): the revision is `main` until the upload of the image
-        // model's repository lands; pin its commit here and in catalog.yaml.
-        // The sha256s guard the content meanwhile.
+        // The image model: the upload's hub commit, and the published sidecar
+        // (converter.command paths replaced by placeholders).
         (
             "ignis-image-2.1-turbo",
             "gpillon/ignis-image-2.1-turbo",
-            "main",
+            "d6912417aa47320cd71c78e19d99872faa5cb63b",
             "ignis_image_2_1_turbo-v2.ninfer",
             &[
-                ("ignis_image_2_1_turbo-v2.ninfer.conversion.json", 618_040, "b96d32efc29102c8d2fcef139b544b0f24758459a250e2c79fc854f569bc13ce"),
+                ("ignis_image_2_1_turbo-v2.ninfer.conversion.json", 617_924, "a97f04912b9a6d76e828efc02b7e458d0f45d00bc00d794cca39d703ad0f33ca"),
                 ("ignis_image_2_1_turbo-v2.ninfer", 16_721_644_544, "4205dd1932f0801804b0a544fe1340697e4e0a0dea4a276996bcb981006050af"),
             ],
         ),

@@ -577,13 +577,13 @@ The baseline on 96db56b (322d never recorded one): `cargo test --workspace`
 - **Catalog (AC 11).** `ignis-image-2.1-turbo` is the fourth built-in entry:
   repo `gpillon/ignis-image-2.1-turbo`, the artifact
   `ignis_image_2_1_turbo-v2.ninfer` (16,721,644,544 bytes, sha256
-  `4205dd19...6050af`) and its `.conversion.json` record (618,040 bytes,
-  sha256 `b96d32ef...13ce`), which the catalog's parser requires beside any
-  artifact and the loader verifies against. **The revision is `main`, with a
-  TODO in `catalog.yaml` and `catalog.rs`'s `RELEASES`:** the repository was
-  still private and held only `.gitattributes` when this was written, so no
-  commit could be pinned. Until it is, the sha256s alone guard the content;
-  pin the commit in both places when the upload lands. Tests: `RELEASES`
+  `4205dd19...6050af`) and its `.conversion.json` record (617,924 bytes,
+  sha256 `a97f0491...0f33ca`), which the catalog's parser requires beside any
+  artifact and the loader verifies against. That record is the published one:
+  its `converter.command` paths are placeholders, so its bytes differ from the
+  local record (618,040 bytes, `b96d32ef...13ce`). The revision is the
+  upload's hub commit `d6912417aa47320cd71c78e19d99872faa5cb63b` (2026-10-14),
+  pinned in `catalog.yaml` and in `catalog.rs`'s `RELEASES`. Tests: `RELEASES`
   holds the four entries value for value, `entry("Ignis-Image-2.1-Turbo")`
   resolves (what `model download` looks up), and the listing, `--all` and
   operator-catalog tests count four. No test downloads the 15.6 GiB.
