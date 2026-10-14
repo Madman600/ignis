@@ -198,6 +198,10 @@ count_kind!(
     /// An area in units of 1,048,576 pixels, a 1024x1024 image each.
     Mipx: u32, "Mipx", "Mi-pixel count"
 );
+count_kind!(
+    /// An image's area in latent cells, 16 x 16 pixels each.
+    Cells: u32, "cells", "latent-cell count"
+);
 
 /// A byte count with the size suffixes an operator actually types: a bare
 /// count, or one followed by `K`/`M`/`G` (case-insensitive, binary — `4G`
@@ -688,7 +692,8 @@ impl FieldKind for KnownModels {
 /// `<width>x<height>` entries, `;`- or `,`-separated — a flag names one or
 /// more per occurrence, a file may give a list. Each side is a nonzero
 /// multiple of 32, the VAE's 16 pixels a latent cell times the DiT's 2 × 2
-/// patch; at least one size, and none twice.
+/// patch, and at most [`crate::config::MAX_IMAGE_SIDE`]; at least one size,
+/// and none twice.
 pub struct Sizes;
 
 impl FieldKind for Sizes {
@@ -702,6 +707,9 @@ impl FieldKind for Sizes {
             let size = ImageSize::parse(entry)?;
             if size.width % 32 != 0 || size.height % 32 != 0 {
                 return Err(format!("takes sizes whose sides are multiples of 32, got `{entry}`"));
+            }
+            if size.width.max(size.height) > crate::config::MAX_IMAGE_SIDE {
+                return Err(format!("takes sides of at most {} pixels, got `{entry}`", crate::config::MAX_IMAGE_SIDE));
             }
             if sizes.contains(&size) {
                 return Err(format!("names `{entry}` twice"));
@@ -900,7 +908,14 @@ mod tests {
     fn sizes_are_multiples_of_32_named_once_each() {
         let sizes = Sizes::parse("2048x2048; 2752x1536,1024x1024").unwrap();
         assert_eq!(sizes, [ImageSize::new(2048, 2048), ImageSize::new(2752, 1536), ImageSize::new(1024, 1024)]);
-        for (raw, says) in [("1000x1024", "multiples of 32"), ("1024x1024;1024x1024", "twice"), ("1024", "<width>x<height>"), (";", "at least one"), ("0x32", "<width>x<height>")] {
+        for (raw, says) in [
+            ("1000x1024", "multiples of 32"),
+            ("1024x1024;1024x1024", "twice"),
+            ("1024", "<width>x<height>"),
+            (";", "at least one"),
+            ("0x32", "<width>x<height>"),
+            ("32x16416", "at most 16384"),
+        ] {
             assert!(Sizes::parse(raw).unwrap_err().contains(says), "{raw}");
         }
         // A file may give a list as well as the joined string.
@@ -908,6 +923,7 @@ mod tests {
         assert_eq!(Sizes::file_text(&list), Ok(Some("2048x2048;1024x1024".into())));
         assert!(Sizes::file_text(&serde_json::json!([2048])).is_err());
         assert_eq!(Sizes::render(&sizes), serde_json::json!(["2048x2048", "2752x1536", "1024x1024"]));
+        assert_eq!(Sizes::parse("16384x16384;32x16384"), Ok(vec![ImageSize::new(16384, 16384), ImageSize::new(32, 16384)]), "the bound itself");
         round_trips::<Sizes>(sizes);
     }
 }

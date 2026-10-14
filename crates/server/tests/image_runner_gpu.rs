@@ -372,13 +372,13 @@ async fn the_count_holds_the_arena_and_the_rope_table_beside_the_budget() {
 }
 
 /// Review-321c L2: `vae_decode` refuses a size whose bands do not fit the arena, and the load
-/// sizes the arena for the largest of `image.sizes` (`max_target_cells`). Every default size must
+/// sizes the arena for the largest of `image.sizes` within `image.max_target_cells` (`max_target_cells`). Every default size must
 /// then decode in it. Host-side, the kernel leaf's sizes: no GPU call.
 #[test]
 #[ignore = "the kernel leaf (cuda): run under scripts/gpu-profile.ps1"]
 fn every_default_size_decodes_within_the_arena_the_load_sizes() {
     let sizes = ignis_server::config::DEFAULT_IMAGE_SIZES;
-    let max_target = u32::try_from(ignis_server::images::leaf::max_target_cells(&sizes)).unwrap();
+    let max_target = u32::try_from(ignis_server::images::leaf::max_target_cells(&sizes, ignis_core::image_leaf::MAX_TARGET_TOKENS)).unwrap();
     for size in sizes {
         match ignis_core::image_leaf::decode_band_rows(max_target, size.width, size.height) {
             Ok(rows) => println!("{size}: decodes in bands of {rows} rows in an arena for {max_target} cells"),

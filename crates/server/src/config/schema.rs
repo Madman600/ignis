@@ -497,6 +497,12 @@ config_group! {
         /// 1024x1024, the size OpenAI clients often send. `auto` picks among
         /// them.
         sizes: Sizes = super::DEFAULT_IMAGE_SIZES.to_vec(), NO_RULE, ALL, [Visible, Patchable];
+        /// The largest image the image model's load makes room for, in
+        /// latent cells of 16x16 pixels: 16,800, 2400x1792, the checkpoint's
+        /// largest preset. The load sizes its working memory for the largest
+        /// of `sizes` within it; a size past it is not served, and the load
+        /// warns. Read by the load, so a change holds from the next one.
+        max_target_cells: Cells = ignis_core::image_leaf::MAX_TARGET_TOKENS, between(1, 1 << 20), ALL, [Visible, Patchable];
         /// The condition budget, in condition-prefix tokens (~256 KiB each, a
         /// 1024x1024 condition image 4,096 of them). 0 is the whole budget the
         /// load planned; a value can only lower it.

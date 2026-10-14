@@ -31,19 +31,22 @@
 //!   `Drop`: the leaf's own drop frees its weights and arena, not prefixes.
 
 use ignis_core::image::{ImageError, ImageSize, TargetLatents, LATENT_CHANNELS, LATENT_SCALE};
-use ignis_core::image_leaf::{ImageLeafError, MAX_TARGET_TOKENS};
+use ignis_core::image_leaf::ImageLeafError;
 
 #[cfg(feature = "cuda")]
 pub use device::LeafRunner;
 
 /// The largest target the load makes, in latent cells: the largest of
-/// `image.sizes` (spec image-model/05 §Sizes). One number sizes the leaf's
-/// arena (`ImageLeafOptions::max_target_tokens`) and is planned as
+/// `sizes` (`image.sizes`, spec image-model/05 §Sizes) within `cap`
+/// (`image.max_target_cells`), or the cap when none is. One number sizes the
+/// leaf's arena (`ImageLeafOptions::max_target_tokens`) and is planned as
 /// [`ignis_core::image::ImagePlan::max_target_cells`], so a size the routes
-/// serve is one the arena holds; the defaults' largest is 2400x1792, 16,800
-/// cells.
-pub fn max_target_cells(sizes: &[ImageSize]) -> usize {
-    sizes.iter().map(|size| size.latent_cells()).max().unwrap_or(MAX_TARGET_TOKENS as usize)
+/// serve is one the arena holds, and a size past the cap — not served, the
+/// load warns — never grows the arena; the defaults' largest is 2400x1792,
+/// 16,800 cells, the cap's default.
+pub fn max_target_cells(sizes: &[ImageSize], cap: u32) -> usize {
+    let cap = cap as usize;
+    sizes.iter().map(|size| size.latent_cells()).filter(|&cells| cells <= cap).max().unwrap_or(cap)
 }
 
 /// The joint sequence a target starts over, for the leaf's RoPE rule
@@ -184,14 +187,15 @@ mod device {
         pub fn load(artifact: &Path, config: &crate::config::Config) -> Result<Self, String> {
             let reader = Reader::open(artifact).map_err(|e| format!("open the image artifact: {e}"))?;
             let frontend = EncoderFrontend::from_reader(&reader)?;
-            let max_target = max_target_cells(&config.settings().image.sizes);
+            let image = &config.settings().image;
+            let max_target = max_target_cells(&image.sizes, image.max_target_cells);
             let options = ImageLeafOptions {
                 vram: config.vram,
                 // `image.condition_budget_tokens` lowers the budget per
                 // request (`images::budget`), so a PATCH of it holds live.
                 condition_budget_cap: None,
                 max_target_tokens: u32::try_from(max_target).unwrap_or(u32::MAX),
-                min_condition_budget_tokens: config.settings().image.min_condition_budget_tokens,
+                min_condition_budget_tokens: image.min_condition_budget_tokens,
                 prefix_chunk: None,
             };
             let dev = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
@@ -347,6 +351,7 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ignis_core::image_leaf::MAX_TARGET_TOKENS;
 
     /// A 48 x 32 target (3 x 2 latent cells), each value its channel, row and
     /// column.
@@ -396,13 +401,20 @@ mod tests {
         assert_eq!(image_error(ImageLeafError::Plan(plan.clone())), ImageError::Leaf(plan.to_string()));
     }
 
-    /// The arena is sized for the largest of `image.sizes`: by default
-    /// 2400x1792's 16,800 cells, the leaf's own default; fewer sizes, less.
+    /// The arena is sized for the largest of `image.sizes` within
+    /// `image.max_target_cells`: by default 2400x1792's 16,800 cells, the
+    /// leaf's own default; fewer sizes, less. A size past the cap does not
+    /// grow it (review-321d F2), and with none within it the arena is the cap.
     #[test]
-    fn the_largest_target_is_the_largest_size_served() {
-        assert_eq!(max_target_cells(&crate::config::DEFAULT_IMAGE_SIZES), 16_800);
-        assert_eq!(max_target_cells(&crate::config::DEFAULT_IMAGE_SIZES), MAX_TARGET_TOKENS as usize);
-        assert_eq!(max_target_cells(&[ImageSize::new(1024, 1024), ImageSize::new(512, 768)]), 4096);
+    fn the_largest_target_is_the_largest_size_served_within_the_cap() {
+        let defaults = crate::config::DEFAULT_IMAGE_SIZES;
+        assert_eq!(max_target_cells(&defaults, MAX_TARGET_TOKENS), 16_800);
+        assert_eq!(max_target_cells(&defaults, MAX_TARGET_TOKENS), MAX_TARGET_TOKENS as usize);
+        assert_eq!(max_target_cells(&[ImageSize::new(1024, 1024), ImageSize::new(512, 768)], MAX_TARGET_TOKENS), 4096);
+        let huge = [ImageSize::new(4096, 4096), ImageSize::new(1024, 1024)];
+        assert_eq!(max_target_cells(&huge, MAX_TARGET_TOKENS), 4096, "65,536 cells, past the cap");
+        assert_eq!(max_target_cells(&defaults, 16_384), 16_384, "2048x2048, the largest within 16,384");
+        assert_eq!(max_target_cells(&[ImageSize::new(4096, 4096)], 8_000), 8_000, "none within: the cap");
     }
 
     /// The RoPE layout of a prefix: its text first, each image's block in

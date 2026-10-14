@@ -2063,6 +2063,7 @@ fn every_image_field_resolves_from_flag_env_and_file_by_precedence() {
         ("max_condition_mipx", "4", "8", "32"),
         ("max_condition_decodes", "2", "3", "4"),
         ("sizes", "1024x1024", "2048x2048;1024x1024", "2752x1536"),
+        ("max_target_cells", "4096", "8192", "16384"),
         ("condition_budget_tokens", "8192", "16384", "4096"),
         ("min_condition_budget_tokens", "0", "4096", "16384"),
         ("condition_floor_px", "256", "384", "640"),
@@ -2105,6 +2106,7 @@ fn an_image_field_past_its_bounds_is_refused_naming_it() {
         ("max_condition_images", 1, 10),
         ("max_condition_mipx", 1, 64),
         ("max_condition_decodes", 1, 16),
+        ("max_target_cells", 1, 1 << 20),
         ("min_condition_budget_tokens", 0, 1 << 20),
         ("condition_floor_px", 32, 1024),
         ("prompt_enhancer_max_tokens", 16, 8192),
@@ -2127,4 +2129,7 @@ fn an_image_field_past_its_bounds_is_refused_naming_it() {
     assert!(err.contains("image.queue_depth") && err.contains("0..=64"), "{err}");
     let err = refused(&["--image-sizes", "1000x1000"]);
     assert!(err.contains("--image-sizes") && err.contains("multiples of 32"), "{err}");
+    let err = refused(&["--image-sizes", "16416x32"]);
+    assert!(err.contains("--image-sizes") && err.contains("16384"), "{err}");
+    assert_eq!(config(&[]).settings().image.max_target_cells, 16_800, "2400x1792, the largest preset");
 }

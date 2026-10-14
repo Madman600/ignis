@@ -136,6 +136,12 @@ pub const MAX_REQUEST_TIMEOUT_SECS: u32 = 3600;
 /// this only catches a unit mistake.
 pub const MAX_VISION_EMBEDDING_POOL_MIB: u64 = 64 * 1024;
 
+/// The longest side `image.sizes` takes, in pixels: 1,024 latent cells, so a
+/// size is at most 2^20 cells, the most the image leaf's arena is sized for,
+/// and its RoPE block within the table's reach (2,048 cells a side). Far past
+/// any size the checkpoint was trained at (2752 at most); against a typo.
+pub const MAX_IMAGE_SIDE: u32 = 16_384;
+
 /// The sizes an image request may ask for unless the operator names others
 /// (`--image-sizes`, spec image-model/05 §Sizes): the checkpoint card's
 /// presets, then 1024x1024, diffusers' own default output, which OpenAI

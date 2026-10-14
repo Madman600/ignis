@@ -358,8 +358,11 @@ pub fn load_model(prepared: PreparedModel) -> Result<LoadedModel, LoadError> {
 
 /// The image model's load (spec image-model/05): its runner — the image
 /// leaf's under `cuda` ([`cuda_image_runner`]), [`ignis_core::image::FakeImageRunner`]
-/// otherwise, as a build without `cuda` serves `MockCompute` — and the model
-/// over it, its source kept for a switch back and for the idle unload.
+/// otherwise, as a build without `cuda` serves `MockCompute`, its largest
+/// target the leaf's ([`crate::images::leaf::max_target_cells`]) — and the
+/// model over it, its source kept for a switch back and for the idle unload.
+/// A size of `image.sizes` past the largest target is not served: the load
+/// warns of it.
 fn load_image_model(
     artifact: std::path::PathBuf,
     model: String,
@@ -373,7 +376,12 @@ fn load_image_model(
             name: "ignis.model.fake_image_runner",
             "built without --features cuda — the fake image runner despite --model-artifact (its images are deterministic noise, not the prompt's)"
         );
-        Box::new(ignis_core::image::FakeImageRunner::default())
+        let image = &config.settings().image;
+        let max_target_cells = crate::images::leaf::max_target_cells(&image.sizes, image.max_target_cells);
+        Box::new(ignis_core::image::FakeImageRunner::new(ignis_core::image::ImagePlan {
+            max_target_cells,
+            ..ignis_core::image::fake_plan()
+        }))
     };
     tracing::info!(
         name: "ignis.model.loaded",
@@ -393,7 +401,7 @@ fn load_image_model(
             name: "ignis.image.sizes_not_served",
             sizes = %past.join(", "),
             max_target_cells = runner.plan().max_target_cells,
-            "image.sizes names sizes past the largest image this load makes: they are not served"
+            "image.sizes names sizes past the largest image this load makes (image.max_target_cells): they are not served"
         );
     }
     let image = crate::images::ImageModel::new(model.clone(), runner);
@@ -488,4 +496,37 @@ fn cuda_scheduler_for(
         "model loaded on the GPU"
     );
     Ok((Box::new(scheduler), reserved))
+}
+
+#[cfg(all(test, not(feature = "cuda")))]
+mod tests {
+    use super::*;
+    use ignis_core::image::ImageSize;
+
+    /// Review-321d F2: a size of `image.sizes` past `image.max_target_cells`
+    /// neither grows the load's largest target nor is served, and the load
+    /// says so (`ignis.image.sizes_not_served`); the fake plans what the
+    /// leaf would.
+    #[test]
+    fn a_size_past_the_cap_is_not_served_and_the_load_warns() {
+        let args: Vec<String> = ["--image-sizes", "4096x4096;1024x1024", "--image-max-target-cells", "8000"].map(String::from).to_vec();
+        let crate::config::ConfigOutcome::Config(config) = crate::config::resolve(&args, |_| None).expect("the options resolve") else {
+            panic!("a config")
+        };
+        use tracing_subscriber::layer::SubscriberExt;
+        let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+        let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+        let loaded = tracing::subscriber::with_default(subscriber, || {
+            load_image_model("image.ninfer".into(), "ignis-image-2.1-turbo".into(), &config).map_err(|e| e.to_string())
+        })
+        .expect("the fake loads");
+        let image = loaded.model.image_model().expect("the image model").clone();
+        assert_eq!(image.plan().max_target_cells, 4096, "1024x1024, the largest size within 8,000 cells");
+        assert_eq!(crate::images::served_sizes(&config.settings().image.sizes, image.plan()), [ImageSize::new(1024, 1024)]);
+        let records: Vec<serde_json::Value> = sink.lines().iter().map(|line| serde_json::from_str(line).expect("json")).collect();
+        let warned = records.iter().find(|event| event["event_name"] == "ignis.image.sizes_not_served").expect("the warning");
+        let field = |name: &str| warned.get(name).or_else(|| warned["attributes"].get(name)).cloned();
+        assert_eq!(field("sizes"), Some(serde_json::json!("4096x4096")), "{warned}");
+        assert_eq!(field("max_target_cells"), Some(serde_json::json!(4096)), "{warned}");
+    }
 }

@@ -1210,8 +1210,8 @@ async fn the_image_fields_are_listed_and_change_live_within_their_bounds() {
     assert_eq!(
         names,
         [
-            "queue_depth", "max_n", "max_condition_images", "max_condition_mipx", "max_condition_decodes", "sizes", "condition_budget_tokens",
-            "min_condition_budget_tokens", "condition_floor_px",
+            "queue_depth", "max_n", "max_condition_images", "max_condition_mipx", "max_condition_decodes", "sizes", "max_target_cells",
+            "condition_budget_tokens", "min_condition_budget_tokens", "condition_floor_px",
             "prompt_enhancement", "prompt_enhancer", "prompt_enhancer_max_tokens",
         ]
     );
@@ -1222,6 +1222,7 @@ async fn the_image_fields_are_listed_and_change_live_within_their_bounds() {
     }
     assert_eq!(declaration(&fields, "image.queue_depth")["rule"], json!({ "min": 0, "max": 64 }));
     assert_eq!(declaration(&fields, "image.max_condition_images")["rule"], json!({ "min": 1, "max": 10 }));
+    assert_eq!(declaration(&fields, "image.max_target_cells")["rule"], json!({ "min": 1, "max": 1 << 20 }));
     assert_eq!(declaration(&fields, "image.max_condition_mipx")["rule"], json!({ "min": 1, "max": 64 }));
     assert_eq!(declaration(&fields, "image.sizes")["default"][7], "1024x1024");
     let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
