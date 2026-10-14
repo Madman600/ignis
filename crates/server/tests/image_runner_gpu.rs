@@ -301,7 +301,9 @@ async fn the_image_model_serves_generations_and_edits_over_http_and_frees_what_i
         (dropped as f64 - clean as f64) / (1u64 << 20) as f64
     );
     assert!(loaded.saturating_sub(holding) > 512 << 20, "the held prefix shows: {:.1} MiB", mib(loaded.saturating_sub(holding)));
-    assert!(dropped.abs_diff(clean) < 64 << 20, "the runner's drop frees the prefix it held: {:.1} MiB apart", mib(dropped.abs_diff(clean)));
+    // NVML's free memory is the card's, the desktop's own use in it: two runs of 321f's gate read
+    // +84.6 and -46.5 MiB here. A prefix left behind reads about -1,042 MiB.
+    assert!(dropped.abs_diff(clean) < 256 << 20, "the runner's drop frees the prefix it held: {:.1} MiB apart", mib(dropped.abs_diff(clean)));
 }
 
 /// Review-321ab I3: the leaf's arena is a second limit on a condition beside the budget. With a
