@@ -1,28 +1,35 @@
 import { generate, generateStreaming, type ImageOutcome, type ImageParams, type ImageProgress, isEdit, type MadeImage, STOPPED } from "../api/images.ts";
-import { imageLoaded, type LastSwitch, type ModelState } from "../api/model.ts";
+import { canSend, imageLoaded, type LastSwitch, type ModelState } from "../api/model.ts";
 import { lastSwitchLine } from "../server/outcome.ts";
 import { type CatalogRow, type ConfigDocument, switchTo } from "../server/routes.ts";
 
 // The image view's pure parts (spec image-model/05 §Playground, GitHub #322):
 // what the server's configuration allows, which catalog row is the image
-// model, how progress and refusals read, and the gallery's download. The view
-// and its hook only compose these.
+// model, what Generate does with the model loaded now (GitHub #324), how
+// progress and refusals read, and the gallery's download. The view and its
+// hook only compose these.
 
 /** `auto` first, then the server's `image.sizes`: the form offers exactly what the server will accept. */
 export const AUTO_SIZE = "auto";
 
-/** What the form may ask for, from the running configuration; the server's own defaults while it is unread. */
-export type Limits = { sizes: string[]; maxN: number; maxImages: number; enhance: boolean };
+/**
+ * What the form may ask for, from the running configuration; the server's own defaults while it is unread. `enhancer`
+ * (`image.prompt_enhancer`) and `allowImplicit` (`switch.allow_implicit`) say what Generate does with a text model loaded.
+ */
+export type Limits = { sizes: string[]; maxN: number; maxImages: number; enhance: boolean; enhancer: string; allowImplicit: boolean };
 
 export const DEFAULT_LIMITS: Limits = {
   sizes: ["2048x2048", "2400x1792", "1792x2400", "2528x1696", "1696x2528", "2752x1536", "1536x2752", "1024x1024"],
   maxN: 10,
   maxImages: 10,
   enhance: false,
+  enhancer: "qwen3.8-27b",
+  allowImplicit: true,
 };
 
 export function limitsOf(config: ConfigDocument | null): Limits {
   const image = config?.image ?? {};
+  const enhancer = image.prompt_enhancer;
   const sizes = Array.isArray(image.sizes) ? image.sizes.filter((s): s is string => typeof s === "string") : [];
   const count = (value: unknown, fallback: number) => (typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : fallback);
   return {
@@ -30,6 +37,8 @@ export function limitsOf(config: ConfigDocument | null): Limits {
     maxN: count(image.max_n, DEFAULT_LIMITS.maxN),
     maxImages: count(image.max_condition_images, DEFAULT_LIMITS.maxImages),
     enhance: image.prompt_enhancement === true,
+    enhancer: typeof enhancer === "string" && enhancer !== "" ? enhancer : DEFAULT_LIMITS.enhancer,
+    allowImplicit: config?.switch?.allow_implicit !== false,
   };
 }
 
@@ -37,6 +46,34 @@ export function limitsOf(config: ConfigDocument | null): Limits {
 export function imageModelRow(catalog: CatalogRow[] | null): CatalogRow | null {
   const rows = (catalog ?? []).filter((row) => row.family === "qwenimage21" || /^ignis-image/.test(row.id));
   return rows.find((row) => row.switchable) ?? rows[0] ?? null;
+}
+
+/**
+ * What pressing Generate or Edit does with the model loaded now (GitHub #324): the button's words, a line on what
+ * happens first or why it cannot, and whether it can. With a text model loaded the press is the owner's choice of the
+ * image model: the request names it (`model`), and the server switches — after the rewrite, when enhancement is on and
+ * the enhancer is the model loaded (spec image-model/05 §Prompt enhancement).
+ */
+export type RunPlan = { label: string; note: string | null; model?: string; ready: boolean };
+
+export function runPlan(model: ModelState, limits: Limits, imageModel: CatalogRow | null, enhance: boolean, edit: boolean): RunPlan {
+  const verb = edit ? "edit" : "generate";
+  const plain = edit ? "Edit" : "Generate";
+  if (imageLoaded(model)) return { label: plain, note: null, ready: true };
+  if (!canSend(model) || !imageModel) return { label: plain, note: "Needs the image model.", ready: false };
+  if (!limits.allowImplicit) {
+    return { label: plain, note: "switch.allow_implicit is off, so a request does not switch: switch to the image model first.", ready: false };
+  }
+  const switching = { model: imageModel.id, ready: true };
+  if (enhance && model.id === limits.enhancer) {
+    return { label: `Enhance with ${model.id}, then switch & ${verb}`, note: `${model.id} rewrites the prompt, then the image model replaces it.`, ...switching };
+  }
+  const note = enhance
+    ? `Switches to ${limits.enhancer} to rewrite the prompt, then to the image model.`
+    : model.state === "ready"
+      ? `Unloads ${model.id} and loads the image model first.`
+      : "Loads the image model first.";
+  return { label: `Switch & ${verb}`, note, ...switching };
 }
 
 const PHASE: Record<ImageProgress["phase"], string> = {
@@ -79,6 +116,8 @@ export function refusalLine(outcome: Extract<ImageOutcome, { ok: false }>): stri
       return `The queue is full: ${outcome.message}${wait}`;
     case "model_switching":
       return `A model switch is under way: ${outcome.message}${wait}`;
+    case "model_not_found":
+      return `The server would not switch for this request (${outcome.message}): switch.allow_implicit is off, or the image model is not where it looks. Switch to the image model with the button above.`;
     default:
       return outcome.status === 503 ? `${outcome.message}${wait}` : outcome.message;
   }
@@ -141,8 +180,8 @@ export type RunSink = {
 
 /**
  * One request from the form to the gallery. Streamed or whole, it goes to the generations route, or the edits route when
- * condition images are given, and it names no model: whichever model is loaded answers, or says with a 409 that it
- * is the wrong kind.
+ * condition images are given. It names the image model only when the params do (`runPlan`'s switch); else whichever
+ * model is loaded answers, or says with a 409 that it is the wrong kind.
  */
 export async function performRun(
   params: ImageParams,
@@ -161,21 +200,22 @@ export async function performRun(
     // A whole answer arrives all at once; a stream's images are in the gallery already.
     if (!stream) outcome.images.forEach(add);
     const scaled = outcome.extras.conditionSizes.length > 0 ? [`Condition images used at ${outcome.extras.conditionSizes.join(", ")}.`] : [];
-    sink.done({ notes: [...outcome.extras.warnings, ...scaled], error: null, reread: false });
+    // A request that named the image model switched to it.
+    sink.done({ notes: [...outcome.extras.warnings, ...scaled], error: null, reread: params.model !== undefined });
     return;
   }
   const stopped = outcome.status === 0 && outcome.message === STOPPED;
   sink.done({
     notes: outcome.extras.warnings,
     error: stopped ? null : refusalLine(outcome),
-    // A 409 or a 503 may mean the model changed under the page.
-    reread: outcome.status === 409 || outcome.status === 503,
+    // A 409 or a 503 may mean the model changed under the page; a request that named a model may have switched it.
+    reread: params.model !== undefined || outcome.status === 409 || outcome.status === 503,
   });
 }
 
 /**
- * The owner's "Switch to the image model": the Server view's switch by id. This is the one request of the view
- * that carries a `model`, and only the button sends it.
+ * The owner's "Switch to the image model": the Server view's switch by id, the switch on its own. The other requests
+ * of the view that carry a `model` are Generate and Edit pressed with a text model loaded (`runPlan`).
  */
 export function switchToImageModel(catalog: CatalogRow[] | null, fetcher: typeof fetch = fetch) {
   const row = imageModelRow(catalog);

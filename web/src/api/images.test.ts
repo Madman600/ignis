@@ -3,7 +3,8 @@ import { EDITS_PATH, editForm, generate, generateStreaming, GENERATIONS_PATH, ge
 
 // The image routes' client (spec image-model/05 §Playground): the request
 // shapes, the answer, the stream's events and the refusals, over a mocked
-// fetch. No request carries a `model`.
+// fetch. No request carries a `model` but one whose run names the image
+// model (GitHub #324).
 
 const params: ImageParams = { prompt: "a lantern", n: 2, size: "1024x1024", seed: 7, enhance: false, images: [] };
 const png = (name: string) => new File([new Uint8Array([137, 80, 78, 71])], name, { type: "image/png" });
@@ -49,6 +50,12 @@ describe("the request bodies", () => {
     expect(form.get("prompt_enhancement")).toBe("false");
     expect(form.get("stream")).toBe("true");
     expect(form.has("model")).toBe(false);
+  });
+
+  it("names the image model when the run does (GitHub #324), in either shape", () => {
+    const named = { ...params, model: "ignis-image-2.1-turbo" };
+    expect(generationBody(named, true)).toMatchObject({ model: "ignis-image-2.1-turbo", prompt: "a lantern", stream: true });
+    expect(editForm({ ...named, images: [png("a.png")] }, false).get("model")).toBe("ignis-image-2.1-turbo");
   });
 });
 

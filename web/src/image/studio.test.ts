@@ -14,6 +14,7 @@ import {
   progressLine,
   progressShare,
   refusalLine,
+  runPlan,
   type RunSink,
   settleSwitch,
   switchToImageModel,
@@ -22,7 +23,8 @@ import {
 // The image view's behaviour over a mocked server (spec image-model/05 AC 12):
 // it generates (JSON and streamed) and edits (multipart), shows progress, the
 // switch button switches, the gallery downloads, and no request carries a
-// `model` unless the button was pressed.
+// `model` unless the owner pressed for the image model: the switch button, or
+// Generate and Edit while a text model is loaded (GitHub #324).
 
 const params: ImageParams = { prompt: "a lantern", n: 2, size: "auto", seed: null, enhance: true, images: [] };
 const png = (name: string) => new File([new Uint8Array([1])], name, { type: "image/png" });
@@ -122,6 +124,44 @@ describe("performRun", () => {
     await performRun({ ...params, images: [png("a.png")] }, false, sink().s, nextId, undefined, fetcher);
     expect(calls).toHaveLength(4);
     expect(calls.some(names)).toBe(false);
+  });
+
+  it("names the image model in every request of a run that switches to it, and reads the model again after", async () => {
+    const { calls, fetcher } = server({
+      "/v1/images/generations": () => json({ data: [{ b64_json: "A" }] }),
+      "/v1/images/edits": () => sse([{ type: "image_edit.completed", image: 0, b64_json: "A" }]),
+    });
+    const named: ImageParams = { ...params, model: "ignis-image-2.1-turbo" };
+    const edit: ImageParams = { ...named, images: [png("a.png")] };
+    const ends: (Parameters<RunSink["done"]>[0] | null)[] = [];
+    for (const [run, stream] of [
+      [named, false],
+      [named, true],
+      [edit, true],
+      [edit, false],
+    ] as const) {
+      const { log, s } = sink();
+      await performRun(run, stream, s, nextId, undefined, fetcher);
+      ends.push(log.end);
+    }
+    expect(calls.every(names)).toBe(true);
+    expect(calls.map((c) => (c.init.body instanceof FormData ? c.init.body.get("model") : JSON.parse(c.init.body as string).model))).toEqual(
+      Array(4).fill("ignis-image-2.1-turbo"),
+    );
+    expect(ends.map((end) => end?.reread)).toEqual([true, true, true, true]);
+  });
+
+  it("says plainly when the server would not switch for the request, and points to the switch button", async () => {
+    const { fetcher } = server({
+      "/v1/images/generations": () =>
+        json({ error: { message: "unknown model: ignis-image-2.1-turbo (loaded: qwen3.8-27b)", code: "model_not_found" } }, 404),
+    });
+    const { log, s } = sink();
+    await performRun({ ...params, model: "ignis-image-2.1-turbo" }, false, s, nextId, undefined, fetcher);
+    expect(log.end?.error).toContain("unknown model: ignis-image-2.1-turbo (loaded: qwen3.8-27b)");
+    expect(log.end?.error).toContain("switch.allow_implicit");
+    expect(log.end?.error).toContain("Switch to the image model");
+    expect(log.end?.reread).toBe(true);
   });
 
   it("shows a 409 with the way out and asks for the model to be read again", async () => {
@@ -229,6 +269,50 @@ describe("the switch to the image model", () => {
   });
 });
 
+describe("what Generate and Edit do (GitHub #324)", () => {
+  const row: CatalogRow = { id: "ignis-image-2.1-turbo", source: "built-in", on_disk: "complete", family: "qwenimage21", loaded: false, switchable: true };
+  const text: ModelState = { state: "ready", id: "qwen3.8-27b", contextLimit: 786432, kind: "text" };
+  const image: ModelState = { state: "ready", id: "ignis-image-2.1-turbo", contextLimit: null, kind: "image" };
+
+  it("runs on the image model as it is, naming none", () => {
+    expect(runPlan(image, DEFAULT_LIMITS, row, true, false)).toEqual({ label: "Generate", note: null, ready: true });
+    expect(runPlan({ ...image, state: "unloaded" }, DEFAULT_LIMITS, row, false, true)).toEqual({ label: "Edit", note: null, ready: true });
+  });
+
+  it("with a text model loaded, names the image model and says the switch", () => {
+    const plan = runPlan(text, DEFAULT_LIMITS, row, false, false);
+    expect(plan).toEqual({ label: "Switch & generate", note: "Unloads qwen3.8-27b and loads the image model first.", model: "ignis-image-2.1-turbo", ready: true });
+    expect(runPlan(text, DEFAULT_LIMITS, row, false, true).label).toBe("Switch & edit");
+    // An older server reports no kind: a text model.
+    expect(runPlan({ state: "ready", id: "qwen3.8-27b", contextLimit: 1 }, DEFAULT_LIMITS, row, false, false).model).toBe("ignis-image-2.1-turbo");
+    expect(runPlan({ ...text, state: "unloaded" }, DEFAULT_LIMITS, row, false, false).note).toBe("Loads the image model first.");
+  });
+
+  it("with enhancement on and the enhancer loaded, says the rewrite comes first, on it", () => {
+    expect(runPlan(text, DEFAULT_LIMITS, row, true, false)).toMatchObject({
+      label: "Enhance with qwen3.8-27b, then switch & generate",
+      model: "ignis-image-2.1-turbo",
+      ready: true,
+    });
+    expect(runPlan(text, DEFAULT_LIMITS, row, true, true).label).toBe("Enhance with qwen3.8-27b, then switch & edit");
+    const other = runPlan({ ...text, id: "qwen3.8-flash-next" }, DEFAULT_LIMITS, row, true, false);
+    expect(other).toMatchObject({ label: "Switch & generate", model: "ignis-image-2.1-turbo", ready: true });
+    expect(other.note).toBe("Switches to qwen3.8-27b to rewrite the prompt, then to the image model.");
+  });
+
+  it("does not offer a switch the server would refuse, and says why", () => {
+    const off = runPlan(text, { ...DEFAULT_LIMITS, allowImplicit: false }, row, true, false);
+    expect(off).toMatchObject({ label: "Generate", ready: false });
+    expect(off.model).toBeUndefined();
+    expect(off.note).toContain("switch.allow_implicit");
+    // `on_disk` counts only `download.path`: a known model elsewhere reads `absent` and switches all the same (AC 14).
+    expect(runPlan(text, DEFAULT_LIMITS, { ...row, on_disk: "absent" }, false, false)).toMatchObject({ ready: true, model: "ignis-image-2.1-turbo" });
+    expect(runPlan(text, DEFAULT_LIMITS, null, false, false)).toEqual({ label: "Generate", note: "Needs the image model.", ready: false });
+    const busy: ModelState[] = [{ state: "switching", from: "a", to: "b", since: 0 }, { state: "loading", to: "b", since: 0 }, { state: "reading" }];
+    for (const model of busy) expect(runPlan(model, DEFAULT_LIMITS, row, false, false)).toMatchObject({ ready: false });
+  });
+});
+
 describe("the gallery's download", () => {
   const item: GalleryItem = { id: 3, url: "data:image/png;base64,AAA", prompt: "a lantern", size: "1024x1024", seed: 12, edit: false };
 
@@ -263,6 +347,12 @@ describe("the form's limits and words", () => {
       maxN: 3,
       maxImages: 4,
       enhance: true,
+      enhancer: "qwen3.8-27b",
+      allowImplicit: true,
+    });
+    expect(limitsOf({ image: { prompt_enhancer: "qwen3.8-flash-next" }, switch: { allow_implicit: false } })).toMatchObject({
+      enhancer: "qwen3.8-flash-next",
+      allowImplicit: false,
     });
     expect(limitsOf(null).sizes).toContain("2752x1536");
     expect(limitsOf(null).maxImages).toBe(10);
@@ -274,6 +364,8 @@ describe("the form's limits and words", () => {
       maxN: 10,
       maxImages: 10,
       enhance: false,
+      enhancer: "qwen3.8-27b",
+      allowImplicit: true,
     });
   });
 
