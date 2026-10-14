@@ -146,9 +146,10 @@ Where the CPU front end chose what the sections above leave open.
   rescale factor are read from it. The synthetic fixture's config (patch 4,
   no `size`) is refused.
 - **Results: bound 0 everywhere.**
-  - Against the oracle: `input_ids`, `drop_idx` and `mrope_position_ids`
-    for t2i and edit; edit's image-pad rows, `image_grid_thw` [1, 64, 64]
-    and `pixel_values` (4096 × 1536), all bit for bit.
+  - Against the oracle, every case of spec 01 (t2i, t2i-2k, edit):
+    `input_ids`, `drop_idx`, `mrope_position_ids` and the image-pad rows;
+    edit's `image_grid_thw` [1, 64, 64] and `pixel_values` (4096 × 1536),
+    all bit for bit.
   - The edit image's RGBA is read back from `condition_vae_input`, and the
     read-back is exact: `2·(u/255) − 1` of the recovered bytes is the
     recording.

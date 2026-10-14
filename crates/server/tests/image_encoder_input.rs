@@ -190,8 +190,8 @@ fn f32s(bytes: &[u8]) -> Vec<f32> {
     bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
 }
 
-/// ACs 1, 2 and 6 on spec 01's recordings: t2i and edit, every field bit for
-/// bit. The edit case's condition image is the VAE's input read back, which
+/// ACs 1, 2 and 6 on spec 01's recordings: every case (t2i, t2i-2k, edit),
+/// every field bit for bit. The edit case's condition image is the VAE's input read back, which
 /// is exact: `2 · (u / 255) − 1` of the recovered bytes is the recording.
 #[test]
 fn the_oracle_cases_are_reproduced_exactly() {
@@ -201,7 +201,7 @@ fn the_oracle_cases_are_reproduced_exactly() {
         return;
     }
     let Some(frontend) = frontend() else { return };
-    for name in ["t2i", "edit"] {
+    for name in ["t2i", "t2i-2k", "edit"] {
         let dir = oracle.join(name);
         let case: JsonValue = serde_json::from_slice(&std::fs::read(dir.join("case.json")).unwrap()).unwrap();
         let npy = |field: &str| load_npy(&dir.join(format!("{field}.npy"))).unwrap_or_else(|| panic!("{name}/{field}.npy"));
