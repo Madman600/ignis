@@ -532,6 +532,23 @@ pub fn bind_text_encoder(reader: &Reader, geometry: &TextEncoderGeometry) -> Res
     Ok(QwenImagePlan { plan: binder.plan(), handles })
 }
 
+/// Bind the vision tower alone (spec image-model/03, GitHub #320): the
+/// config resource (its `vision_config` names the DeepStack taps) and every
+/// `vision/` tensor, the merger's and the DeepStack mergers' among them, as
+/// [`bind_text_encoder`] binds the text model's. A scoped bind.
+pub fn bind_vision(reader: &Reader, geometry: &VisionGeometry) -> Result<QwenImagePlan> {
+    require_family(reader)?;
+    let mut binder = Binder::new(reader);
+    let mut handles = BTreeMap::new();
+    let config = binder.require_resource(TEXT_ENCODER_CONFIG, ResourceEncoding::RawBytesV1)?;
+    binder.retain_on_host(config)?;
+    handles.insert(TEXT_ENCODER_CONFIG.to_string(), config);
+    for entry in vision_entries(geometry) {
+        require_entry(&mut binder, entry, &mut handles)?;
+    }
+    Ok(QwenImagePlan { plan: binder.plan(), handles })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

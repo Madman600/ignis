@@ -18,6 +18,7 @@ use ignis_artifact::qwen_image::{self, QwenImageGeometry, Role, MODEL_ID};
 use ignis_artifact::{materialize, CpuDevice, Object, Reader};
 use ignis_core::compute::ModelFamily;
 use ignis_core::image_encoder::{embed_rows, TextEncoderConfig};
+use ignis_core::image_vision::VisionTowerConfig;
 
 const PYTHON: &str = "F:/ai/venvs/ignis-image/Scripts/python.exe";
 const REAL_ARTIFACT: &str = "F:/ai/models/ignis-image-2.1-turbo/ignis_image_2_1_turbo-v2.ninfer";
@@ -151,6 +152,39 @@ fn the_text_encoder_binds_alone() {
     fewer.layers = 3;
     let missing = qwen_image::bind_text_encoder(&reader, &fewer).unwrap_err().to_string();
     assert!(missing.contains("required artifact object is missing: text_encoder/layers.2."), "{missing}");
+}
+
+/// Spec image-model/03 (GitHub #320): the vision tower binds alone, the
+/// config resource with it (its `vision_config` names the DeepStack taps),
+/// every matrix a W8 payload with its scale plane.
+#[test]
+fn the_vision_tower_binds_alone() {
+    let scratch = Scratch::new("vision");
+    let artifact = scratch.0.join("synthetic-v2.ninfer");
+    let reader = pack_tree(&committed_tree(), &artifact, |_| {});
+    let g = QwenImageGeometry::fixture();
+
+    let bound = qwen_image::bind_vision(&reader, &g.vision).expect("the vision tower binds");
+    let tensors = qwen_image::vision_entries(&g.vision).len();
+    assert_eq!(bound.plan.object_count, tensors + 1);
+    assert_eq!(bound.plan.device_objects.len(), tensors);
+    assert_eq!(bound.plan.host_objects.len(), 1);
+    assert!(bound.handles.keys().all(|n| n.starts_with("vision/") || n == qwen_image::TEXT_ENCODER_CONFIG));
+
+    let mut device = CpuDevice::new();
+    let m = materialize(&reader, &bound.plan, &mut device, None).expect("the scoped plan materializes");
+    let config = m.resource_bytes(bound.handles[qwen_image::TEXT_ENCODER_CONFIG]).unwrap();
+    let parsed = VisionTowerConfig::parse(config, &g.vision).expect("the fixture's vision config");
+    assert_eq!(parsed, VisionTowerConfig { num_heads: 2, deepstack_layers: vec![0, 1, 2] });
+    for name in ["vision/patch_embedding", "vision/layers/2/mlp/fc2", "vision/merger/fc2", "vision/deepstack/2/fc1"] {
+        let view = m.device_view(bound.handles[name]).unwrap();
+        assert!(view.scale_plane().is_some(), "{name} has a scale plane");
+    }
+
+    let mut deeper = g.vision.clone();
+    deeper.depth = 4;
+    let missing = qwen_image::bind_vision(&reader, &deeper).unwrap_err().to_string();
+    assert!(missing.contains("required artifact object is missing: vision/layers/3/"), "{missing}");
 }
 
 /// The real geometry's DiT, VAE and text-decoder objects are the pinned
