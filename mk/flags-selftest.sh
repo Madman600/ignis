@@ -160,6 +160,12 @@ fact="$(make config CUDA=1 MODEL=image 2>/dev/null | sed -n 's/^MODEL  *//p')"
 case "$fact" in "image  "*) ;; *) fail "MODEL line of the image family: $fact" ;; esac
 plan="$(plan_of MODEL=image)"
 case "$plan" in *"image model"*) ;; *) fail "PLAN of the image family: $plan" ;; esac
+# `make smoke` asks the image model for one image, never a chat completion
+# (a 409 model_kind_mismatch); a text model keeps its chat.
+smoke="$(make -n smoke MODEL=image 2>/dev/null)"
+case "$smoke" in *"/v1/images/generations"*'"model":"ignis-image-2.1-turbo"'*) ;; *) fail "smoke MODEL=image: no image request in: $smoke" ;; esac
+lacks "smoke MODEL=image" "$smoke" "/v1/chat/completions"
+case "$(make -n smoke 2>/dev/null)" in *"/v1/chat/completions"*) ;; *) fail "smoke: the 27B's chat completion is gone" ;; esac
 
 if [ "$failed" -ne 0 ]; then
     printf 'flags-selftest: %d failure(s)\n' "$failed" >&2
