@@ -1031,3 +1031,47 @@ three loads, where the server already had the text-first path (one load).
   `cargo check -p ignis-server --features cuda --tests` clean (its one
   warning, `openapi.rs`' unused import, is older). The view was not looked at
   in a browser (the owner watches :5173).
+
+## As built (324 items 3-4, 2026-10-15, branch `followups-324-serving`: the catalog's `on_disk`, and what an image job leaves behind)
+
+- **Item 3, `on_disk`.** A catalog row is `complete` when the file the
+  server would load the model from is there: the artifact a listed model
+  names (`switch.known_models`, including the model the server started on)
+  wins over `download.path`, exactly as `Switcher::resolve` lets it win for a
+  switch. `bytes` is then that file's size and `family` its header's. The
+  rule is one `metadata` call per row, no hash (the sha256 stays `model
+  verify`'s). A listed model whose file is missing keeps the
+  `download.path` reading, so a partial download still shows. Test:
+  `a_known_model_that_is_also_a_catalog_entry_is_one_row`.
+- **324ui's default revisited, and kept.** The image view still takes "known"
+  to mean the catalog row, not `on_disk` or `switchable`: the server's `404
+  model_not_found` stays the one place that decides, and the row is right for
+  a model the server cannot find yet. Nothing on the web side changed for
+  item 3.
+- **Item 4, the log line.** One `ignis.image.job` INFO line per ended job,
+  every outcome: `request_id` (`img-<n>`), `model`, `kind`
+  (`generation|edit`), `outcome`, `n`, `images` made, `size`,
+  `condition_images`, `enhancement` (`off|rewritten|as_sent`), and in
+  milliseconds `enhance_ms`, `switch_ms` (loads and switches before the job),
+  `queued_ms`, `encode_ms`, `denoise_ms`, `decode_ms`, `run_ms` (turn to end)
+  and `total_ms` (admission to end). A job whose request left the queue is
+  `cancelled` with zeros for the phases it never reached.
+- **Item 4, the metrics.** Five `ignis_image_*` families (ADR 0017's
+  amendment of 2026-10-15): jobs by outcome, images, a duration histogram of
+  the completed jobs, seconds per phase, and the queue gauge. Absent until
+  the image model admitted a job. Recorded by `job::spawn` as the job ends;
+  the queue gauge is also set at admission and at the job's turn.
+- **Item 4, the Monitor.** `snapshot.ts` reads the families (all in the
+  contract, the restart check counts them), `derive.ts` gives `images` (the
+  window's jobs by outcome, images, duration quantiles, each phase's share),
+  and an *Image jobs* card draws them once they exist.
+- **Defaults taken.** Outcomes are the five of `ImageOutcome`; a refused
+  runner call (`ImageError::Refused`) is `refused`, not `failed`. The
+  duration histogram reuses the request duration's bounds. `queued` is a
+  phase of the counter and not of the histogram. The id is a process
+  counter, not an id the client sees.
+- **Tests.** `metrics.rs`: absent then counted, declared once.
+  `tests/images_observability.rs`, a binary of its own (the line is written
+  on the blocking thread, so it installs the process subscriber): one fake
+  runner job, one line with its fields, the families on `/metrics`.
+  Monitor: `snapshot.test.ts`, `derive.test.ts`, `MonitorView.test.tsx`.

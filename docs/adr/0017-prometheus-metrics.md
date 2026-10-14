@@ -128,6 +128,21 @@ families on a load with KV-disk. Three disk families join them:
 render only on such a load.
 `ignis_kv_cache_evictions_total` and `ignis_kv_ram_evictions_total` keep their
 meanings.
+Amended 2026-10-15 (#324 item 4, spec image-model/05): five families for the
+**image jobs**, rendered after the counting routes' counter and before
+Flash-Next's. The image model has no engine, so no fact of it reaches the
+telemetry consumer: the job itself records them (`images::job::spawn`), once,
+as it ends, into the same atomics; a scrape still formats atomics only. They
+take the decision family's exception: **absent until the image model has
+admitted a job**, then every series renders, zeros included. Fixed labels:
+`outcome=completed|cancelled|stopped|refused|failed`, `phase=queued|encoding|
+denoising|decoding`, `state=waiting|running`. A completed job's duration runs
+from its turn to its last image, so the wait is the `queued` phase's alone.
+Each ended job also writes one `ignis.image.job` log line (id, kind, model,
+`n`, size, condition images, enhancement, outcome, images made, and the
+milliseconds of enhancing, switching, queueing, encoding, denoising,
+decoding, the run and the total). The Playground's Monitor reads the families
+(an *Image jobs* card, shown once they exist).
 
 ## Context
 
@@ -293,6 +308,11 @@ The initial stable metric contract is:
 | `ignis_locates_total` | counter | `kind=log\|prose\|records`, `method=shortlist\|vote`, `compression=template_fold\|none`, `found=true\|false\|unmeasured` | `locate`s answered, by the route that answered them and whether it found an answer (#278, spec 22). Only the served combinations have a series. **Absent until the first one** |
 | `ignis_thinking_forced_closes_total` | counter | none | Completed requests whose reasoning block the thinking budget closed (#265, spec server/08). The request log's `thinking_forced` says which. **Absent until the first one** |
 | `ignis_tokenize_requests_total` | counter | `route=tokenize\|detokenize` | Calls to `POST /v1/tokenize` and `/v1/detokenize`, whatever they answered (#285, spec server/10). Not requests of the lifecycle above: they never enter the scheduler. **Absent until the first one** |
+| `ignis_image_jobs_total` | counter | `outcome=completed\|cancelled\|stopped\|refused\|failed` | Image jobs ended, by how (#324, spec image-model/05). A request that went away is `cancelled`, a model stopped under it `stopped`, a runner that refused its condition `refused`, a failed or panicked call `failed`. **Absent until the image model admitted a job**, as the four below |
+| `ignis_image_images_total` | counter | none | Images the image jobs made, including those of a job that ended before its last (#324) |
+| `ignis_image_job_duration_seconds` | histogram | none | A **completed** job's time from its turn to its last image, buckets 0.1 s to 600 s (#324) |
+| `ignis_image_job_phase_seconds_total` | counter | `phase=queued\|encoding\|denoising\|decoding` | Seconds the jobs of every outcome spent waiting for their turn, encoding the condition, denoising and decoding (#324). A phase's share of the total is computed by the reader |
+| `ignis_image_queue_jobs` | gauge | `state=waiting\|running` | Image jobs waiting for their turn behind the running one, and the one running (#324); set as a job is admitted, takes its turn or ends |
 | `ignis_responses_sockets` | gauge | none | Open Responses API WebSocket connections (#282) |
 | `ignis_responses_queued_requests` | gauge | none | Responses WebSocket requests waiting in the server-wide **socket admission queue**; a request the engine found full is counted here rather than in `ignis_requests_rejected_total` (#282) |
 | `ignis_expert_cache_hits_total` | counter | `class`, `phase=decode\|prefill` | Flash-Next: selected expert projections already resident in the VRAM expert cache, or staged for their layer (#301). A decode hit rate is hits over hits plus misses of `phase="decode"` |
