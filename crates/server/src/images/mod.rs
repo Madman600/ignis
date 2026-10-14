@@ -118,9 +118,8 @@ impl ImageJobs {
 
     /// One job counted as waiting, at the back of the queue, whatever the
     /// depth ([`ImageJobs::admit`] without its bound): it waits until
-    /// [`Waiting::start`] or [`Waiting::turn`], and leaves the count when the
-    /// guard is dropped — run, refused or cancelled alike. The queue must be
-    /// open.
+    /// [`Waiting::turn`], and leaves the count when the guard is dropped —
+    /// run, refused or cancelled alike. The queue must be open.
     pub fn wait(self: &Arc<Self>) -> Waiting {
         self.admit(u32::MAX).expect("an open queue admits without a bound")
     }
@@ -160,7 +159,7 @@ impl ImageJobs {
 }
 
 /// A job counted as waiting ([`ImageJobs::wait`], [`ImageJobs::admit`]),
-/// until dropped or started.
+/// until dropped or its turn comes.
 #[derive(Debug)]
 pub struct Waiting {
     jobs: Option<Arc<ImageJobs>>,
@@ -168,20 +167,10 @@ pub struct Waiting {
 }
 
 impl Waiting {
-    /// The job runs now, whatever its place: counted as running until the
-    /// returned guard is dropped, and never as neither nor both in between.
-    pub fn start(mut self) -> Running {
-        let jobs = self.jobs.take().expect("a waiting job starts once");
-        let mut queue = jobs.queue();
-        queue.waiting.retain(|&ticket| ticket != self.ticket);
-        queue.running += 1;
-        drop(queue);
-        Running(jobs)
-    }
-
     /// Wait for the job's turn — no job running, and every job admitted
-    /// before it run or gone — and start it ([`Waiting::start`]). `None` once
-    /// the queue is closed. Dropping the future leaves the queue.
+    /// before it run or gone — and start it: counted as running until the
+    /// returned guard is dropped, and never as neither nor both in between.
+    /// `None` once the queue is closed. Dropping the future leaves the queue.
     pub async fn turn(mut self) -> Option<Running> {
         let jobs = Arc::clone(self.jobs.as_ref().expect("a waiting job"));
         loop {
@@ -217,7 +206,7 @@ impl Drop for Waiting {
     }
 }
 
-/// A job counted as running ([`Waiting::start`]), until dropped.
+/// A job counted as running ([`Waiting::turn`]), until dropped.
 #[derive(Debug)]
 pub struct Running(Arc<ImageJobs>);
 
@@ -228,6 +217,60 @@ impl Drop for Running {
     }
 }
 
+/// The edits decoding their condition images now: at most
+/// `image.max_condition_decodes` at once (review-322b F2), since each may
+/// decode `image.max_condition_images` frames of up to
+/// `image.max_condition_mipx` before the queue sees it, and the queue behind
+/// runs one job at a time anyway — decodes side by side buy memory, not
+/// throughput.
+#[derive(Debug, Default)]
+pub struct Decodes {
+    running: Mutex<u32>,
+    /// Told whenever a decode ends.
+    ended: tokio::sync::Notify,
+}
+
+impl Decodes {
+    /// A decode's turn, once fewer than `limit` run — the limit as the caller
+    /// reads it now, so a live change applies from the next decode that
+    /// begins or ends. Counted until the guard is dropped: moved into the
+    /// blocking task that decodes, a request that goes away mid-decode does
+    /// not free it before the decode ends.
+    pub async fn enter(self: &Arc<Self>, limit: u32) -> Decoding {
+        loop {
+            // Asked before the count is read, so no end between the two goes
+            // unseen.
+            let ended = self.ended.notified();
+            tokio::pin!(ended);
+            ended.as_mut().enable();
+            {
+                let mut running = self.running.lock().expect("decodes lock");
+                if *running < limit.max(1) {
+                    *running += 1;
+                    return Decoding(Arc::clone(self));
+                }
+            }
+            ended.await;
+        }
+    }
+
+    /// The decodes running now.
+    pub fn running(&self) -> u32 {
+        *self.running.lock().expect("decodes lock")
+    }
+}
+
+/// A decode counted as running ([`Decodes::enter`]), until dropped.
+#[derive(Debug)]
+pub struct Decoding(Arc<Decodes>);
+
+impl Drop for Decoding {
+    fn drop(&mut self) {
+        *self.0.running.lock().expect("decodes lock") -= 1;
+        self.0.ended.notify_waiters();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,12 +278,12 @@ mod tests {
 
     /// A job is counted from its admission until its guard goes, waiting then
     /// running, and is never between the two.
-    #[test]
-    fn a_job_counts_as_waiting_then_running_until_its_guard_goes() {
+    #[tokio::test]
+    async fn a_job_counts_as_waiting_then_running_until_its_guard_goes() {
         let jobs = Arc::new(ImageJobs::default());
         let (first, second) = (jobs.wait(), jobs.wait());
         assert_eq!(jobs.in_flight(), InFlight { waiting: 2, running: 0 });
-        let running = first.start();
+        let running = first.turn().await.expect("the first's turn at once");
         assert_eq!(jobs.in_flight(), InFlight { waiting: 1, running: 1 });
         drop(second);
         drop(running);
@@ -252,10 +295,10 @@ mod tests {
 
     /// Spec image-model/05 §The queue: `depth` jobs wait behind the running
     /// one and one more is refused; a closed queue admits none.
-    #[test]
-    fn the_queue_admits_up_to_its_depth_behind_the_running_job() {
+    #[tokio::test]
+    async fn the_queue_admits_up_to_its_depth_behind_the_running_job() {
         let jobs = Arc::new(ImageJobs::default());
-        let running = jobs.admit(2).expect("an empty queue admits").start();
+        let running = jobs.admit(2).expect("an empty queue admits").turn().await.expect("its turn at once");
         let waiting: Vec<Waiting> = (0..2).map(|_| jobs.admit(2).expect("room to wait")).collect();
         assert_eq!(jobs.in_flight(), InFlight { waiting: 2, running: 1 });
         assert!(jobs.admit(2).is_none(), "a third would wait past the depth");
@@ -264,7 +307,7 @@ mod tests {
         let again = jobs.admit(2);
         assert!(again.is_some(), "room again");
         drop((again, waiting));
-        let one = jobs.admit(0).map(Waiting::start);
+        let one = jobs.admit(0).expect("depth 0 runs one").turn().await;
         assert!(one.is_some(), "depth 0 runs one");
         assert!(jobs.admit(0).is_none(), "with none waiting");
         drop(one);
@@ -306,7 +349,7 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), [0, 2, 3]);
         assert!(jobs.in_flight().is_idle());
 
-        let running = jobs.admit(8).unwrap().start();
+        let running = jobs.admit(8).unwrap().turn().await.expect("an empty queue's turn at once");
         let waiting = jobs.admit(8).unwrap();
         let closed = tokio::spawn(async move { waiting.turn().await.is_none() });
         tokio::task::yield_now().await;
@@ -314,6 +357,29 @@ mod tests {
         assert!(closed.await.unwrap(), "a waiting job gets no turn once closed");
         drop(running);
         assert!(jobs.in_flight().is_idle());
+    }
+
+    /// Review-322cf L1: at most `limit` decodes run, read as each one asks,
+    /// and one waiting gets its turn when one ends.
+    #[tokio::test]
+    async fn decodes_run_up_to_the_limit_each_one_reads() {
+        let decodes = Arc::new(Decodes::default());
+        let (first, second) = (decodes.enter(2).await, decodes.enter(2).await);
+        assert_eq!(decodes.running(), 2);
+        let third = tokio::spawn({
+            let decodes = Arc::clone(&decodes);
+            async move { decodes.enter(2).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!third.is_finished(), "a third waits at a limit of 2");
+        drop(first);
+        let third = third.await.unwrap();
+        assert_eq!(decodes.running(), 2);
+        let fourth = tokio::time::timeout(std::time::Duration::from_secs(5), decodes.enter(3)).await.expect("room at a limit of 3");
+        drop((second, third, fourth));
+        assert_eq!(decodes.running(), 0);
+        let _one = decodes.enter(0).await;
+        assert_eq!(decodes.running(), 1, "a limit of 0 still lets one run");
     }
 
     /// Spec image-model/05 §Sizes: the fake's plan makes every default size,

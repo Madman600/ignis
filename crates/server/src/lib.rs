@@ -139,12 +139,9 @@ pub struct Server {
     /// routes `501`: a server built in a test without one has no config to
     /// show or change.
     pub config: Option<std::sync::Arc<config_http::ConfigState>>,
-    /// The edits decoding their condition images now: one at a time
-    /// (review-322b F2), since each may decode `image.max_condition_images`
-    /// frames of up to `image.max_condition_mipx` before the queue sees it,
-    /// and the queue behind runs one job at a time anyway — decodes side by
-    /// side would buy memory, not throughput.
-    pub image_decodes: std::sync::Arc<tokio::sync::Semaphore>,
+    /// The edits decoding their condition images now, at most
+    /// `image.max_condition_decodes` at once ([`images::Decodes`]).
+    pub image_decodes: std::sync::Arc<images::Decodes>,
 }
 
 /// The server-level knobs a live config change may touch (spec config-v2/02
@@ -298,7 +295,7 @@ impl Server {
             usage: std::sync::Arc::default(),
             switcher: None,
             config: None,
-            image_decodes: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            image_decodes: std::sync::Arc::default(),
         }
     }
 
@@ -502,6 +499,14 @@ impl Server {
     /// (`--model-idle-unload`, spec model-switch/02); zero never does.
     pub fn with_idle_unload(self, after: Duration) -> Self {
         self.update_live(|live| live.idle_unload = after);
+        self
+    }
+
+    /// Serve images as `image` says (`image.*`, spec image-model/05): what
+    /// `main` resolved at start, until a live change or a switch applies
+    /// another configuration.
+    pub fn with_image(self, image: config::schema::ImageGroup) -> Self {
+        self.update_live(|live| live.image = image);
         self
     }
 

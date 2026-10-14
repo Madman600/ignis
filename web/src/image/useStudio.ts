@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type ImageParams, type ImageProgress, isEdit } from "../api/images.ts";
-import { imageLoaded, type ModelState } from "../api/model.ts";
+import { imageLoaded, type LastSwitch, type ModelState } from "../api/model.ts";
+import { afterSwitch } from "../server/outcome.ts";
 import { type CatalogRow, type ConfigDocument, readCatalog, readConfig } from "../server/routes.ts";
-import { type GalleryItem, imageModelRow, type Limits, limitsOf, performRun, switchToImageModel } from "./studio.ts";
+import { type GalleryItem, imageModelRow, lastSwitchOf, type Limits, limitsOf, performRun, settleSwitch, switchToImageModel } from "./studio.ts";
 
 // The image view's state (spec image-model/05 §Playground): what the server
 // allows, the run under way with its progress, the gallery, and the explicit
@@ -52,10 +53,13 @@ export function useStudio(model: ModelState, refreshModel: () => void, visible: 
   const [notes, setNotes] = useState<string[]>([]);
   const [gallery, setGallery] = useState<GalleryItem[]>([]);
   const [revised, setRevised] = useState<string | null>(null);
-  const [switching, setSwitching] = useState(false);
+  // The owner's switch under way, with the last switch recorded when the button was pressed.
+  const [following, setFollowing] = useState<{ before?: LastSwitch } | null>(null);
   const [switchRefusal, setSwitchRefusal] = useState<string | null>(null);
   const abort = useRef<AbortController | null>(null);
   const nextId = useRef(1);
+  const modelNow = useRef(model);
+  modelNow.current = model;
 
   // Read on opening the view and on each return to it, and again once the image model serves: the sizes
   // and counts it offers are the running server's.
@@ -66,16 +70,19 @@ export function useStudio(model: ModelState, refreshModel: () => void, visible: 
     void readCatalog().then((answer) => answer.ok && setCatalog(answer.value));
   }, [visible, served]);
 
-  // After the owner's switch the page follows the model until it serves as an image model, or the switch fails.
+  // After the owner's switch the page follows the model until it serves as an image model, or the switch's record
+  // says it did not land (settleSwitch), and then says why.
   useEffect(() => {
-    if (!switching) return;
-    if (served || model.state === "error") {
-      setSwitching(false);
+    if (!following) return;
+    const settled = settleSwitch(following.before, model);
+    if (settled.kind === "done") {
+      setFollowing(null);
+      if (settled.line) setSwitchRefusal(settled.line);
       return;
     }
     const timer = setInterval(refreshModel, 1000);
     return () => clearInterval(timer);
-  }, [switching, served, model.state, refreshModel]);
+  }, [following, model, refreshModel]);
 
   useEffect(() => () => abort.current?.abort(), []);
 
@@ -110,18 +117,23 @@ export function useStudio(model: ModelState, refreshModel: () => void, visible: 
   }, [refreshModel]);
 
   const switchToImage = useCallback(() => {
-    if (!imageModelRow(catalog) || switching) return;
+    if (!imageModelRow(catalog) || following) return;
     setSwitchRefusal(null);
-    setSwitching(true);
+    setFollowing({ before: lastSwitchOf(modelNow.current) });
     void switchToImageModel(catalog).then((answer) => {
-      if (answer && !answer.ok) {
-        setSwitching(false);
-        setSwitchRefusal(answer.message);
+      if (!answer) {
+        setFollowing(null);
         return;
       }
-      refreshModel();
+      // A refusal is named in the band; a 409 (a switch already under way) reads the model again.
+      const after = afterSwitch(answer);
+      if (!after.follow) {
+        setFollowing(null);
+        setSwitchRefusal(after.refusal);
+      }
+      if (after.refreshModel) refreshModel();
     });
-  }, [catalog, switching, refreshModel]);
+  }, [catalog, following, refreshModel]);
 
   const state: StudioState = {
     limits: limitsOf(config),
@@ -131,7 +143,7 @@ export function useStudio(model: ModelState, refreshModel: () => void, visible: 
     notes,
     gallery,
     revised,
-    switching,
+    switching: following !== null,
     switchRefusal,
   };
   const actions: StudioActions = {

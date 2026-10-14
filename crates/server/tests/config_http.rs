@@ -1210,7 +1210,7 @@ async fn the_image_fields_are_listed_and_change_live_within_their_bounds() {
     assert_eq!(
         names,
         [
-            "queue_depth", "max_n", "max_condition_images", "max_condition_mipx", "sizes", "condition_budget_tokens", "condition_floor_px",
+            "queue_depth", "max_n", "max_condition_images", "max_condition_mipx", "max_condition_decodes", "sizes", "condition_budget_tokens", "condition_floor_px",
             "prompt_enhancement", "prompt_enhancer", "prompt_enhancer_max_tokens",
         ]
     );
@@ -1238,4 +1238,40 @@ async fn the_image_fields_are_listed_and_change_live_within_their_bounds() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
     assert!(refused["error"]["message"].as_str().unwrap().contains("image.max_n"), "{refused}");
     assert_eq!(server.live().image.queue_depth, 2, "nothing in a refused patch applies");
+}
+
+/// Spec image-model/05 §Prompt enhancement (review-322cf M3): a patch naming
+/// `image.prompt_enhancer` is refused whole unless it names a text model a
+/// rewrite can run on — the loaded one, or one an explicit switch may name,
+/// the patch's own `switch.known_models` among them; the image model is
+/// none. A patch that does not name it is not judged by it.
+#[tokio::test]
+async fn a_patch_naming_an_enhancer_no_switch_reaches_is_refused() {
+    let loader = MockLoader::new();
+    let server = server_on(&loader, started(&["--image-prompt-enhancer", "nobody"]));
+    let app = server.app();
+    let enhancer = || server.live().image.prompt_enhancer.clone();
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "image": { "queue_depth": 1 } }))).await;
+    assert_eq!(status, StatusCode::OK, "an enhancer the start took is not judged again: {applied}");
+
+    for (body, named) in [
+        (json!({ "image": { "prompt_enhancer": "nobody-else", "queue_depth": 2 } }), "nobody-else"),
+        (
+            json!({ "switch": { "known_models": { "ignis-image-2.1-turbo": "image.ninfer" } }, "image": { "prompt_enhancer": "ignis-image-2.1-turbo" } }),
+            "ignis-image-2.1-turbo",
+        ),
+    ] {
+        let (status, refused) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+        assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("config_invalid")), "{refused}");
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(message.contains("image.prompt_enhancer") && message.contains(named), "{message}");
+        assert_eq!((server.live().image.queue_depth, enhancer()), (1, "nobody".to_owned()), "nothing applied");
+    }
+
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "image": { "prompt_enhancer": "mock-a" } }))).await;
+    assert_eq!(status, StatusCode::OK, "the loaded model: {applied}");
+    let body = json!({ "switch": { "known_models": { "mock-b": "mock-b.ninfer" } }, "image": { "prompt_enhancer": "mock-b" } });
+    let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "a model the patch itself lists: {applied}");
+    assert_eq!(enhancer(), "mock-b");
 }

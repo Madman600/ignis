@@ -112,15 +112,21 @@ All are multiples of 32.
 ### Prompt enhancement
 
 Optional, and off unless the request or `image.prompt_enhancement` asks for
-it. The enhancer model is `image.prompt_enhancer`, a served id that must be a
-known model (default the 27B's).
+it. The enhancer model is `image.prompt_enhancer` (default the 27B's), the
+served id of a text model the server can switch to by id, or of the text
+model loaded. Where the server knows its text models (it can switch), a
+`PATCH` naming any other is refused and a start warns of it; a request that
+meets one anyway uses its prompt as sent, with a warning.
 
 - **Text model loaded when the job arrives.** If it is the enhancer, the job
   is rewritten first and then the switch to the image model happens, with no
   extra switch. If it is another text model, the job switches to the
-  enhancer first and then to the image model.
+  enhancer first and then to the image model: the request's switch, so
+  *Last switch* records both.
 - **Image model loaded.** One **enhancement visit** per job: switch to the
   enhancer, rewrite, switch back.
+  - The job takes its turn in the queue first: the jobs admitted before it
+    finish on the image model, and the visit begins with none running.
   - During the visit other requests get `503 model_switching` with
     `Retry-After`.
   - *Last switch* is not updated, and the visit counts as use.
@@ -484,8 +490,8 @@ The workspace on 08c23b3, which 322c never recorded, was 2896/0/6.
     permit, holds each edit's decode.
   - **F3, F4.** §Streaming names the edit events (the coordinator's ruling).
     `media.rs` names the Pillow 12.3.0 files its resize ports and root
-    `NOTICE` carries Pillow's notice; ADR 0051's licence list is the owner's
-    and is left as written.
+    `NOTICE` carries Pillow's notice. ADR 0051, amended by the owner
+    (2026-10-14), admits MIT-CMU (HPND), Pillow's licence.
   - **L1-L7, N1, N4.** No doc claims a 400 never loads a model. A runner's
     own `OverBudget` is `400 condition_budget_exceeded`. OpenAI's Images
     fields go through `openai_fields` (`Surface::Images`: `partial_images`
@@ -511,7 +517,8 @@ The workspace on 08c23b3, which 322c never recorded, was 2896/0/6.
   next), then on (`Visit::on`, or the beginner gone). Every other request
   meets `503 model_switching` with `Retry-After`, and a switch `409`, from
   the first step to the last. `last_switch` is never written: `run` and
-  `restore` record a switch or a reload only. A way there refused or failed
+  `restore` record a switch or a reload only (322g: and each switch of a
+  visit that ends on another model than it left, L2). A way there refused or failed
   ends the visit with the old model serving, reloaded if need be; a way on
   that fails reloads the visited model. `SwitchRefusal::NotServing` refuses
   a visit with nothing serving.
@@ -544,23 +551,23 @@ The workspace on 08c23b3, which 322c never recorded, was 2896/0/6.
 - **Defaults taken** (owner may revisit).
   - An `image.prompt_enhancer` that names no switchable text model falls back
     with a warning rather than refusing the request; a `PATCH` naming one is
-    accepted.
+    accepted (322g: refused now, M3; the fallback stays).
   - A visit drains the image model as any switch does: a running or queued
     job gets `switch.drain_timeout`, then ends `503 model_stopped`. Taking
-    the queue's turn first was considered and not built.
+    the queue's turn first was considered and not built (322g: built, M1).
   - An unloaded image model loads first and is then visited: three loads.
     Loading the enhancer straight away would race the requests waiting on
     the unloaded image model.
   - The enhancer-serving path's switch to the image model is an ordinary
     implicit switch, written to `last_switch`; a visit from another text
-    model is not.
+    model is not (322g: it is now, L2).
   - The rewrite is a client request on the enhancer (logged and counted),
     not an internal one. Upstream's user turn is kept verbatim, its stray
     space before `Rewritten Prompt:` included. An edit's answer that is not
     the JSON object is taken as the prompt; a rewrite cut at the token cap
     is used as it is.
   - One decode permit, fixed: it mirrors the one-job queue rather than
-    being a tunable.
+    being a tunable (322g: `image.max_condition_decodes`, default 1, L1).
 - **Tests.** `tests/image_enhancement.rs` (the streamed phases, the visit
   and its failures, AC 9: the enhancer-serving path's one switch and its
   Chinese system prompt, the visit's two switches and untouched
@@ -606,13 +613,13 @@ The baseline on 96db56b (322d never recorded one): `cargo test --workspace`
   4. Done (322b).
   5. Done (322b, with 322c's fixes).
   6. Done (322b, 322d's phases).
-  7. Done (322b).
+  7. Done (322b); an enhanced request's visit keeps the FIFO (322g, M1).
   8. Done (322a).
-  9. Done (322d).
-  10. Done (322a).
+  9. Done (322d); 322g closes review-322cf's M1, M3, L2 and L3 on it.
+  10. Done (322a); 322g adds `image.max_condition_decodes`.
   11. Done (322e); the revision is pinned to d6912417 (c81e8c6).
-  12. Done (322f): the image view, its switch button and gallery; see "As built (322f)".
-  13. Done: OpenAPI (322b) and the user docs (322e).
+  12. Done (322f): the image view, its switch button and gallery; see "As built (322f)". 322g: the switch is followed by its record (M2).
+  13. Done: OpenAPI (322b) and the user docs (322e), corrected by 322g (L4).
   14. The runner adapter is built (321d, below); the live run from the Playground remains.
 
 ## As built (322f, 2026-10-14, branch `image-serving-322`: AC 12)
@@ -651,6 +658,106 @@ The Playground's image view. Web only; no Rust touched.
   retry. The previews are object URLs, revoked on unmount.
 - **Gates.** `npm test` (855 tests) and `npm run build` pass. The view was not
   looked at in a browser (the owner watches :5173).
+
+## As built (322g, 2026-10-14, branch `image-serving-322`: the review-322cf close-out)
+
+The findings of `.scratch/orchestra/reviews/review-322cf.md`, as listed in
+`step0-322g.md`; M1 and M3 as the coordinator decided them. Commits
+e74a0e6..HEAD.
+
+- **M1, the queue turn before a visit.** An enhanced request on the loaded
+  image model is admitted to its queue as a job is (`503 engine_full`,
+  `model_stopped`) and waits its turn (`routes::queue_turn`). The visit
+  begins once every job admitted before it has run, with none running, so
+  its drain cuts none of them. The jobs admitted behind it run in the
+  visit's drain, as in any switch's, and end `503 model_stopped` past
+  `switch.drain_timeout`. The enhanced job then runs on the image model
+  loaded again. Test: a running and a queued job, held past a 200 ms drain
+  window, both complete, then the visit, then the enhanced job.
+- **M2 (web).** The image view follows its switch as the Server view follows
+  Load. It records the last switch at the press, stops once the image model
+  serves or the record changes, and shows `lastSwitchLine` in the band when
+  the switch did not land (`studio.ts` `settleSwitch`, tested). The POST's
+  answer goes through `afterSwitch`, so a `409` re-reads the model.
+- **M3, the enhancer's rule.** `images::enhance::unknown_enhancer` applies
+  where the server can switch. The enhancer must be the text model loaded,
+  or one an explicit switch by id may name (`Switcher::text_model_among`,
+  the patch's own `switch.known_models` included), never the image model.
+  - A `PATCH` naming `image.prompt_enhancer` otherwise is `400
+    config_invalid`, nothing applied. A patch that does not name it is not
+    judged by it.
+  - A start warns once: `ignis.config.prompt_enhancer_unknown`, naming it.
+  - The request-time fallback with a warning stays.
+- **Found on the way: the start's `image.*`.** `main` never put the start's
+  `image.*` (flag, env, file) into the live knobs. Every image route ran on
+  the defaults until a `PATCH` or a switch applied the configuration.
+  `Server::with_image` now does it at start. The start warning's test sets
+  the enhancer by flag, so it covers this.
+- **L1, the decode.** The decode's turn is held by the blocking task that
+  decodes, so a disconnect mid-decode does not free it (`images::Decodes`).
+  Their count is the new live field `image.max_condition_decodes` (1,
+  1..=16). Each condition image is resized as soon as it is decoded, to its
+  unscaled encoded size (`routes::Conditions`); its size as sent stays for
+  the budget and `auto`.
+- **L2, the visit from another text model.** A visit that ends on another
+  model than it left writes each of its two switches to `last_switch` with
+  that switch's own ends (`Begun::recorded`). Once it lands, the record is
+  the enhancer to the image model; when the way on fails, it says how
+  (restored: the enhancer serves again). A visit back to the model it left
+  writes nothing, as before.
+- **L3.** An enhanced request on the enhancer the idle clock unloaded loads
+  the enhancer, rewrites on it and switches once: two loads, not three.
+- **L4, the user docs.** The README now:
+  - links the weights' `LICENSE` and `NOTICE` on the hub at the pinned
+    revision, with root `NOTICE` for the third-party code and text;
+  - describes the queue turn and the drain behind it, the visit's records
+    and the enhancer's rule;
+  - gives `max_condition_mipx` in Mi pixels per image, lists every
+    condition-image refusal, and adds `max_condition_decodes`;
+  - names the past-the-plan `400` under Sizes.
+- **L5.** `tools/image-prompts/gen_prompts.py`, whose docstring is the
+  recipe, regenerates `prompts.rs` byte for byte; the header names it.
+- **L6.** An edit's images are PNG-encoded for the enhancer on
+  `spawn_blocking`. The vision path, untested before, now has a test.
+- **L7.**
+  - `make smoke` under `MODEL=image` makes one 1024x1024 image and prints
+    its status and size; `flags-selftest` checks both families.
+  - The web's `DEFAULT_LIMITS.maxN` is 10, and a test pins the defaults to
+    the server's.
+  - The chat's empty state names the image view for an unloaded image model
+    too, tested.
+  - A gallery picture's data URL is built once, when it arrives.
+- **Nits.** `loading` is streamed from any load a request waits on, another
+  request's included. `enhance` checks and rewrites on one pinned server.
+  `Waiting::start` is gone (review-322b L5).
+- **Defaults taken** (owner may revisit).
+  - **M1, the jobs behind.** They run in the visit's drain rather than being
+    cut at once: they cannot move to the image model loaded again, and the
+    drain window is what any switch gives them. The enhanced job runs after
+    them.
+  - **L1, scaled images.** An image the budget scales is resized again from
+    its 1024²-area copy, not from the source: two Lanczos passes where there
+    was one. diffusers has no scaled case to match. The unscaled case is the
+    single pass from the source it always was. A source smaller than 1024² of
+    area is upscaled at once too (a 64x32 PNG is held as 1440x736, about
+    4 MiB): what an edit holds while it waits is bounded by 10 such images,
+    not 10 frames of up to 64 MiB.
+  - **L2, the records.** Each leg is recorded with its own ends, not one
+    record from the first model to the last, so that a restored or failed
+    outcome names the model actually loaded again.
+  - **M3, without a switcher.** A server that cannot switch judges no
+    enhancer: there are no text models to judge it against.
+- **For #321.** A runner that panicked keeps serving: the job is `500
+  engine_error` and its prefix is released. With the real leaf, a panic may
+  leave device state behind, so the adapter should then fail the model
+  (status `failed`, with a switch or reload as the way back).
+- **Also.** `tests/idle_unload.rs`' `unloaded()` waits for the unload to
+  free the switch's slot. Under CPU load, four tests met the slot still held
+  (`409 switch_in_progress`).
+- **Gates.** `CARGO_INCREMENTAL=0 cargo test --workspace` 2921/0/6 (322e's
+  2913 plus eight new tests); `cargo check -p ignis-server --features cuda
+  --tests` clean; in `web/`, `npm test` 860 and `npm run build` green;
+  `mk/flags-selftest.sh` ok.
 
 ## As built (321d, 2026-10-14, branch `image-leaf-321`: the real runner behind these routes)
 

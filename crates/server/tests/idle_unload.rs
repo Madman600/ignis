@@ -146,10 +146,13 @@ async fn until_true(what: &str, check: impl Fn() -> bool) {
     panic!("never: {what}");
 }
 
-/// [`until`] `unloaded`, from a server's start, and the teardown after it.
+/// [`until`] `unloaded`, from a server's start, and the teardown after it —
+/// through the release of the switch's slot, a moment after the scheduler
+/// is dropped: a switch asked for before it is `409 switch_in_progress`.
 async fn unloaded(server: &Server, loader: &MockLoader) {
     until(server, "unloaded", IDLE * 5).await;
     until_true("the unloaded model's scheduler was dropped", || loader.resident() == 0).await;
+    until_true("the unload freed the switch's slot", || server.switcher.as_ref().unwrap().running().is_none()).await;
 }
 
 /// AC 2: with nobody using it, the model is torn down after `idle_unload`

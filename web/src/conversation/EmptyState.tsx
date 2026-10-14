@@ -19,7 +19,7 @@ export function EmptyState({ model }: { model: ModelState }) {
           {HEADLINE[model.state]}
         </p>
         <p className="text-sm text-ash">
-          {model.state === "ready" && model.kind === "image" && (
+          {(model.state === "ready" || model.state === "unloaded") && model.kind === "image" && (
             <>
               <span className="font-display text-ink">{model.id}</span> makes images, not replies. Make them in the Image view; a chat model
               loads from the Server view.
@@ -33,7 +33,7 @@ export function EmptyState({ model }: { model: ModelState }) {
           )}
           {model.state === "reading" && "Asking ignis which model it serves."}
           {model.state === "switching" && `Loading ${model.to}. The prompt opens once it serves.`}
-          {model.state === "unloaded" && (
+          {model.state === "unloaded" && model.kind !== "image" && (
             <>
               <span className="font-display text-ink">{model.id}</span> was unloaded while idle. Send a prompt: it loads
               again first, and the first reply takes as long as the load.

@@ -308,7 +308,8 @@ async fn main() {
     let server = server
         .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))
         .with_instruction_policy(instruction_policy)
-        .with_idle_unload(std::time::Duration::from_secs(u64::from(idle_unload_secs)));
+        .with_idle_unload(std::time::Duration::from_secs(u64::from(idle_unload_secs)))
+        .with_image(running.settings().image.clone());
     // Spec config-v2/02: the running configuration, shown and changed over
     // `GET`/`PATCH /v1/config` and written back to the config file in use;
     // the model loader shares it, so a later switch loads with a live change
@@ -347,6 +348,19 @@ async fn main() {
                 .with_catalog(catalog_models, allow_model_switch),
         )
         .with_config(config_state);
+
+    // Spec image-model/05 §Prompt enhancement: an enhancer no switch reaches
+    // leaves every enhanced request on its prompt as sent. A `PATCH` naming
+    // one is refused; the start is not, and says so once.
+    let enhancer = server.live().image.prompt_enhancer.clone();
+    if let Some(reason) = ignis_server::images::enhance::unknown_enhancer(&server, &enhancer, &Default::default()) {
+        tracing::warn!(
+            name: "ignis.config.prompt_enhancer_unknown",
+            enhancer = %enhancer,
+            %reason,
+            "prompt enhancement uses each prompt as sent until image.prompt_enhancer names a text model this server can switch to"
+        );
+    }
 
     // GitHub #209: joining or gathering developer messages trades prefix
     // reuse for fewer system blocks; the operator is told once, at start.

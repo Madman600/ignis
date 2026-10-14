@@ -6,7 +6,6 @@ import { Switch } from "../ui/Switch.tsx";
 import { actionInk, actionShape, caption, field } from "../ui/classes.ts";
 import {
   AUTO_SIZE,
-  dataUrl,
   downloadImage,
   type GalleryItem,
   parseSeed,
@@ -372,7 +371,7 @@ function Gallery({ items, onClear, onRemove }: { items: GalleryItem[]; onClear: 
         {items.map((item) => (
           <li key={item.id} className="flex min-w-0 flex-col gap-2">
             <div className="checker overflow-hidden rounded-[2px] border border-line">
-              <img src={dataUrl(item.b64)} alt={item.revisedPrompt ?? item.prompt} className="block h-auto w-full" />
+              <img src={item.url} alt={item.revisedPrompt ?? item.prompt} className="block h-auto w-full" />
             </div>
             <p className="line-clamp-2 text-sm [overflow-wrap:anywhere]" title={item.revisedPrompt ?? item.prompt}>
               {item.revisedPrompt ?? item.prompt}

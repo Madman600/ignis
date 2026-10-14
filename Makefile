@@ -339,12 +339,18 @@ logs: ## Follow the background server log
 	tail -n 100 -f "$(SERVER_LOG)"
 
 .PHONY: smoke
-smoke: ## One /v1/models + one short chat completion against BIND
+smoke: ## One /v1/models + one short chat completion (MODEL=image: one 1024x1024 image) against BIND
 	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/v1/models"
 	@echo ""
+ifeq ($(MODEL_FAMILY),image)
+	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/v1/images/generations" -H 'Content-Type: application/json' \
+	  -d '{"model":"$(SMOKE_MODEL)","prompt":"a red circle on white","size":"1024x1024","n":1,"seed":1}' \
+	  -o /dev/null -w 'one 1024x1024 image: HTTP %{http_code}, %{size_download} bytes\n'
+else
 	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/v1/chat/completions" -H 'Content-Type: application/json' \
 	  -d '{"model":"$(SMOKE_MODEL)","messages":[{"role":"user","content":"Say hi in five words."}],"max_tokens":32}'
 	@echo ""
+endif
 
 .PHONY: metrics
 metrics: ## Scrape the metrics listener (a server started with METRICS=1; no key)

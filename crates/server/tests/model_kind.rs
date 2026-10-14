@@ -309,7 +309,7 @@ async fn a_queued_or_running_image_job_keeps_the_image_model_loaded() {
     let waiting = jobs.wait();
     tokio::time::sleep(IDLE + IDLE / 2).await;
     assert_eq!(server.status().as_str(), "serving", "a queued job is use");
-    let running = waiting.start();
+    let running = waiting.turn().await.expect("the only job's turn at once");
     tokio::time::sleep(IDLE + IDLE / 2).await;
     assert_eq!(server.status().as_str(), "serving", "a running job is use");
     assert_eq!(loader.resident(), 1);
@@ -366,7 +366,7 @@ async fn a_switch_drains_the_image_jobs_and_past_its_window_closes_the_queue() {
             .with_switcher(Switcher::new(Arc::clone(&loader) as _, drain).with_known_models(known(&[IMAGE, "mock-a"])));
         let app = server.app();
         let jobs = Arc::clone(&server.active().image_model().expect("the image model").jobs);
-        let running = jobs.wait().start();
+        let running = jobs.wait().turn().await.expect("the only job's turn at once");
         let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(switch_to("mock-a"))).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
         if released {

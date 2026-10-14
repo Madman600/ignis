@@ -14,7 +14,8 @@
 //! the hosted API it calls. The user turn is upstream's own
 //! ([`super::enhance`]). Each constant is generated from the pinned file:
 //! the literal's runtime value, its escapes resolved; a change to one is a
-//! re-pin of the commit above.
+//! re-pin of the commit above, this whole file written again by
+//! `tools/image-prompts/gen_prompts.py` (its docstring has the recipe).
 
 /// Rewrites a generation's English prompt (`polish_prompt_en`).
 pub const GENERATION_EN: &str = r#"# Image Prompt Rewriting Expert

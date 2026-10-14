@@ -90,8 +90,8 @@ describe("ImageView", () => {
   it("lists the gallery over a checkerboard, each picture with its download", () => {
     const html = render(image, {
       gallery: [
-        { id: 2, b64: "BBB", prompt: "a lantern", size: "1024x1024", seed: 8, edit: true },
-        { id: 1, b64: "AAA", prompt: "a lantern", revisedPrompt: "a brass lantern", size: "1024x1024", seed: 7, edit: false },
+        { id: 2, url: "data:image/png;base64,BBB", prompt: "a lantern", size: "1024x1024", seed: 8, edit: true },
+        { id: 1, url: "data:image/png;base64,AAA", prompt: "a lantern", revisedPrompt: "a brass lantern", size: "1024x1024", seed: 7, edit: false },
       ],
     });
     expect(html).toContain("Gallery · 2");

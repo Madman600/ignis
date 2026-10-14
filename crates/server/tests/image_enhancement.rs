@@ -29,6 +29,9 @@ use tower::ServiceExt;
 mod switch_support;
 use switch_support::{source, MockLoader};
 
+#[path = "support/media.rs"]
+mod media_support;
+
 /// The image model's served id: its family's own.
 const IMAGE: &str = "ignis-image-2.1-turbo";
 
@@ -153,6 +156,42 @@ async fn send_chat(app: &axum::Router) -> (StatusCode, Value) {
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// Review-322cf L3: a request to be rewritten on the enhancer the idle clock
+/// unloaded loads the enhancer, not the image model it names — the rewrite on
+/// it, then one switch: two loads, not three. A streamed request that comes
+/// while another's load runs waits on it, and hears `loading` too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enhanced_request_on_the_unloaded_enhancer_loads_it_and_switches_once() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]).with_idle_unload(IDLE);
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+    until(&server, "unloaded", IDLE * 5).await;
+    let body = json!({ "prompt": "a red fox", "model": IMAGE, "size": "1024x1024", "seed": 4, "prompt_enhancement": true, "stream": true });
+    let events = events_of(&app, body).await;
+    assert_eq!(phases(&events), then_the_job(&["loading 1/1", "enhancing 1/1", "switching 1/1", "loading 1/1"]));
+    assert!(events.last().unwrap().1["revised_prompt"].is_string(), "{:?}", events.last());
+    assert_eq!(loader.loads(), ["mock-a", IMAGE], "the enhancer, then the image model");
+
+    until(&server, "unloaded", IDLE * 5).await;
+    let hold = loader.hold_next_load();
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move { send_generation(&app, json!({ "prompt": "first", "size": "1024x1024" })).await }
+    });
+    until(&server, "loading", PATIENT).await;
+    let response = app.clone().oneshot(generation(json!({ "prompt": "second", "size": "1024x1024", "stream": true }))).await.unwrap();
+    let mut stream = response.into_body();
+    let heard = tokio::time::timeout(Duration::from_secs(5), stream.frame()).await.expect("an event while the load runs");
+    let heard = String::from_utf8(heard.unwrap().unwrap().into_data().unwrap().to_vec()).unwrap();
+    assert!(heard.contains("\"phase\":\"loading\""), "{heard}");
+    hold.send(()).unwrap();
+    assert_eq!(first.await.unwrap().0, StatusCode::OK);
+    while stream.frame().await.is_some() {}
+    assert_eq!(loader.loads(), ["mock-a", IMAGE, IMAGE]);
 }
 
 // ── the visit (model_switch::visit) ───────────────────────────────────────
@@ -359,6 +398,41 @@ async fn with_the_image_model_loaded_an_enhanced_request_visits_the_enhancer_and
     assert_eq!((loader.loads().len(), loader.encoded_prompts().last().map(String::as_str)), (5, Some("as sent")));
 }
 
+/// Review-322cf L2 (ADR 0049 §5): a visit from another text model ends on
+/// the image model the request names — the request's switch, streamed as a
+/// visit's two — so each of its switches is written to `last_switch` as a
+/// switch is: the last, from the enhancer to the image model, once it lands;
+/// when that one fails, how, the enhancer loaded again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_from_another_text_model_is_written_to_last_switch() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, "mock-b", &["mock-a", "mock-b", IMAGE]);
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    let last = || server.switcher.as_ref().unwrap().last_switch();
+    let body = json!({ "prompt": "a red fox", "model": IMAGE, "size": "1024x1024", "seed": 2, "prompt_enhancement": true, "stream": true });
+    let events = events_of(&app, body.clone()).await;
+    assert_eq!(
+        phases(&events),
+        then_the_job(&["switching 1/2", "loading 1/2", "enhancing 1/1", "switching 2/2", "loading 2/2"])
+    );
+    assert!(events.last().unwrap().1["revised_prompt"].is_string(), "{:?}", events.last());
+    assert_eq!(loader.loads(), ["mock-a", IMAGE]);
+    assert_eq!(last(), Some(LastSwitch { from: "mock-a".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched }));
+
+    let (_, task) = ignis_server::model_switch::begin(&server, source("mock-b")).unwrap();
+    assert_eq!(task.await.unwrap(), SwitchOutcome::Switched);
+    loader.break_load(IMAGE);
+    let mut whole = body;
+    whole["stream"] = json!(false);
+    let (status, refused) = send_generation(&app, whole).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("model_switch_failed")), "{refused}");
+    assert_eq!((server.status().as_str(), server.active().model_id()), ("serving", "mock-a".to_owned()));
+    let restored = last().expect("a record");
+    assert_eq!((restored.from.as_str(), restored.to.as_str()), ("mock-a", IMAGE));
+    assert!(matches!(restored.outcome, SwitchOutcome::Restored { .. }), "{restored:?}");
+}
+
 /// AC 9: while a visit runs — here with the rewrite done and the image
 /// model's reload held — every other request is answered `503
 /// model_switching` with `Retry-After`; the enhanced request is answered
@@ -394,6 +468,58 @@ async fn during_a_visit_other_requests_are_answered_model_switching() {
     let (status, answer) = enhanced.await.unwrap();
     assert_eq!(status, StatusCode::OK, "{answer}");
     assert!(answer["data"][0]["revised_prompt"].is_string(), "{answer}");
+    assert_eq!(server.status().as_str(), "serving");
+}
+
+/// Review-322cf M1: an enhanced request on the loaded image model takes its
+/// turn in the queue before it visits the enhancer. The job running and the
+/// one waiting before it run to their end on the image model — past the
+/// drain window, which would have cut them had the visit begun — and the
+/// visit comes after them; the enhanced job then runs on the image model
+/// loaded again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enhanced_request_visits_only_once_the_jobs_admitted_before_it_have_run() {
+    let loader = MockLoader::new();
+    let (model, gate) = loader.gated_image_model(IMAGE);
+    let drain = Duration::from_millis(200);
+    let server = Server::from_active(model)
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, drain).with_known_models(known(&["mock-a", IMAGE])));
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    let jobs = Arc::clone(&server.active().image_model().expect("the image model").jobs);
+    let send = |body: Value| {
+        let app = app.clone();
+        tokio::spawn(async move { send_generation(&app, body).await })
+    };
+    let in_flight = |waiting: u32, running: u32| {
+        let jobs = Arc::clone(&jobs);
+        async move {
+            let deadline = Instant::now() + PATIENT;
+            while (jobs.in_flight().waiting, jobs.in_flight().running) != (waiting, running) {
+                assert!(Instant::now() < deadline, "never {waiting} waiting and {running} running: {:?}", jobs.in_flight());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    };
+    let first = send(json!({ "prompt": "first", "size": "1024x1024" }));
+    in_flight(0, 1).await;
+    let second = send(json!({ "prompt": "second", "size": "1024x1024" }));
+    in_flight(1, 1).await;
+    let enhanced = send(json!({ "prompt": "third", "size": "1024x1024", "prompt_enhancement": true }));
+    in_flight(2, 1).await;
+    tokio::time::sleep(drain + drain / 2).await;
+    assert_eq!((server.status().as_str(), loader.loads().len()), ("serving", 0), "no visit while jobs before it remain");
+
+    gate.open();
+    for (name, answer) in [("first", first), ("second", second)] {
+        let (status, answer) = answer.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{name}: {answer}");
+    }
+    let (status, answer) = enhanced.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let revised = answer["data"][0]["revised_prompt"].as_str().expect("revised_prompt").to_owned();
+    assert_eq!(loader.encoded_prompts(), ["first".to_owned(), "second".to_owned(), revised], "the visit after both jobs");
+    assert_eq!(loader.loads(), ["mock-a", IMAGE]);
     assert_eq!(server.status().as_str(), "serving");
 }
 
@@ -448,14 +574,8 @@ async fn a_failing_enhancer_falls_back_to_the_prompt_as_sent_with_a_warning() {
     assert_eq!((loader.loads(), loader.encoded_prompts()), (vec![IMAGE.to_owned()], vec!["engine fault".to_owned()]));
 }
 
-/// An edit's enhancer with no vision tower rewrites the instruction from its
-/// text alone, and the answer says so beside the rewrite.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_edit_rewritten_without_a_vision_tower_says_so() {
-    let loader = MockLoader::new();
-    let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]);
-    enhancing_with(&server, "mock-a");
-    let app = server.app();
+/// An enhanced edit naming the image model, with one 64x64 condition image.
+fn enhanced_edit() -> Request<Body> {
     const BOUNDARY: &str = "ignis-enhancement-boundary";
     let image = ignis_core::image::RgbaImage { size: ignis_core::image::ImageSize::new(64, 64), pixels: vec![90; 64 * 64 * 4] };
     let png = ignis_server::images::job::encode_png(&image);
@@ -466,18 +586,63 @@ async fn an_edit_rewritten_without_a_vision_tower_says_so() {
     body.extend(format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n").bytes());
     body.extend_from_slice(&png);
     body.extend(format!("\r\n--{BOUNDARY}--\r\n").bytes());
-    let request = Request::builder()
+    Request::builder()
         .method(Method::POST)
         .uri("/v1/images/edits")
         .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={BOUNDARY}"))
         .body(Body::from(body))
-        .unwrap();
-    let response = app.clone().oneshot(request).await.unwrap();
+        .unwrap()
+}
+
+/// An edit's enhancer with no vision tower rewrites the instruction from its
+/// text alone, and the answer says so beside the rewrite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_rewritten_without_a_vision_tower_says_so() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]);
+    enhancing_with(&server, "mock-a");
+    let response = server.app().oneshot(enhanced_edit()).await.unwrap();
     let status = response.status();
     let answer: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(status, StatusCode::OK, "{answer}");
     assert!(answer["data"][0]["revised_prompt"].is_string(), "{answer}");
     let warning = answer["warnings"][0].as_str().unwrap_or_default();
     assert!(warning.contains("no vision tower") && warning.contains("without seeing its condition images"), "{answer}");
+    assert_eq!(loader.loads(), [IMAGE]);
+}
+
+/// An edit's enhancer with a vision tower is shown the condition images —
+/// PNG-encoded off the async workers (review-322cf L6) — before the
+/// instruction, and the answer has nothing to say of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_rewritten_with_a_vision_tower_shows_it_the_images() {
+    let loader = MockLoader::new();
+    let compute = Arc::new(MockCompute::new());
+    let limits = ignis_artifact::vision::ProcessorOptions {
+        min_pixels: 32 * 32,
+        max_pixels: 128 * 128,
+        max_encoded_media_bytes: 256 << 20,
+        max_decoded_pixels: 1 << 24,
+        max_raw_patches: 1 << 17,
+        max_vision_tokens: 1 << 15,
+    };
+    let acquirer = ignis_server::media::MediaAcquirer::new(
+        Arc::new(media_support::processor(limits.clone())),
+        limits,
+        ignis_server::media::MediaPolicy::new(false, 0),
+    );
+    let server = Server::from_active(loader.model_over("mock-a", Arc::clone(&compute) as _))
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_known_models(known(&["mock-a", IMAGE])))
+        .with_media(Arc::new(acquirer));
+    enhancing_with(&server, "mock-a");
+    let response = server.app().oneshot(enhanced_edit()).await.unwrap();
+    let status = response.status();
+    let answer: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer["data"][0]["revised_prompt"].is_string(), "{answer}");
+    assert!(answer.get("warnings").is_none(), "{answer}");
+    let rewrites = prefilled(&compute);
+    assert_eq!(rewrites.len(), 1, "one rewrite");
+    assert!(rewrites[0].1.contains(&ignis_artifact::vision::IMAGE_PAD_ID), "the rewrite saw the condition image");
     assert_eq!(loader.loads(), [IMAGE]);
 }
