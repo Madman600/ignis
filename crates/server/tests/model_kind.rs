@@ -353,6 +353,40 @@ async fn an_unused_image_model_unloads_and_the_next_request_that_needs_a_model_l
     assert_eq!(loader.loads(), [IMAGE, "mock-a"], "one load each, never the image model before the text one");
 }
 
+/// A switch away from the image model drains its jobs as it drains a text
+/// model's lanes: a running job holds the teardown back for the drain
+/// window — the runner stays, nothing loads — and past a short window the
+/// queue is closed and the switch lands anyway, the runner dropped before
+/// the next model loads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_switch_drains_the_image_jobs_and_past_its_window_closes_the_queue() {
+    for (drain, released) in [(PATIENT, true), (Duration::from_millis(100), false)] {
+        let loader = MockLoader::new();
+        let server = Server::from_active(loader.model(IMAGE))
+            .with_switcher(Switcher::new(Arc::clone(&loader) as _, drain).with_known_models(known(&[IMAGE, "mock-a"])));
+        let app = server.app();
+        let jobs = Arc::clone(&server.active().image_model().expect("the image model").jobs);
+        let running = jobs.wait().start();
+        let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(switch_to("mock-a"))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+        if released {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(server.status().as_str(), "switching", "a running job holds the switch in its drain");
+            assert!(loader.loads().is_empty() && !jobs.is_closed());
+            assert_eq!(loader.resident(), 1, "the image runner is still there");
+            drop(running);
+            until(&server, "serving", PATIENT).await;
+        } else {
+            until(&server, "serving", PATIENT).await;
+            assert!(jobs.is_closed(), "past the window the queue is closed: the job stops at its next step");
+            drop(running);
+        }
+        assert_eq!(server.active().model_id(), "mock-a");
+        assert_eq!(loader.loads(), ["mock-a"]);
+        assert_eq!(loader.resident_at_load(), [0], "the image runner left the card before the text model loaded");
+    }
+}
+
 /// The same as [`implicit_off`] or [`implicit_on`], with the idle clock's
 /// `model.idle_unload` at [`IDLE`].
 fn idle(server: Server) -> Server {

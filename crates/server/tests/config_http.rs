@@ -349,6 +349,33 @@ async fn a_thinking_default_the_template_cannot_honour_is_refused_live() {
     assert_eq!(server.live().default_thinking_budget, None);
 }
 
+/// The image model thinks nothing (spec image-model/05): a live change to
+/// the thinking defaults is not judged by its template — the same changes
+/// the text model's refuses above apply — and the next text model's load
+/// judges them.
+#[tokio::test]
+async fn with_the_image_model_loaded_the_thinking_defaults_are_not_judged() {
+    let loader = MockLoader::new();
+    let config = started(&[]);
+    let server = Server::from_active(loader.model("ignis-image-2.1-turbo"))
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT))
+        .with_config(Arc::new(ConfigState::new(config.clone(), Arc::new(RealFiles))));
+    server.apply_config(&config);
+    server.update_active(|model| model.template = Arc::new(NoThinkingControl));
+    let app = server.app();
+    for body in [
+        json!({ "model": { "enable_thinking": false } }),
+        json!({ "model": { "reasoning_effort": "low" } }),
+        json!({ "model": { "thinking_budget": 2048 } }),
+    ] {
+        let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{body}: {applied}");
+    }
+    assert!(!server.live().default_enable_thinking);
+    assert_eq!(server.live().default_thinking_budget, Some(2048));
+    assert!(loader.loads().is_empty(), "a live change, no reload");
+}
+
 /// The placeholder's template, except that it can neither disable thinking
 /// nor take an effort: what a real template's capabilities can refuse.
 struct NoThinkingControl;

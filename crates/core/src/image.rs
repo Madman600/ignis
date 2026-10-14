@@ -80,8 +80,9 @@ pub struct RgbaImage {
 /// What an image job is conditioned on: its prompt, as the client sent it
 /// (or as prompt enhancement revised it), and its condition images at the
 /// size the condition budget left them — none for text-to-image. The runner
-/// tokenizes and prepares them itself: it holds the artifact's tokenizer and
-/// templates (spec image-model/03).
+/// tokenizes and prepares them: the real one is the server's adapter over the
+/// image leaf, which holds the artifact's tokenizer and templates and runs
+/// the server's image preprocessing (spec image-model/03 §Seams, 05).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageCondition {
     pub prompt: String,
@@ -186,8 +187,9 @@ impl std::fmt::Display for ImageError {
 }
 
 /// The image model's compute seam: the only calls an image job makes on the
-/// model, one at a time. The real runner is the image leaf's (spec
-/// image-model/04); [`FakeImageRunner`] stands in for it on the CPU.
+/// model, one at a time. The real runner is the server's adapter over the
+/// image leaf (spec image-model/04, 05); [`FakeImageRunner`] stands in for it
+/// on the CPU.
 ///
 /// `&mut self`: one job runs at a time (spec image-model/05 §The queue), so
 /// the runner has one caller, and its holder serializes the calls.

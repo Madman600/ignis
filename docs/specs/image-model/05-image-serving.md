@@ -262,8 +262,9 @@ enhancement and the Playground are the agents after it.
   → `ConditionId`, `denoise_step(id, &mut TargetLatents, σ, σ_next,
   velocity)`, `vae_decode` → RGBA, `release_condition`. `&mut self`: one job
   at a time. The prompt goes in as text and the condition images as RGBA at
-  their budgeted size: the runner owns the tokenizer and the preprocessing
-  (spec 03). The latents cross to the host between calls (≤ 4 MiB a step).
+  their budgeted size; the runner tokenizes and prepares them (322c's F7,
+  below, says where that runner lives). The latents cross to the host
+  between calls (≤ 4 MiB a step).
   `vae_encode` is inside `encode_condition`. `FakeImageRunner` is
   deterministic in the condition and the noise and counts its held prefixes.
 - **The image model in the server** (`crates/server/src/images/mod.rs`):
@@ -424,3 +425,35 @@ The findings of `.scratch/orchestra/reviews/review-322a.md` (F1-F8), on
 - **A runner call that panics (F5).** `with_runner` and `shut_down` take a
   poisoned lock (`PoisonError::into_inner`): the job's prefix is still
   released while it unwinds, and the shutdown still drops the runner.
+- **Where the real runner lives (F7).** Spec 03 §Seams puts the tokenizer,
+  the templates and the Qwen3-VL preprocessing in server-side Rust
+  (`crates/server/src/media.rs`), and the trait holds: #321's runner is an
+  adapter in `crates/server`, beside `cuda_image_runner` (`load.rs`), over
+  the image leaf. The adapter owns the artifact's tokenizer and templates and
+  `media.rs`'s preprocessing, and it hands the leaf token ids and prepared
+  patches. So the routes pass the prompt as text and the images as RGBA, and
+  `condition_tokens` is host-side.
+- **Coverage (F6).** These tests pin behaviour already built: the switch
+  drain's image arm (a running job holds the teardown back; past a short
+  window the queue closes and the switch lands, the runner gone before the
+  next load); the thinking checks' skip on the image model (`PATCH`); and
+  the Responses socket on the image model (`409` as an `error` event, with
+  the socket left open). `main.rs`'s skip of the thinking validation stays
+  untested, as the review allowed.
+- **322b's review notes, checked.**
+  - The edit's media body limit is a layer on the edit route alone, so it
+    holds on the image model and on a text load without vision; both are
+    tested.
+  - A job holds `with_runner` for one call at a time, on `spawn_blocking`.
+  - A job that passes the gate between the drain and `close()` stops at its
+    next call: `run` checks the queue before every call, and a runner taken
+    by the shutdown answers `Stopped`.
+  - `auto` without 2048x2048 picks the nearest ratio among the sizes served.
+- **Not done.** F8, caching `kind_of` per artifact, is left out: optional in
+  the review, and a header read costs nothing next to the switch it
+  precedes.
+- **Tests.** `core::image` (the count, `takes`), `images` (`served_sizes`,
+  the poisoned lock), `tests/images_http.rs` (the size past the plan, `auto`
+  among the served sizes, the body limit on a text load), and
+  `tests/model_kind.rs` (the unloaded refusal, the metrics after a switch,
+  the drain), plus `tests/config_http.rs` and `tests/responses_socket.rs`.

@@ -145,8 +145,8 @@ pub struct PreparedModel {
     /// The start options the load runs with.
     config: crate::config::Config,
     /// What only a text model's load prepares; `None` for the image model,
-    /// whose runner reads its own tokenizer and templates (spec
-    /// image-model/03).
+    /// whose runner — the adapter [`cuda_image_runner`] builds — reads the
+    /// tokenizer and templates itself (spec image-model/03 §Seams, 05).
     text: Option<PreparedText>,
 }
 
@@ -402,7 +402,10 @@ fn load_image_model(
 }
 
 /// The image leaf's runner for `artifact` (spec image-model/04, GitHub #321,
-/// which builds it): until it does, the load is refused naming it.
+/// which builds it): an adapter here, in the server, over the leaf — the
+/// artifact's tokenizer and templates and `crate::media`'s Qwen3-VL
+/// preprocessing on the host (spec image-model/03 §Seams), the leaf's calls
+/// on the device. Until #321 builds it, the load is refused naming it.
 #[cfg(feature = "cuda")]
 fn cuda_image_runner(
     artifact: &std::path::Path,
