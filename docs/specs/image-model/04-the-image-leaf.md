@@ -554,6 +554,7 @@ applies.
     - `LatentNorm::denormalize`;
     - `ImageLeaf::vae_decode()`, which turns the started image's latents
       into RGBA8 bytes `[16 h][16 w][4]`;
+    - `vae_decode_band_rows()`, the rows a band takes;
     - `vae_decode_in_bands(band_rows)`, for tests and diagnosis;
     - `device_free_bytes()`.
 

@@ -1378,20 +1378,24 @@ mod device {
             self.decode_in(&arena, self.layout.seq, &phase)
         }
 
-        /// [`ImageLeaf::vae_decode`] in bands of `band_rows` image rows (the image's height: unbanded),
-        /// and the rows a band of [`ImageLeaf::vae_decode`] would take. When the phase does not fit
-        /// the arena's sequential region, its memory is allocated for the call, outside the plan: a
-        /// test's or a diagnosis' reference (spec image-model/04 acceptance 6), never the server's
-        /// path.
-        pub fn vae_decode_in_bands(&mut self, band_rows: u32) -> Result<(Vec<u8>, u32), ImageLeafError> {
+        /// The image rows a band of [`ImageLeaf::vae_decode`] takes for the started image.
+        pub fn vae_decode_band_rows(&self) -> Result<u32, ImageLeafError> {
+            let (h, w) = self.image.ok_or_else(|| ImageLeafError::Refused("vae_decode before start_image".into()))?;
+            Ok(DecodePhase::fitting(self.decoder.geometry(), 16 * w, 16 * h, self.layout.seq_bytes).map_err(ImageLeafError::Refused)?.band_rows)
+        }
+
+        /// [`ImageLeaf::vae_decode`] in bands of `band_rows` image rows (the image's height: unbanded).
+        /// When the phase does not fit the arena's sequential region, its memory is allocated for the
+        /// call, outside the plan: a test's or a diagnosis' reference (spec image-model/04 acceptance
+        /// 6), never the server's path.
+        pub fn vae_decode_in_bands(&mut self, band_rows: u32) -> Result<Vec<u8>, ImageLeafError> {
             let (h, w) = self.image.ok_or_else(|| ImageLeafError::Refused("vae_decode before start_image".into()))?;
             let geometry = self.decoder.geometry().clone();
-            let planned = DecodePhase::fitting(&geometry, 16 * w, 16 * h, self.layout.seq_bytes).map_err(ImageLeafError::Refused)?.band_rows;
             if band_rows == 0 || band_rows > 16 * h {
                 return Err(ImageLeafError::Refused(format!("bands of {band_rows} rows for an image of {} rows", 16 * h)));
             }
             let phase = DecodePhase::new(&geometry, 16 * w, 16 * h, band_rows);
-            let rgba = if phase.bytes <= self.layout.seq_bytes {
+            if phase.bytes <= self.layout.seq_bytes {
                 let arena = *self.arena();
                 self.decode_in(&arena, self.layout.seq, &phase)
             } else {
@@ -1400,8 +1404,7 @@ mod device {
                 let _ = sync();
                 let _ = self.dev.deallocate(buffer);
                 rgba
-            }?;
-            Ok((rgba, planned))
+            }
         }
 
         /// The decode with its phase at `at` in `buffer`: the latents denormalized on the host (fp32,

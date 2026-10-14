@@ -520,7 +520,7 @@ fn the_vae_decode_of_the_final_latents_is_the_recorded_png() {
         let (pw, ph, want) = read_png(&dir.join("image.png"));
         assert_eq!((pw, ph), (16 * w, 16 * h), "{name}: the recorded image's size");
         let db = psnr(&rgba, &want);
-        let Some((_, planned)) = ran(leaf.vae_decode_in_bands(16 * h), "the band plan") else { return };
+        let Some(planned) = ran(leaf.vae_decode_band_rows(), "the band plan") else { return };
         println!(
             "{name}: vae_decode {}x{} in bands of {planned} rows, {ms:.0} ms (the first at this size): PSNR R {:.2} G {:.2} B {:.2} A {:.2} dB against \
              diffusers' fp32 image.png",
@@ -536,13 +536,13 @@ fn the_vae_decode_of_the_final_latents_is_the_recorded_png() {
         }
         if name == "t2i" {
             // The unbanded decode needs ~2.4 GB, more than the arena: its workspace is allocated for the call.
-            let Some((unbanded, _)) = ran(leaf.vae_decode_in_bands(16 * h), "the unbanded decode") else { return };
+            let Some(unbanded) = ran(leaf.vae_decode_in_bands(16 * h), "the unbanded decode") else { return };
             assert!(planned < 16 * h, "the arena's 1024² decode runs in bands ({planned} rows)");
             assert_eq!(mismatches(&rgba, &unbanded), 0, "t2i: the decode in {planned}-row bands equals the unbanded one bit for bit");
         }
         if name == "t2i-2k" {
             let other = (planned / 2).div_ceil(16) * 16;
-            let Some((half, _)) = ran(leaf.vae_decode_in_bands(other), "the decode in other bands") else { return };
+            let Some(half) = ran(leaf.vae_decode_in_bands(other), "the decode in other bands") else { return };
             assert_eq!(mismatches(&rgba, &half), 0, "t2i-2k: the decode in {planned}-row bands equals the one in {other}-row bands bit for bit");
         }
     }
