@@ -1,10 +1,11 @@
-//! The image model's VAE ops in the kernel leaf (spec image-model/02 acceptance 6, GitHub #319):
-//! the flat C ABI of `kernel/include/ignis_image_vae.h`, 1:1, and thin wrappers that turn its
-//! return codes into `Result`s carrying the leaf's own message.
+//! The image model's VAE ops in the kernel leaf (spec image-model/02 acceptance 6 and 7, GitHub
+//! #319): the flat C ABI of `kernel/include/ignis_image_vae.h`, 1:1, and thin wrappers that turn
+//! its return codes into `Result`s carrying the leaf's own message.
 //!
 //! The ops are the image leaf's VAE (spec image-model/04), which calls them inside the kernel
 //! leaf: the convolution (an implicit GEMM on BF16 tensor cores, with row windows for banded
-//! decoding), the residual shortcuts (AvgDown / DupUp) and the one-head mid-block attention. These
+//! decoding), the residual shortcuts (AvgDown / DupUp), the one-head mid-block attention and the
+//! channel RMS norm with its SiLU. These
 //! bindings exist for Rust-side tests and tools that drive them directly. Every pointer argument is
 //! a device pointer the caller vouches for, so the wrappers are `unsafe`; the shapes and alignments
 //! they take are checked by the leaf.
@@ -79,6 +80,16 @@ pub mod ffi {
             workspace_bytes: u64,
             o: *mut c_void,
             o_f32: u32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn ignis_image_vae_rms_norm(
+            x: *const c_void,
+            pixels: u32,
+            channels: u32,
+            gamma: *const c_void,
+            silu: u32,
+            y: *mut c_void,
+            y_f32: u32,
             stream: *mut c_void,
         ) -> i32;
         pub fn ignis_image_vae_last_error() -> *const c_char;
@@ -248,4 +259,23 @@ pub unsafe fn attn(
     check(unsafe {
         ffi::ignis_image_vae_attn(qkv, tokens, dim, scale, row_tile, workspace, workspace_bytes, o, o_f32 as u32, stream)
     })
+}
+
+/// The channel RMS norm of NHWC BF16 `x [pixels][channels]` (`gamma` BF16 `[channels]`), then SiLU
+/// when `silu`; fp32 output when `y_f32`, else BF16, and `y` may be `x`.
+///
+/// # Safety
+/// Every pointer is a device pointer of the size the shape implies.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rms_norm(
+    x: *const c_void,
+    pixels: u32,
+    channels: u32,
+    gamma: *const c_void,
+    silu: bool,
+    y: *mut c_void,
+    y_f32: bool,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    check(unsafe { ffi::ignis_image_vae_rms_norm(x, pixels, channels, gamma, silu as u32, y, y_f32 as u32, stream) })
 }

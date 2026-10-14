@@ -24,8 +24,8 @@ each with a reference test at the image model's real geometry.
 | encoder attention | FlashAttention-2 forward, bf16, causal, GQA 32/8, D=128 | `Dao-AILab/flash-attention` `csrc/flash_attn/src`: structure and softmax forms, raw PTX (BSD-3) | adapted |
 | VAE convolution | implicit-GEMM conv2d, bf16, the shapes in spec 01's `conversion.json` (3×3 stride 1 pad 1, 3×3 stride 2 after a (0,1,0,1) pad, 1×1) | written from our FP8 GEMM; CUTLASS 2.x's implicit-GEMM fprop and ggml's `conv2d_implicit_gemm` (BSD-3 / MIT) were allowed, neither was used | our own |
 | VAE mid-block attention | one head, D = 768 (encoder) / 1152 (decoder), over the latent grid: row-tiled QKᵀ, softmax, PV on the bf16 GEMM, with a fixed workspace | — | our own |
-| DiT elementwise | LayerNorm without affine × (1 + scale), with the per-token choice of the t row or the t=0 row; `x + tanh(gate) · y`; QK RMSNorm + 3-axis RoPE (complex form, adjacent pairs); SwiGLU; GELU-tanh; zero-centred RMSNorm (w + 1) | our existing norm/RoPE ops extended. FlashInfer `fused_dit_layernorm.cuh` and `fused_qk_rmsnorm_rope.cuh` as reading or source (Apache-2.0) | ours or adapted |
-| VAE elementwise | channel RMS norm, SiLU (AC 7); the nearest-exact 2× upsample (fused into the convolution's gather) and the AvgDown / DupUp shortcuts (AC 6) | — | our own |
+| DiT elementwise | LayerNorm without affine × (1 + scale), with the per-token choice of the t row or the t=0 row; `x + tanh(gate) · y`; QK RMSNorm + 3-axis RoPE (complex form, adjacent pairs); SwiGLU; GELU-tanh; zero-centred RMSNorm (w + 1); the norms and activations can emit the FP8 GEMM's E4M3 input | written new: the existing norm/RoPE ops are vendored with the text model's layouts. FlashInfer `fused_dit_layernorm.cuh` and `fused_qk_rmsnorm_rope.cuh` (Apache-2.0) were allowed, neither was used | our own |
+| VAE elementwise | channel RMS norm with its SiLU fused (AC 7); the nearest-exact 2× upsample (fused into the convolution's gather) and the AvgDown / DupUp shortcuts (AC 6) | — | our own |
 | sampler | Euler update `x += (σ_next − σ) · v` on the device | — | our own |
 
 **The GEMM's inner instruction is measured, not assumed.** One single source
@@ -136,6 +136,39 @@ In steps 2-8 only the target's queries run, over [prefix ; target].
 
 ## As built
 
+**Status per acceptance criterion** (2026-10-14, branch `image-kernels-319`;
+the sections below have the numbers):
+1. **Done.** The instruction table below; the GEMM takes `kind::mxf8f6f4`
+   with unit scales (911 TFLOPS with FP32 accumulation, twice the plain form).
+2. **Done.** 0 outputs over the bound at every linear shape, 1 to 41,000
+   tokens; quantization error reported (3.6-3.8% relative RMS on synthetic
+   inputs); 495-536 TFLOPS, about 72% of the bar (reported, not tuned further).
+3. **Done.** The norms and activations emit the E4M3 pair in their own pass
+   (AC 7), bit for bit with `ignis_image_quantize_tokens`. The attention
+   output's quantization stays the separate kernel: 0.012 ms per 1024²
+   block, 0.3% of it.
+4. **Done.** 0 outputs over the bound in every call; cosine ≥ 0.99 per head
+   on DiT-like inputs and on the DiT's real Q, K and V (worst 0.99796); the
+   prefix seams tested; 489-573 TOPS against 618-643. The synthetic 20×
+   outlier arm (0.918-0.96) is report-only, by the coordinator's call.
+5. **Done.** 0 outputs over a replay bound from 1 to 41,000 tokens; 196-207
+   TOPS against ~210.
+6. **Done.** Every VAE convolution shape at 1024² and 2048², the mid-block
+   attention at both D, and the upsample and shortcuts (bit for bit against
+   PyTorch); 167-186 TFLOPS on the 3 × 3 calls.
+7. **Done.** Every elementwise op within a bound that tracks its roundings,
+   the per-token t / t=0 row bit for bit with a negative control, and the
+   RoPE table within one ulp of diffusers' `pos_embed` for the t2i and edit
+   layouts.
+8. **Done.** The adapted ops (SageAttention for AC 4, FlashAttention-2 for
+   AC 5, FlashInfer's helpers through SageAttention) are named in their
+   headers and `kernel/NOTICE`; everything else is our own. Nothing comes
+   from CUTLASS 3.x or FlashInfer's `csrc/fmha_v2`.
+9. **Done.** Five CTests at the image model's geometry, plus two that read
+   data outside the repo (the real Q/K/V probe, the RoPE oracle) and print
+   SKIP without it; five Rust `--ignored` tests drive every binding. The
+   benches are tools.
+
 ### The instruction microbenchmark (AC 1)
 
 `kernel/tests/bench_mma_peak.cu` (`ignis_mma_peak_bench`, a tool, not a
@@ -233,7 +266,9 @@ codes `[tokens][cols]` plus fp32 `scales[tokens]`:
 `ignis_image_quantize_tokens` is the standalone producer.
 `fp8_quant.cuh` holds the device steps, so a norm, modulation, SwiGLU or
 attention-output epilogue can emit the same pair and drop the separate pass.
-For now it is a separate kernel, whose cost is in the speed table below.
+The norms and activations of AC 7 emit the pair in their own pass ("The
+elementwise ops (AC 7)" below); the attention output still goes through the
+standalone kernel, whose cost is in the speed table below.
 
 **The kernel.**
 - Weights: the row-scale-v1 payload as it is.
@@ -373,7 +408,8 @@ would close the gap, largest first:
 3. **Power.** The card is limited to 575 W; the literature's numbers are at
    600 W. The wide GEMMs reach 575-580 W and drop to 2.0-2.6 GHz.
 4. **Fusing the quantization** into the producers: 3.4% at 1024² and about
-   5% at 16,512 tokens.
+   5% at 16,512 tokens. Done for the norms and SwiGLU in AC 7; the
+   attention output's (one of the four) remains.
 
 ### The 8-bit DiT attention (AC 4)
 
@@ -1242,6 +1278,226 @@ test drives every binding:
   bias, residual, fp32 and BF16 output, and a band, against fp64;
 - AvgDown in fp32 and DupUp accumulating in BF16, bit for bit;
 - the attention in fp32 and BF16, against fp64;
+- refusals that come back with the leaf's message.
+
+The bench is a tool.
+
+### The elementwise ops (AC 7)
+
+**Where.**
+- ABI: `kernel/include/ignis_image_dit.h`: `ignis_image_dit_rope_positions`
+  (host), `ignis_image_dit_rope_table`, `ignis_image_dit_modulated_norm`,
+  `ignis_image_dit_rms_norm`, `ignis_image_dit_gated_residual`,
+  `ignis_image_dit_qk_norm_rope`, `ignis_image_dit_act` (SiLU, GELU-tanh,
+  SwiGLU), `ignis_image_dit_last_error`; and `ignis_image_vae_rms_norm` in
+  `ignis_image_vae.h`.
+- Code: `kernel/src/image/dit_ops.cu` and `vae_norm.cu`. All our own (ADR
+  0051 tier 1).
+  - The leaf's existing norm and RoPE ops are vendored ninfer code
+    (`kernel/vendor`, never edited) with the text model's layouts
+    (rotate-half RoPE, one position per token), so these are new.
+  - FlashInfer's `fused_dit_layernorm.cuh` and `fused_qk_rmsnorm_rope.cuh`
+    were not read or copied.
+- Tests: the CTests `ignis_kernel_image_elementwise_test`
+  (`kernel/tests/test_image_elementwise.cu`, about 1 s) and
+  `ignis_kernel_image_elementwise_rope_oracle_test` (the same file, `--cases
+  rope-oracle`), and the Rust `--ignored` test
+  `crates/core/tests/image_elementwise_gpu.rs` (bindings in
+  `crates/core/src/image_dit.rs`, and `rms_norm` in `image_vae.rs`). Speed:
+  `ignis_image_elementwise_bench` (`kernel/tests/bench_image_elementwise.cu`,
+  a tool).
+
+**What diffusers 0.41.0 does** (`transformer_qwenimage21.py`), and where
+these ops differ:
+- **No shift.** `_modulate` (lines 604-613) is `x * (1 + scale)` with
+  `scale, gate = mod_params.chunk(2)`, and `norm_out`
+  (`QwenImage21AdaLayerNormContinuous`) is "scale only". The shared
+  modulation's four chunks are [mod1.scale, mod1.gate, mod2.scale,
+  mod2.gate]. So the op is LayerNorm × (1 + s), without a shift.
+- **The gate is tanh(gate) · y** (lines 641 and 644:
+  `hidden_states + img_gate1.tanh() * attn_output`).
+- **The row choice** (`_select_modulation_rows`): text and condition-image
+  tokens take the t = 0 row, the target's tokens the t row. The target block
+  is the sequence's last, so a call takes both rows and `first_target`. The
+  leaf's prefix pass reads only t = 0, a denoising step only t.
+- **RoPE**: the complex product of adjacent pairs (`apply_rotary_emb_qwen`
+  with `use_real=False`), positions from `QwenImage21Rope.forward`, and the
+  table from `rope_params`, computed in fp32 on the CPU at init.
+- **One rounding instead of diffusers' BF16 intermediates.** Each op works
+  in fp32 from its BF16 inputs and rounds once to the output.
+  - diffusers' BF16 path rounds the norm's output, `1 + scale`, `tanh(gate)`
+    and the product before the residual add, the normed q and k before RoPE
+    (and RMSNorm's x · r before the weight), and SiLU's output before
+    SwiGLU's product.
+  - The largest of these is `1 + scale`: up to 2^-9 of the modulated value.
+  - The VAE norm skips three BF16 roundings (the normalized x, × √C, × γ)
+    and SiLU's.
+  - So spec 04's teacher-forced comparison sees these ops' rounding, not
+    diffusers'.
+- The modulation rows are fp32 (the GEMM's fp32 output; diffusers holds them
+  in BF16). The norms' weights are BF16, as stored.
+
+**The ops** (the header has the definitions):
+- **Row ops** (the two norms and the activations): one CTA per token, each
+  thread on the row's 8-element chunks, sums in a fixed order (each thread's
+  elements, a warp butterfly, then the 8 warps).
+- **The modulated norm**: the row is staged in shared memory, and the
+  variance takes two passes (the mean, then the centred sum of squares). The
+  one-pass E[x²] − μ² cancels on a row with a large mean; the test has rows
+  at −96 ± 0.75.
+- **The zero-centred RMSNorm**: (w + 1) in fp32. `eps` is an argument
+  (`txt_in` passes 1e-6; the class default is 1e-5).
+- **The gated residual**: one fma per element, `fma(tanhf(g), y, x)`, BF16,
+  in place.
+- **The QK norm with RoPE**: one warp per (token, head), q and k in one
+  call. It rewrites the fused QKV row in place (q at column 0, k at 4096, v
+  untouched), the addressing the 8-bit attention reads.
+- **The activations**: SiLU = x / (1 + e^-x). GELU-tanh is computed as x /
+  (1 + e^-2z), which equals 0.5 x (1 + tanh z) without its cancellation at
+  negative x. SwiGLU reads separate gate and up rows, or the fused
+  [tokens][24576] output with one row stride.
+- **The VAE norm**: one warp per NHWC pixel row; fl32(√C), as PyTorch takes
+  the Python float; the norm clamped at 1e-12; SiLU fused; y may be x.
+- Every rounding step is an `_rn` intrinsic, so nvcc's FMA contraction
+  cannot change the sequence the bound follows. `expf`, `tanhf` and `rsqrtf`
+  are CUDA's accurate functions (no fast math); sqrt and division are IEEE.
+
+**The fused quantization (AC 3).** The norms and activations take an E4M3
+output: the BF16 output is staged in shared memory, then quantized with
+`fp8_quant.cuh`'s steps. The result is `ignis_image_quantize_tokens` of the
+BF16 output, bit for bit (tested over every output).
+- **Fused** for the inputs of q/k/v and gate/up (the two modulated norms),
+  `proj_out` (norm_out), `txt_in`'s two linears (the zero-centred norm,
+  GELU), down (SwiGLU) and the timestep path's linears (SiLU).
+- **Not fused**: the attention output into `to_out` (AC 4's kernel; the
+  separate kernel costs 0.3% of a block) and `img_in`'s latents.
+
+**RoPE.**
+- **Positions**: a host call, from the blocks' starts and sizes. diffusers
+  finds the starts in the image-token mask; the leaf knows them. A text
+  token advances the position on all three axes. A block takes frame =
+  the position, height and width on a grid centred on zero, then advances
+  the position by max(h, w). Positions outside [−1024, 8192), diffusers'
+  table rows, are refused: beyond them diffusers' indexing would read the
+  negative rows or fail.
+- **Frequencies**: PyTorch's fp32 values, f_i = fl32(1 / fl32(10000^fl32(2i
+  / d))).
+  - The exponent is rounded first, which puts f up to 5 ulp from
+    fl32(10000^(−2i / d)).
+  - torch's `powf` differs from that formula at one pair: d = 56, i = 11
+    (0x1.b7886ep-6, one ulp above it).
+  - The 64 values are constants in `dit_ops.cu`; the test restates the
+    formula and the exception.
+- **The table**: fl32(position · f), as torch's outer product rounds it,
+  then cos and sin in fp64 rounded to fp32.
+- **The bound is one ulp per element.** The angles are bit-identical by
+  construction. Ours are then correctly rounded, and torch's CPU fp32 cos and
+  sin are within one ulp.
+- **Results:**
+  - The table op against the host's table at every position of
+    [−1024, 8192), on every axis and pair (1,179,648 values): equal, bit
+    for bit.
+  - The positions op against diffusers' forward restated in its mask form,
+    for seven layouts: equal. They are t2i, edit, adjacent blocks, an image
+    first, text only, trailing text, and ten condition images with the
+    172 × 96 preset (57,505 tokens). Also a layout worked by hand, and the
+    refusals.
+  - **Against the oracle's `rope.npy`** (spec 01's recordings):
+
+    | case | tokens | equal | at one ulp | worse |
+    |---|---|---|---|---|
+    | t2i (text 31, target 64 × 64) | 4127 | 527,739 | 517 (0.10%) | 0 |
+    | edit (text 8, image 64 × 64, text 18, target 64 × 64) | 8218 | 1,046,782 | 5,122 (0.49%) | 0 |
+
+    The largest difference is 2^-24.
+  - The comparison sees the constants: with the (56, 11) frequency one ulp
+    lower, diffusers' own module puts 558 elements of the edit table more
+    than one ulp from `rope.npy`.
+
+**Mechanics.** The reference is our own fp64 code that follows each kernel's
+operations in its order and tracks a bound on its error:
+- every fp32 operation adds 2^-24 of its result;
+- `expf`, `tanhf` and `rsqrtf` add 2 ulp (CUDA Math API);
+- an input's error goes through the operation's own sensitivity;
+- a sum in a fixed tree adds γ_d of Σ|terms|, with d each thread's element
+  count plus 5 butterfly levels plus 8 warps.
+
+The inputs' rows mix profiles: plain, tiny, × 40, an offset, a large offset
+with a small spread (the mean cancels), outlier channels, zero rows and
+constant rows.
+
+| op | calls | worst / bound |
+|---|---|---|
+| modulated norm | 1, 7, 4127 (prefix 31), 8218 (prefix 4122), 16,512 tokens × 4096 | 0.04-0.10 |
+| zero-centred RMSNorm | 1, 31, 2048 × 4096 | 0.10-0.18 |
+| SiLU | 2, 33 × 4096 | 0.72-0.82 |
+| GELU-tanh | 31, 2048 × 4096 | 0.80 |
+| SwiGLU | 1, 4127 × 12288 separate; 4096, 16,512 fused | 0.59-0.84 |
+| gated residual | 1, 7, 4127, 16,512 × 4096 | 0.84-0.99 |
+| QK norm + RoPE | 1, 4127 (t2i), 8218 (edit), 16,584 tokens × 64 heads | 0.26-0.36 |
+| VAE norm, with and without SiLU | 4096 pixels × every channel count (96-1152), 1 pixel, 1024² × 144, 128² × 1152 | 0.12-0.30 |
+
+- **0 outputs over the bound.** BF16 equals the fp32 output rounded over
+  every output; the in-place forms equal the out-of-place ones; the E4M3
+  output equals the standalone quantization of the BF16 one; 0 NaN (the
+  outputs start as NaN); v untouched.
+- **The row choice.** In [prefix ; target] calls the target's rows equal the
+  all-t call's and the prefix's the all-t0 call's, bit for bit. The
+  reference with the two rows swapped puts 98-99.9% of the checked outputs
+  over the bound (the negative control).
+- **Tightness.** With `--bound-factor 0.05` every op has calls over the
+  bound (all but the two one-token LayerNorms), so each bound is within 20×
+  of the worst error. The residual and the activations sit at 0.6-0.99:
+  their bounds are one rounding plus CUDA's 2-ulp transcendentals.
+
+**Speed** (2026-10-14, `ignis_image_elementwise_bench`, GPU lock in timing
+mode, zero inputs; reads plus writes over time). At 2048² every op runs at
+1.5-1.66 TB/s, 84-93% of the card's 1.79 TB/s; at 1024² part of the data
+stays in L2.
+
+| op | 1024² (4096 tokens) | 2048² (16,384) |
+|---|---|---|
+| modulated norm, E4M3 out | 0.019 ms | 0.121 ms |
+| modulated norm BF16, then the separate quantization | 0.029 ms | 0.295 ms |
+| gated residual, in place | 0.017 ms | 0.256 ms |
+| QK norm + RoPE, in place | 0.032 ms | 0.357 ms |
+| SwiGLU from the fused gate / up, E4M3 out | 0.150 ms | 0.622 ms |
+| SwiGLU BF16, then the separate quantization | 0.279 ms | 1.160 ms |
+| **a step**: 32 × (2 norms, 2 residual adds, QK, SwiGLU) + norm_out | **8.1 ms** (12.9 unfused) | **55.6 ms** (84.1 unfused) |
+
+- The fused quantization saves 37% (1024²) and 34% (2048²) of a step's
+  elementwise time. At 1024² the 8.1 ms sit beside the linears' 115.5 ms
+  (AC 2) and the attention's 21.8 ms (AC 4).
+- The RoPE table: 0.013 ms for 4127 tokens, 0.123 ms for 57,505; once per
+  job.
+- The VAE norm with SiLU at a 2048² decode's stage sizes: 0.03 ms (128² ×
+  1152) to 3.15 ms (2048² × 288), 1.63 ms at 2048² × 144; 1.5 TB/s.
+- Not tuned. The next saving would be folding each residual add into the
+  norm after it (one read of x less); it was not built.
+
+**Defaults taken** (the owner may revisit):
+1. The modulation rows are fp32; diffusers holds them in BF16.
+2. The residual stream is BF16, as in diffusers' BF16 path.
+3. The E4M3 output is the quantization of the BF16 output, not of the fp32
+   value, so the seam is tested bit for bit.
+4. RoPE positions outside [−1024, 8192) are refused.
+5. GELU-tanh is computed as x · σ(2z).
+6. The QK norm takes q and k in one call, in place, with 32 heads of 128.
+
+**AC 8.** Nothing is adapted: the headers say OURS, and `kernel/NOTICE` has
+nothing to add.
+
+**AC 9.** The CTests run in the profile's kernel stage. The oracle case
+prints SKIP without the oracle (`--oracle DIR`, `$IGNIS_IMAGE_ORACLE`, or
+`F:/ai/models/ignis-image-2.1-turbo/oracle`), by the coordinator's call, as
+the real Q/K/V probe does. The Rust `--ignored` test drives every binding:
+- the positions worked by hand and the table, and the oracle's t2i table
+  when it is there;
+- the modulated norm with its row choice in fp32, BF16 and E4M3 (against
+  `quantize_tokens`);
+- the RMSNorm, the residual (in place), the QK norm in place on a fused row
+  (v untouched), the three activations and the VAE norm with SiLU, against
+  fp64;
 - refusals that come back with the leaf's message.
 
 The bench is a tool.

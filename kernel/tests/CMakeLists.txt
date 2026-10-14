@@ -834,3 +834,25 @@ add_test(NAME ignis_kernel_image_vae_test COMMAND ignis_kernel_image_vae_test)
 add_executable(ignis_image_vae_bench bench_image_vae.cu)
 target_include_directories(ignis_image_vae_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_image_vae_bench PRIVATE ignis_kernel ignis_vendor CUDA::nvml)
+# The elementwise ops (acceptance 7, kernel/include/ignis_image_dit.h and the VAE's channel norm):
+# the modulated LayerNorm with its per-token t / t=0 row, the zero-centred RMSNorm, the gated
+# residual, the QK RMSNorm with RoPE, SiLU, GELU-tanh, SwiGLU and the VAE norm against fp64
+# references that track the kernels' roundings, with the E4M3 outputs against the standalone
+# quantization bit for bit; the RoPE positions and table against diffusers' definition restated.
+# GPU (ADR 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_image_elementwise_test test_image_elementwise.cu)
+target_include_directories(ignis_kernel_image_elementwise_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_image_elementwise_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_image_elementwise_test COMMAND ignis_kernel_image_elementwise_test)
+# The RoPE table of the oracle's t2i and edit layouts against diffusers' own pos_embed (rope.npy
+# in spec 01's recordings). The oracle lives outside the repo (--oracle DIR, $IGNIS_IMAGE_ORACLE,
+# or the default under F:/ai/models): without it the case prints SKIP and passes, as the attention's
+# qkv-probe case does (the coordinator's call for #319).
+add_test(NAME ignis_kernel_image_elementwise_rope_oracle_test
+         COMMAND ignis_kernel_image_elementwise_test --cases rope-oracle)
+# Their speed at a 1024² and a 2048² denoising step and the VAE decoder's stage sizes (GB/s), with
+# the fused quantization against the separate one. A timing is a finding: a tool, NOT registered
+# with CTest.
+add_executable(ignis_image_elementwise_bench bench_image_elementwise.cu)
+target_include_directories(ignis_image_elementwise_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_image_elementwise_bench PRIVATE ignis_kernel ignis_vendor)

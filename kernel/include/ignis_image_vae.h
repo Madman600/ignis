@@ -1,5 +1,6 @@
 /* ignis kernel leaf: the image model's VAE ops -- the convolution, the mid-block attention and the
- * residual shortcuts (spec image-model/02 acceptance 6, GitHub #319) -- OURS (ADR 0051 tier 1:
+ * residual shortcuts (spec image-model/02 acceptance 6, GitHub #319), and the channel RMS norm
+ * (acceptance 7) -- OURS (ADR 0051 tier 1:
  * written from our FP8 GEMM, kernel/src/image/fp8_gemm_kernel.cuh; no convolution source was
  * read or copied). The convolution's shared-memory plumbing is attn_smem.cuh's (FlashInfer through
  * SageAttention, Apache-2.0; kernel/NOTICE).
@@ -113,6 +114,18 @@ uint64_t ignis_image_vae_attn_workspace_bytes(uint32_t tokens, uint32_t dim, uin
  * and > 0. o must not overlap qkv or the workspace. */
 int32_t ignis_image_vae_attn(const void *qkv, uint32_t tokens, uint32_t dim, float scale, uint32_t row_tile,
                              void *workspace, uint64_t workspace_bytes, void *o, uint32_t o_f32, void *stream);
+
+/* The channel RMS norm (QwenImage21RMS_norm: channel_first, no bias), then SiLU when `silu`. Per
+ * pixel, y = (x * (fl32(sqrt(channels)) / max(||x||_2, 1e-12))) * gamma, ||x||_2 = sqrt of the
+ * fp32 sum of squares in a fixed order, and with `silu` y = y / (1 + exp(-y)) on the fp32 value.
+ * The resnets' norm1 / norm2 and the encoder's and decoder's norm_out are followed by SiLU; the
+ * mid-block attention's norm is not. One rounding to the output type; diffusers' BF16 path rounds
+ * the normalized x, the product with sqrt(channels) and the one with gamma, and then SiLU's output.
+ * x BF16 NHWC [pixels][channels] (a band of rows is a range of pixels), gamma BF16 [channels]; y
+ * BF16, or fp32 when `y_f32`; y may be x. channels a positive multiple of 8, pixels 1 .. 2^24; x,
+ * gamma and y 16-byte aligned. */
+int32_t ignis_image_vae_rms_norm(const void *x, uint32_t pixels, uint32_t channels, const void *gamma, uint32_t silu,
+                                 void *y, uint32_t y_f32, void *stream);
 
 /* Thread-local message from the most recent failed call. Never NULL. */
 const char *ignis_image_vae_last_error(void);
