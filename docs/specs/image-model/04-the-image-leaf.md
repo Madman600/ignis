@@ -1218,7 +1218,9 @@ that panics. Commits 05b6c7c..HEAD on `image-leaf-321`.
   - A condition image past 200:1 answers `400 image_refused`. If a job
     panics, the model unloads, and the next request loads it again
     (~9 s).
-- **Gates** (code on 31ed17b):
+- **Gates** (the GPU runs and the cuda check on 31ed17b; the workspace and
+  `npm test` on 23b8d14, the same code but for one `cuda`-only test's
+  tolerance):
   - The CTest under the profile (`kernel/build.ps1 -Test`,
     `IGNIS_GPU_PROFILE=1`): 124/124.
   - `CARGO_INCREMENTAL=0 cargo test --workspace`: 2980 passed, 0 failed,
@@ -1234,4 +1236,4 @@ that panics. Commits 05b6c7c..HEAD on `image-leaf-321`.
       free memory includes the desktop's own use, so the tolerance is now
       256 MiB; a prefix left behind reads about -1,042 MiB.
   - The 27B's vision tests 7/7 under the profile.
-  - `npm test` in `web/`: 860 passed.
+  - `npm test` in `web/`: 860 passed. `mk/flags-selftest.sh`: ok.
