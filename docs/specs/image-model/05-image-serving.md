@@ -629,7 +629,7 @@ The baseline on 96db56b (322d never recorded one): `cargo test --workspace`
   11. Done (322e); the revision is pinned to d6912417 (c81e8c6).
   12. Done (322f): the image view, its switch button and gallery; see "As built (322f)". 322g: the switch is followed by its record (M2).
   13. Done: OpenAPI (322b) and the user docs (322e), corrected by 322g (L4).
-  14. The runner adapter is built (321d, below); the live run from the Playground remains.
+  14. Done (live run, 2026-10-14, on d81e33e): 27B → image 10.0 s, 2048² generation 7.87 s, 2-image edit 9.48 s, image → 27B 11.3 s; see "As built (AC 14, live run)".
 
 ## As built (322f, 2026-10-14, branch `image-serving-322`: AC 12)
 
@@ -837,3 +837,135 @@ Spec 04's "As built (321f)" has the details. On this side of the seam:
   a switcher the answer is `503 model_stopped`.
 - **AC 14** remains the owner's. Spec 04's "As built (321f)" has the notes
   for it.
+
+## As built (AC 14, live run, 2026-10-14, branch `image-live-322` on d81e33e)
+
+One live run on the 5090, switching from the 27B to the image model and back.
+The run uses the Playground's own HTTP calls, in its order.
+
+**Setup.**
+- The build: `make build` (release, CUDA leaf, embedded UI).
+- The start: `make start` with `ARTIFACT=F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer`,
+  `IDLE_UNLOAD=0`, `METRICS=1` and
+  `ARGS='--switch-known-models ignis-image-2.1-turbo=F:/ai/models/ignis-image-2.1-turbo/ignis_image_2_1_turbo-v2.ninfer'`.
+  The rest is the make defaults: context 524,288, `hq-e8-2b`, dflash2/7,
+  yarn:2, host pool 8G.
+- The process was ready in 12.7 s.
+- The image load dropped `--spec-backend` and `--spec-draft-tokens`
+  (`ignis.model.switch_flags_dropped`).
+- The image plan: weights 14.40 GiB, arena 1.23 GiB, condition budget 43,584
+  tokens; budget 26.96 of 28.46 GiB free; the leaf's load took 8.17-8.47 s.
+
+**The calls.** The driver is `.scratch/live/drive.py` (log `drive.jsonl`,
+server log `ignis-server.log`, both in `.scratch/live/`). Its bodies are the
+Playground's:
+- the chat is `buildChatRequest` (streamed, no `model`);
+- the switch is `switchTo` (`POST /v1/models/switch {model}`, with the id
+  `imageModelRow` picks from `GET /v1/models/catalog`), then `GET /v1/models`
+  polled every 250 ms until it serves with a new `last_switch`;
+- the image requests are `generationBody` and `editForm` (streamed, no
+  `model`).
+
+The times are client-side, from each request's send. The phase marks are the
+first SSE event of each phase. "Server" is `ignis.model.switched`.
+
+| step | call | answer | time |
+|---|---|---|---|
+| a | chat on the 27B, 23 prompt tokens | 29 tokens | first token 0.216 s, done 0.403 s |
+| b | switch 27B → `ignis-image-2.1-turbo` | 202 in 16 ms | serving at **10.02 s**. Server: 9,962 ms (teardown 908, load 9,021, warm-up 0) |
+| c | 2048x2048 generation, seed 2, streamed | 200 in 15 ms | encoding 0.015 → denoising 0.188 → decoding 6.100 → completed 7.847; **7.87 s** total |
+| d | edit, 2 images, size `auto` (→ 2048x2048), seed 3, streamed | 200 in 48 ms | encoding 0.048 → denoising 0.999 → decoding 7.872 → completed 9.466; **9.48 s** total |
+| e | switch `ignis-image-2.1-turbo` → 27B (the Server view's Load) | 202 in 16 ms | serving at **11.30 s**. Server: 11,246 ms (teardown 123, load 10,570, warm-up 124) |
+| f | chat on the 27B again | 41 tokens | first token 0.050 s, done 0.331 s |
+
+Steps a to f took 39.5 s end to end.
+
+**The image times, by phase.**
+- **The generation (c).**
+  - Encoding: 0.17 s.
+  - Denoising: 8 steps in 5.91 s, 0.731-0.742 s each (321e's in-process
+    step: 747-802 ms).
+  - Decoding to completed: 1.75 s. The VAE decode alone is 646 ms (321e).
+    The other ~1.1 s is the PNG, its base64 and the send; the events do not
+    split them.
+  - Against 321e's in-process 2048² job (6.79 s), the request takes 1.08 s
+    more, all of it in that last phase.
+- **The edit (d).**
+  - Encoding: 0.95 s, between 321e's one image (469 ms) and four (2,162 ms).
+  - Denoising: 8 steps in 6.87 s, 0.855-0.861 s each (321e: 809-816 ms with
+    one image, 982-991 with four).
+  - Decoding to completed: 1.59 s.
+  - 9.48 s in all, inside the 7.6-10.7 s that spec 04's 321f notes expect.
+
+**The PNGs**, in `F:/ai/models/ignis-image-2.1-turbo/freerun/live/`:
+- **`t2i-2048-seed2-0.png`** (2048x2048 RGBA, 8,711,736 bytes). The prompt is
+  the oracle's t2i prompt: a red fox in snow at dawn, holding a sign reading
+  "ignis", oil painting.
+  - It looks right: a sharp, coherent fox, the sign spelled "ignis", an
+    oil-paint texture, a misty treeline.
+  - Alpha is 250-255.
+  - Byte-identical to `attempt1-t2i-2048-seed2-0.png`, the same request on
+    an earlier load.
+- **`edit-2img-auto-seed3-0.png`** (2048x2048 RGBA, 4,922,151 bytes). The
+  condition images, in this order: the oracle's `edit/condition.png` (shapes
+  on a transparent background) and `freerun/t2i/ignis.png` (the 1024² fox).
+  The prompt: "Place the colourful shapes from the first image as polished
+  glass ornaments in the snow around the fox from the second image".
+  - It is coherent, with no noise or banding to the eye.
+  - The circle, square and triangle are now glossy glass.
+  - The first image's layout and alpha are kept: transparent above, opaque
+    below.
+  - The opaque band is the second image's snow. Under the triangle are the
+    fox's tail and fur and the sign's post.
+  - The model followed the first image's layout more than "around the fox":
+    the fox is mostly hidden. That is the model's reading of the prompt, not
+    a fault of the run.
+
+**Defaults taken.**
+- **Calls, not clicks.** The Playground's calls were sent by a script, not by
+  clicking in the browser: the same routes, bodies and order.
+- **The chat.** It is the Playground's body with `reasoning_effort: "none"`
+  (its "Off") and `max_tokens: 256`, instead of the defaults xhigh/16384, so
+  the chat stays short.
+- **The 27B's artifact.** It is named outright. The worktree has no
+  `models/` link, and the default `./models/...` points there from the main
+  checkout.
+- **The known model.** The image model is known through `ARGS`
+  (`--switch-known-models`). Make has no knob for it.
+- **Prompts and seeds.** The generation reuses the oracle's prompt, with
+  seed 2 as the oracle's 2K case. The edit prompt is agent-live's: the oracle's
+  "keep the transparent background" shows W8A8's faint band (321e).
+- **Attempt 1.** The driver failed on its own log call after the
+  generation's image had arrived (a keyword clash). In that attempt:
+  - 27B → image took 9.86 s (server 9,810 ms: teardown 1,065, load 8,711);
+  - the 2048² phases matched the clean run (decoding at 6.185 s);
+  - it went back to the 27B in 11.61 s (server 11,569 ms).
+
+  The table above is the second, clean run of the whole sequence. Its logs
+  are `attempt1.jsonl` and `back.jsonl`.
+
+**Anything odd.**
+- **The 27B comes back with a smaller KV pool.** After a switch away and
+  back, it planned 10,428 pages (667,392 tokens) against 11,357 (726,848)
+  at the cold start: 8.2% less.
+  - The cause: its `free_at_start` was 30,556,864,512 bytes against
+    31,104,512,000, so 547,647,488 bytes less.
+  - The plan charges the CUDA context (452,595,712 bytes) as if it did not
+    exist yet (`crates/runtime/src/lib.rs`, `CUDA_CONTEXT_BYTES`). But a
+    switch keeps the process's context alive across the teardown, so the
+    context is counted twice. The other ~91 MiB is held across the teardown
+    as well.
+  - It leaves 1.78 GB free after the load, against 1.24 GB cold.
+  - The image plan reads the same smaller free figure but charges no
+    context; its budget is 43,584 tokens here against 321f's 43,840.
+  - This is not image-specific: any switch or reload does it. It is not
+    changed here.
+- **The catalog's `on_disk` reads `absent` for both built-in rows.** That
+  covers the 27B, which is loaded, and the image model, which is switchable
+  through `--switch-known-models`. `on_disk` counts only `download.path`,
+  and neither model is under it. The switch by id follows `switchable` and
+  works; only the badge misleads.
+- **A successful image job leaves no log line and no metric.** The text
+  requests log `admitted`/`ttft`/`done`. An image job logs only when refused,
+  failed or panicked. `/metrics` has no image series, so the phase times
+  above exist only in the stream.
