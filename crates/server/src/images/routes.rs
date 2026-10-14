@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 use utoipa::ToSchema;
 
 use super::budget::{self, Fitted};
+use super::enhance::Rewritten;
 use super::job::{self, Background, ImageJob, JobEnd, JobEvent, Phase, Progress};
 use super::ImageModel;
 use crate::api::{
@@ -39,9 +40,9 @@ use crate::api::{
     load_failed, refused_field, split_model_lane, unknown_model, unswitchable_named, ApiError, ENGINE_ERROR_MESSAGE,
 };
 use crate::config::schema::ImageGroup;
-use crate::model_switch::{Steps, SwitchStep};
+use crate::model_switch::{ImplicitRefusal, Steps, SwitchOutcome, SwitchRefusal, SwitchStep};
 use crate::openai_fields::{self, Surface};
-use crate::{ModelStatus, Server};
+use crate::{ModelSource, ModelStatus, Server};
 
 /// `POST /v1/images/generations`'s body, and the fields of an edit's form
 /// beside its images.
@@ -116,6 +117,11 @@ pub(crate) struct ImagesResponse {
     /// the condition budget scaled them below 1024² of area.
     #[serde(skip_serializing_if = "Option::is_none")]
     condition_sizes: Option<Vec<String>>,
+    /// ignis: what the request should know of how it was served — prompt
+    /// enhancement that did not rewrite the prompt, or rewrote an edit's
+    /// without seeing its images. Absent when there is nothing to say.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// One image.
@@ -166,10 +172,14 @@ pub(crate) struct CompletedEvent {
     output_format: &'static str,
     /// The job's seed: this image started from `seed + image`.
     seed: u64,
+    /// The prompt as prompt enhancement rewrote it, when it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     revised_prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     condition_sizes: Option<Vec<String>>,
+    /// As in the whole answer.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// `error`: the job ended before its last image, the status already sent.
@@ -222,6 +232,9 @@ struct ImageRequest {
     size: Option<ImageSize>,
     background: Background,
     seed: Option<u64>,
+    /// Whether its prompt is rewritten first: the request's
+    /// `prompt_enhancement`, else `image.prompt_enhancement`.
+    enhance: bool,
     stream: bool,
 }
 
@@ -272,7 +285,16 @@ fn checked(fields: GenerationRequest, limits: &ImageGroup) -> Result<ImageReques
             bad_request_param(&format!("background `{asked}` is not auto, transparent or opaque"), "background")
         })?,
     };
-    Ok(ImageRequest { model: fields.model, prompt, n, size, background, seed: fields.seed, stream: fields.stream })
+    Ok(ImageRequest {
+        model: fields.model,
+        prompt,
+        n,
+        size,
+        background,
+        seed: fields.seed,
+        enhance: fields.prompt_enhancement.unwrap_or(limits.prompt_enhancement),
+        stream: fields.stream,
+    })
 }
 
 /// `auto` (spec image-model/05 §Image routes): among `sizes`, the one whose
@@ -367,9 +389,11 @@ ignis adds `seed` (image `i` starts from `seed + i`; absent, one is drawn and re
 
 One job runs at a time and up to `image.queue_depth` wait, in order; past that the answer is `503 engine_full` with `Retry-After`. A client that disconnects cancels its job, while it waits or between two denoising steps.
 
-`stream: false` answers one JSON body. `stream: true` answers `text/event-stream`, each event an `event:` named by its `type` and a `data:` object: `image_generation.progress` (`{phase, image, step, total}`) as each unit of work starts -- `encoding` once, then per image one `denoising` per step and its `decoding` -- and one `image_generation.completed` per image with its `b64_json`, as soon as it is made. A job that ends early sends one `error` event (`{type, error}`) instead of the rest.
+`stream: false` answers one JSON body. `stream: true` answers `text/event-stream`, each event an `event:` named by its `type` and a `data:` object: `image_generation.progress` (`{phase, image, step, total}`) as each unit of work starts -- `switching`, `loading` and `enhancing` first when the request waits on a switch, a load or a rewrite, then `encoding` once, then per image one `denoising` per step and its `decoding` -- and one `image_generation.completed` per image with its `b64_json`, as soon as it is made. A job that ends early sends one `error` event (`{type, error}`) instead of the rest; so does a refusal that comes once a stream waiting on a switch, a load or a rewrite has begun.
 
-`model` absent, or the loaded image model's id, is served as it is; another known image model is switched to first when `switch.allow_implicit` is on. With a text model loaded and no `model` naming the image model, the answer is `409 model_kind_mismatch`.",
+`model` absent, or the loaded image model's id, is served as it is; another known image model is switched to first when `switch.allow_implicit` is on. With a text model loaded and no `model` naming the image model, the answer is `409 model_kind_mismatch`.
+
+Prompt enhancement (`prompt_enhancement: true`, or `image.prompt_enhancement` when absent): the text model `image.prompt_enhancer` rewrites the prompt first with Qwen's own system prompts (a prompt holding a CJK ideograph in Chinese, any other in English; reasoning off; seeded with `seed`), and the images are made from the rewrite, returned as each image's `revised_prompt`. With the enhancer loaded it rewrites, and the request then switches to the image model it names. Otherwise the request visits the enhancer: a switch to it and one on to the image model, during which every other request is answered `503 model_switching`; the visit does not change `GET /v1/models`' `last_switch`. A rewrite that cannot be had -- an enhancer the server cannot switch to, a switch to it that does not land, a rewrite that fails -- leaves the prompt as sent, and `warnings` says why.",
     request_body = GenerationRequest,
     responses(
         (status = 200, description = "The images. `application/json` when `stream` is false or absent; `text/event-stream` when it is true.", content(
@@ -381,7 +405,7 @@ One job runs at a time and up to `image.queue_depth` wait, in order; past that t
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 409, description = "The model that would serve the request is a text model (`model_kind_mismatch`, naming both kinds and the loaded id).", body = ApiError),
         (status = 500, description = "The image model refused a call (`engine_error`).", body = ApiError),
-        (status = 503, description = "The queue is full (`engine_full`, with `Retry-After`); a model switch is under way (`model_switching`, with `Retry-After`) or did not land (`model_switch_failed`); the image model was stopped before the job finished (`model_stopped`, with `Retry-After`); or the model was unloaded while idle and loading it again failed (`model_load_failed`).", body = ApiError),
+        (status = 503, description = "The queue is full (`engine_full`, with `Retry-After`); a model switch is under way (`model_switching`, with `Retry-After`) or did not land (`model_switch_failed`, also when a prompt enhancement visit could not switch back to the image model); the image model was stopped before the job finished (`model_stopped`, with `Retry-After`); or the model was unloaded while idle and loading it again failed (`model_load_failed`).", body = ApiError),
     ),
 )]
 pub(crate) async fn create_image(State(server): State<Arc<Server>>, Json(fields): Json<GenerationRequest>) -> Response {
@@ -402,7 +426,7 @@ pub(crate) async fn create_image(State(server): State<Arc<Server>>, Json(fields)
 
 Each condition image is resized to 1024x1024 pixels of area at its own aspect ratio, each side a multiple of 32 (diffusers' `calculate_dimensions`). When the prompt and the images exceed the condition budget -- the load's, lowered by `image.condition_budget_tokens`; a condition image costs one token per 16x16 pixels, 4,096 at 1024x1024 -- every image is scaled down by the same factor until they fit, and `condition_sizes` reports the sizes encoded; below `image.condition_floor_px` squared of area the request is a 400 naming the budget.
 
-`size: auto` is the size in `image.sizes` whose aspect ratio is nearest the last condition image's. Streaming, the events are `image_edit.progress` and `image_edit.completed`, otherwise as for a generation. Every other field, the queue and the switch are as for `POST /v1/images/generations`.",
+`size: auto` is the size in `image.sizes` whose aspect ratio is nearest the last condition image's. Streaming, the events are `image_edit.progress` and `image_edit.completed`, otherwise as for a generation. Prompt enhancement rewrites the instruction with Qwen's edit prompt, showing the enhancer the condition images when its vision tower is loaded; without one it rewrites from the text alone, and `warnings` says so. Every other field, the queue and the switch are as for `POST /v1/images/generations`.",
     request_body(content = EditForm, content_type = "multipart/form-data"),
     responses(
         (status = 200, description = "The images. `application/json` when `stream` is false or absent; `text/event-stream` when it is true.", content(
@@ -547,9 +571,10 @@ fn switch_steps(events: mpsc::UnboundedSender<Streamed>, legs: u32) -> Steps {
 /// switch to ([`unswitchable_named`]); then [`admit`]ted, and answered whole
 /// or streamed. A streamed request that waits on a load or a switch starts
 /// its stream at once, so that it hears those phases as they happen; what
-/// refuses it past that point is its `error` event. One the loaded image
-/// model takes as it is starts streaming once admitted, so every refusal
-/// before its job is still a status.
+/// refuses it past that point is its `error` event — and so does one whose
+/// prompt is rewritten first. One the loaded image model takes as it is
+/// starts streaming once admitted, so every refusal before its job is still
+/// a status.
 async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage>, route: Route) -> Response {
     let named = split_model_lane(request.model.clone()).0;
     if let Err(refused) = check_kind(&server, ModelKind::Image, named.as_deref()) {
@@ -560,7 +585,7 @@ async fn serve(server: Arc<Server>, request: ImageRequest, images: Vec<RgbaImage
     }
     let (events, receiver) = mpsc::unbounded_channel();
     let stream = request.stream;
-    if stream && waits_before_the_job(&server, named.as_deref()) {
+    if stream && (request.enhance || waits_before_the_job(&server, named.as_deref())) {
         tokio::spawn(async move {
             let refused = tokio::select! {
                 admitted = admit(server, request, images, route, &events) => admitted.err(),
@@ -603,8 +628,9 @@ async fn error_of(refused: Response) -> ApiError {
 }
 
 /// A request past its first checks, to its job: the load of a model the idle
-/// clock unloaded and the implicit switch to the image model it names, each
-/// phase sent to `events` as it starts (ADR 0049's rules); then, on the
+/// clock unloaded, prompt enhancement ([`enhance`]) and the implicit switch
+/// to the image model it names, each phase sent to `events` as it starts
+/// (ADR 0049's rules); then, on the
 /// image model, pinned for the rest of the request, the size against what
 /// its load makes (`auto` resolved among those), the queue's admission, the
 /// condition budget and the resize, and the job — its answer sent to
@@ -621,6 +647,12 @@ async fn admit(
         let _ = events.send(progress(Phase::Loading, 1, 1));
     }
     crate::model_switch::ensure_loaded(&server, named.as_deref()).await.map_err(|reason| load_failed(&server, &reason))?;
+    // Drawn now, so that the rewrite is seeded with it too.
+    let seed = request.seed.or(server.seedless_seed).unwrap_or_else(crate::api::fresh_seed);
+    let enhanced = match request.enhance {
+        true => enhance(&server, request.prompt.clone(), &images, named.as_deref(), seed, events).await?,
+        false => Enhanced::sent(request.prompt.clone()),
+    };
     crate::model_switch::implicit_switch_telling(&server, named.as_deref(), Some(switch_steps(events.clone(), 1)))
         .await
         .map_err(implicit_switch_refused)?;
@@ -662,8 +694,8 @@ async fn admit(
             format!("the image queue is full: one job runs and {} wait (image.queue_depth); retry", limits.queue_depth),
         ));
     };
-    let seed = request.seed.or(server.seedless_seed).unwrap_or_else(crate::api::fresh_seed);
-    let ImageRequest { prompt, n, background, .. } = request;
+    let ImageRequest { n, background, .. } = request;
+    let Enhanced { prompt, revised, warnings } = enhanced;
     let prepared = {
         let model = model.clone();
         tokio::task::spawn_blocking(move || prepare(model, &limits, prompt, images, size, n, seed, background, route))
@@ -678,9 +710,118 @@ async fn admit(
         size: size.to_string(),
         background: background.as_str(),
         condition_sizes: fitted.scaled.then(|| fitted.sizes.iter().map(ToString::to_string).collect()),
+        revised_prompt: revised,
+        warnings,
     }));
     job::spawn(model, job, waiting, events.clone());
     Ok(())
+}
+
+/// The prompt a job runs on, and what its answer says of it.
+#[derive(Debug)]
+struct Enhanced {
+    prompt: String,
+    /// The rewrite, when there was one: each image's `revised_prompt`.
+    revised: Option<String>,
+    warnings: Vec<String>,
+}
+
+impl Enhanced {
+    /// `prompt` as sent, no rewrite asked for.
+    fn sent(prompt: String) -> Self {
+        Self { prompt, revised: None, warnings: Vec::new() }
+    }
+
+    /// `prompt` as sent, since `enhancer` did not rewrite it, for `why`.
+    fn without(prompt: String, enhancer: &str, why: &str) -> Self {
+        tracing::warn!(
+            name: "ignis.image.enhancement_failed",
+            enhancer,
+            reason = why,
+            "prompt enhancement did not rewrite the prompt; the job runs on the prompt as sent"
+        );
+        let warning = format!("prompt enhancement with {enhancer} did not rewrite the prompt ({why}); the prompt was used as sent");
+        Self { prompt, revised: None, warnings: vec![warning] }
+    }
+
+    /// `prompt` as `enhancer` rewrote it, or as sent when it did not.
+    fn of(prompt: String, enhancer: &str, rewritten: Result<Rewritten, String>) -> Self {
+        match rewritten {
+            Ok(Rewritten { prompt: revised, warnings }) => Self { prompt: revised.clone(), revised: Some(revised), warnings },
+            Err(why) => Self::without(prompt, enhancer, &why),
+        }
+    }
+}
+
+/// Prompt enhancement (spec image-model/05 §Prompt enhancement), on
+/// `image.prompt_enhancer`, before the switch to the image model:
+///
+/// - the enhancer serving: the rewrite on it, then the request's switch to
+///   the image model — no switch of its own;
+/// - otherwise a visit to it ([`crate::model_switch::visit`]): from the image
+///   model and back, or from another text model on to the image model the
+///   request names (`named`) — two switches, the gate closed throughout,
+///   `last_switch` left as it was.
+///
+/// Each phase is sent to `events`. A rewrite that cannot be had — an
+/// enhancer the server cannot switch to, a visit that does not get there,
+/// a rewrite that fails — leaves the prompt as sent, with a warning; `Err`
+/// is a visit that left no image model to serve the request.
+async fn enhance(
+    server: &Server,
+    prompt: String,
+    images: &[RgbaImage],
+    named: Option<&str>,
+    seed: u64,
+    events: &mpsc::UnboundedSender<Streamed>,
+) -> Result<Enhanced, Response> {
+    let enhancer = server.live().image.prompt_enhancer.clone();
+    let loaded = server.active();
+    if loaded.kind() == ModelKind::Text && loaded.model_id() == enhancer {
+        let _ = events.send(progress(Phase::Enhancing, 1, 1));
+        let rewritten = super::enhance::rewrite(&server.pinned(), &prompt, images, seed).await;
+        return Ok(Enhanced::of(prompt, &enhancer, rewritten));
+    }
+    let Some(switcher) = server.switcher.as_ref() else {
+        return Ok(Enhanced::without(prompt, &enhancer, "this server cannot switch models"));
+    };
+    let Some(via) = switcher.text_model(&enhancer) else {
+        return Ok(Enhanced::without(prompt, &enhancer, "image.prompt_enhancer names no text model this server can switch to"));
+    };
+    // Where the visit ends: the image model the request names, else the one
+    // loaded.
+    let named = named.filter(|named| !named.is_empty() && *named != loaded.model_id());
+    let then = named
+        .and_then(|named| switcher.known(named).map(|artifact| ModelSource { artifact, model: named.to_owned() }))
+        .or_else(|| loaded.source.clone().filter(|_| loaded.kind() == ModelKind::Image));
+    let Some(then) = then else {
+        return Ok(Enhanced::without(prompt, &enhancer, "the image model has no artifact to load again after a visit"));
+    };
+    let to = then.model.clone();
+    let mut visit = match crate::model_switch::visit(server, via, then, Some(switch_steps(events.clone(), 2))) {
+        Ok(visit) => visit,
+        Err(SwitchRefusal::InProgress(running)) => return Err(implicit_switch_refused(ImplicitRefusal::Switching(running))),
+        Err(refused) => return Ok(Enhanced::without(prompt, &enhancer, &format!("a visit to it could not begin ({refused:?})"))),
+    };
+    let rewritten = match visit.arrived().await {
+        Some(visited) => {
+            let _ = events.send(progress(Phase::Enhancing, 1, 1));
+            Some(super::enhance::rewrite(&visited, &prompt, images, seed).await)
+        }
+        None => None,
+    };
+    match (visit.on().await, rewritten) {
+        (SwitchOutcome::Switched, Some(rewritten)) => Ok(Enhanced::of(prompt, &enhancer, rewritten)),
+        // The way there did not land, and the model it left serves again.
+        (SwitchOutcome::Refused { reason } | SwitchOutcome::Restored { reason }, None) => {
+            Ok(Enhanced::without(prompt, &enhancer, &format!("switching to it did not land: {reason}")))
+        }
+        (SwitchOutcome::Switched, None) => Ok(Enhanced::without(prompt, &enhancer, "the visit never handed it over")),
+        // Nothing serves, or the way on did not land: no image model.
+        (SwitchOutcome::Refused { reason } | SwitchOutcome::Restored { reason } | SwitchOutcome::Failed { reason }, _) => {
+            Err(implicit_switch_refused(ImplicitRefusal::Failed { to, reason }))
+        }
+    }
 }
 
 /// The condition budget and the resize, then the job: blocking, since the
@@ -731,6 +872,8 @@ struct Answer {
     size: String,
     background: &'static str,
     condition_sizes: Option<Vec<String>>,
+    revised_prompt: Option<String>,
+    warnings: Vec<String>,
 }
 
 /// A request that did not stream: the job's `n` images, collected, or why
@@ -742,7 +885,7 @@ async fn collect(mut events: mpsc::UnboundedReceiver<Streamed>, route: Route) ->
         match event {
             Streamed::Admitted(admitted) => answer = Some(admitted),
             Streamed::Job(JobEvent::Progress(_)) => {}
-            Streamed::Job(JobEvent::Image { png, .. }) => data.push(ImageData { b64_json: job::base64(&png), revised_prompt: None }),
+            Streamed::Job(JobEvent::Image { png, .. }) => data.push(png),
             Streamed::Job(JobEvent::Ended(end)) => return Refusal::of(Some(end), route).into_response(),
             // A whole answer's refusals are statuses (`serve`): none comes here.
             Streamed::Refused(error) => return Refusal { status: StatusCode::INTERNAL_SERVER_ERROR, error }.into_response(),
@@ -751,12 +894,13 @@ async fn collect(mut events: mpsc::UnboundedReceiver<Streamed>, route: Route) ->
     match answer {
         Some(answer) if data.len() == answer.n as usize => Json(ImagesResponse {
             created: answer.created,
-            data,
+            data: data.iter().map(|png| ImageData { b64_json: job::base64(png), revised_prompt: answer.revised_prompt.clone() }).collect(),
             seed: answer.seed,
             size: answer.size,
             background: answer.background,
             output_format: "png",
             condition_sizes: answer.condition_sizes,
+            warnings: answer.warnings,
         })
         .into_response(),
         // The job's thread went away without saying why: it panicked.
@@ -822,8 +966,9 @@ impl Stream for ImageSse {
                         background: answer.background,
                         output_format: "png",
                         seed: answer.seed,
-                        revised_prompt: None,
+                        revised_prompt: answer.revised_prompt.clone(),
                         condition_sizes: answer.condition_sizes.clone(),
+                        warnings: answer.warnings.clone(),
                     })
                 }
                 Poll::Ready(Some(Streamed::Refused(error))) => {

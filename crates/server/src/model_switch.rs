@@ -502,6 +502,19 @@ impl Switcher {
         }
     }
 
+    /// The text model a visit to `model` loads (spec image-model/05 §Prompt
+    /// enhancement): one an explicit switch by id may name — the listed
+    /// models' entry for it, else a catalog entry on disk — whatever
+    /// `switch.allow_implicit` says, since the operator named it in
+    /// `image.prompt_enhancer`; `None` for any other id, and for an image
+    /// model. Whether a listed model's file is there is the visit's prepare
+    /// to say.
+    pub fn text_model(&self, model: &str) -> Option<ModelSource> {
+        let artifact = self.listed_models().remove(model).or_else(|| self.catalog.as_ref()?.artifact(model))?;
+        let source = ModelSource { artifact, model: model.to_owned() };
+        (self.loader.kind_of(&source) != Some(ModelKind::Image)).then_some(source)
+    }
+
     /// The artifact a request naming `model` would switch to, if it is known:
     /// the known models' entry for it, else a catalog entry on disk.
     pub(crate) fn known(&self, model: &str) -> Option<PathBuf> {

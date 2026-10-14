@@ -501,9 +501,14 @@ config_group! {
         /// Whether a request that does not say has its prompt rewritten by
         /// `prompt_enhancer` before the image model reads it.
         prompt_enhancement: Bool = false, NO_RULE, ALL, [Visible, Patchable];
-        /// The text model that rewrites prompts: the served id of a known
-        /// model.
+        /// The text model that rewrites prompts: the served id of a model an
+        /// explicit switch may name (`switch.known_models`, the start model,
+        /// or a downloaded catalog entry), whatever `switch.allow_implicit`
+        /// says. An id that names none skips the rewrite, with a warning.
         prompt_enhancer: Text = ModelFamily::Qwen38_27b.model_id().to_owned(), NO_RULE, ALL, [Visible, Patchable];
+        /// The most tokens one rewrite may take. Qwen's prompts ask for
+        /// about 200 words; a longer answer is cut here and used as it is.
+        prompt_enhancer_max_tokens: Tokens = 1024, between(16, 8192), ALL, [Visible, Patchable];
     }
 }
 

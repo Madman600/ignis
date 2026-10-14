@@ -45,3 +45,8 @@ used under the MIT-CMU License:
     LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
     OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
     PERFORMANCE OF THIS SOFTWARE.
+
+Prompt enhancement's system prompts (crates/server/src/images/prompts.rs) are
+Qwen's, from QwenLM/Qwen-Image (src/examples/tools/prompt_utils_2512.py and
+prompt_utils.py, commit 6b5e1f5), Copyright 2024 Alibaba Cloud, licensed
+under the Apache License, Version 2.0; that file says how they were adapted.

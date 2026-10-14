@@ -296,6 +296,12 @@ fn the_image_routes_document_their_extensions_events_and_errors() {
     assert!(schemas["EditForm"].to_string().contains("image[]"), "{}", schemas["EditForm"]);
     assert!(schemas["ImagesResponse"]["properties"]["seed"].is_object());
     assert!(schemas["ImagesResponse"]["properties"]["condition_sizes"].is_object());
+    // AC 9: the rewrite and the warnings a fallback leaves.
+    assert!(schemas["ImagesResponse"]["properties"]["warnings"].is_object());
+    assert!(schemas["ImageData"]["properties"]["revised_prompt"].is_object());
+    assert!(schemas["CompletedEvent"]["properties"]["revised_prompt"].is_object() && schemas["CompletedEvent"]["properties"]["warnings"].is_object());
+    let generation_text = generation["description"].as_str().unwrap();
+    assert!(generation_text.contains("image.prompt_enhancer") && generation_text.contains("503 model_switching"), "{generation_text}");
     let events = schemas["ImageStreamEvent"].to_string();
     for event in ["ProgressEvent", "CompletedEvent", "ErrorEvent"] {
         assert!(events.contains(event), "{events}");

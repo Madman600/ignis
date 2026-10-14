@@ -2066,6 +2066,7 @@ fn every_image_field_resolves_from_flag_env_and_file_by_precedence() {
         ("condition_floor_px", "256", "384", "640"),
         ("prompt_enhancement", "true", "false", "true"),
         ("prompt_enhancer", "qwen3.8-flash-next", "my-27b", "qwen3.8-27b"),
+        ("prompt_enhancer_max_tokens", "256", "512", "2048"),
     ];
     assert_eq!(cases.len(), schema::ImageGroup::FIELDS.len(), "every image field has a case");
     for (name, file, env, flag) in cases {
@@ -2102,6 +2103,7 @@ fn an_image_field_past_its_bounds_is_refused_naming_it() {
         ("max_condition_images", 1, 10),
         ("max_condition_mipx", 1, 64),
         ("condition_floor_px", 32, 1024),
+        ("prompt_enhancer_max_tokens", 16, 8192),
     ] {
         let flag = schema::field("image", name).unwrap().flag();
         for taken in [low, high] {

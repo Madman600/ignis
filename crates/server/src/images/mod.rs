@@ -10,7 +10,9 @@
 //! ([`ImageJobs::in_flight`]) as they read a text model's lanes.
 
 pub mod budget;
+pub mod enhance;
 pub mod job;
+mod prompts;
 pub(crate) mod routes;
 
 use std::collections::VecDeque;

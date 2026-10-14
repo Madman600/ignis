@@ -1348,7 +1348,7 @@ fn normalize_tool(tool: &mut JsonValue) {
 /// `content` (GitHub #68): feeds the whole token list through the same
 /// [`OutputDecoder`] the streaming path uses one token at a time, so the
 /// two modes agree by construction (spec story 24).
-fn split_reasoning(
+pub(crate) fn split_reasoning(
     template: &dyn TemplateProvider,
     tokens: &[ignis_core::TokenId],
     thinking: &ThinkingOptions,

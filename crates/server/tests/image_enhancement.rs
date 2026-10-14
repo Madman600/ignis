@@ -1,7 +1,9 @@
 //! What an image request waits on before its job (spec image-model/05
 //! §Streaming, §Prompt enhancement, GitHub #322): the load of an unloaded
 //! model and the switch to the image model, streamed as `loading` and
-//! `switching` phases ahead of the job's own. The models are
+//! `switching` phases ahead of the job's own; the visit those switches
+//! make for prompt enhancement; and prompt enhancement itself (AC 9). The
+//! models are
 //! `support/switch.rs`'s mock loader's: the text models on `MockCompute`,
 //! the image model on `FakeImageRunner`.
 
@@ -14,7 +16,11 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use ignis_core::compute::ModelKind;
+use ignis_core::MockCompute;
+use ignis_server::images::enhance::Task;
 use ignis_server::model_switch::{visit, LastSwitch, SwitchOutcome, SwitchRefusal, SwitchStarted, SwitchStep, Switcher};
+use ignis_server::template::{SimpleTemplateProvider, TemplateProvider};
+use ignis_server::thinking::ThinkingOptions;
 use ignis_server::{ModelStatus, Server};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -247,4 +253,231 @@ async fn a_visit_that_fails_either_way_ends_with_a_model_serving_and_writes_no_l
     assert_eq!(server.active().model_id(), IMAGE, "a visit left by its beginner goes back");
     assert_eq!(loader.loads()[loads..], ["mock-b", IMAGE]);
     assert_eq!(last(), the_switch_to_the_image_model());
+}
+
+// ── prompt enhancement (AC 9) ─────────────────────────────────────────────
+
+/// `image.prompt_enhancer` set to `enhancer`, its rewrites short.
+fn enhancing_with(server: &Server, enhancer: &str) {
+    server.update_live(|live| {
+        live.image.prompt_enhancer = enhancer.to_owned();
+        live.image.prompt_enhancer_max_tokens = 16;
+    });
+}
+
+async fn send_generation(app: &axum::Router, body: Value) -> (StatusCode, Value) {
+    let response = app.clone().oneshot(generation(body)).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned())))
+}
+
+/// The prompt tokens each request prefilled on `compute`, with its decode
+/// parameters, by request in order.
+fn prefilled(compute: &MockCompute) -> Vec<(u64, Vec<u32>, ignis_core::DecodeParams)> {
+    let mut requests: Vec<(u64, Vec<u32>, ignis_core::DecodeParams)> = Vec::new();
+    for job in compute.prefill_calls().into_iter().flatten() {
+        match requests.iter_mut().find(|(request, ..)| *request == job.request as u64) {
+            // Only the last chunk carries the request's own parameters.
+            Some((_, tokens, params)) => {
+                tokens.extend(job.tokens.iter().map(|&token| token as u32));
+                *params = job.params.clone();
+            }
+            None => requests.push((job.request as u64, job.tokens.iter().map(|&token| token as u32).collect(), job.params.clone())),
+        }
+    }
+    requests
+}
+
+/// AC 9: with the enhancer loaded, an image request naming the image model
+/// is rewritten on it first — a CJK prompt with Qwen's Chinese system
+/// prompt, reasoning off, the job's seed — and then switches once, to the
+/// image model, which runs on the rewrite; `revised_prompt` is returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_the_enhancer_loaded_the_rewrite_comes_first_and_the_request_switches_once() {
+    let loader = MockLoader::new();
+    let compute = Arc::new(MockCompute::new());
+    let server = Server::from_active(loader.model_over("mock-a", Arc::clone(&compute) as _))
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_known_models(known(&["mock-a", IMAGE])));
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    let prompt = "一只雪地里的红狐狸";
+    let body = json!({ "prompt": prompt, "model": IMAGE, "size": "1024x1024", "seed": 5, "prompt_enhancement": true });
+    let (status, answer) = send_generation(&app, body).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let revised = answer["data"][0]["revised_prompt"].as_str().expect("revised_prompt").to_owned();
+    assert!(!revised.is_empty() && revised != prompt, "{revised}");
+    assert!(answer.get("warnings").is_none(), "{answer}");
+    assert_eq!(loader.encoded_prompts(), [revised], "the image model ran on the rewrite");
+    assert_eq!(loader.loads(), [IMAGE], "one switch: the rewrite needed none");
+    let last = server.switcher.as_ref().unwrap().last_switch();
+    assert_eq!(last, Some(LastSwitch { from: "mock-a".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched }));
+
+    let thinking_off = ThinkingOptions { enable_thinking: false, ..ThinkingOptions::default() };
+    let expected = SimpleTemplateProvider.apply_chat_template(&Task::GenerationZh.messages(prompt, &[]), &thinking_off, &[]).unwrap();
+    let rewrites = prefilled(&compute);
+    assert_eq!(rewrites.len(), 1, "one rewrite");
+    let (_, tokens, params) = &rewrites[0];
+    assert_eq!(*tokens, expected.tokens.iter().map(|&token| token as u32).collect::<Vec<_>>(), "the Chinese system prompt and upstream's user turn");
+    assert_eq!((params.seed, params.max_tokens, params.starts_in_reasoning), (5, Some(16), false));
+}
+
+/// AC 9: with the image model loaded, an enhanced request visits the
+/// enhancer — `switching`, `loading`, `enhancing`, `switching`, `loading`
+/// streamed before the job — two switches that leave `last_switch` as it
+/// was; the image model runs on the rewrite, returned as `revised_prompt`.
+/// `image.prompt_enhancement` turns it on for a request that does not say,
+/// and `prompt_enhancement: false` off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_the_image_model_loaded_an_enhanced_request_visits_the_enhancer_and_comes_back() {
+    let loader = MockLoader::new();
+    let server = on_the_image_model(&loader).await;
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    let body = json!({ "prompt": "a red fox in snow", "size": "1024x1024", "seed": 3, "prompt_enhancement": true, "stream": true });
+    let events = events_of(&app, body).await;
+    assert_eq!(
+        phases(&events),
+        then_the_job(&["switching 1/2", "loading 1/2", "enhancing 1/1", "switching 2/2", "loading 2/2"])
+    );
+    let completed = &events.last().unwrap().1;
+    let revised = completed["revised_prompt"].as_str().expect("revised_prompt").to_owned();
+    assert_eq!(loader.encoded_prompts(), [revised.clone()]);
+    assert_eq!(loader.loads(), [IMAGE, "mock-a", IMAGE]);
+    assert_eq!(loader.resident_at_load(), [0, 0, 0]);
+    assert_eq!(server.switcher.as_ref().unwrap().last_switch(), the_switch_to_the_image_model(), "a visit is not a switch");
+    assert_eq!((server.status().as_str(), server.active().model_id()), ("serving", IMAGE.to_owned()));
+
+    server.update_live(|live| live.image.prompt_enhancement = true);
+    let (status, answer) = send_generation(&app, json!({ "prompt": "a red fox in snow", "size": "1024x1024", "seed": 3 })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["data"][0]["revised_prompt"], revised, "the same seed, the same rewrite");
+    assert_eq!(loader.loads().len(), 5, "the config's default visited too");
+    let (status, answer) = send_generation(&app, json!({ "prompt": "as sent", "size": "1024x1024", "prompt_enhancement": false })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer["data"][0].get("revised_prompt").is_none(), "{answer}");
+    assert_eq!((loader.loads().len(), loader.encoded_prompts().last().map(String::as_str)), (5, Some("as sent")));
+}
+
+/// AC 9: while a visit runs — here with the rewrite done and the image
+/// model's reload held — every other request is answered `503
+/// model_switching` with `Retry-After`; the enhanced request is answered
+/// once the image model is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn during_a_visit_other_requests_are_answered_model_switching() {
+    let loader = MockLoader::new();
+    let server = on_the_image_model(&loader).await;
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    let there = loader.hold_next_load();
+    let back = loader.hold_next_load();
+    let body = json!({ "prompt": "a red fox", "size": "1024x1024", "prompt_enhancement": true });
+    let enhanced = tokio::spawn({
+        let app = app.clone();
+        async move { send_generation(&app, body).await }
+    });
+    until(&server, "switching", PATIENT).await;
+    there.send(()).unwrap();
+    let visiting = ModelStatus::Switching { from: "mock-a".into(), to: IMAGE.into() };
+    let deadline = Instant::now() + PATIENT;
+    while *server.status() != visiting || loader.resident() != 0 {
+        assert!(Instant::now() < deadline, "the visit never got to its way back: {:?}", server.status());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The enhancer rewrote and was torn down; the image model's load waits.
+    let (status, refused) = send_chat(&app).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("model_switching")), "{refused}");
+    let response = app.clone().oneshot(generation(json!({ "prompt": "another" }))).await.unwrap();
+    assert_eq!((response.status(), response.headers()[header::RETRY_AFTER].to_str().unwrap()), (StatusCode::SERVICE_UNAVAILABLE, "1"));
+    assert!(!enhanced.is_finished());
+    back.send(()).unwrap();
+    let (status, answer) = enhanced.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer["data"][0]["revised_prompt"].is_string(), "{answer}");
+    assert_eq!(server.status().as_str(), "serving");
+}
+
+/// AC 9: a failing enhancer falls back to the prompt as sent, with a
+/// warning — refused before anything stopped, failed to load (the image
+/// model loaded again), an id that names no model, an engine that refuses
+/// the rewrite — and the request is served all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_enhancer_falls_back_to_the_prompt_as_sent_with_a_warning() {
+    let loader = MockLoader::new();
+    let server = on_the_image_model(&loader).await;
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    let enhanced = |prompt: &str| json!({ "prompt": prompt, "size": "1024x1024", "prompt_enhancement": true });
+    let fell_back = |answer: &Value, words: &str| {
+        assert!(answer["data"][0].get("revised_prompt").is_none(), "{answer}");
+        let warning = answer["warnings"][0].as_str().unwrap_or_default();
+        assert!(warning.contains("did not rewrite the prompt") && warning.contains("used as sent") && warning.contains(words), "{answer}");
+    };
+
+    loader.refuse("mock-a");
+    let (status, answer) = send_generation(&app, enhanced("refused")).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    fell_back(&answer, "refused at prepare");
+    assert_eq!(loader.loads().len(), 1, "nothing stopped");
+
+    enhancing_with(&server, "mock-b");
+    loader.break_load("mock-b");
+    let (status, answer) = send_generation(&app, enhanced("broken")).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    fell_back(&answer, "failed to load");
+    assert_eq!(loader.loads()[1..], ["mock-b", IMAGE], "the image model was loaded again");
+
+    enhancing_with(&server, "nobody");
+    let (status, answer) = send_generation(&app, enhanced("unknown")).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    fell_back(&answer, "names no text model");
+    assert_eq!(loader.encoded_prompts(), ["refused", "broken", "unknown"], "each job ran on the prompt as sent");
+    assert_eq!(server.switcher.as_ref().unwrap().last_switch(), the_switch_to_the_image_model());
+
+    // On a loaded enhancer whose engine refuses the rewrite: the system
+    // prompt and 8,192 tokens of answer are past the mock's 8,192 context.
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]);
+    enhancing_with(&server, "mock-a");
+    server.update_live(|live| live.image.prompt_enhancer_max_tokens = 8192);
+    let app = server.app();
+    let body = json!({ "prompt": "engine fault", "model": IMAGE, "size": "1024x1024", "prompt_enhancement": true });
+    let (status, answer) = send_generation(&app, body).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    fell_back(&answer, "mock-a did not take the rewrite");
+    assert_eq!((loader.loads(), loader.encoded_prompts()), (vec![IMAGE.to_owned()], vec!["engine fault".to_owned()]));
+}
+
+/// An edit's enhancer with no vision tower rewrites the instruction from its
+/// text alone, and the answer says so beside the rewrite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_rewritten_without_a_vision_tower_says_so() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]);
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    const BOUNDARY: &str = "ignis-enhancement-boundary";
+    let image = ignis_core::image::RgbaImage { size: ignis_core::image::ImageSize::new(64, 64), pixels: vec![90; 64 * 64 * 4] };
+    let png = ignis_server::images::job::encode_png(&image);
+    let mut body = Vec::new();
+    for (name, value) in [("prompt", "make it blue"), ("model", IMAGE), ("size", "1024x1024"), ("prompt_enhancement", "true")] {
+        body.extend(format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").bytes());
+    }
+    body.extend(format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n").bytes());
+    body.extend_from_slice(&png);
+    body.extend(format!("\r\n--{BOUNDARY}--\r\n").bytes());
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/images/edits")
+        .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={BOUNDARY}"))
+        .body(Body::from(body))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let answer: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer["data"][0]["revised_prompt"].is_string(), "{answer}");
+    let warning = answer["warnings"][0].as_str().unwrap_or_default();
+    assert!(warning.contains("no vision tower") && warning.contains("without seeing its condition images"), "{answer}");
+    assert_eq!(loader.loads(), [IMAGE]);
 }
