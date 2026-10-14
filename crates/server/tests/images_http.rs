@@ -714,23 +714,31 @@ async fn a_stopped_model_ends_its_job_with_model_stopped() {
 /// Review-322b F1: a runner call that panics mid-job neither aborts the
 /// process nor keeps the job's prefix — the lock it poisoned still releases
 /// it — and its request is answered `500 engine_error`; streamed, with an
-/// `error` event in place of the images it never got (L7). The same model
-/// then serves the next request. (That a shutdown still drops a runner whose
-/// call panicked is `images::tests::a_runner_call_that_panics_neither_keeps_its_prefix_nor_survives_the_shutdown`.)
+/// `error` event in place of the images it never got (L7). Then the model is
+/// failed (322g's note): its queue closed and its runner dropped before the
+/// request hears the end, so the request after it is `503 model_stopped`.
+/// This server cannot load the model again; one with a switcher unloads it
+/// and loads it for the next request (`model_kind.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_runner_that_panics_mid_job_is_an_engine_error_and_the_model_serves_on() {
+async fn a_runner_that_panics_mid_job_is_an_engine_error_and_fails_the_model() {
     let harness = Harness::new(Gate::opened());
     let body = json!({ "prompt": "a fault", "n": 2, "size": "64x64", "seed": 4 });
     harness.faults.panic_at_step.store(3, Ordering::SeqCst);
     let (status, refused) = send(&harness.app, json_request("/v1/images/generations", &body)).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{refused}");
     assert_eq!(refused["error"]["code"], "engine_error");
-    until("the prefix released", || harness.held.load(Ordering::SeqCst) == 0 && harness.jobs().in_flight().is_idle()).await;
-    assert_eq!(harness.calls().last(), Some(&Call::Release));
+    assert_eq!(harness.calls().last(), Some(&Call::Release), "the prefix released through the poisoned lock");
+    assert_eq!(harness.held.load(Ordering::SeqCst), 0);
+    let model = harness.server.active().image_model().expect("the image model").clone();
+    assert!(model.jobs.is_closed() && model.with_runner(|_| ()).is_none(), "the model failed: its queue closed, its runner gone");
+    until("the job ended", || harness.jobs().in_flight().is_idle()).await;
+    let (status, stopped) = send(&harness.app, json_request("/v1/images/generations", &body)).await;
+    assert_eq!((status, stopped["error"]["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("model_stopped")), "{stopped}");
 
-    // Streamed: the first image is sent, then the step of the second panics.
-    // The first request took steps 1 to 3; this one's first image 4 to 11.
-    harness.faults.panic_at_step.store(3 + 8 + 3, Ordering::SeqCst);
+    // Streamed, on a model of its own: the first image is sent, then the
+    // step of the second panics (steps 1 to 8 are the first image's).
+    let harness = Harness::new(Gate::opened());
+    harness.faults.panic_at_step.store(8 + 3, Ordering::SeqCst);
     let mut streamed = body.clone();
     streamed["stream"] = json!(true);
     let events = events_of(harness.app.clone().oneshot(json_request("/v1/images/generations", &streamed)).await.unwrap()).await;
@@ -739,10 +747,7 @@ async fn a_runner_that_panics_mid_job_is_an_engine_error_and_the_model_serves_on
     assert_eq!((completed, last.as_str()), (1, "error"), "{events:?}");
     assert_eq!(error["error"]["code"], "engine_error", "{error}");
     until("the prefix released", || harness.held.load(Ordering::SeqCst) == 0 && harness.jobs().in_flight().is_idle()).await;
-
-    let (status, body) = send(&harness.app, json_request("/v1/images/generations", &body)).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["data"].as_array().map(Vec::len), Some(2));
+    assert!(harness.jobs().is_closed());
 }
 
 /// Review-322b L2: a runner whose prefix count drifted below the one its

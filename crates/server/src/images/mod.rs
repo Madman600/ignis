@@ -62,11 +62,17 @@ impl ImageModel {
         &self.plan
     }
 
+    /// Whether `other` is this model (a clone of it), not another load.
+    pub fn is(&self, other: &ImageModel) -> bool {
+        Arc::ptr_eq(&self.jobs, &other.jobs)
+    }
+
     /// Run `calls` on the runner, holding it: `None` once the model was shut
     /// down. A job holds it for as many calls as it makes in one go, and a
     /// shutdown waits for that. A call that panicked leaves the lock
     /// poisoned, not the runner unreachable: the job's prefix is still
-    /// released, and the shutdown still drops it.
+    /// released, and the shutdown still drops it — which the job does at
+    /// once (`job::spawn`).
     pub fn with_runner<T>(&self, calls: impl FnOnce(&mut dyn ImageRunner) -> T) -> Option<T> {
         let mut runner = self.runner.lock().unwrap_or_else(PoisonError::into_inner);
         runner.as_mut().map(|runner| calls(runner.as_mut()))

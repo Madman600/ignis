@@ -190,7 +190,20 @@ pub fn run<E: From<JobEvent>>(model: &ImageModel, job: &ImageJob, events: &mpsc:
 /// that ends early sends why, unless its request is gone. Dropping the
 /// channel's receiver cancels the job: while it waits it leaves the queue at
 /// once; once it runs, at its next call.
-pub fn spawn<E: From<JobEvent> + Send + 'static>(model: ImageModel, job: ImageJob, waiting: Waiting, events: mpsc::UnboundedSender<E>) {
+///
+/// A runner call that panics fails the model (322g's note): its request
+/// sees the channel close before its last image, the queue is closed — the
+/// jobs behind it never reach a runner left mid-call — and the runner is
+/// dropped, both before the job stops counting; then `server` unloads the
+/// model, so the next request loads it again
+/// ([`crate::model_switch::unload_failed`]).
+pub fn spawn<E: From<JobEvent> + Send + 'static>(
+    server: std::sync::Arc<crate::Server>,
+    model: ImageModel,
+    job: ImageJob,
+    waiting: Waiting,
+    events: mpsc::UnboundedSender<E>,
+) {
     tokio::spawn(async move {
         let running = tokio::select! {
             running = waiting.turn() => running,
@@ -200,8 +213,19 @@ pub fn spawn<E: From<JobEvent> + Send + 'static>(model: ImageModel, job: ImageJo
             let _ = events.send(JobEvent::Ended(JobEnd::Stopped).into());
             return;
         };
+        let failed = model.clone();
         let ran = tokio::task::spawn_blocking(move || {
-            let ended = run(&model, &job, &events);
+            let ended = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&model, &job, &events))) {
+                Ok(ended) => ended,
+                Err(panic) => {
+                    // The prefix went as the job unwound (`Held`); the
+                    // runner the call left is not trusted with another.
+                    model.jobs.close();
+                    model.shut_down();
+                    drop(running);
+                    return Err(panic_message(panic.as_ref()));
+                }
+            };
             // No longer counted before its request hears the end: a request
             // answered is never a job in flight.
             drop(running);
@@ -221,14 +245,29 @@ pub fn spawn<E: From<JobEvent> + Send + 'static>(model: ImageModel, job: ImageJo
                     let _ = events.send(JobEvent::Ended(end).into());
                 }
             }
+            Ok(())
         })
-        .await;
-        if let Err(panicked) = ran {
-            // The events' sender went with the thread: the request sees the
-            // channel close before its last image.
-            tracing::error!(name: "ignis.image.job_panicked", error = %panicked, "an image job panicked");
+        .await
+        .unwrap_or_else(|panicked| Err(panicked.to_string()));
+        if let Err(why) = ran {
+            tracing::error!(
+                name: "ignis.image.job_panicked",
+                model = %failed.model_id(),
+                error = %why,
+                "an image job panicked: the image model is failed, unloaded, and loaded again by the next request"
+            );
+            crate::model_switch::unload_failed(&server, &failed, format!("an image job panicked: {why}")).await;
         }
     });
+}
+
+/// What a panic said, when it said it as text.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    match (panic.downcast_ref::<&str>(), panic.downcast_ref::<String>()) {
+        (Some(message), _) => (*message).to_owned(),
+        (None, Some(message)) => message.clone(),
+        (None, None) => "a panic with no message".to_owned(),
+    }
 }
 
 /// `image` composited on white, alpha 255: each colour blended as the

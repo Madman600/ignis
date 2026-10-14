@@ -19,7 +19,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -47,6 +47,8 @@ struct State {
     /// The prompt of every condition prefix an image runner encoded, in
     /// order.
     encoded: Arc<Mutex<Vec<String>>>,
+    /// Set, the next denoising step of any image runner panics, once.
+    panic_step: Arc<AtomicBool>,
     /// How many built models were still alive as each load began.
     resident_at_load: Mutex<Vec<usize>>,
     /// The ids loaded, in order.
@@ -115,7 +117,7 @@ impl MockLoader {
         let gate = Arc::new(StepGate::default());
         let runner = FakeImageRunner::default();
         self.state.built_images.lock().unwrap().push(Arc::downgrade(&runner.held_conditions()));
-        let runner = Logged { inner: runner, encoded: Arc::clone(&self.state.encoded), gate: Some(Arc::clone(&gate)) };
+        let runner = Logged { inner: runner, encoded: Arc::clone(&self.state.encoded), gate: Some(Arc::clone(&gate)), panic: Arc::clone(&self.state.panic_step) };
         (ActiveModel::image(ImageModel::new(id, Box::new(runner))).with_source(source(id)), gate)
     }
 
@@ -140,6 +142,12 @@ impl MockLoader {
     /// test proves a later attempt is made, and can succeed.
     pub fn mend(&self, id: &str) {
         self.state.broken.lock().unwrap().remove(id);
+    }
+
+    /// Make the next denoising step of an image runner panic, as a leaf
+    /// fault would.
+    pub fn panic_next_step(&self) {
+        self.state.panic_step.store(true, Ordering::SeqCst);
     }
 
     /// Hold the next load until the returned sender sends (or is dropped).
@@ -213,7 +221,7 @@ fn build(state: &State, id: &str, compute: Arc<dyn Compute>) -> ActiveModel {
     if ModelFamily::of_model_id(id) == Some(ModelFamily::QwenImage21) {
         let runner = FakeImageRunner::default();
         state.built_images.lock().unwrap().push(Arc::downgrade(&runner.held_conditions()));
-        let runner = Logged { inner: runner, encoded: Arc::clone(&state.encoded), gate: None };
+        let runner = Logged { inner: runner, encoded: Arc::clone(&state.encoded), gate: None, panic: Arc::clone(&state.panic_step) };
         return ActiveModel::image(ImageModel::new(id, Box::new(runner))).with_source(source(id));
     }
     state.built.lock().unwrap().push(Arc::downgrade(&compute));
@@ -294,11 +302,13 @@ impl StepGate {
 }
 
 /// `FakeImageRunner`, logging the prompt of each prefix it encodes, each
-/// denoising step behind `gate` when there is one.
+/// denoising step behind `gate` when there is one, and panicking at one when
+/// `panic` is set.
 struct Logged {
     inner: FakeImageRunner,
     encoded: Arc<Mutex<Vec<String>>>,
     gate: Option<Arc<StepGate>>,
+    panic: Arc<AtomicBool>,
 }
 
 impl ImageRunner for Logged {
@@ -325,6 +335,9 @@ impl ImageRunner for Logged {
     ) -> Result<(), ImageError> {
         if let Some(gate) = &self.gate {
             gate.pass();
+        }
+        if self.panic.swap(false, Ordering::SeqCst) {
+            panic!("a leaf fault (simulated)");
         }
         self.inner.denoise_step(condition, latents, sigma, sigma_next, velocity)
     }

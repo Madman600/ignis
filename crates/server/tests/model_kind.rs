@@ -387,6 +387,31 @@ async fn a_switch_drains_the_image_jobs_and_past_its_window_closes_the_queue() {
     }
 }
 
+/// 322g's note: an image runner that panics mid-job fails its model. The
+/// request is answered `500 engine_error`; the model is unloaded as the
+/// idle clock unloads one — its runner dropped, `GET /v1/models` saying
+/// `unloaded` — and the next request loads it again and is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_image_runner_that_panics_unloads_its_model_and_the_next_request_loads_it_again() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, IMAGE, &[IMAGE]);
+    let app = server.app();
+    loader.panic_next_step();
+    let body = json!({ "prompt": "a fault", "size": "1024x1024", "seed": 4 });
+    let (status, failed) = send(&app, Method::POST, "/v1/images/generations", Some(body.clone())).await;
+    assert_eq!((status, failed["error"]["code"].as_str()), (StatusCode::INTERNAL_SERVER_ERROR, Some("engine_error")), "{failed}");
+    unloaded(&server).await;
+    assert_eq!(loader.resident(), 0, "the failed runner was dropped");
+    let (_, models) = send(&app, Method::GET, "/v1/models", None).await;
+    assert_eq!((models["status"].as_str(), models["data"][0]["id"].as_str()), (Some("unloaded"), Some(IMAGE)), "{models}");
+
+    let (status, made) = send(&app, Method::POST, "/v1/images/generations", Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    assert_eq!(made["data"].as_array().map(Vec::len), Some(1));
+    assert_eq!(loader.loads(), [IMAGE], "loaded again, once");
+    assert_eq!(server.status().as_str(), "serving");
+}
+
 /// The same as [`implicit_off`] or [`implicit_on`], with the idle clock's
 /// `model.idle_unload` at [`IDLE`].
 fn idle(server: Server) -> Server {

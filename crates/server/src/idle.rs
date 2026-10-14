@@ -186,6 +186,6 @@ async fn tick_once(server: &Server) {
         .usage
         .when_idle(after, |idle| crate::model_switch::claim_unload(server).map(|unloading| (unloading, idle)));
     if let Some((unloading, idle)) = due {
-        crate::model_switch::unload(server, unloading, idle).await;
+        crate::model_switch::unload(server, unloading, crate::model_switch::UnloadCause::Idle(idle)).await;
     }
 }

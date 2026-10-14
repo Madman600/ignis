@@ -701,7 +701,9 @@ async fn admit(
         .await
         .map_err(implicit_switch_refused)?;
     // One model for the rest of the request (spec model-switch/01), the
-    // image model (spec image-model/05).
+    // image model (spec image-model/05); the server itself for the job,
+    // which unloads its model should it fail.
+    let unpinned = Arc::clone(&server);
     let server = Arc::new(server.pinned());
     check_served_kind(&server, ModelKind::Image, named.as_deref())?;
     let model = server.active().image_model().expect("the kind check passed: the image model").clone();
@@ -748,7 +750,7 @@ async fn admit(
         revised_prompt: revised,
         warnings,
     }));
-    job::spawn(model, job, waiting, events.clone());
+    job::spawn(unpinned, model, job, waiting, events.clone());
     Ok(())
 }
 

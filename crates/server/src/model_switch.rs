@@ -1199,21 +1199,36 @@ pub(crate) struct Unloading {
 /// ([`crate::idle::Usage`]), which a request's admission takes too: the
 /// count it saw at zero stays zero until the status says `unloaded`.
 pub(crate) fn claim_unload(server: &Server) -> Option<Unloading> {
+    claim_unload_if(server, |_| true)
+}
+
+/// [`claim_unload`], when `meant` says the model loaded now is the one to
+/// unload: one a switch has loaded since is left alone.
+fn claim_unload_if(server: &Server, meant: impl FnOnce(&ActiveModel) -> bool) -> Option<Unloading> {
     let switcher = server.switcher.clone()?;
     let mut running = switcher.running.lock().expect("switch lock");
-    if running.is_some() || !matches!(*server.status(), ModelStatus::Serving) || server.active().source.is_none() {
+    let active = server.active();
+    if running.is_some() || !matches!(*server.status(), ModelStatus::Serving) || active.source.is_none() || !meant(&active) {
         return None;
     }
-    *running = Some(Slot::Unload { model: server.active().model_id() });
+    *running = Some(Slot::Unload { model: active.model_id() });
     server.status.store(Arc::new(ModelStatus::Unloaded));
     drop(running);
     Some(Unloading { _slot: RunningGuard { switcher, status: Arc::clone(&server.status), records: false } })
 }
 
+/// Why an unload tears the model down.
+pub(crate) enum UnloadCause {
+    /// Nobody used it for this long (`model.idle_unload`).
+    Idle(Duration),
+    /// It failed while it served, for this reason ([`unload_failed`]).
+    Failed(String),
+}
+
 /// Tear the model down the way a switch does ([`ActiveModel::shut_down`]:
 /// the model thread drops its scheduler, and with it every GPU buffer and
-/// pinned arena), after [`claim_unload`] closed it, `idle` after its last
-/// use. The [`ActiveModel`] stays published — its id and its source are
+/// pinned arena), after [`claim_unload`] closed it, for `cause`: idle for
+/// so long after its last use, or failed. The [`ActiveModel`] stays published — its id and its source are
 /// what `GET /v1/models` names and what the next load reads — and its
 /// engine is never called again. Not a switch: `ignis.model.unloaded`, and
 /// `last_switch` is left as it was (AC 14). The slot is freed, and the
@@ -1225,24 +1240,49 @@ pub(crate) fn claim_unload(server: &Server) -> Option<Unloading> {
 /// mid-teardown must not free the slot — and wake a request to load a model
 /// — while the old model still holds the card. `/metrics` stops showing the
 /// model's reservations in the same unit, before a load could write its own.
-pub(crate) async fn unload(server: &Server, unloading: Unloading, idle: Duration) {
+pub(crate) async fn unload(server: &Server, unloading: Unloading, cause: UnloadCause) {
     let model = server.active();
     let server = server.clone();
     let teardown = tokio::task::spawn_blocking(move || {
         let teardown_began = Instant::now();
         model.shut_down();
         server.observe_unload();
-        tracing::info!(
-            name: "ignis.model.unloaded",
-            model = %model.model_id(),
-            idle_secs = idle.as_secs(),
-            teardown_ms = teardown_began.elapsed().as_millis() as u64,
-            "nobody used the model for model.idle_unload seconds: it is unloaded, and the next request that needs it loads it again"
-        );
+        let teardown_ms = teardown_began.elapsed().as_millis() as u64;
+        match cause {
+            UnloadCause::Idle(idle) => tracing::info!(
+                name: "ignis.model.unloaded",
+                model = %model.model_id(),
+                idle_secs = idle.as_secs(),
+                teardown_ms,
+                "nobody used the model for model.idle_unload seconds: it is unloaded, and the next request that needs it loads it again"
+            ),
+            UnloadCause::Failed(reason) => tracing::warn!(
+                name: "ignis.model.unloaded",
+                model = %model.model_id(),
+                reason = %reason,
+                teardown_ms,
+                "the model failed while it served: it is unloaded, and the next request that needs it loads it again"
+            ),
+        }
         drop(unloading);
     });
     if let Err(panicked) = teardown.await {
         tracing::error!(name: "ignis.model.teardown_panicked", error = %panicked, "tearing the unloaded model down panicked");
+    }
+}
+
+/// The image model `failed` stopped serving on a fault of its own — a
+/// runner call panicked mid-job, and the job closed its queue and dropped
+/// its runner (`images::job::spawn`): unloaded as the idle clock unloads a
+/// model ([`claim_unload`], [`unload`]), so the next request that needs it
+/// loads it again ([`ensure_loaded`]). Nothing when it is no longer the
+/// model serving — a switch has replaced it, or one under way replaces it
+/// anyway — or the server could not load it again (no switcher): then each
+/// request on it is answered `503 model_stopped`.
+pub(crate) async fn unload_failed(server: &Server, failed: &crate::images::ImageModel, reason: String) {
+    let unloading = claim_unload_if(server, |active| active.image_model().is_some_and(|model| model.is(failed)));
+    if let Some(unloading) = unloading {
+        unload(server, unloading, UnloadCause::Failed(reason)).await;
     }
 }
 
