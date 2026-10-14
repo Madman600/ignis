@@ -9,13 +9,16 @@ import { type GalleryItem, imageModelRow, lastSwitchOf, type Limits, limitsOf, p
 // allows, the run under way with its progress, the gallery, and the explicit
 // switch to the image model. The view renders it and nothing else.
 //
-// Nothing here names a model. A run goes to the image routes bare, and the
-// one `model` this page sends is the id in the switch the owner asked for, to
-// the Server view's `/v1/models/switch`.
+// A `model` is sent only where the owner chose the image model: the switch
+// button, to the Server view's `/v1/models/switch`, and a run whose params name
+// it — Generate or Edit pressed with a text model loaded (`runPlan`, GitHub
+// #324). Any other run goes to the image routes bare.
 
 export type Run = {
   edit: boolean;
   n: number;
+  /** The request names the image model: the server switches to it before the job. */
+  switches: boolean;
   progress: ImageProgress | null;
 };
 
@@ -90,7 +93,10 @@ export function useStudio(model: ModelState, refreshModel: () => void, visible: 
     if (abort.current) return;
     const controller = new AbortController();
     abort.current = controller;
-    setRun({ edit: isEdit(params), n: params.n, progress: null });
+    const switches = params.model !== undefined;
+    // The page reads the switch once, when the request begins it: the model follows from there (useModel).
+    let refreshed = false;
+    setRun({ edit: isEdit(params), n: params.n, switches, progress: null });
     setError(null);
     setNotes([]);
     setRevised(null);
@@ -98,7 +104,13 @@ export function useStudio(model: ModelState, refreshModel: () => void, visible: 
       params,
       stream,
       {
-        progress: (progress) => setRun({ edit: isEdit(params), n: params.n, progress }),
+        progress: (progress) => {
+          setRun({ edit: isEdit(params), n: params.n, switches, progress });
+          if (switches && !refreshed && (progress.phase === "switching" || progress.phase === "loading")) {
+            refreshed = true;
+            refreshModel();
+          }
+        },
         image: (item) => {
           setGallery((current) => [item, ...current]);
           if (item.revisedPrompt) setRevised(item.revisedPrompt);

@@ -9,6 +9,10 @@ import {
   type ExpertPhase,
   emptySnapshot,
   type Histogram,
+  IMAGE_OUTCOMES,
+  IMAGE_PHASES,
+  type ImageOutcome,
+  type ImagePhase,
   KV_DISK_SPILL_SOURCES,
   type KvDiskSpillSource,
   REJECT_REASONS,
@@ -177,6 +181,23 @@ export type Speculation = {
   byPosition: (number | null)[];
 };
 
+/**
+ * The image jobs over the window (GitHub #324): how many ended and how, the
+ * images made, how long the completed ones took and where the time went.
+ * Shares are computed here from the phase counters, since the server
+ * exports none.
+ */
+export type Images = {
+  /** Jobs ended, all outcomes; `byOutcome` splits them. */
+  jobs: Counter & { byOutcome: Record<ImageOutcome, Tally> };
+  images: Counter;
+  duration: Latency;
+  waiting: number | null;
+  running: number | null;
+  /** Seconds in each phase over the window, and its share of all of them. */
+  phases: { phase: ImagePhase; seconds: Tally; share: number | null }[];
+};
+
 export type HealthLevel = "idle" | "healthy" | "busy" | "saturated";
 /** The verdict: its level, what it rests on in a phrase, and the facts behind it. */
 export type Health = { level: HealthLevel; summary: string; notes: string[] };
@@ -216,6 +237,8 @@ export type Dashboard = {
   ngram: Ngram | null;
   /** Null until a verify round ran: a load without speculation. */
   speculation: Speculation | null;
+  /** Null until the image model admitted a job: a text-only server. */
+  images: Images | null;
   health: Health;
 };
 
@@ -411,6 +434,21 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
     experts: last.experts ? deriveExperts(points, from) : null,
     ngram: last.ngram ? deriveNgram(points, from) : null,
     speculation: last.speculation ? deriveSpeculation(points, from) : null,
+    images: last.images
+      ? {
+          jobs: {
+            ...counter((s) => sumKnown(IMAGE_OUTCOMES.map((outcome) => s.images?.jobs[outcome] ?? null))),
+            byOutcome: Object.fromEntries(
+              IMAGE_OUTCOMES.map((outcome) => [outcome, { total: last.images!.jobs[outcome], window: increaseOver(points, (s) => s.images?.jobs[outcome] ?? null, from) }]),
+            ) as Record<ImageOutcome, Tally>,
+          },
+          images: counter((s) => s.images?.images ?? null),
+          duration: latency((s) => s.images?.duration ?? null),
+          waiting: last.images.waiting,
+          running: last.images.running,
+          phases: deriveImagePhases(points, from),
+        }
+      : null,
     health: { level: "idle", summary: "", notes: [] },
   };
   dash.health = assessHealth({
@@ -429,6 +467,17 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
   return dash;
 }
 
+
+/** Each image phase's seconds, and its share of the window's image time (GitHub #324). */
+function deriveImagePhases(points: Point[], since: number): Images["phases"] {
+  const last = points.at(-1)?.snap ?? emptySnapshot();
+  const seconds = IMAGE_PHASES.map((phase) => ({
+    phase,
+    seconds: { total: last.images?.phaseSeconds[phase] ?? null, window: increaseOver(points, (s) => s.images?.phaseSeconds[phase] ?? null, since) },
+  }));
+  const all = sumKnown(seconds.map((p) => p.seconds.window));
+  return seconds.map((p) => ({ ...p, share: shareOf(p.seconds.window, all) }));
+}
 
 /** A part over its whole, null for an empty or unknown whole. */
 const shareOf = (part: number | null, whole: number | null): number | null => (part !== null && whole !== null && whole > 0 ? part / whole : null);

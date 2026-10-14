@@ -143,6 +143,55 @@ impl Rejection {
     }
 }
 
+/// How an image job ended: `ignis_image_jobs_total`'s fixed `outcome` label
+/// (GitHub #324, ADR 0017's amendment of 2026-10-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageOutcome {
+    /// Every image was made.
+    Completed,
+    /// Its request went away, while it waited or between two calls.
+    Cancelled,
+    /// The model was stopped (a switch, an unload) before or while it ran.
+    Stopped,
+    /// The runner refused the request's condition or size.
+    Refused,
+    /// The runner failed a call, or panicked.
+    Failed,
+}
+
+impl ImageOutcome {
+    const ALL: [ImageOutcome; 5] = [Self::Completed, Self::Cancelled, Self::Stopped, Self::Refused, Self::Failed];
+
+    /// As the series and the log line spell it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Stopped => "stopped",
+            Self::Refused => "refused",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The phases of an image job `ignis_image_job_phase_seconds_total` splits
+/// its time by.
+const IMAGE_PHASES: [&str; 4] = ["queued", "encoding", "denoising", "decoding"];
+
+/// What a finished image job tells the projection.
+#[derive(Debug, Clone, Copy)]
+pub struct ImageJobEnd {
+    pub outcome: ImageOutcome,
+    /// Images made before it ended.
+    pub images: u32,
+    /// Waiting for its turn, then encoding, denoising and decoding, in
+    /// [`IMAGE_PHASES`]' order.
+    pub phases: [std::time::Duration; 4],
+    /// From its turn to its last image, the PNG encodes and the sends
+    /// included: what the duration histogram observes.
+    pub ran: std::time::Duration,
+}
+
 /// Which of the two counting routes a call reached:
 /// `ignis_tokenize_requests_total`'s fixed `route` label (GitHub #285).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -502,6 +551,17 @@ pub struct Metrics {
     /// Per [`LOCATE_SERIES`] (GitHub #278). Absent from the exposition until
     /// the first `locate`, like the decision family.
     locates: [AtomicU64; LOCATE_SERIES.len()],
+    /// Image jobs (GitHub #324): by [`ImageOutcome::ALL`], the images made,
+    /// each phase's milliseconds, the duration of the completed ones, and
+    /// the queue as the jobs last set it. Absent from the exposition until
+    /// `image_seen` -- a text server never renders them.
+    image_jobs: [AtomicU64; ImageOutcome::ALL.len()],
+    image_images: AtomicU64,
+    image_phase_ms: [AtomicU64; IMAGE_PHASES.len()],
+    image_duration: Histogram,
+    image_waiting: AtomicU64,
+    image_running: AtomicU64,
+    image_seen: AtomicU64,
     /// Open Responses API WebSockets, and their requests waiting in the
     /// server-wide admission queue (GitHub #282).
     responses_sockets: AtomicU64,
@@ -654,6 +714,13 @@ impl Metrics {
             spec_accepted_at: std::array::from_fn(|_| AtomicU64::new(0)),
             tokenize_calls: Default::default(),
             locates: Default::default(),
+            image_jobs: Default::default(),
+            image_images: AtomicU64::new(0),
+            image_phase_ms: Default::default(),
+            image_duration: Histogram::new(&DURATION_BOUNDS_MS),
+            image_waiting: AtomicU64::new(0),
+            image_running: AtomicU64::new(0),
+            image_seen: AtomicU64::new(0),
             responses_sockets: AtomicU64::new(0),
             responses_queued: AtomicU64::new(0),
             flash_next: FlashNextSeries::default(),
@@ -755,6 +822,30 @@ impl Metrics {
     pub(crate) fn record_tokenize(&self, route: TokenizeRoute) {
         // `ALL` lists the routes in declaration order.
         self.tokenize_calls[route as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An image job ended (GitHub #324). Recorded by the job itself: the
+    /// image model has no engine, so no fact of it reaches the telemetry
+    /// consumer.
+    pub fn record_image_job(&self, ended: &ImageJobEnd) {
+        self.image_seen.store(1, Ordering::Relaxed);
+        self.image_jobs[ended.outcome as usize].fetch_add(1, Ordering::Relaxed);
+        self.image_images.fetch_add(u64::from(ended.images), Ordering::Relaxed);
+        for (series, phase) in self.image_phase_ms.iter().zip(ended.phases) {
+            series.fetch_add(phase.as_millis() as u64, Ordering::Relaxed);
+        }
+        if ended.outcome == ImageOutcome::Completed {
+            // From its turn to its last image: the wait is its own phase.
+            self.image_duration.observe(ended.ran.as_millis() as u64);
+        }
+    }
+
+    /// The image queue as it stands: jobs waiting for their turn, and the
+    /// one running (GitHub #324).
+    pub fn set_image_queue(&self, waiting: u32, running: u32) {
+        self.image_seen.store(1, Ordering::Relaxed);
+        self.image_waiting.store(u64::from(waiting), Ordering::Relaxed);
+        self.image_running.store(u64::from(running), Ordering::Relaxed);
     }
 
     /// A submission was rejected, for `reason`.
@@ -1295,6 +1386,29 @@ impl Metrics {
                 let _ = writeln!(out, "ignis_tokenize_requests_total{{route=\"{}\"}} {}", route.label(), read(series));
             }
         }
+        // GitHub #324: absent until an image job was admitted or ended, as
+        // the counting routes' counter is.
+        if read(&self.image_seen) > 0 {
+            declare(&mut out, "ignis_image_jobs_total", "counter", "Image jobs ended, by outcome.");
+            for outcome in ImageOutcome::ALL {
+                let _ = writeln!(out, "ignis_image_jobs_total{{outcome=\"{}\"}} {}", outcome.label(), read(&self.image_jobs[outcome as usize]));
+            }
+            declare(&mut out, "ignis_image_images_total", "counter", "Images the image jobs made.");
+            let _ = writeln!(out, "ignis_image_images_total {}", read(&self.image_images));
+            self.image_duration.render(&mut out, "ignis_image_job_duration_seconds", "Image job duration from its turn to its last image, completed jobs only.");
+            declare(
+                &mut out,
+                "ignis_image_job_phase_seconds_total",
+                "counter",
+                "Seconds the image jobs spent in each phase: waiting for their turn, encoding the condition, denoising, decoding.",
+            );
+            for (phase, series) in IMAGE_PHASES.iter().zip(&self.image_phase_ms) {
+                let _ = writeln!(out, "ignis_image_job_phase_seconds_total{{phase=\"{phase}\"}} {}", decimal(read(series), THOUSANDTHS));
+            }
+            declare(&mut out, "ignis_image_queue_jobs", "gauge", "Image jobs waiting for their turn and running (at most one).");
+            let _ = writeln!(out, "ignis_image_queue_jobs{{state=\"waiting\"}} {}", read(&self.image_waiting));
+            let _ = writeln!(out, "ignis_image_queue_jobs{{state=\"running\"}} {}", read(&self.image_running));
+        }
         // GitHub #301, #302: last, so a 27B load's exposition is the same
         // bytes it was before Flash-Next.
         if read(&self.flash_next_loaded) == 1 {
@@ -1516,6 +1630,44 @@ mod tests {
         let counted = Metrics::new();
         counted.record_tokenize(TokenizeRoute::Tokenize);
         declared_once(&counted.render(), &[("ignis_tokenize_requests_total", "counter")]);
+        // And the image families (GitHub #324).
+        let imaged = Metrics::new();
+        imaged.set_image_queue(0, 0);
+        declared_once(
+            &imaged.render(),
+            &[
+                ("ignis_image_jobs_total", "counter"),
+                ("ignis_image_images_total", "counter"),
+                ("ignis_image_job_duration_seconds", "histogram"),
+                ("ignis_image_job_phase_seconds_total", "counter"),
+                ("ignis_image_queue_jobs", "gauge"),
+            ],
+        );
+    }
+
+    /// GitHub #324: the image families are absent from a text server, then
+    /// a job moves its outcome, its images, its phases and (completed) its
+    /// duration, and the queue gauge reads what was last set.
+    #[test]
+    fn the_image_families_are_absent_until_a_job_and_count_its_outcome_images_and_phases() {
+        use std::time::Duration;
+        let metrics = Metrics::new();
+        assert!(!metrics.render().contains("ignis_image_"));
+        let ms = Duration::from_millis;
+        metrics.record_image_job(&ImageJobEnd { outcome: ImageOutcome::Completed, images: 2, phases: [ms(500), ms(100), ms(2_000), ms(400)], ran: ms(2_700) });
+        metrics.record_image_job(&ImageJobEnd { outcome: ImageOutcome::Cancelled, images: 1, phases: [ms(0), ms(100), ms(1_000), ms(0)], ran: ms(1_200) });
+        metrics.set_image_queue(3, 1);
+        let text = metrics.render();
+        assert_eq!(value(&text, "ignis_image_jobs_total", "outcome=\"completed\""), "1", "{text}");
+        assert_eq!(value(&text, "ignis_image_jobs_total", "outcome=\"cancelled\""), "1", "{text}");
+        assert_eq!(value(&text, "ignis_image_jobs_total", "outcome=\"failed\""), "0", "{text}");
+        assert_eq!(value(&text, "ignis_image_images_total", ""), "3", "{text}");
+        assert_eq!(value(&text, "ignis_image_job_phase_seconds_total", "phase=\"queued\""), "0.5", "{text}");
+        assert_eq!(value(&text, "ignis_image_job_phase_seconds_total", "phase=\"denoising\""), "3", "{text}");
+        assert_eq!(value(&text, "ignis_image_job_duration_seconds_count", ""), "1", "only the completed job: {text}");
+        assert_eq!(value(&text, "ignis_image_job_duration_seconds_sum", ""), "2.7", "{text}");
+        assert_eq!(value(&text, "ignis_image_queue_jobs", "state=\"waiting\""), "3", "{text}");
+        assert_eq!(value(&text, "ignis_image_queue_jobs", "state=\"running\""), "1", "{text}");
     }
 
     /// GitHub #285: absent until a counting route is called, then both routes

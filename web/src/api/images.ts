@@ -8,10 +8,12 @@ export const STOPPED = "Stopped.";
 // GitHub #322): `POST /v1/images/generations` (JSON) and `/v1/images/edits`
 // (multipart, `image[]`), answered whole or as Server-Sent Events.
 //
-// A request here never names a model. A text model loaded answers
-// `409 model_kind_mismatch`, and the view says so and offers the explicit
-// switch (the Server view's `switchTo`); naming the image model in the request
-// would have the server switch on its own (`switch.allow_implicit`).
+// A request names a model only when its params say so: the image view sets
+// the image model's id when the owner pressed Generate or Edit with a text
+// model loaded, and the server switches to it (`switch.allow_implicit`) —
+// after the rewrite, when prompt enhancement is on and the enhancer is the
+// model loaded (GitHub #324). A bare request on a text model answers
+// `409 model_kind_mismatch`.
 
 export const GENERATIONS_PATH = "/v1/images/generations";
 export const EDITS_PATH = "/v1/images/edits";
@@ -30,6 +32,8 @@ export type ImageParams = {
   enhance: boolean;
   /** Condition images: any makes the request an edit. */
   images: File[];
+  /** The image model's id when the run is the owner's switch to it (GitHub #324); absent, the loaded model answers. */
+  model?: string;
 };
 
 /** One finished image, base64 PNG. `seed` is the job's: this image started from `seed + index`. */
@@ -47,9 +51,10 @@ export type ImageOutcome =
 
 export const isEdit = (params: ImageParams) => params.images.length > 0;
 
-/** The JSON body of a generation; never a `model`. */
+/** The JSON body of a generation; a `model` only when the params name one. */
 export function generationBody(params: ImageParams, stream: boolean): object {
   return {
+    ...(params.model ? { model: params.model } : {}),
     prompt: params.prompt,
     n: params.n,
     size: params.size,
@@ -59,10 +64,11 @@ export function generationBody(params: ImageParams, stream: boolean): object {
   };
 }
 
-/** The multipart body of an edit; never a `model`. */
+/** The multipart body of an edit; a `model` only when the params name one. */
 export function editForm(params: ImageParams, stream: boolean): FormData {
   const form = new FormData();
   for (const image of params.images) form.append("image[]", image, image.name);
+  if (params.model) form.append("model", params.model);
   form.append("prompt", params.prompt);
   form.append("n", String(params.n));
   form.append("size", params.size);

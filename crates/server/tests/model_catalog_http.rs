@@ -185,12 +185,31 @@ async fn a_known_model_that_is_also_a_catalog_entry_is_one_row() {
     let models = catalog_in("both", &[("mock-b", Disk::Absent)]);
     let elsewhere = fresh_dir("both-elsewhere");
     let start = file_in(&elsewhere, "mock-a.ninfer", b"start");
-    let own = file_in(&elsewhere, "mock-b.ninfer", b"own copy");
+    let own = file_in(&elsewhere, "mock-b.ninfer", b"own copy!!");
     let app = server_with(&loader, &start, models.clone(), &[("mock-b", &own)], true).app();
     let (_, rows) = send(&app, Method::GET, "/v1/models/catalog", None).await;
     assert_eq!(rows["data"].as_array().unwrap().iter().filter(|row| row["id"] == "mock-b").count(), 1, "{rows}");
     let b = row(&rows, "mock-b");
     assert_eq!((b["source"].clone(), b["switchable"].clone()), (json!("operator"), json!(true)), "switchable by the known entry's file");
+    // 324 item 3: the file the server would load is what `on_disk` and `bytes` read, not `download.path`.
+    assert_eq!((b["on_disk"].clone(), b["bytes"].clone()), (json!("complete"), json!(10)), "{b}");
+    let _ = (std::fs::remove_dir_all(models.dir), std::fs::remove_dir_all(elsewhere));
+}
+
+/// Review-324serving F5: a listed model whose file is gone reads absent and
+/// is not switchable, as `resolve` has it, though `download.path` holds the
+/// catalog entry of the same id.
+#[tokio::test]
+async fn a_listed_model_whose_file_is_gone_reads_absent_though_download_path_has_the_entry() {
+    let loader = MockLoader::new();
+    let models = catalog_in("gone", &[("mock-b", Disk::Complete)]);
+    let elsewhere = fresh_dir("gone-elsewhere");
+    let start = file_in(&elsewhere, "mock-a.ninfer", b"start");
+    let gone = elsewhere.join("mock-b.ninfer");
+    let app = server_with(&loader, &start, models.clone(), &[("mock-b", &gone)], true).app();
+    let (_, rows) = send(&app, Method::GET, "/v1/models/catalog", None).await;
+    let b = row(&rows, "mock-b");
+    assert_eq!((b["on_disk"].clone(), b["switchable"].clone()), (json!("absent"), json!(false)), "{b}");
     let _ = (std::fs::remove_dir_all(models.dir), std::fs::remove_dir_all(elsewhere));
 }
 

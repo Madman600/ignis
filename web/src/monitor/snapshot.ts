@@ -169,6 +169,29 @@ export type Ngram = {
   readBytes: number | null;
 };
 
+/** How an image job ended (GitHub #324): `ignis_image_jobs_total`'s `outcome` label. */
+export const IMAGE_OUTCOMES = ["completed", "cancelled", "stopped", "refused", "failed"] as const;
+export type ImageOutcome = (typeof IMAGE_OUTCOMES)[number];
+
+/** Where an image job's time goes (GitHub #324): `ignis_image_job_phase_seconds_total`'s `phase` label. */
+export const IMAGE_PHASES = ["queued", "encoding", "denoising", "decoding"] as const;
+export type ImagePhase = (typeof IMAGE_PHASES)[number];
+
+/**
+ * The image jobs (GitHub #324, ADR 0017's amendment of 2026-10-15): by
+ * outcome, the images made, the seconds each phase took, the duration of the
+ * completed jobs and the queue. Absent until the image model has admitted a
+ * job, so null on a text-only server.
+ */
+export type ImageJobs = {
+  jobs: Record<ImageOutcome, number | null>;
+  images: number | null;
+  phaseSeconds: Record<ImagePhase, number | null>;
+  duration: Histogram | null;
+  waiting: number | null;
+  running: number | null;
+};
+
 /** A histogram: upper bounds in seconds ending in +Inf, their cumulative counts, the sum and the count. */
 export type Histogram = { bounds: number[]; cumulative: number[]; sum: number; count: number };
 
@@ -199,6 +222,8 @@ export type Snapshot = {
   ngram: Ngram | null;
   /** Null until a request that ran verify rounds ended, or on a load without speculation. */
   speculation: Speculation | null;
+  /** Null until the image model admitted a job: a text-only server. */
+  images: ImageJobs | null;
   ttft: Histogram | null;
   duration: Histogram | null;
   unknown: Sample[];
@@ -256,6 +281,15 @@ const SPEC_FAMILIES = {
   positionAccepted: "ignis_speculative_position_accepted_total",
 } as const;
 
+/** The image families (GitHub #324). */
+const IMAGE_FAMILIES = {
+  jobs: "ignis_image_jobs_total",
+  images: "ignis_image_images_total",
+  duration: "ignis_image_job_duration_seconds",
+  phaseSeconds: "ignis_image_job_phase_seconds_total",
+  queue: "ignis_image_queue_jobs",
+} as const;
+
 /** The typed primitives a decision's question asks for (GitHub #241, ADR 0034). */
 export const DECISION_TYPES = ["noul", "choice", "score"] as const;
 export type DecisionType = (typeof DECISION_TYPES)[number];
@@ -282,6 +316,7 @@ const KNOWN = new Set<string>([
   ...Object.values(EXPERT_FAMILIES),
   ...Object.values(NGRAM_FAMILIES),
   ...Object.values(SPEC_FAMILIES),
+  ...Object.values(IMAGE_FAMILIES),
 ]);
 
 const emptyMatrix = (): RetainedMatrix =>
@@ -317,6 +352,7 @@ export function emptySnapshot(): Snapshot {
     experts: null,
     ngram: null,
     speculation: null,
+    images: null,
     ttft: null,
     duration: null,
     unknown: [],
@@ -408,6 +444,18 @@ export function readSnapshot({ families }: Exposition): Snapshot {
     };
   }
 
+  // The image jobs, all or nothing: the first admitted job renders every series.
+  if (families.has(IMAGE_FAMILIES.jobs)) {
+    snap.images = {
+      jobs: Object.fromEntries(IMAGE_OUTCOMES.map((outcome) => [outcome, valueOf(IMAGE_FAMILIES.jobs, ["outcome", outcome])])) as ImageJobs["jobs"],
+      images: valueOf(IMAGE_FAMILIES.images),
+      phaseSeconds: Object.fromEntries(IMAGE_PHASES.map((phase) => [phase, valueOf(IMAGE_FAMILIES.phaseSeconds, ["phase", phase])])) as ImageJobs["phaseSeconds"],
+      duration: readHistogram(samples(IMAGE_FAMILIES.duration), IMAGE_FAMILIES.duration),
+      waiting: valueOf(IMAGE_FAMILIES.queue, ["state", "waiting"]),
+      running: valueOf(IMAGE_FAMILIES.queue, ["state", "running"]),
+    };
+  }
+
   snap.ttft = readHistogram(samples("ignis_request_ttft_seconds"), "ignis_request_ttft_seconds");
   snap.duration = readHistogram(samples("ignis_request_duration_seconds"), "ignis_request_duration_seconds");
   snap.unknown = [...families.values()].flatMap((f) => f.samples.filter((s) => !inContract(f.name, s)));
@@ -433,7 +481,14 @@ function inContract(family: string, s: Sample): boolean {
     case "ignis_request_ttft_seconds":
     case "ignis_request_duration_seconds":
     case "ignis_decision_answer_mass":
+    case IMAGE_FAMILIES.duration:
       return true;
+    case IMAGE_FAMILIES.jobs:
+      return oneOf(IMAGE_OUTCOMES, s.labels.outcome) && Object.keys(s.labels).length === 1;
+    case IMAGE_FAMILIES.phaseSeconds:
+      return oneOf(IMAGE_PHASES, s.labels.phase) && Object.keys(s.labels).length === 1;
+    case IMAGE_FAMILIES.queue:
+      return (s.labels.state === "waiting" || s.labels.state === "running") && Object.keys(s.labels).length === 1;
     case "ignis_decisions_total":
       return oneOf(DECISION_TYPES, s.labels.type);
     case "ignis_vram_reserved_bytes":
@@ -495,6 +550,10 @@ export function counterValues(s: Snapshot): (number | null)[] {
     s.speculation?.rounds ?? null,
     s.speculation?.drafted ?? null,
     s.speculation?.accepted ?? null,
+    ...IMAGE_OUTCOMES.map((outcome) => s.images?.jobs[outcome] ?? null),
+    s.images?.images ?? null,
+    ...IMAGE_PHASES.map((phase) => s.images?.phaseSeconds[phase] ?? null),
+    s.images?.duration?.count ?? null,
     s.ttft?.count ?? null,
     s.duration?.count ?? null,
   ];

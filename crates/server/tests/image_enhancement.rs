@@ -194,6 +194,25 @@ async fn an_enhanced_request_on_the_unloaded_enhancer_loads_it_and_switches_once
     assert_eq!(loader.loads(), ["mock-a", IMAGE, IMAGE]);
 }
 
+/// Review-324serving F2: the idle clock unloaded a text model that is not the
+/// enhancer; an enhanced request naming the image model loads the enhancer
+/// first, the rewrite on it, then one switch: two loads, not the image
+/// model, a visit to the enhancer and back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enhanced_request_on_another_unloaded_text_model_loads_the_enhancer_first() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, "mock-b", &["mock-a", "mock-b", IMAGE]).with_idle_unload(IDLE);
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+    until(&server, "unloaded", IDLE * 5).await;
+    let body = json!({ "prompt": "a red fox", "model": IMAGE, "size": "1024x1024", "seed": 4, "prompt_enhancement": true, "stream": true });
+    let events = events_of(&app, body).await;
+    assert_eq!(phases(&events), then_the_job(&["loading 1/1", "enhancing 1/1", "switching 1/1", "loading 1/1"]));
+    assert!(events.last().unwrap().1["revised_prompt"].is_string(), "{:?}", events.last());
+    assert_eq!(loader.loads(), ["mock-a", IMAGE], "the enhancer, then the image model");
+}
+
 // ── the visit (model_switch::visit) ───────────────────────────────────────
 
 /// What a visit's switches told, in order.
@@ -359,6 +378,77 @@ async fn with_the_enhancer_loaded_the_rewrite_comes_first_and_the_request_switch
     let (_, tokens, params) = &rewrites[0];
     assert_eq!(*tokens, expected.tokens.iter().map(|&token| token as u32).collect::<Vec<_>>(), "the Chinese system prompt and upstream's user turn");
     assert_eq!((params.seed, params.max_tokens, params.starts_in_reasoning), (5, Some(16), false));
+}
+
+/// A server on `mock-a`, the enhancer, over `compute`, as the Playground
+/// meets the 27B (GitHub #324); its requests may switch to the image model.
+fn on_the_loaded_enhancer(loader: &Arc<MockLoader>) -> (Server, Arc<MockCompute>) {
+    let compute = Arc::new(MockCompute::new());
+    let server = Server::from_active(loader.model_over("mock-a", Arc::clone(&compute) as _))
+        .with_switcher(Switcher::new(Arc::clone(loader) as _, PATIENT).with_known_models(known(&["mock-a", IMAGE])));
+    enhancing_with(&server, "mock-a");
+    (server, compute)
+}
+
+/// GitHub #324: the Playground's Generate with the enhancer loaded and
+/// enhancement on, streamed. The rewrite runs on the enhancer first, then
+/// the request switches once, to the image model: `enhancing`, `switching`,
+/// `loading`, then the job's phases; one load, `last_switch` the enhancer
+/// to the image model, and the rewrite on the completed event, the prompt
+/// the image model ran on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_streamed_request_on_the_loaded_enhancer_hears_the_rewrite_then_one_switch() {
+    let loader = MockLoader::new();
+    let (server, compute) = on_the_loaded_enhancer(&loader);
+    let app = server.app();
+    let body = json!({ "prompt": "a red fox in snow", "model": IMAGE, "size": "1024x1024", "seed": 6, "prompt_enhancement": true, "stream": true });
+    let events = events_of(&app, body).await;
+    assert_eq!(phases(&events), then_the_job(&["enhancing 1/1", "switching 1/1", "loading 1/1"]));
+    let revised = events.last().unwrap().1["revised_prompt"].as_str().expect("revised_prompt").to_owned();
+    assert_eq!(loader.encoded_prompts(), [revised], "the image model ran on the rewrite");
+    assert_eq!(prefilled(&compute).len(), 1, "one rewrite, on mock-a");
+    assert_eq!(loader.loads(), [IMAGE], "one switch: the rewrite needed none");
+    let last = server.switcher.as_ref().unwrap().last_switch();
+    assert_eq!(last, Some(LastSwitch { from: "mock-a".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched }));
+    assert_eq!((server.status().as_str(), server.active().model_id()), ("serving", IMAGE.to_owned()));
+}
+
+/// GitHub #324: the same request with enhancement off — the request's
+/// `false` over `image.prompt_enhancement` on — is one switch and no
+/// rewrite: `switching` and `loading` before the job, nothing prefilled on
+/// the text model, the prompt as sent, no `revised_prompt`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_enhancement_off_a_request_on_the_loaded_enhancer_switches_once_and_rewrites_nothing() {
+    let loader = MockLoader::new();
+    let (server, compute) = on_the_loaded_enhancer(&loader);
+    server.update_live(|live| live.image.prompt_enhancement = true);
+    let app = server.app();
+    let body = json!({ "prompt": "as sent", "model": IMAGE, "size": "1024x1024", "seed": 6, "prompt_enhancement": false, "stream": true });
+    let events = events_of(&app, body).await;
+    assert_eq!(phases(&events), then_the_job(&["switching 1/1", "loading 1/1"]));
+    assert!(events.last().unwrap().1.get("revised_prompt").is_none(), "{:?}", events.last());
+    assert!(prefilled(&compute).is_empty(), "no rewrite");
+    assert_eq!((loader.loads(), loader.encoded_prompts()), (vec![IMAGE.to_owned()], vec!["as sent".to_owned()]));
+}
+
+/// GitHub #324: with `switch.allow_implicit` off, the Playground's Generate
+/// naming the image model on the loaded enhancer is refused by name —
+/// `404 model_not_found`, a status even when streamed — before any rewrite
+/// or load; the text model serves on, and an explicit switch is the way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_implicit_switching_off_a_request_naming_the_image_model_is_refused_before_any_rewrite() {
+    let loader = MockLoader::new();
+    let compute = Arc::new(MockCompute::new());
+    let server = Server::from_active(loader.model_over("mock-a", Arc::clone(&compute) as _))
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_listed_models(known(&["mock-a", IMAGE])));
+    enhancing_with(&server, "mock-a");
+    let body = json!({ "prompt": "a red fox", "model": IMAGE, "size": "1024x1024", "prompt_enhancement": true, "stream": true });
+    let (status, refused) = send_generation(&server.app(), body).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("model_not_found")), "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains(IMAGE) && message.contains("mock-a"), "{message}");
+    assert!(prefilled(&compute).is_empty() && loader.loads().is_empty(), "nothing rewritten, nothing loaded");
+    assert_eq!((server.status().as_str(), server.active().model_id()), ("serving", "mock-a".to_owned()));
 }
 
 /// AC 9: with the image model loaded, an enhanced request visits the

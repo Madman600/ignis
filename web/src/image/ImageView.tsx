@@ -11,6 +11,7 @@ import {
   parseSeed,
   progressLine,
   progressShare,
+  runPlan,
 } from "./studio.ts";
 import type { StudioActions, StudioState } from "./useStudio.ts";
 
@@ -18,8 +19,11 @@ import type { StudioActions, StudioState } from "./useStudio.ts";
 // the sizes the server offers, how many, a seed, up to ten condition images
 // with their alpha shown, the prompt-enhancement toggle, progress as the
 // stream reports it, and a gallery that lives in this tab. With a text model
-// loaded it offers the switch to the image model — a button, never a side
-// effect of "Generate". It has no side drawers. useStudio owns the state.
+// loaded, Generate and Edit are the owner's choice of the image model: the
+// request names it and the server switches, after the rewrite when the
+// enhancer is the model loaded (GitHub #324); the button says which. The
+// switch on its own stays offered beside. It has no side drawers. useStudio
+// owns the state.
 
 const ACCEPTED = ["image/png", "image/jpeg", "image/webp"];
 
@@ -33,7 +37,7 @@ export function ImageView({ model, state, actions }: { model: ModelState; state:
       <div className="mx-auto flex w-full max-w-[1180px] flex-1 flex-col gap-6 px-4 py-5 md:px-6">
         {!ready && <SwitchBand model={model} state={state} onSwitch={actions.switchToImage} />}
         <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,26rem)_minmax(0,1fr)]">
-          <Form ready={ready} state={state} actions={actions} />
+          <Form model={model} state={state} actions={actions} />
           <Results state={state} actions={actions} />
         </div>
       </div>
@@ -57,7 +61,7 @@ export function SwitchBand({ model, state, onSwitch }: { model: ModelState; stat
             {under
               ? "The page follows the switch and opens the form once the image model serves."
               : row
-                ? "Images are made by the image model. Switching unloads the one serving now and loads it; the chat waits until a text model is loaded again."
+                ? `Images are made by the image model. ${state.limits.allowImplicit ? "Generate switches to it on its own, or switch now: either" : "Switching"} unloads the model serving and loads it, and the chat waits until a text model is loaded again.`
                 : "ignis lists no image model. Fetch it with `ignis-server model download ignis-image-2.1-turbo`, then reload this page."}
           </p>
           {state.switchRefusal && <p className="text-sm text-[#ff7b6b] [overflow-wrap:anywhere]">{state.switchRefusal}</p>}
@@ -65,7 +69,7 @@ export function SwitchBand({ model, state, onSwitch }: { model: ModelState; stat
         <button
           type="button"
           className={`${actionShape} bg-[#ff5a1f] px-4 py-2.5 text-[#1c2026] hover:bg-[#ff8a4c]`}
-          disabled={under || !row || model.state === "reading" || model.state === "error"}
+          disabled={under || !row || state.run !== null || model.state === "reading" || model.state === "error"}
           onClick={onSwitch}
         >
           Switch to the image model
@@ -75,7 +79,7 @@ export function SwitchBand({ model, state, onSwitch }: { model: ModelState; stat
   );
 }
 
-function Form({ ready, state, actions }: { ready: boolean; state: StudioState; actions: StudioActions }) {
+function Form({ model, state, actions }: { model: ModelState; state: StudioState; actions: StudioActions }) {
   const { limits } = state;
   const [prompt, setPrompt] = useState("");
   const [size, setSize] = useState(AUTO_SIZE);
@@ -130,11 +134,20 @@ function Form({ ready, state, actions }: { ready: boolean; state: StudioState; a
 
   const seed = parseSeed(seedText);
   const n = Math.min(limits.maxN, Math.max(1, count));
-  const canRun = ready && !busy && prompt.trim() !== "" && seed !== undefined;
+  const plan = runPlan(model, limits, state.imageModel, enhance, conditions.length > 0, busy);
+  const canRun = plan.ready && !busy && prompt.trim() !== "" && seed !== undefined;
 
   function submit() {
     if (!canRun || seed === undefined) return;
-    const params: ImageParams = { prompt: prompt.trim(), n, size, seed, enhance, images: conditions.map((c) => c.file) };
+    const params: ImageParams = {
+      prompt: prompt.trim(),
+      n,
+      size,
+      seed,
+      enhance,
+      images: conditions.map((c) => c.file),
+      ...(plan.model ? { model: plan.model } : {}),
+    };
     actions.run(params, stream);
   }
 
@@ -218,16 +231,18 @@ function Form({ ready, state, actions }: { ready: boolean; state: StudioState; a
         </div>
       </div>
 
-      <div className="flex items-center gap-3">
-        <button type="submit" disabled={!canRun} className={`${actionShape} ${actionInk} px-5 py-2.5`}>
-          {conditions.length > 0 ? "Edit" : "Generate"}
-        </button>
-        {busy && (
-          <button type="button" className={`${actionShape} border border-line px-4 py-2.5 hover:border-ember`} onClick={actions.stop}>
-            Stop
+      <div className="flex flex-col gap-2">
+        <div className="flex flex-wrap items-center gap-3">
+          <button type="submit" disabled={!canRun} className={`${actionShape} ${actionInk} px-5 py-2.5`}>
+            {plan.label}
           </button>
-        )}
-        {!ready && <span className="text-sm text-ash">Needs the image model.</span>}
+          {busy && (
+            <button type="button" className={`${actionShape} border border-line px-4 py-2.5 hover:border-ember`} onClick={actions.stop}>
+              Stop
+            </button>
+          )}
+        </div>
+        {plan.note && <p className="text-sm text-ash [overflow-wrap:anywhere]">{plan.note}</p>}
       </div>
     </form>
   );
@@ -346,7 +361,9 @@ function Progress({ run }: { run: NonNullable<StudioState["run"]> }) {
   const share = progress ? progressShare(progress, run.n) : 0;
   return (
     <div role="status" aria-live="polite" className="flex flex-col gap-2 border border-line bg-surface p-3">
-      <p className="font-display text-sm font-medium">{progress ? progressLine(progress, run.n) : run.edit ? "Sending the edit…" : "Sending the request…"}</p>
+      <p className="font-display text-sm font-medium">
+        {progress ? progressLine(progress, run.n) : `Sending the ${run.edit ? "edit" : "request"}${run.switches ? ": the image model is loaded before the job…" : "…"}`}
+      </p>
       <div className="h-1.5 overflow-hidden bg-line" aria-hidden>
         <div className="h-full bg-ember transition-[width] motion-reduce:transition-none" style={{ width: `${Math.round(share * 100)}%` }} />
       </div>

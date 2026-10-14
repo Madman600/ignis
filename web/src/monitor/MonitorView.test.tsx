@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, KV_DISK_EXPOSITION } from "./fixture.ts";
+import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, IMAGE_EXPOSITION, KV_DISK_EXPOSITION } from "./fixture.ts";
 import { MonitorView } from "./MonitorView.tsx";
 import { applyScrape, initialMonitor } from "./scrape.ts";
 
@@ -168,6 +168,19 @@ describe("MonitorView", () => {
     const html27b = renderToStaticMarkup(<MonitorView state={dense} />);
     expect(html27b).not.toContain('aria-label="Expert residency"');
     expect(html27b).not.toContain('aria-label="N-gram rows"');
+  });
+
+  it("draws the image jobs once the image model admitted one, and nothing of them before (GitHub #324)", () => {
+    const now = Date.now();
+    // Ten seconds on: ten more seconds of denoising, so the phases have a window to share.
+    const later = IMAGE_EXPOSITION.replace('ignis_image_job_phase_seconds_total{phase="denoising"} 14', 'ignis_image_job_phase_seconds_total{phase="denoising"} 24');
+    const state = applyScrape(applyScrape(initialMonitor(), { kind: "ok", text: IMAGE_EXPOSITION }, now - 10_000, 2), { kind: "ok", text: later }, now, 2);
+    const html = renderToStaticMarkup(<MonitorView state={state} />);
+    expect(html).toContain("Image jobs");
+    expect(html).toContain("Median duration");
+    expect(html).toContain("Time denoising");
+    const text = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now, 2)} />);
+    expect(text).not.toContain("Image jobs");
   });
 
   it("says when the key is wanted instead of drawing charts", () => {
