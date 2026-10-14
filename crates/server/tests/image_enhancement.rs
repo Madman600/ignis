@@ -362,6 +362,41 @@ async fn with_the_image_model_loaded_an_enhanced_request_visits_the_enhancer_and
     assert_eq!((loader.loads().len(), loader.encoded_prompts().last().map(String::as_str)), (5, Some("as sent")));
 }
 
+/// Review-322cf L2 (ADR 0049 §5): a visit from another text model ends on
+/// the image model the request names — the request's switch, streamed as a
+/// visit's two — so each of its switches is written to `last_switch` as a
+/// switch is: the last, from the enhancer to the image model, once it lands;
+/// when that one fails, how, the enhancer loaded again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_from_another_text_model_is_written_to_last_switch() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, "mock-b", &["mock-a", "mock-b", IMAGE]);
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    let last = || server.switcher.as_ref().unwrap().last_switch();
+    let body = json!({ "prompt": "a red fox", "model": IMAGE, "size": "1024x1024", "seed": 2, "prompt_enhancement": true, "stream": true });
+    let events = events_of(&app, body.clone()).await;
+    assert_eq!(
+        phases(&events),
+        then_the_job(&["switching 1/2", "loading 1/2", "enhancing 1/1", "switching 2/2", "loading 2/2"])
+    );
+    assert!(events.last().unwrap().1["revised_prompt"].is_string(), "{:?}", events.last());
+    assert_eq!(loader.loads(), ["mock-a", IMAGE]);
+    assert_eq!(last(), Some(LastSwitch { from: "mock-a".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched }));
+
+    let (_, task) = ignis_server::model_switch::begin(&server, source("mock-b")).unwrap();
+    assert_eq!(task.await.unwrap(), SwitchOutcome::Switched);
+    loader.break_load(IMAGE);
+    let mut whole = body;
+    whole["stream"] = json!(false);
+    let (status, refused) = send_generation(&app, whole).await;
+    assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("model_switch_failed")), "{refused}");
+    assert_eq!((server.status().as_str(), server.active().model_id()), ("serving", "mock-a".to_owned()));
+    let restored = last().expect("a record");
+    assert_eq!((restored.from.as_str(), restored.to.as_str()), ("mock-a", IMAGE));
+    assert!(matches!(restored.outcome, SwitchOutcome::Restored { .. }), "{restored:?}");
+}
+
 /// AC 9: while a visit runs — here with the rewrite done and the image
 /// model's reload held — every other request is answered `503
 /// model_switching` with `Retry-After`; the enhanced request is answered

@@ -64,8 +64,10 @@
 //! visits that text model ([`visit`]): two switches in one hold of the
 //! slot — to the visited model, then on to the model the request runs on —
 //! with the gate closed from the first step to the last, so every other
-//! request is answered `503 model_switching` throughout, and `last_switch`
-//! never written: a visit is not the operator's switch.
+//! request is answered `503 model_switching` throughout. A visit back to the
+//! model it left never writes `last_switch`: it is not a switch. One that
+//! ends on another model is the request's switch, and each of its two
+//! switches is written there as a switch is (ADR 0049 §5).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -759,9 +761,11 @@ enum Run {
     /// when the slot is taken — one load, never a switch over a model another
     /// request's load has just published.
     OnDemand,
-    /// A leg of a visit ([`visit`]): logged `ignis.model.visit_*`, never
-    /// written to `last_switch`, and refused ([`SwitchRefusal::NotServing`])
-    /// unless a model is serving when the slot is taken.
+    /// A leg of a visit ([`visit`]): logged `ignis.model.visit_*`, written
+    /// to `last_switch` only when the visit ends on another model than the
+    /// one it left ([`Begun::recorded`]), and refused
+    /// ([`SwitchRefusal::NotServing`]) unless a model is serving when the
+    /// slot is taken.
     Visit,
 }
 
@@ -775,8 +779,8 @@ impl Run {
     }
 
     /// Whether how it ends goes to `last_switch`: a switch's or a reload's,
-    /// not a request's load (spec model-switch/02 AC 14) nor a visit's (spec
-    /// image-model/05).
+    /// not a request's load (spec model-switch/02 AC 14); a visit's leg as
+    /// [`Begun::recorded`] says.
     fn records(&self) -> bool {
         !matches!(self, Run::OnDemand | Run::Visit)
     }
@@ -811,6 +815,11 @@ struct Begun {
     /// The status a load that lands stores: `serving`, unless a visit holds
     /// the gate closed past it.
     landed: ModelStatus,
+    /// What how it ends is written to `last_switch` as: a switch's or a
+    /// reload's own ends; a visit's leg's own, when the visit ends on another
+    /// model than the one it left — the request's switch (ADR 0049 §5);
+    /// nothing for a request's load, or a visit back.
+    recorded: Option<SwitchStarted>,
 }
 
 impl Begun {
@@ -879,7 +888,11 @@ fn begin_run(
             Some(plan) => ModelStatus::Switching { from: target.model.clone(), to: plan.then.model.clone() },
             None => ModelStatus::Serving,
         };
-        (started, Begun { run: asked, back, unloaded, steps, landed })
+        let recorded = match &visit {
+            Some(plan) => (started.from != plan.then.model).then(|| started.clone()),
+            None => asked.records().then(|| started.clone()),
+        };
+        (started, Begun { run: asked, back, unloaded, steps, landed, recorded })
     };
     // Nothing resident, nothing to drain: every request is let through, and
     // the ones that need the model wait for this load (spec model-switch/02).
@@ -969,7 +982,9 @@ impl Visit {
 /// closed. Once whoever began it is done with it ([`Visit::on`]), or gone,
 /// the switch to `then` follows. Every other request is answered `503
 /// model_switching` from the first step to the last; `last_switch` is left
-/// as it was. `steps` is told each switch's steps. Refused as a switch is
+/// as it was when `then` is the model it leaves, and is written by each
+/// switch as a switch writes it otherwise (the request's switch, ADR 0049
+/// §5). `steps` is told each switch's steps. Refused as a switch is
 /// ([`SwitchRefusal`]), and when no model serves ([`SwitchRefusal::NotServing`]).
 pub fn visit(server: &Server, via: ModelSource, then: ModelSource, steps: Option<Steps>) -> Result<Visit, SwitchRefusal> {
     let (arrived_tx, arrived) = tokio::sync::oneshot::channel();
@@ -1238,10 +1253,10 @@ async fn run(
     let SwitchStarted { from, to } = started;
     let reconfigure = begun.run.reconfigure();
     let on_demand = matches!(begun.run, Run::OnDemand);
-    let records = begun.run.records();
+    let recorded = begun.recorded.clone();
     let record = |outcome: &SwitchOutcome| {
-        if records {
-            switcher.record(&from, &to, outcome);
+        if let Some(switch) = &recorded {
+            switcher.record(&switch.from, &switch.to, outcome);
         }
     };
 
@@ -1377,8 +1392,8 @@ async fn run(
                     took_ms = began.elapsed().as_millis() as u64,
                     "model switched: the API admits requests"
                 );
-                record(&SwitchOutcome::Switched);
             }
+            record(&SwitchOutcome::Switched);
             server.status.store(Arc::new(begun.landed));
             SwitchOutcome::Switched
         }
@@ -1419,7 +1434,7 @@ async fn run(
                 "the target failed to load after the old model was torn down; reloading the old model"
             );
             server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone(), from_unloaded: false }));
-            restore(server, &switcher, &old, (&from, &to), records, reason).await
+            restore(server, &switcher, &old, recorded.as_ref(), reason).await
         }
     }
 }
@@ -1442,17 +1457,19 @@ async fn run_visit(
 ) -> SwitchOutcome {
     let steps = begun.steps.clone();
     let visited = started.to.clone();
+    let left = started.from.clone();
     let first = run(server, running, via, started, begun).await;
     if first != SwitchOutcome::Switched {
         return first;
     }
     // From here the slot names the switch on, as the gate does.
     let on = SwitchStarted { from: visited, to: plan.then.model.clone() };
+    let recorded = (left != plan.then.model).then(|| on.clone());
     *running.switcher.running.lock().expect("switch lock") = Some(Slot::Switch(on.clone()));
     let _ = plan.arrived.send(server.pinned());
     // Done with, or the request gone: either way the visit goes on.
     let _ = plan.done.await;
-    let begun = Begun { run: Run::Visit, back: Some(ModelStatus::Serving), unloaded: false, steps, landed: ModelStatus::Serving };
+    let begun = Begun { run: Run::Visit, back: Some(ModelStatus::Serving), unloaded: false, steps, landed: ModelStatus::Serving, recorded };
     begun.step(SwitchStep::Switching);
     let outcome = run(server, running, plan.then, on, begun).await;
     tracing::info!(name: "ignis.model.visit_ended", outcome = ?outcome, "the visit is over");
@@ -1530,18 +1547,18 @@ fn publish(server: &Server, model: ActiveModel) {
 
 /// After a failed load: load `old` again from where it came from, so a bad
 /// switch ends with the previous model serving. `reason` is why the target
-/// failed; `(from, to)` are the switch's ends, for `last_switch`.
+/// failed; `recorded` is what its end is written to `last_switch` as, if
+/// anything ([`Begun::recorded`]).
 async fn restore(
     server: &Server,
     switcher: &Arc<Switcher>,
     old: &ActiveModel,
-    (from, to): (&str, &str),
-    records: bool,
+    recorded: Option<&SwitchStarted>,
     reason: String,
 ) -> SwitchOutcome {
     let record = |outcome: &SwitchOutcome| {
-        if records {
-            switcher.record(from, to, outcome);
+        if let Some(switch) = recorded {
+            switcher.record(&switch.from, &switch.to, outcome);
         }
     };
     let Some(source) = old.source.clone() else {

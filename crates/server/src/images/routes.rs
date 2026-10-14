@@ -394,7 +394,7 @@ One job runs at a time and up to `image.queue_depth` wait, in order; past that t
 
 `model` absent, or the loaded image model's id, is served as it is; another known image model is switched to first when `switch.allow_implicit` is on. With a text model loaded and no `model` naming the image model, the answer is `409 model_kind_mismatch`.
 
-Prompt enhancement (`prompt_enhancement: true`, or `image.prompt_enhancement` when absent): the text model `image.prompt_enhancer` rewrites the prompt first with Qwen's own system prompts (a prompt holding a CJK ideograph in Chinese, any other in English; reasoning off; seeded with `seed`), and the images are made from the rewrite, returned as each image's `revised_prompt`. With the enhancer loaded it rewrites, and the request then switches to the image model it names. Otherwise the request visits the enhancer: a switch to it and one on to the image model, during which every other request is answered `503 model_switching`. From the image model it first takes its turn in the queue, so the jobs admitted before it finish there; the ones admitted behind it run in the visit's drain, as in any switch's. The visit does not change `GET /v1/models`' `last_switch`. A rewrite that cannot be had -- an enhancer the server cannot switch to, a switch to it that does not land, a rewrite that fails -- leaves the prompt as sent, and `warnings` says why.",
+Prompt enhancement (`prompt_enhancement: true`, or `image.prompt_enhancement` when absent): the text model `image.prompt_enhancer` rewrites the prompt first with Qwen's own system prompts (a prompt holding a CJK ideograph in Chinese, any other in English; reasoning off; seeded with `seed`), and the images are made from the rewrite, returned as each image's `revised_prompt`. With the enhancer loaded it rewrites, and the request then switches to the image model it names. Otherwise the request visits the enhancer: a switch to it and one on to the image model, during which every other request is answered `503 model_switching`. From the image model it first takes its turn in the queue, so the jobs admitted before it finish there; the ones admitted behind it run in the visit's drain, as in any switch's. A visit back to the model it left does not change `GET /v1/models`' `last_switch`; one from another text model is the request's switch to the image model, and each of its two switches is written there as a switch is. A rewrite that cannot be had -- an enhancer the server cannot switch to, a switch to it that does not land, a rewrite that fails -- leaves the prompt as sent, and `warnings` says why.",
     request_body = GenerationRequest,
     responses(
         (status = 200, description = "The images. `application/json` when `stream` is false or absent; `text/event-stream` when it is true.", content(
@@ -797,9 +797,10 @@ impl Enhanced {
 /// - the enhancer serving: the rewrite on it, then the request's switch to
 ///   the image model — no switch of its own;
 /// - otherwise a visit to it ([`crate::model_switch::visit`]): from the image
-///   model and back, or from another text model on to the image model the
-///   request names (`named`) — two switches, the gate closed throughout,
-///   `last_switch` left as it was. From the image model the request first
+///   model and back, `last_switch` left as it was, or from another text
+///   model on to the image model the request names (`named`), each switch
+///   written there — two switches, the gate closed throughout. From the
+///   image model the request first
 ///   takes its turn in the queue ([`queue_turn`]): the jobs admitted before
 ///   it run to their end there, and the visit begins with none running; the
 ///   ones admitted behind it run in the visit's drain, as for any switch.
