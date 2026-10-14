@@ -11,6 +11,9 @@
 //! - **A runner dropped holding a prefix** (a switch or an unload mid-job, when the job's own
 //!   release finds no runner) frees it: the device's free memory after that drop is what it was
 //!   after a clean one.
+//! - **The arena beside the budget** (review-321ab I3): on a budget larger than this card's, ten
+//!   condition images at the worst aspect ratio fit the budget but not the arena, and the count
+//!   says so, so the fit scales them.
 //!
 //! The PNGs are written beside the free runs' (`<oracle>/../freerun/http/`) for the eye. The
 //! artifact is `$IGNIS_IMAGE_ARTIFACT`, else
@@ -70,10 +73,11 @@ fn recorded_prefix(case: &Value) -> u64 {
     case["segments"].as_array().and_then(|segments| segments.last()).and_then(|last| last[1].as_u64()).expect("the case's segments")
 }
 
-/// The image model loaded through the server's loader, on its default options, and how long the
-/// load took; the load's own refusal is a failure under the profile.
-async fn load(artifact: &Path) -> Option<(ActiveModel, Duration)> {
-    let options = match ignis_server::config::resolve(&[], |_| None).expect("the defaults resolve") {
+/// The image model loaded through the server's loader, on the options `args` give over the
+/// defaults, and how long the load took; the load's own refusal is a failure under the profile.
+async fn load(artifact: &Path, args: &[&str]) -> Option<(ActiveModel, Duration)> {
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let options = match ignis_server::config::resolve(&args, |_| None).expect("the options resolve") {
         ignis_server::config::ConfigOutcome::Config(config) => config,
         other => panic!("{other:?}"),
     };
@@ -190,7 +194,7 @@ async fn the_image_model_serves_generations_and_edits_over_http_and_frees_what_i
     let (t2i, edit) = (case(&oracle.join("t2i")), case(&oracle.join("edit")));
     let condition = std::fs::read(oracle.join("edit/condition.png")).unwrap();
     let out = oracle.parent().map(|models| models.join("freerun")).filter(|freerun| freerun.is_dir()).map(|freerun| freerun.join("http"));
-    let Some((model, took)) = load(&artifact).await else { return };
+    let Some((model, took)) = load(&artifact, &[]).await else { return };
     let image = model.image_model().expect("the image model").clone();
     let plan = image.plan().clone();
     println!(
@@ -258,7 +262,7 @@ async fn the_image_model_serves_generations_and_edits_over_http_and_frees_what_i
 
     // Loaded again, a prefix held, and the model shut down under it (a switch's or an unload's
     // drain mid-job): the runner's drop frees the prefix, ~1 GiB, with the rest of the model.
-    let Some((model, _)) = load(&artifact).await else { return };
+    let Some((model, _)) = load(&artifact, &[]).await else { return };
     let image = model.image_model().expect("the image model").clone();
     let mut pixels = png::Decoder::new(Cursor::new(&condition)).read_info().unwrap();
     let mut rgba = vec![0; pixels.output_buffer_size().unwrap()];
@@ -279,4 +283,53 @@ async fn the_image_model_serves_generations_and_edits_over_http_and_frees_what_i
     );
     assert!(loaded.saturating_sub(holding) > 512 << 20, "the held prefix shows: {:.1} MiB", mib(loaded.saturating_sub(holding)));
     assert!(dropped.abs_diff(clean) < 64 << 20, "the runner's drop frees the prefix it held: {:.1} MiB apart", mib(dropped.abs_diff(clean)));
+}
+
+/// Review-321ab I3: the leaf's arena is a second limit on a condition beside the budget. With a
+/// budget past what the card has (an explicit 40 GiB, oversubscribed: a larger card's), ten
+/// condition images at the worst condition size (13120x96, 1,230 merged tokens each, spec
+/// image-model/03: a 16380x100 source at 1024² of area) fit the budget, and the count says past it
+/// when the arena has no room for their tower and encoder; the fit then scales them to sizes the
+/// arena takes. A size the encoder's processor would not keep counts past the budget too: scaled
+/// to 13088x64 the panorama passes 200:1. The fit runs from a floor of 640: at the default 512 the
+/// floor's own sizes (6560x32) pass 200:1, and the fit, which reads the floor first, refuses
+/// (the processor's limit is not monotone in the area; a corner left to the fit). Host-side counts
+/// only, after the load: nothing is encoded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "GPU: run under scripts/gpu-profile.ps1"]
+async fn the_count_holds_the_arena_beside_the_budget() {
+    use ignis_server::images::budget;
+    let Some((artifact, oracle)) = fixtures() else { return };
+    let edit = case(&oracle.join("edit"));
+    let prompt = edit["case"]["prompt"].as_str().unwrap();
+    let Some((model, _)) = load(&artifact, &["--vram-budget-bytes", "40G", "--vram-allow-oversubscription"]).await else { return };
+    let image = model.image_model().expect("the image model").clone();
+    let budget = image.plan().condition_budget_tokens;
+    let sources = vec![ImageSize::new(16380, 100); 10];
+    let worst = vec![budget::condition_size(1024.0 * 1024.0, 163.8); 10];
+    assert_eq!(worst[0], ImageSize::new(13120, 96), "the worst condition size");
+    let squares = vec![ImageSize::new(1024, 1024); 10];
+    let (counted_worst, counted_squares, fitted) = image
+        .with_runner(|runner| {
+            let fitted = budget::fit(|sizes| runner.condition_tokens(prompt, sizes), &sources, budget, 640);
+            assert_eq!(runner.condition_tokens(prompt, &[ImageSize::new(13088, 64); 10]), budget + 1, "past 200:1");
+            (runner.condition_tokens(prompt, &worst), runner.condition_tokens(prompt, &squares), fitted)
+        })
+        .unwrap();
+    let cells = |sizes: &[ImageSize]| sizes.iter().map(|size| size.latent_cells() as u64).sum::<u64>();
+    println!(
+        "a {budget}-token budget: ten 13120x96 images ({} latent cells) count {counted_worst}; ten 1024² ({} cells) count {counted_squares}; \
+         the fit: {:?}",
+        cells(&worst),
+        cells(&squares),
+        fitted
+    );
+    assert!(cells(&worst) < budget, "the worst case fits the budget: {} cells", cells(&worst));
+    assert_eq!(counted_worst, budget + 1, "past the arena's room, the count is one past the budget");
+    assert!(counted_squares <= budget && counted_squares > cells(&squares), "ten 1024² images fit both");
+    let fitted = fitted.expect("the fit scales the worst case into the arena");
+    assert!(fitted.scaled, "{fitted:?}");
+    let counted = image.with_runner(|runner| runner.condition_tokens(prompt, &fitted.sizes)).unwrap();
+    assert!(counted <= budget, "the fitted sizes count within the budget, so within the arena and the processor: {counted}");
+    tokio::task::spawn_blocking(move || model.shut_down()).await.unwrap();
 }

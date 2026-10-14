@@ -105,9 +105,13 @@ impl EncoderFrontend {
 
     /// What [`EncoderFrontend::input`] builds for `prompt` with condition
     /// images of `sizes`, counted without preparing an image: the template
-    /// tokenized once, and each image at a condition size (sides multiples of
-    /// 32, which the processor keeps) a pad per 2 x 2 of its latent cells.
+    /// tokenized once, and each image a pad per 2 x 2 of its latent cells.
+    /// Refused for a size the processor would not keep
+    /// ([`ImageProcessor::keeps`]): the image model encodes only those.
     pub fn count(&self, prompt: &str, sizes: &[ImageSize]) -> Result<ConditionCount, String> {
+        for (k, size) in sizes.iter().enumerate() {
+            self.processor.keeps(*size).map_err(|why| format!("condition image {k} is {size}: {why}"))?;
+        }
         let text = self.prompt.rows(prompt, sizes.len())?.saturating_sub(sizes.len()) as u64;
         let cells: u64 = sizes.iter().map(|size| size.latent_cells() as u64).sum();
         let pads = cells / 4;
@@ -178,6 +182,23 @@ impl ImageProcessor {
             mean: triple("image_mean", f64::MIN)?,
             std: triple("image_std", f64::MIN_POSITIVE)?,
         })
+    }
+
+    /// Whether the processor keeps a condition image of `size` as it is:
+    /// `smart_resize` leaves it (sides multiples of 32 within the pixel
+    /// bounds, at most 200:1). Only then does its every 2 x 2 of latent cells
+    /// meet one vision token, as the image model's condition prefix lays them
+    /// out (spec image-model/04); Err says what the processor would do.
+    pub fn keeps(&self, size: ImageSize) -> Result<(), String> {
+        match smart_resize(size.height, size.width, self.min_pixels, self.max_pixels) {
+            Ok(kept) if (kept.width, kept.height) == (size.width, size.height) => Ok(()),
+            Ok(kept) => Err(format!(
+                "the encoder's processor resizes it to {}x{} (it keeps sides that are multiples of 32 within {} to {} pixels), so its \
+                 vision tokens would not line up with its latents",
+                kept.width, kept.height, self.min_pixels, self.max_pixels
+            )),
+            Err(e) => Err(format!("the encoder's processor refuses it ({e:?}: at most 200:1)")),
+        }
     }
 
     /// One condition image as the processor prepares it: on white,
@@ -463,6 +484,24 @@ mod tests {
                 },
                 "{prompt:?} with {sizes:?}"
             );
+        }
+    }
+
+    /// A condition size the processor would not keep is not counted: its vision tokens would not
+    /// line up with its latents, and the leaf refuses it. The budget's fit scales a panorama until
+    /// its rounded sides pass 200:1 (13088x64), which `smart_resize` refuses; a size off the
+    /// 32-pixel grid or below the pixel floor is resized.
+    #[test]
+    fn the_count_refuses_a_size_the_processor_would_not_keep() {
+        let frontend = EncoderFrontend { prompt: crate::image_prompt::tests::prompt(), processor: processor() };
+        assert!(frontend.count("x", &[ImageSize::new(13120, 96)]).is_ok(), "136:1 within the bounds");
+        for (size, says) in [
+            (ImageSize::new(13088, 64), "refuses"),
+            (ImageSize::new(224, 192), "resizes it to 288x256"),
+            (ImageSize::new(1024, 1008), "resizes it to 1024x1024"),
+        ] {
+            let refused = frontend.count("x", &[ImageSize::new(1024, 1024), size]).unwrap_err();
+            assert!(refused.contains(&format!("condition image 1 is {size}")) && refused.contains(says), "{size}: {refused}");
         }
     }
 

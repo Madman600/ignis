@@ -8,9 +8,10 @@
 //! - **The count.** `condition_tokens` is [`EncoderFrontend::count`]'s
 //!   prefix, the very count the leaf's `encode_condition` refuses by. A
 //!   condition within the plan's budget that the leaf's arena has no room to
-//!   encode (`ImageLeaf::condition_fits`) counts one past the budget, so the
-//!   server's fit (`images::budget::fit`) scales the images down for that
-//!   limit too.
+//!   encode (`ImageLeaf::condition_fits`), or with a condition size the
+//!   encoder's processor would not keep (a panorama scaled past 200:1),
+//!   counts one past the budget, so the server's fit (`images::budget::fit`)
+//!   scales the images for those limits too.
 //! - **The latents.** A job keeps its target's latents on the host,
 //!   channel-major ([`TargetLatents`]); the leaf keeps the started image's in
 //!   its slot, packed `[y · w + x][c]` ([`packed`]). Each step sends them up
@@ -110,7 +111,6 @@ mod device {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use ignis_artifact::vision::PATCH;
     use ignis_artifact::{CudaDevice, Reader};
     use ignis_core::image::{ConditionId, ImageCondition, ImageError, ImagePlan, ImageRunner, ImageSize, RgbaImage, TargetLatents, LATENT_SCALE};
     use ignis_core::image_leaf::{Condition, ConditionImage as LeafImage, ConditionText, ImageLeaf, ImageLeafOptions};
@@ -172,8 +172,9 @@ mod device {
             &self.plan
         }
 
-        /// The front end's count; one past the budget when the tokenizer
-        /// fails or the arena has no room for the condition.
+        /// The front end's count; one past the budget when it refuses (a
+        /// size the processor would not keep, a tokenizer failure) or the
+        /// arena has no room for the condition.
         fn condition_tokens(&self, prompt: &str, images: &[ImageSize]) -> u64 {
             let past = self.plan.condition_budget_tokens.saturating_add(1);
             let Ok(count) = self.frontend.count(prompt, images) else { return past };
@@ -186,6 +187,8 @@ mod device {
             if fits.is_ok() { count.prefix } else { past }
         }
 
+        /// The count first: a size the processor would not keep, or a prefix
+        /// past the budget, is refused before any image is prepared.
         fn encode_condition(&mut self, condition: &ImageCondition) -> Result<ConditionId, ImageError> {
             let sizes: Vec<ImageSize> = condition.images.iter().map(|image| image.size).collect();
             let count = self.frontend.count(&condition.prompt, &sizes).map_err(ImageError::Refused)?;
@@ -199,19 +202,19 @@ mod device {
                 .map(|image| ConditionImage { width: image.size.width, height: image.size.height, rgba: &image.pixels })
                 .collect();
             let input = self.frontend.input(&condition.prompt, &images).map_err(ImageError::Refused)?;
-            let mut leaf_images = Vec::with_capacity(images.len());
-            for (k, (patches, image)) in input.images.iter().zip(&condition.images).enumerate() {
-                let (width, height) = (patches.grid.w * PATCH as u32, patches.grid.h * PATCH as u32);
-                if (width, height) != (image.size.width, image.size.height) {
-                    return Err(ImageError::Refused(format!(
-                        "condition image {k} is {}, which the encoder's processor resizes to {width}x{height}: its vision tokens would not \
-                         line up with its latents. A condition image keeps its size with sides that are multiples of 32 within the \
-                         processor's pixel bounds (image.condition_floor_px)",
-                        image.size
-                    )));
-                }
-                leaf_images.push(LeafImage { grid: patches.grid, pixels: &patches.pixels, width, height, rgba: &image.pixels });
-            }
+            // The processor kept every size (the count): each grid is its image in 16-pixel patches.
+            let leaf_images: Vec<LeafImage> = input
+                .images
+                .iter()
+                .zip(&condition.images)
+                .map(|(patches, image)| LeafImage {
+                    grid: patches.grid,
+                    pixels: &patches.pixels,
+                    width: image.size.width,
+                    height: image.size.height,
+                    rgba: &image.pixels,
+                })
+                .collect();
             let text = ConditionText {
                 input_ids: &input.input_ids,
                 positions: &input.positions,
