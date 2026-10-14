@@ -605,10 +605,15 @@ pub fn needs_reload(running: &Config, next: &Config) -> bool {
 /// no forced close for, is refused rather than silently inert. Only for what
 /// `patch` changes — a value the load already accepted is not judged again —
 /// and the budget's check only on a model loaded from an artifact, as at
-/// start: the placeholder has no tokenizer to close with.
+/// start: the placeholder has no tokenizer to close with. Not on the image
+/// model, which thinks nothing: the next text model's load judges them
+/// (spec image-model/05).
 fn check_thinking(server: &Server, next: &Config, patch: &Layer) -> Result<(), String> {
     let named = |name: &str| patch.named().any(|(meta, _)| meta.group == "model" && meta.name == name);
     let active = server.active();
+    if active.engine().is_none() {
+        return Ok(());
+    }
     if named("enable_thinking") || named("reasoning_effort") {
         let defaults = crate::thinking::ThinkingDefaults {
             enable_thinking: next.enable_thinking,
@@ -623,6 +628,23 @@ fn check_thinking(server: &Server, next: &Config, patch: &Layer) -> Result<(), S
         crate::thinking::check_default_budget_close(next.thinking_budget, &close)?;
     }
     Ok(())
+}
+
+/// Spec image-model/05 §Prompt enhancement: an `image.prompt_enhancer` a
+/// patch names must be a text model a rewrite can run on — the loaded one, or
+/// one an explicit switch by id may name, the patch's own
+/// `switch.known_models` among them — where the server knows its text models
+/// ([`crate::images::enhance::unknown_enhancer`]). Only for what `patch`
+/// changes: an enhancer the running configuration already names is not
+/// judged again (the start warned of it).
+fn check_enhancer(server: &Server, next: &Config, patch: &Layer) -> Result<(), String> {
+    if !patch.named().any(|(meta, _)| meta.group == "image" && meta.name == "prompt_enhancer") {
+        return Ok(());
+    }
+    match crate::images::enhance::unknown_enhancer(server, &next.settings().image.prompt_enhancer, &next.known_models) {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
 }
 
 /// `PATCH /v1/config` — change the running configuration.
@@ -661,6 +683,9 @@ pub(crate) async fn patch_config(State(server): State<Arc<Server>>, Json(body): 
         Ok(next) => next,
         Err(error) => return refused("config_invalid", error.0),
     };
+    if let Err(error) = check_enhancer(&server, &next, &patch) {
+        return refused("config_invalid", error);
+    }
     let shadowed = shadowed_at_restart(&patch, &running);
     if !needs_reload(&running, &next) {
         if let Err(error) = check_thinking(&server, &next, &patch) {

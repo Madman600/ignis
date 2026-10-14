@@ -129,11 +129,11 @@ FN_DEFAULT_TOKENS = ($(FN_LANE_TOKENS)<524288?$(FN_LANE_TOKENS):524288)
 FN_FLOOR_TOKENS = ($(FN_CONTEXT_TOKENS)+64*($(or $(RETAINED_HOST),8)+$(or $(RETAINED_DEVICE),0)))
 KV_POOL_PLAN = $(if $(KV_POOL_BYTES),$(if $(filter flash-next,$(MODEL_FAMILY)),offloaded,resident) $(KV_POOL_BYTES) (named$(COMMA) $$(sh mk/kv-pool-tokens.sh '$(KV_POOL_BYTES)' $(MODEL_FAMILY) $(or $(KV_FORMAT),hq-e8-2b)) tokens),$(if $(filter flash-next,$(MODEL_FAMILY)),offloaded $$(( $(FN_DEFAULT_TOKENS)>$(FN_FLOOR_TOKENS)?$(FN_DEFAULT_TOKENS):$(FN_FLOOR_TOKENS) )) tokens,resident (the rest of the VRAM budget)))
 SERVER_ENV = $(if $(LOG_LEVEL),IGNIS_LOG_LEVEL=$(LOG_LEVEL)) $(if $(LOG_FORMAT),IGNIS_LOG_FORMAT=$(LOG_FORMAT))
-# The served id: Flash-Next's own, the id MODEL names (mk/config.mk), the
+# The served id: Flash-Next's own, the image model's own, the id MODEL names (mk/config.mk), the
 # abliterated variant's catalog id with UNCENSORED=1 (ADR 0047: one family, two
 # artifacts, told apart by the served id), or none for the 27B (the server's
 # default).
-SERVED_MODEL := $(if $(filter flash-next,$(MODEL_FAMILY)),qwen3.8-flash-next,$(or $(filter-out 27b,$(MODEL)),$(if $(filter 1,$(UNCENSORED)),qwen3.8-27b-abliterated)))
+SERVED_MODEL := $(if $(filter flash-next,$(MODEL_FAMILY)),qwen3.8-flash-next,$(if $(filter image,$(MODEL_FAMILY)),ignis-image-2.1-turbo,$(or $(filter-out 27b,$(MODEL)),$(if $(filter 1,$(UNCENSORED)),qwen3.8-27b-abliterated))))
 SMOKE_MODEL := $(or $(SERVED_MODEL),qwen3.8-27b)
 # A generated key (API_KEY=auto) is unknown to make: pass the printed one.
 SMOKE_AUTH := $(if $(filter-out auto,$(API_KEY)),-H 'Authorization: Bearer $(API_KEY)')
@@ -201,11 +201,11 @@ config: ## Print the resolved knobs and paths
 	@echo "ARTIFACT        $(ARTIFACT)"
 	@echo "UNCENSORED      $(if $(filter 1,$(UNCENSORED)),1  (default ARTIFACT is the huihui-abliterated image, served as qwen3.8-27b-abliterated),off)"
 	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(KV_POOL_PLAN) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),$(if $(filter flash-next,$(MODEL_FAMILY)),off (SPEC=mtp turns the MTP head on),server default (the rtx5090 profile: dflash2)))$(if $(filter-out off,$(SPEC)),/$(DRAFT_TOKENS)$(if $(DRAFT_HEAD),/$(DRAFT_HEAD)))$(if $(DRAFT_ROWS), rows=$(DRAFT_ROWS)) rope=$(or $(ROPE_SCALING),none)"
-	@echo "PLAN            $(if $(filter flash-next,$(MODEL_FAMILY)),lanes=$(LANES) context/lane=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) prefill_chunk=$(or $(PREFILL_CHUNK),default) decode_share=$(if $(DECODE_SHARE),$(DECODE_SHARE)%,25% (default)) retained_host=$(or $(RETAINED_HOST),8 (Flash-Next default)) kv_ram_arena=$(or $(KV_HOST_POOL_BYTES),default) kv_pool=$(KV_POOL_PLAN) expert_cache_floor=$(if $(filter 1,$(ALLOW_EXPERT_CACHE_BELOW_FLOOR)),12G (below it allowed with a warning),12G (refused below)) ngram_hot=$(or $(NGRAM_HOT_BYTES),1G (default; auto = what the host plan leaves)),(Flash-Next only: the plan is the server's for the 27B))"
+	@echo "PLAN            $(if $(filter image,$(MODEL_FAMILY)),(image model: no context, lanes, prefill chunk, speculation, KV pool or vision; the server plans its own VRAM),$(if $(filter flash-next,$(MODEL_FAMILY)),lanes=$(LANES) context/lane=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) prefill_chunk=$(or $(PREFILL_CHUNK),default) decode_share=$(if $(DECODE_SHARE),$(DECODE_SHARE)%,25% (default)) retained_host=$(or $(RETAINED_HOST),8 (Flash-Next default)) kv_ram_arena=$(or $(KV_HOST_POOL_BYTES),default) kv_pool=$(KV_POOL_PLAN) expert_cache_floor=$(if $(filter 1,$(ALLOW_EXPERT_CACHE_BELOW_FLOOR)),12G (below it allowed with a warning),12G (refused below)) ngram_hot=$(or $(NGRAM_HOT_BYTES),1G (default; auto = what the host plan leaves)),(Flash-Next only: the plan is the server's for the 27B)))"
 	@echo "KV-DISK (CUDA=1) $(if $(filter 0,$(KV_DISK_BUDGET)),off$(if $(KV_DISK_BYTES),, (the 27B's default; KV_DISK_BYTES=4G turns it on)),budget=$(KV_DISK_BUDGET) (cut at start to the volume's free space less 10 GiB) dir=$(KV_DISK_LOCATION)/ignis-kv-disk/<pid>-<nonce>)"
 	@echo "VISION (CUDA=1) $(if $(filter 1,$(VISION)),on  max_tokens=$(or $(VISION_MAX_TOKENS),(server default)),off  (image parts are refused with vision_disabled))"
 	@echo "VRAM (CUDA=1)   $(if $(VRAM_BUDGET),budget=$(VRAM_BUDGET)$(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)), (oversubscription allowed)),headroom=$(or $(VRAM_HEADROOM),(server default: 1536M))) retained_device=$(or $(RETAINED_DEVICE),(server default: 0)) retained_host=$(or $(RETAINED_HOST),(server default: two per lane))"
-	@echo "MODEL           $(MODEL_FAMILY)  $(if $(filter flash-next,$(MODEL_FAMILY)),(Qwen3.8-Flash-Next as $(SERVED_MODEL); lanes=$(LANES); its prefetch width 16, 10 in prefill is not a server flag yet),$(if $(SERVED_MODEL),(Qwen3.8-27B served as $(SERVED_MODEL)),(Qwen3.8-27B under the server's default id)))"
+	@echo "MODEL           $(MODEL_FAMILY)  $(if $(filter image,$(MODEL_FAMILY)),(the image model served as $(SERVED_MODEL); generation and edit routes, no text engine knobs),$(if $(filter flash-next,$(MODEL_FAMILY)),(Qwen3.8-Flash-Next as $(SERVED_MODEL); lanes=$(LANES); its prefetch width 16, 10 in prefill is not a server flag yet),$(if $(SERVED_MODEL),(Qwen3.8-27B served as $(SERVED_MODEL)),(Qwen3.8-27B under the server's default id))))"
 	@echo "BIND            $(BIND)"
 	@echo "LOG_LEVEL       $(or $(LOG_LEVEL),(server default))"
 	@echo "LOG_FORMAT      $(or $(LOG_FORMAT),(server default))"
@@ -339,12 +339,18 @@ logs: ## Follow the background server log
 	tail -n 100 -f "$(SERVER_LOG)"
 
 .PHONY: smoke
-smoke: ## One /v1/models + one short chat completion against BIND
+smoke: ## One /v1/models + one short chat completion (MODEL=image: one 1024x1024 image) against BIND
 	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/v1/models"
 	@echo ""
+ifeq ($(MODEL_FAMILY),image)
+	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/v1/images/generations" -H 'Content-Type: application/json' \
+	  -d '{"model":"$(SMOKE_MODEL)","prompt":"a red circle on white","size":"1024x1024","n":1,"seed":1}' \
+	  -o /dev/null -w 'one 1024x1024 image: HTTP %{http_code}, %{size_download} bytes\n'
+else
 	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/v1/chat/completions" -H 'Content-Type: application/json' \
 	  -d '{"model":"$(SMOKE_MODEL)","messages":[{"role":"user","content":"Say hi in five words."}],"max_tokens":32}'
 	@echo ""
+endif
 
 .PHONY: metrics
 metrics: ## Scrape the metrics listener (a server started with METRICS=1; no key)

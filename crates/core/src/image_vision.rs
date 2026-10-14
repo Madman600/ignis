@@ -121,7 +121,13 @@ impl VisionCall {
     }
 }
 
-fn to_bf16(v: f32) -> u16 {
+/// `v` rounded to BF16 bits, nearest even, as torch's `.to(torch.bfloat16)`: a NaN is torch's
+/// quiet NaN, 0x7FC0. The image leaf's one host rounding (the tower's patches, the VAE's input and
+/// the decoder's latents).
+pub(crate) fn to_bf16(v: f32) -> u16 {
+    if v.is_nan() {
+        return 0x7FC0;
+    }
     let b = v.to_bits();
     ((b + 0x7FFF + ((b >> 16) & 1)) >> 16) as u16
 }

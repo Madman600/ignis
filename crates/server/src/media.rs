@@ -26,8 +26,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ignis_artifact::vision::{
-    Budget, InvalidMedia, PreparedMedia, ProcessorError, ProcessorOptions, VisionProcessor,
+    Budget, DecodeFailure, InvalidMedia, PreparedMedia, ProcessorError, ProcessorOptions, VisionProcessor,
 };
+use ignis_core::image::{ImageSize, RgbaImage};
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, Semaphore};
 
@@ -828,6 +829,129 @@ impl MediaAcquirer {
     }
 }
 
+// ── the image model's condition images ──────────────────────────────────
+
+/// An edit's condition image (spec image-model/05): PNG, JPEG or WebP bytes
+/// decoded to RGBA, PNG and WebP with their alpha, JPEG opaque, refused past
+/// `max_pixels` before its frame is allocated (`image.max_condition_mipx`).
+/// The message says why it is not one.
+pub fn decode_condition_image(bytes: &[u8], max_pixels: u64) -> Result<RgbaImage, String> {
+    match ignis_artifact::vision::decode_image_rgba(bytes, max_pixels) {
+        Ok(image) => Ok(RgbaImage { size: ImageSize::new(image.width, image.height), pixels: image.rgba }),
+        Err(DecodeFailure::Invalid(InvalidMedia::Undecodable(why))) => Err(format!("cannot decode image: {why}")),
+        Err(DecodeFailure::Invalid(InvalidMedia::Unsupported(why))) => Err(format!("unsupported image: {why}")),
+        // The decoders never raise it: the vision processor's resize does.
+        Err(DecodeFailure::Invalid(InvalidMedia::AspectRatio { width, height })) => {
+            Err(format!("unsupported image: {width}x{height}"))
+        }
+        Err(DecodeFailure::Pixels(pixels)) => Err(format!(
+            "the image has {pixels} pixels, over the {max_pixels} a condition image may decode to (image.max_condition_mipx)"
+        )),
+    }
+}
+
+// `resize_rgba`, `clip8`, `lanczos_weights` and `PRECISION_BITS` are a port
+// of python-pillow/Pillow 12.3.0 (tag commit bb1d8e8), MIT-CMU licensed:
+// `src/libImaging/Resample.c` (`ImagingResample`, `precompute_coeffs`,
+// `normalize_coeffs_8bpc`, the 8-bit horizontal and vertical passes, `clip8`,
+// `PRECISION_BITS`), `src/libImaging/Convert.c` (`rgbA2rgba`, the
+// premultiply, and `rgba2rgbA`, its inverse) and
+// `src/libImaging/ImagingUtils.h` (`MULDIV255`). Pillow's copyright and
+// permission notice are in the repository's root NOTICE.
+
+/// `image` resampled to `size` the way diffusers' `VaeImageProcessor.resize`
+/// does it, through Pillow (spec image-model/03 §Image preprocessing):
+/// Pillow's `ImagingResample` with its Lanczos-3 filter, step for step —
+/// RGBA premultiplied to `RGBa` (Pillow resizes RGBA that way, so a
+/// transparent pixel's colour never bleeds into its neighbours), the
+/// horizontal pass then the vertical, each only when its side changes, each
+/// in Pillow's 8-bit fixed point (the filter widened by the downscale factor,
+/// 22-bit weights summing to 1, each pass rounded and clamped to a byte), and
+/// `RGBa` back to RGBA.
+pub fn resize_rgba(image: &RgbaImage, size: ImageSize) -> RgbaImage {
+    // Pillow copies an image asked for at its own size.
+    if image.size == size {
+        return image.clone();
+    }
+    // Pillow's `rgbA2rgba`, through its MULDIV255: c · a / 255, rounded.
+    let premultiply = |c: u8, a: u8| {
+        let t = u32::from(c) * u32::from(a) + 128;
+        ((t + (t >> 8)) >> 8) as u8
+    };
+    let mut pixels: Vec<u8> = image
+        .pixels
+        .chunks_exact(4)
+        .flat_map(|px| [premultiply(px[0], px[3]), premultiply(px[1], px[3]), premultiply(px[2], px[3]), px[3]])
+        .collect();
+    let (mut width, height) = (image.size.width as usize, image.size.height as usize);
+    if size.width as usize != width {
+        let columns = lanczos_weights(width, size.width as usize);
+        let mut out = Vec::with_capacity(columns.len() * height * 4);
+        for row in pixels.chunks_exact(width * 4) {
+            for (first, weights) in &columns {
+                for c in 0..4 {
+                    out.push(clip8(weights.iter().enumerate().map(|(k, w)| i64::from(row[(first + k) * 4 + c]) * w).sum()));
+                }
+            }
+        }
+        (pixels, width) = (out, size.width as usize);
+    }
+    if size.height as usize != height {
+        let rows = lanczos_weights(height, size.height as usize);
+        let mut out = Vec::with_capacity(rows.len() * width * 4);
+        for (first, weights) in &rows {
+            for x in 0..width * 4 {
+                out.push(clip8(weights.iter().enumerate().map(|(k, w)| i64::from(pixels[(first + k) * width * 4 + x]) * w).sum()));
+            }
+        }
+        pixels = out;
+    }
+    // Pillow's `rgba2rgbA`: c · 255 / a, truncated; alpha 0 and 255 kept.
+    for px in pixels.chunks_exact_mut(4) {
+        let alpha = u32::from(px[3]);
+        if alpha != 0 && alpha != 255 {
+            for c in &mut px[..3] {
+                *c = (u32::from(*c) * 255 / alpha).min(255) as u8;
+            }
+        }
+    }
+    RgbaImage { size, pixels }
+}
+
+/// Pillow's fixed-point precision for 8-bit samples (`PRECISION_BITS`).
+const PRECISION_BITS: u32 = 32 - 8 - 2;
+
+/// A sum of samples times 22-bit weights back to a byte: Pillow's `clip8`,
+/// from its rounding offset.
+fn clip8(sum: i64) -> u8 {
+    ((sum + (1 << (PRECISION_BITS - 1))) >> PRECISION_BITS).clamp(0, 255) as u8
+}
+
+/// Pillow's `precompute_coeffs` and `normalize_coeffs_8bpc` for Lanczos-3
+/// from `input` samples to `out`: per output sample, its first input sample
+/// and the 22-bit weights of the run starting there.
+fn lanczos_weights(input: usize, out: usize) -> Vec<(usize, Vec<i64>)> {
+    let sinc = |x: f64| if x == 0.0 { 1.0 } else { (x * std::f64::consts::PI).sin() / (x * std::f64::consts::PI) };
+    let lanczos = |x: f64| if (-3.0..3.0).contains(&x) { sinc(x) * sinc(x / 3.0) } else { 0.0 };
+    let scale = input as f64 / out as f64;
+    let filter_scale = scale.max(1.0);
+    let (support, ss) = (3.0 * filter_scale, 1.0 / filter_scale);
+    (0..out)
+        .map(|i| {
+            let center = (i as f64 + 0.5) * scale;
+            let first = (center - support + 0.5).max(0.0) as usize;
+            let last = ((center + support + 0.5) as usize).min(input);
+            let weights: Vec<f64> = (first..last).map(|x| lanczos((x as f64 - center + 0.5) * ss)).collect();
+            let total: f64 = weights.iter().sum();
+            let fixed = |w: f64| {
+                let w = if total == 0.0 { w } else { w / total } * f64::from(1u32 << PRECISION_BITS);
+                (if w < 0.0 { w - 0.5 } else { w + 0.5 }) as i64
+            };
+            (first, weights.iter().map(|&w| fixed(w)).collect())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,4 +1067,49 @@ mod tests {
             ]
         );
     }
+
+    /// The condition images' resize is Pillow's byte for byte: the fixtures
+    /// are Pillow 12.3's `Image.resize(.., LANCZOS)` of the vision fixtures —
+    /// an RGBA image down on both sides, a crop of it up, and an opaque one —
+    /// as diffusers resizes a condition image.
+    #[test]
+    fn the_condition_resize_is_pillows_lanczos_byte_for_byte() {
+        let decode = |bytes: &[u8]| decode_condition_image(bytes, 64 << 20).unwrap();
+        let alpha = decode(include_bytes!("../../artifact/tests/fixtures/vision/images/alpha.png"));
+        let crop = RgbaImage {
+            size: ImageSize::new(100, 60),
+            pixels: (70..130).flat_map(|y| alpha.pixels[(y * 300 + 100) * 4..][..400].to_vec()).collect(),
+        };
+        let grid = decode(include_bytes!("../../artifact/tests/fixtures/vision/images/on_grid.png"));
+        for (source, pillow) in [
+            (&alpha, &include_bytes!("../tests/fixtures/pillow_resize/alpha_160x96.png")[..]),
+            (&crop, &include_bytes!("../tests/fixtures/pillow_resize/alpha_crop_160x96.png")[..]),
+            (&grid, &include_bytes!("../tests/fixtures/pillow_resize/on_grid_224x160.png")[..]),
+        ] {
+            let pillow = decode(pillow);
+            assert!(resize_rgba(source, pillow.size) == pillow, "{} to {}", source.size, pillow.size);
+        }
+        assert!(resize_rgba(&alpha, alpha.size) == alpha, "the same size is the same image");
+    }
+
+    /// A transparent pixel's colour does not bleed into an opaque one; one
+    /// resized side leaves the other untouched.
+    #[test]
+    fn the_condition_resize_never_bleeds_a_transparent_colour() {
+        // Left half transparent red, right half opaque blue.
+        let pixels = (0..64 * 32).flat_map(|i| if i % 64 < 32 { [255, 0, 0, 0] } else { [0, 0, 255, 255] }).collect();
+        let image = RgbaImage { size: ImageSize::new(64, 32), pixels };
+        let resized = resize_rgba(&image, ImageSize::new(40, 32));
+        assert!(resized.pixels.chunks_exact(4).all(|px| px[0] == 0), "no red anywhere");
+        assert!(resized.pixels.chunks_exact(4).any(|px| px[3] == 0) && resized.pixels.chunks_exact(4).any(|px| px[3] == 255));
+        let rows: Vec<&[u8]> = resized.pixels.chunks_exact(40 * 4).collect();
+        assert!(rows.iter().all(|row| *row == rows[0]), "the height did not change, nor did the rows");
+    }
+
+    #[test]
+    fn a_condition_image_that_is_not_png_jpeg_or_webp_is_refused_saying_so() {
+        assert!(decode_condition_image(b"GIF89a....", 64 << 20).unwrap_err().starts_with("unsupported image"));
+        assert!(decode_condition_image(b"\x89PNG\r\n\x1a\nxx", 64 << 20).unwrap_err().starts_with("cannot decode image"));
+    }
 }
+

@@ -514,6 +514,18 @@ pub fn bind(reader: &Reader, geometry: &QwenImageGeometry) -> Result<QwenImagePl
 /// `text_encoder/config.json` verbatim (eps, rope theta, mrope section).
 pub const TEXT_ENCODER_CONFIG: &str = "frontend/text_encoder_config.json";
 
+/// The DiT's config resource: the checkpoint's `transformer/config.json`
+/// verbatim (eps, the RoPE axes, `causal_condition`).
+pub const TRANSFORMER_CONFIG: &str = "frontend/transformer_config.json";
+
+/// The converter's `image_model.json`: the sampler's sigmas and scheduler
+/// config, the latent normalization, the processor, the prompt templates.
+pub const IMAGE_MODEL: &str = "frontend/image_model.json";
+
+/// The VAE's config resource: the checkpoint's `vae/config.json` verbatim
+/// (the residual blocks, the patch size, the ladder).
+pub const VAE_CONFIG: &str = "frontend/vae_config.json";
+
 /// Bind the text encoder alone (spec image-model/03): its config resource
 /// and every `text_encoder/` tensor, each with its exact format, layout and
 /// shape and placed by its role. A scoped bind ([`Binder::plan`]): the

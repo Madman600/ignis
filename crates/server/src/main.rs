@@ -308,7 +308,8 @@ async fn main() {
     let server = server
         .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))
         .with_instruction_policy(instruction_policy)
-        .with_idle_unload(std::time::Duration::from_secs(u64::from(idle_unload_secs)));
+        .with_idle_unload(std::time::Duration::from_secs(u64::from(idle_unload_secs)))
+        .with_image(running.settings().image.clone());
     // Spec config-v2/02: the running configuration, shown and changed over
     // `GET`/`PATCH /v1/config` and written back to the config file in use;
     // the model loader shares it, so a later switch loads with a live change
@@ -348,6 +349,19 @@ async fn main() {
         )
         .with_config(config_state);
 
+    // Spec image-model/05 §Prompt enhancement: an enhancer no switch reaches
+    // leaves every enhanced request on its prompt as sent. A `PATCH` naming
+    // one is refused; the start is not, and says so once.
+    let enhancer = server.live().image.prompt_enhancer.clone();
+    if let Some(reason) = ignis_server::images::enhance::unknown_enhancer(&server, &enhancer, &Default::default()) {
+        tracing::warn!(
+            name: "ignis.config.prompt_enhancer_unknown",
+            enhancer = %enhancer,
+            %reason,
+            "prompt enhancement uses each prompt as sent until image.prompt_enhancer names a text model this server can switch to"
+        );
+    }
+
     // GitHub #209: joining or gathering developer messages trades prefix
     // reuse for fewer system blocks; the operator is told once, at start.
     if instruction_policy.developer.rerenders_history() {
@@ -365,16 +379,19 @@ async fn main() {
 
     // A default the loaded template cannot honour is a refused start (a
     // model swap must not silently change behaviour), matching how the
-    // server already treats a missing EOS token or an unclean checksum.
+    // server already treats a missing EOS token or an unclean checksum. The
+    // image model thinks nothing: a text model's load judges them.
     let thinking_defaults = ThinkingDefaults {
         enable_thinking: default_enable_thinking,
         reasoning_effort: default_reasoning_effort,
     };
-    if let Err(err) =
-        thinking::validate_defaults(&thinking_defaults, &server.active().template.thinking_capabilities())
-    {
-        tracing::error!(name: "ignis.config.thinking_invalid", error = %err, "refusing to start");
-        exit_after_flush(&logging_handle, 1);
+    if server.active().engine().is_some() {
+        if let Err(err) =
+            thinking::validate_defaults(&thinking_defaults, &server.active().template.thinking_capabilities())
+        {
+            tracing::error!(name: "ignis.config.thinking_invalid", error = %err, "refusing to start");
+            exit_after_flush(&logging_handle, 1);
+        }
     }
     let server = server
         .with_thinking_defaults(default_enable_thinking, default_reasoning_effort)
@@ -474,7 +491,7 @@ async fn main() {
         name: "ignis.process.started",
         // The id the load is served under (`config::Config::for_family`): a
         // Flash-Next artifact started without `--model-id` is its own.
-        model = %server.active().engine.model_id(),
+        model = %server.active().model_id(),
         bind = %bind,
         api_key_required = auth,
         metrics = metrics.as_deref().unwrap_or("off"),

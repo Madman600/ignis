@@ -33,11 +33,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use utoipa::ToSchema;
 
+use ignis_core::compute::ModelKind;
 use ignis_core::DecodeParams;
 
 use crate::api::{
     bad_request, bad_request_param, content_rejection, error_response, error_response_naming, render_prompt, resolve_model_and_class,
     forced_tool_call, resolve_thinking, resolve_tools, template_rejection, with_thinking_budget, ApiError, Structure,
+    check_served_kind, split_model_lane, unknown_model,
 };
 use crate::media::has_media;
 use crate::metrics::TokenizeRoute;
@@ -119,14 +121,20 @@ A body carrying an `image_url` part is refused with `media_not_countable`: an im
         (status = 400, description = "Both `messages` and `prompt`, or neither; an empty `messages`; a body chat would refuse; `stream: true`; or an image part (`media_not_countable`).", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The body named a model this server has not loaded.", body = ApiError),
+        (status = 409, description = "The loaded model is the image model, which has no chat template to count with (`model_kind_mismatch`).", body = ApiError),
         (status = 501, description = "The raw form on a load whose tokenizer cannot be asked for ids (`tokenizer_unavailable`).", body = ApiError),
     ),
 )]
 pub(crate) async fn tokenize(State(server): State<Arc<Server>>, Json(req): Json<TokenizeRequest>) -> Response {
-    // One model for the whole request (spec model-switch/01).
+    // One model for the whole request (spec model-switch/01), a text model
+    // (spec image-model/05): this route counts, it never switches.
     let server = Arc::new(server.pinned());
     if let Some(metrics) = &server.metrics {
         metrics.record_tokenize(TokenizeRoute::Tokenize);
+    }
+    let named = split_model_lane(req.model.clone()).0;
+    if let Err(refused) = check_served_kind(&server, ModelKind::Text, named.as_deref()) {
+        return refused;
     }
     if req.stream {
         return bad_request_param("stream is not supported here: there is nothing to stream", "stream");
@@ -154,7 +162,7 @@ pub(crate) async fn tokenize(State(server): State<Arc<Server>>, Json(req): Json<
     };
     Json(TokenizeResponse {
         count: ids.len() as u32,
-        max_model_len: server.active().engine.max_model_len(),
+        max_model_len: server.active().text_engine().max_model_len(),
         text,
         token_ids: return_ids.then_some(ids),
     })
@@ -227,13 +235,8 @@ async fn chat(server: &Arc<Server>, req: TokenizeRequest) -> Result<(Vec<u32>, O
     // is refused here as it is there. The cap is a sampling field, inert.
     forced_tool_call(server, &tool_choice, &thinking, None)?;
     let (model, _) = resolve_model_and_class(req.model, None).map_err(|message| bad_request(&message))?;
-    if let Some(model) = model.filter(|model| !model.is_empty() && *model != server.active().engine.model_id()) {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            "model_not_found",
-            "model_not_found",
-            format!("unknown model: {model} (loaded: {})", server.active().engine.model_id()),
-        ));
+    if let Some(model) = model.filter(|model| !model.is_empty() && *model != server.active().model_id()) {
+        return Err(unknown_model(server, &model));
     }
     let structure = if req.return_text { Structure::Text } else { Structure::Tokens };
     let server = Arc::clone(server);
@@ -281,13 +284,18 @@ pub(crate) struct DetokenizeResponse {
         (status = 200, description = "The decoded text.", body = DetokenizeResponse),
         (status = 400, description = "An id outside the vocabulary; the message names the first one's index.", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 409, description = "The loaded model is the image model (`model_kind_mismatch`).", body = ApiError),
     ),
 )]
 pub(crate) async fn detokenize(State(server): State<Arc<Server>>, Json(req): Json<DetokenizeRequest>) -> Response {
-    // One model for the whole request (spec model-switch/01).
+    // One model for the whole request (spec model-switch/01), a text model
+    // (spec image-model/05).
     let server = Arc::new(server.pinned());
     if let Some(metrics) = &server.metrics {
         metrics.record_tokenize(TokenizeRoute::Detokenize);
+    }
+    if let Err(refused) = check_served_kind(&server, ModelKind::Text, None) {
+        return refused;
     }
     let template = Arc::clone(&server.active().template);
     let decoded = blocking(move || {

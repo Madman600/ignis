@@ -141,6 +141,7 @@ Not served, and refused with a 400 rather than ignored: hosted tools (anything b
         (status = 400, description = "The request is malformed, or asks for what this server does not serve: a hosted tool, structured output, a background response, a `previous_response_id`.", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
+        (status = 409, description = "The model that would serve the request is the image model: the one loaded, with no `model` naming a text model to switch to, or the one `model` names (`model_kind_mismatch`, naming both kinds and the loaded id).", body = ApiError),
         (status = 413, description = "The prompt is longer than this server's `--model-max-context`.", body = ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted (`engine_full`); or a model switch is under way (`model_switching`, with `Retry-After`); or the switch this request's `model` began did not land (`model_switch_failed`); or the model was unloaded while idle and loading it again failed (`model_load_failed`).", body = ApiError),
         (status = 504, description = "A non-streaming request the engine did not finish within `--server-request-timeout`.", body = ApiError),
@@ -170,7 +171,7 @@ pub(crate) async fn create_response(
     };
     // The engine the request is submitted to is the one its cancel guard
     // must reach, whatever a model switch does meanwhile.
-    let engine = server.active().engine.clone();
+    let engine = server.active().text_engine().clone();
     let (request_id, mut scheduled) =
         match engine.submit_with_notes(prepared.input, prepared.class, prepared.notes).await {
             Ok(submitted) => submitted,

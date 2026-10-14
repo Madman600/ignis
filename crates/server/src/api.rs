@@ -12,6 +12,9 @@
 //! - `POST /v1/responses` — the OpenAI Responses API, streaming (SSE) and
 //!   not, and `GET /v1/responses`, its WebSocket mode (`crate::responses`,
 //!   GitHub #282).
+//! - `POST /v1/images/generations` and `POST /v1/images/edits` — OpenAI's
+//!   Images API on the image model (`crate::images::routes`, spec
+//!   image-model/05).
 //!
 //! Error shape: OpenAI's `{"error": {message, type, code}}` body with the
 //! matching status (400 bad request, 404 unknown model, 413 oversized
@@ -39,6 +42,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use ignis_core::compute::{ModelFamily, ModelKind};
 use ignis_core::{
     DecodeParams, FinishReason, RequestClass, RequestId, RequestInput, SchedEvent, SubmitError,
 };
@@ -180,6 +184,15 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
             "/v1/systemone",
             post(crate::decide::decide).options(cors_preflight),
         )
+        // Spec image-model/05: the image model's routes. An edit's form
+        // carries up to ten condition images, so its body limit is the media
+        // one on every load: the image model has no vision acquirer, which is
+        // what widens it for the chat routes.
+        .routes(routes!(crate::images::routes::create_image))
+        .routes({
+            let (schemas, paths, edits) = routes!(crate::images::routes::create_image_edit);
+            (schemas, paths, edits.layer(axum::extract::DefaultBodyLimit::max(MEDIA_REQUEST_BODY_LIMIT)))
+        })
         .route("/v1/models", options(cors_preflight))
         .route("/v1/models/switch", options(cors_preflight))
         .route("/v1/models/catalog", options(cors_preflight))
@@ -191,6 +204,8 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         .route("/v1/detokenize", options(cors_preflight))
         .route("/v1/responses", options(cors_preflight))
         .route("/v1/decide", options(cors_preflight))
+        .route("/v1/images/generations", options(cors_preflight))
+        .route("/v1/images/edits", options(cors_preflight))
         .split_for_parts();
     describe_fields(&mut document);
     (router, document)
@@ -202,9 +217,14 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
 /// nor miss one it does. A `#[utoipa::path]` description is a literal, which
 /// is why this is added to the generated document rather than written there.
 fn describe_fields(document: &mut utoipa::openapi::OpenApi) {
-    for (path, surface) in [("/v1/chat/completions", Surface::Chat), ("/v1/responses", Surface::Responses)] {
+    for (path, surface) in [
+        ("/v1/chat/completions", Surface::Chat),
+        ("/v1/responses", Surface::Responses),
+        ("/v1/images/generations", Surface::Images),
+        ("/v1/images/edits", Surface::Images),
+    ] {
         let operation = document.paths.paths.get_mut(path).and_then(|item| item.post.as_mut());
-        let operation = operation.expect("the completion operations are documented");
+        let operation = operation.expect("the operations with a field table are documented");
         let description = operation.description.get_or_insert_with(String::new);
         description.push_str("\n\n");
         description.push_str(&openai_fields::describe(surface));
@@ -326,10 +346,114 @@ fn switching_message(from: &str, to: &str) -> String {
 /// names when the server knows it, so that is one load — and the request
 /// waits for it ([`crate::model_switch::ensure_loaded`], spec
 /// model-switch/02).
-pub(crate) async fn switch_to_named_model(server: &Server, model: Option<&str>) -> Result<(), Response> {
+///
+/// A route of kind `route` refuses first a request a model of the other kind
+/// would serve ([`check_kind`]), or one naming a model it cannot switch to
+/// while the model of the other kind would serve it ([`unswitchable_named`],
+/// [`unknown_model`]), spec image-model/05: a request never loads or switches
+/// to a model only to be refused by it. The route checks again once pinned
+/// ([`check_served_kind`]).
+pub(crate) async fn switch_to_named_model(server: &Server, route: ModelKind, model: Option<&str>) -> Result<(), Response> {
     let (named, _) = split_model_lane(model.map(str::to_owned));
+    check_kind(server, route, named.as_deref())?;
+    if let Some(named) = unswitchable_named(server, route, named.as_deref()) {
+        return Err(unknown_model(server, named));
+    }
     crate::model_switch::ensure_loaded(server, named.as_deref()).await.map_err(|reason| load_failed(server, &reason))?;
     crate::model_switch::implicit_switch(server, named.as_deref()).await.map_err(implicit_switch_refused)
+}
+
+/// The kind check (spec image-model/05 §Model kind, ADR 0050) of a route
+/// that serves `route`'s kind, for a request whose `model` — its lane tag
+/// stripped — is `model`: `409 model_kind_mismatch` when the model that
+/// would serve it is of the other kind, naming both kinds and the loaded
+/// id. That model is the one `model` names when it names another than the
+/// loaded one, its kind told by the switcher ([`crate::model_switch::Switcher::kind_of`]);
+/// else the loaded one — or the unloaded one a request would load again.
+/// A model named whose kind cannot be told passes, for the switch or the
+/// route's own model check to answer. Run before the switch, and again
+/// after it by [`check_served_kind`].
+pub(crate) fn check_kind(server: &Server, route: ModelKind, model: Option<&str>) -> Result<(), Response> {
+    let loaded = server.active();
+    let named = model.filter(|named| !named.is_empty() && *named != loaded.model_id());
+    let kind = match named {
+        Some(named) => match &server.switcher {
+            Some(switcher) => switcher.kind_of(named),
+            None => ModelFamily::of_model_id(named).map(ModelFamily::kind),
+        },
+        None => Some(loaded.kind()),
+    };
+    let Some(kind) = kind.filter(|kind| *kind != route) else {
+        return Ok(());
+    };
+    let message = match named {
+        Some(named) => format!(
+            "`model` names {named}, {}, and this route serves {} models (loaded: {}, {})",
+            a_kind(kind),
+            route.as_str(),
+            loaded.model_id(),
+            a_kind(loaded.kind())
+        ),
+        None => format!(
+            "this route serves {} models, and the loaded model {} is {}; name {} in `model` to switch to it, or switch with POST /v1/models/switch",
+            route.as_str(),
+            loaded.model_id(),
+            a_kind(kind),
+            a_kind(route)
+        ),
+    };
+    Err(error_response_naming(StatusCode::CONFLICT, "invalid_request_error", "model_kind_mismatch", message, Some("model")))
+}
+
+/// The model a request on a route of `route`'s kind names when the server
+/// can neither serve it nor switch to it, while the model that would serve
+/// the request instead — the loaded one, or the unloaded one a request would
+/// load again — is of the other kind (spec image-model/05): that request is
+/// refused by name, and refused at once, before
+/// [`crate::model_switch::ensure_loaded`] reloads a model only to refuse it.
+/// Run past [`check_kind`]: the name is of `route`'s kind, or of none the
+/// server can tell.
+pub(crate) fn unswitchable_named<'a>(server: &Server, route: ModelKind, model: Option<&'a str>) -> Option<&'a str> {
+    let loaded = server.active();
+    if loaded.kind() == route {
+        return None;
+    }
+    let named = model.filter(|named| !named.is_empty() && *named != loaded.model_id())?;
+    let switchable = server.switcher.as_ref().is_some_and(|switcher| switcher.known(named).is_some());
+    (!switchable).then_some(named)
+}
+
+/// "a text model", "an image model".
+fn a_kind(kind: ModelKind) -> &'static str {
+    match kind {
+        ModelKind::Text => "a text model",
+        ModelKind::Image => "an image model",
+    }
+}
+
+/// The kind check on the model a route serves the request on, once pinned:
+/// [`check_kind`], and then the loaded model must be of `route`'s kind —
+/// when it is not, the request named a model of that kind the server did
+/// not switch to (`switch.allow_implicit` off, or a model it does not know),
+/// refused by name as on a model of the same kind ([`unknown_model`]). Past
+/// it, a text route may read the engine ([`crate::ActiveModel::text_engine`]).
+pub(crate) fn check_served_kind(server: &Server, route: ModelKind, model: Option<&str>) -> Result<(), Response> {
+    check_kind(server, route, model)?;
+    if server.active().kind() == route {
+        return Ok(());
+    }
+    Err(unknown_model(server, model.unwrap_or_default()))
+}
+
+/// `404 model_not_found` for `model`, which the server neither serves nor
+/// switched to.
+pub(crate) fn unknown_model(server: &Server, model: &str) -> Response {
+    error_response(
+        StatusCode::NOT_FOUND,
+        "model_not_found",
+        "model_not_found",
+        format!("unknown model: {model} (loaded: {})", server.active().model_id()),
+    )
 }
 
 /// The answer to a request that waited on the load leaving `unloaded` (spec
@@ -343,7 +467,7 @@ pub(crate) fn load_failed(server: &Server, reason: &str) -> Response {
         "model_load_failed",
         format!(
             "{} was unloaded while idle and loading a model again failed, so the request was not served: {reason}",
-            server.active().engine.model_id()
+            server.active().model_id()
         ),
     )
 }
@@ -363,13 +487,16 @@ async fn count_use(State(server): State<Arc<Server>>, req: Request, next: Next) 
 
 /// The routes whose `POST` uses the model (ADR 0049 §2: what the serving
 /// gate holds, apart from the routes that only report state or drive a
-/// switch): the completions, the decision and its alias, and the counting
-/// routes, which read the model's tokenizer. The Responses socket's upgrade
-/// is not one: its jobs count, one by one (`crate::responses::socket`). A
+/// switch): the completions, the decision and its alias, the counting
+/// routes, which read the model's tokenizer, and the image routes. The
+/// Responses socket's upgrade is not one: its jobs count, one by one
+/// (`crate::responses::socket`). A
 /// test classifies every documented `/v1` operation as one of these or as
 /// one that does not use the model, so a new route is never left out unseen.
-const MODEL_ROUTES: [&str; 6] =
-    ["/v1/chat/completions", "/v1/responses", "/v1/decide", "/v1/systemone", "/v1/tokenize", "/v1/detokenize"];
+const MODEL_ROUTES: [&str; 8] = [
+    "/v1/chat/completions", "/v1/responses", "/v1/decide", "/v1/systemone", "/v1/tokenize", "/v1/detokenize",
+    "/v1/images/generations", "/v1/images/edits",
+];
 
 /// Whether a request uses the model ([`MODEL_ROUTES`]), for idle unload.
 fn uses_the_model(method: &axum::http::Method, path: &str) -> bool {
@@ -541,7 +668,7 @@ fn request_input(
 ) -> Result<PreparedRequest, TemplateRejection> {
     let model = model
         .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| server.active().engine.model_id());
+        .unwrap_or_else(|| server.active().model_id());
     let prompt_tokens = rendered.tokens.len() as u32;
     let text = rendered.text;
     if prompt_tokens == 0 {
@@ -794,7 +921,7 @@ const GREEDY_NEUTRAL: SamplingDefaults = SamplingDefaults {
 
 /// A seed of the request's own, for a request that sent none: two identical
 /// seedless requests are two independent samples.
-fn fresh_seed() -> u64 {
+pub(crate) fn fresh_seed() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     std::collections::hash_map::RandomState::new().build_hasher().finish()
 }
@@ -1221,7 +1348,7 @@ fn normalize_tool(tool: &mut JsonValue) {
 /// `content` (GitHub #68): feeds the whole token list through the same
 /// [`OutputDecoder`] the streaming path uses one token at a time, so the
 /// two modes agree by construction (spec story 24).
-fn split_reasoning(
+pub(crate) fn split_reasoning(
     template: &dyn TemplateProvider,
     tokens: &[ignis_core::TokenId],
     thinking: &ThinkingOptions,
@@ -1293,12 +1420,7 @@ pub(crate) fn submit_error(server: &Server, err: SubmitError) -> Response {
                 "request needs {requested} tokens (prompt + max_tokens), over the model's {limit}-token context; lower max_tokens or shorten the prompt"
             ),
         ),
-        SubmitError::UnknownModel(m) => error_response(
-            StatusCode::NOT_FOUND,
-            "model_not_found",
-            "model_not_found",
-            format!("unknown model: {m} (loaded: {})", server.active().engine.model_id()),
-        ),
+        SubmitError::UnknownModel(m) => unknown_model(server, &m),
         SubmitError::Oversized => error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
@@ -1501,7 +1623,7 @@ pub(crate) fn now() -> u64 {
     tag = "models",
     operation_id = "list_models",
     summary = "The loaded model",
-    description = "One entry: the model this server loaded, with the context a single request may spend (`max_model_len`, prompt plus completion). A server serves one model at a time; `POST /v1/models/switch` replaces it.\n\n`status` beside the entry says what the API is doing: `serving`; `switching` while a switch replaces the model (`switching` names both ids, and the entry is still the old model until the new one serves); or `failed` when the last switch failed (`reason` says why) — briefly, while the previous model is reloaded, or until a switch succeeds when it could not be. While switching or failed this route answers; every other `/v1` route answers 503.\n\n`unloaded` when nobody used the model for `model.idle_unload` seconds and it was unloaded (the entry still names it, and the API stays up): the next request that needs it loads it again and is served once it is warm. `loading` while that load runs, `switching` naming what loads; requests arriving meanwhile wait for it. A load out of `unloaded` that fails is `failed`, and the next request tries again.",
+    description = "One entry: the model this server loaded, its `kind` (`text` or `image`: the routes it serves), and for a text model the context a single request may spend (`max_model_len`, prompt plus completion). A server serves one model at a time; `POST /v1/models/switch` replaces it.\n\n`status` beside the entry says what the API is doing: `serving`; `switching` while a switch replaces the model (`switching` names both ids, and the entry is still the old model until the new one serves); or `failed` when the last switch failed (`reason` says why) — briefly, while the previous model is reloaded, or until a switch succeeds when it could not be. While switching or failed this route answers; every other `/v1` route answers 503.\n\n`unloaded` when nobody used the model for `model.idle_unload` seconds and it was unloaded (the entry still names it, and the API stays up): the next request that needs it loads it again and is served once it is warm. `loading` while that load runs, `switching` naming what loads; requests arriving meanwhile wait for it. A load out of `unloaded` that fails is `failed`, and the next request tries again.",
     responses(
         (status = 200, description = "The loaded model.", body = ModelList),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
@@ -1516,10 +1638,11 @@ async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
     Json(ModelList {
         object: "list",
         data: vec![ModelInfo {
-            id: loaded.engine.model_id(),
+            id: loaded.model_id(),
             object: "model",
             owned_by: "ignis",
-            max_model_len: loaded.engine.max_model_len(),
+            kind: loaded.kind().as_str(),
+            max_model_len: loaded.engine().map(Engine::max_model_len),
         }],
         status: status.as_str(),
         switching: match &*status {
@@ -1739,9 +1862,9 @@ pub(crate) fn switch_refused(refusal: crate::model_switch::SwitchRefusal) -> Res
         crate::model_switch::SwitchRefusal::WarmingUp => {
             unavailable("server_not_ready", "the loaded model's first traversal has not finished; retry shortly")
         }
-        // Only the load a request begins is refused so, and that refusal is
-        // never answered: the request looks at the status again.
-        crate::model_switch::SwitchRefusal::NotUnloaded => error_response(
+        // Only the load a request begins and a visit are refused so, and
+        // neither refusal is answered: the request goes on without them.
+        crate::model_switch::SwitchRefusal::NotUnloaded | crate::model_switch::SwitchRefusal::NotServing => error_response(
             StatusCode::CONFLICT,
             "invalid_request_error",
             "switch_in_progress",
@@ -1762,9 +1885,14 @@ struct ModelInfo {
     id: String,
     object: &'static str,
     owned_by: &'static str,
+    /// `text` or `image` (spec image-model/05): which routes the model
+    /// serves; the other kind's answer `409 model_kind_mismatch`.
+    kind: &'static str,
     /// The context for one request, prompt plus `max_tokens`, in tokens
-    /// (vLLM's name for it; the Playground's context bar reads it).
-    max_model_len: u32,
+    /// (vLLM's name for it; the Playground's context bar reads it). A text
+    /// model's only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_model_len: Option<u32>,
 }
 
 // ── POST /v1/chat/completions ─────────────────────────────────────────────
@@ -1874,6 +2002,7 @@ Tool calls come back whole -- one complete `tool_calls` delta per call, never a 
         (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take.", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
+        (status = 409, description = "The model that would serve the request is the image model: the one loaded, with no `model` naming a text model to switch to, or the one `model` names (`model_kind_mismatch`, naming both kinds and the loaded id).", body = ApiError),
         (status = 413, description = "The prompt is longer than this server's `--model-max-context`.", body = ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted (`engine_full`); or a model switch is under way (`model_switching`, with `Retry-After`); or the switch this request's `model` began did not land (`model_switch_failed`); or the model was unloaded while idle and loading it again failed (`model_load_failed`).", body = ApiError),
         (status = 504, description = "The engine did not finish the request within `--server-request-timeout`.", body = ApiError),
@@ -1885,11 +2014,15 @@ async fn chat_completions(
 ) -> Response {
     // A `model` naming another known model switches to it first (spec
     // model-switch/01 §Implicit switch), so the pin below takes that model.
-    if let Err(refused) = switch_to_named_model(&server, req.model.as_deref()).await {
+    if let Err(refused) = switch_to_named_model(&server, ModelKind::Text, req.model.as_deref()).await {
         return refused;
     }
-    // One model for the whole request (spec model-switch/01).
+    // One model for the whole request (spec model-switch/01), a text model
+    // (spec image-model/05).
     let server = Arc::new(server.pinned());
+    if let Err(refused) = check_served_kind(&server, ModelKind::Text, split_model_lane(req.model.clone()).0.as_deref()) {
+        return refused;
+    }
     if let Err(refusal) = openai_fields::check(&req.other, Surface::Chat) {
         return refused_field(refusal);
     }
@@ -1963,7 +2096,7 @@ async fn chat_completions(
     // The model the request runs on: its engine's cancel guard and its
     // template's decoder must be the ones it was submitted to.
     let loaded = server.active();
-    let (request_id, mut stream) = match loaded.engine.submit_with_notes(input, class, notes).await {
+    let (request_id, mut stream) = match loaded.text_engine().submit_with_notes(input, class, notes).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
@@ -1982,7 +2115,7 @@ async fn chat_completions(
         let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
         return Sse::new(ChunkStream::new(
             stream,
-            CancelOnDrop::new(loaded.engine.clone(), request_id),
+            CancelOnDrop::new(loaded.text_engine().clone(), request_id),
             id,
             created,
             model,
@@ -2014,7 +2147,7 @@ async fn chat_completions(
             schemas,
             stop,
         );
-        return match collect_answer(&loaded.engine, request_id, &mut stream, server.live().request_timeout, pipeline).await {
+        return match collect_answer(loaded.text_engine(), request_id, &mut stream, server.live().request_timeout, pipeline).await {
             Ok(Answer { ending: AnswerEnding::Done(FinishReason::Error), .. }) => engine_error_response(),
             Ok(answer) => {
                 let (reasoning, content, calls) = answer.parts();
@@ -2888,12 +3021,26 @@ fn engine_error_chunk() -> Event {
 
 /// The OpenAI error body (`{"error": {...}}`). Every failure on this
 /// surface answers in this shape, `/v1/decide` included.
-#[derive(Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ApiError {
     error: ErrorBody,
 }
 
-#[derive(Serialize, ToSchema)]
+impl ApiError {
+    /// The body naming no field: what a stream that already answered `200`
+    /// ends with.
+    pub(crate) fn new(type_: &str, code: &str, message: &str) -> Self {
+        Self::naming(type_, code, message, None)
+    }
+
+    /// [`ApiError::new`], naming the one request field at fault when there
+    /// is one.
+    pub(crate) fn naming(type_: &str, code: &str, message: &str, param: Option<&str>) -> Self {
+        Self { error: ErrorBody { message: message.into(), r#type: type_.into(), code: code.into(), param: param.map(str::to_owned) } }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ErrorBody {
     message: String,
     r#type: String,
@@ -3206,6 +3353,45 @@ mod tests {
         let finish: JsonValue = serde_json::from_str(data[1]).unwrap();
         assert_eq!(finish["choices"][0]["finish_reason"], "stop");
         assert_eq!(data[2], "[DONE]");
+    }
+
+    /// Spec image-model/05: the kind check serves the image routes as it
+    /// serves the text ones. On a text model an image request naming no
+    /// model is `409`, naming both kinds; one naming the image model passes
+    /// to the switch, and pinned on the text model still is refused by name.
+    /// A text request naming the image model is `409` before any switch.
+    #[tokio::test]
+    async fn the_kind_check_refuses_either_kind_on_a_model_of_the_other() {
+        let scheduler = ignis_core::ConcreteScheduler::with_config(
+            ignis_core::SchedulerConfig { model: "qwen3.8-27b".into(), ..ignis_core::SchedulerConfig::default() },
+            Arc::new(ignis_core::MockCompute::new()),
+        );
+        let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(crate::template::SimpleTemplateProvider));
+        let refused = |response: Response| async move {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice::<JsonValue>(&body).unwrap())
+        };
+
+        let (status, body) = refused(check_kind(&server, ModelKind::Image, None).unwrap_err()).await;
+        assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("model_kind_mismatch")));
+        assert_eq!(
+            body["error"]["message"],
+            "this route serves image models, and the loaded model qwen3.8-27b is a text model; name an image model in `model` to switch to it, or switch with POST /v1/models/switch"
+        );
+        assert!(check_kind(&server, ModelKind::Image, Some("ignis-image-2.1-turbo")).is_ok(), "the switch's to answer");
+        let (status, body) = refused(check_served_kind(&server, ModelKind::Image, Some("ignis-image-2.1-turbo")).unwrap_err()).await;
+        assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("model_not_found")));
+        assert_eq!(body["error"]["message"], "unknown model: ignis-image-2.1-turbo (loaded: qwen3.8-27b)");
+
+        let (status, body) = refused(check_kind(&server, ModelKind::Text, Some("ignis-image-2.1-turbo")).unwrap_err()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"]["message"],
+            "`model` names ignis-image-2.1-turbo, an image model, and this route serves text models (loaded: qwen3.8-27b, a text model)"
+        );
+        assert!(check_served_kind(&server, ModelKind::Text, None).is_ok());
+        assert!(check_served_kind(&server, ModelKind::Text, Some("qwen3.8-27b")).is_ok());
     }
 
     // ── GitHub #120: tagged lanes (the `class` extension + "@<lane>") ────

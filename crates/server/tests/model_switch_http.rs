@@ -303,7 +303,7 @@ async fn a_response_naming_a_known_model_is_answered_by_it_after_the_switch_over
     let (status, _, response) = send(&app, Method::POST, "/v1/responses", Some(response_body("mock-b"))).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["model"], "mock-b");
-    assert_eq!(server.active().engine.model_id(), "mock-b");
+    assert_eq!(server.active().model_id(), "mock-b");
 
     let live = responses::live(server.clone()).await;
     let mut socket = responses::socket(&live).await;
@@ -314,7 +314,7 @@ async fn a_response_naming_a_known_model_is_answered_by_it_after_the_switch_over
     let last = events.last().expect("a terminal event");
     assert!(matches!(last["type"].as_str(), Some("response.completed" | "response.incomplete")), "{events:?}");
     assert_eq!(last["response"]["model"], "mock-a");
-    assert_eq!(server.active().engine.model_id(), "mock-a");
+    assert_eq!(server.active().model_id(), "mock-a");
     assert_eq!(loader.loads(), ["mock-b", "mock-a"]);
 }
 
@@ -334,7 +334,7 @@ async fn a_decision_naming_a_known_model_switches_first_even_from_a_load_that_se
     assert_eq!(refused["error"]["code"], "model_unsupported");
 
     let (status, _, answered) = send(&app, Method::POST, "/v1/decide", Some(decision("mock-a@interactive"))).await;
-    assert_eq!(server.active().engine.model_id(), "mock-a", "{answered}");
+    assert_eq!(server.active().model_id(), "mock-a", "{answered}");
     assert_eq!(loader.loads(), ["mock-a"]);
     // The mock template has no answer labels, so the 27B-family mock refuses
     // the question itself — past the model checks, which is what this shows.

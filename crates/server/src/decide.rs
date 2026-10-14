@@ -55,6 +55,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use axum::response::IntoResponse;
 use serde_json::{Value as JsonValue, json};
 
+use ignis_core::compute::ModelKind;
 use ignis_core::decision::{AnswerAlphabet, AnswerToken, Readout};
 use ignis_core::types::TokenId;
 
@@ -739,8 +740,12 @@ pub fn load_methods(calibration: Option<ignis_core::pointing::Calibration>, visi
 /// `locate` can be answered, with which heads and window (GitHub #275, #278,
 /// `ignis.decide.locate`). The heads are keyed to the artifact's content
 /// hash, so a load nobody calibrated says "chain" or "refused" here instead
-/// of being found out from its answers.
+/// of being found out from its answers. Nothing on the image model, which
+/// serves no `/v1/decide` (spec image-model/05).
 pub fn log_load_heads(model: &crate::ActiveModel) {
+    let Some(engine) = model.engine() else {
+        return;
+    };
     let methods = load_methods(model.calibration, model.media.is_some());
     tracing::info!(
         name: "ignis.decide.pointing_head",
@@ -749,7 +754,7 @@ pub fn log_load_heads(model: &crate::ActiveModel) {
         box_default = methods.box_default,
         head = model.calibration.map(|calibration| calibration.head.to_string()),
         set_heads = model.calibration.and_then(|calibration| calibration.set).map(|set| set.heads.len()),
-        artifact = %model.engine.artifact(),
+        artifact = %engine.artifact(),
         "{}",
         methods.summary
     );
@@ -764,7 +769,7 @@ pub fn log_load_heads(model: &crate::ActiveModel) {
         sum_heads = model.locate.map(|calibration| names(calibration.heads)),
         end_heads = model.locate.map(|calibration| names(calibration.end_heads)),
         window_keys = model.locate.map(|calibration| calibration.window_keys),
-        artifact = %model.engine.artifact(),
+        artifact = %engine.artifact(),
         "{}",
         locate_summary(model.locate)
     );
@@ -2443,6 +2448,7 @@ Thinking is refused rather than ignored: a decision's prompt ends exactly where 
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = crate::api::ApiError),
         (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load, a `method` on anything but a `point` or a `box`, `head` on a load with no calibrated pointing head, or a head `box` on a load with no head set), or a `state` part's reuse marker is not exactly `{\"type\": \"ephemeral\"}` (`malformed_reuse_marker`: retention is by eviction, never by time, so a `ttl` is refused) or there are more than four of them (`too_many_reuse_markers`), or a `locate` cannot be served: the load has no calibrated heads for it (`locate_uncalibrated`), the `state` is content parts (`locate_needs_json_state`), `within` is not a pointer, names nothing, or names a key written twice (`locate_within_malformed`, `locate_within_not_found`, `locate_within_ambiguous`), the target is not a string or a non-empty array (`locate_target_unsegmentable`), fewer than two of its segments own a token (`locate_too_few_segments`), a vote's target is longer than the vote was measured on (`locate_too_long`), a single segment is longer than a window (`locate_segment_too_long`), or the loaded template cannot say where its tokens sit (`locate_unsupported`); a `kind`, `method` or `compression` a locate does not know (`kind_unknown`, `method_unknown`, `compression_unknown`), a fold under `vote` or of prose (`compression_unsupported`), `kind: records` on a state that is not an array of JSON objects or `log`/`prose` on one (`kind_mismatch`); `criteria` and `digits` on a `locate`, and `within`, `kind` and `compression` on anything else (`kind_unsupported`, `compression_unsupported`), are refused too, as is a fold's level-1 text past the context (`context_exceeded`). Nothing reached the engine. (A shortlist step rendered from an earlier step's answer -- a fold's level 2, every `choice` -- can only fault after a prefill, and then answers its own question with an `error`.) A `model` the server neither loads nor may switch to is refused `model_not_found`; one it began switching to that did not load, `model_switch_failed`.",
             body = crate::api::ApiError),
+        (status = 409, description = "The model that would serve the decision is the image model: the one loaded, with no `model` naming a text model to switch to, or the one `model` names (`model_kind_mismatch`).", body = crate::api::ApiError),
         (status = 503, description = "The engine is at capacity and the request was not admitted; or a model switch is under way (`model_switching`, with `Retry-After`); or the model was unloaded while idle and loading it again failed (`model_load_failed`).", body = crate::api::ApiError),
     ),
 )]
@@ -2457,6 +2463,20 @@ pub async fn decide(
     // the `model_not_found` refusal in `serve`, as before.
     let named = body.as_ref().ok().and_then(|request| request.0.model.clone());
     let named = crate::api::split_model_lane(named).0;
+    // A decision is a text model's (spec image-model/05): with the image model
+    // loaded, or naming it, the request is refused before it costs a load or
+    // a switch.
+    if let Err(refused) = crate::api::check_kind(&server, ModelKind::Text, named.as_deref()) {
+        return refused;
+    }
+    // Nor a request naming a text model it cannot switch to: the image model
+    // would only refuse it, as below.
+    if let Some(unswitchable) = crate::api::unswitchable_named(&server, ModelKind::Text, named.as_deref()) {
+        return refused(&Refusal::new(
+            "model_not_found",
+            format!("`model` names {unswitchable:?}, and this engine serves {:?}", server.active().model_id()),
+        ));
+    }
     // A model the idle clock unloaded is loaded first, the named one when
     // the server knows it (spec model-switch/02) — only for a body that
     // parsed: a malformed one is refused `422` below and must not cost a
@@ -2481,6 +2501,18 @@ pub async fn decide(
     // One model for the whole request, every round of it (spec
     // model-switch/01).
     let server = std::sync::Arc::new(server.pinned());
+    // A text model, or the image model still loaded because the named text
+    // model was not switched to: refused by name, as `serve` refuses a model
+    // it does not load (spec image-model/05).
+    if let Err(refused) = crate::api::check_kind(&server, ModelKind::Text, named.as_deref()) {
+        return refused;
+    }
+    if server.active().kind() != ModelKind::Text {
+        return refused(&Refusal::new(
+            "model_not_found",
+            format!("`model` names {:?}, and this engine serves {:?}", named.unwrap_or_default(), server.active().model_id()),
+        ));
+    }
     // Flash-Next has no readouts (spec flash-next/04): the endpoint is not
     // served at all, whatever the body says, and the 400 names the model.
     if !server.active().family.serves_readouts() {
@@ -2553,7 +2585,7 @@ async fn serve(
     // validation … The body details the offending field", which is what a
     // wrong `model` is. A Jev client meets the status its own docs told it
     // to expect.
-    let loaded = server.active().engine.model_id();
+    let loaded = server.active().model_id();
     if let Some(named) = model.as_deref().filter(|named| !named.is_empty() && *named != loaded) {
         return Err(Refusal::new(
             "model_not_found",
@@ -2572,7 +2604,7 @@ async fn serve(
                 "locate_uncalibrated",
                 format!(
                     "the loaded artifact ({}) has no calibrated `locate` heads, and a `locate` is never answered by heads chosen for another model",
-                    server.active().engine.artifact()
+                    server.active().text_engine().artifact()
                 ),
             ));
         }
@@ -2726,7 +2758,7 @@ async fn serve(
     let mut shortlisted: BTreeMap<usize, (Answer, shortlist::Summary)> = BTreeMap::new();
     let resolved = match (resolved, shortlists.is_empty()) {
         (Some(resolved), _) => Some(resolved),
-        (None, false) => Some(model.clone().filter(|named| !named.is_empty()).unwrap_or_else(|| server.active().engine.model_id())),
+        (None, false) => Some(model.clone().filter(|named| !named.is_empty()).unwrap_or_else(|| server.active().model_id())),
         (None, true) => None,
     };
     if let (Some(calibration), false) = (locate, shortlists.is_empty()) {
@@ -2782,7 +2814,7 @@ async fn serve(
     Ok(DecideResponse {
         // The model that *performed* the evaluation, which is the one the
         // engine resolved — not the string the caller sent.
-        model: resolved.unwrap_or_else(|| server.active().engine.model_id()),
+        model: resolved.unwrap_or_else(|| server.active().model_id()),
         answers,
         usage: Usage {
             input_tokens,
@@ -3111,13 +3143,13 @@ async fn render(
             .map_err(|(code, message)| {
                 Refusal::new(code, format!("question {:?}: {message}", question.id))
             })?;
-    if prompt_tokens > server.active().engine.max_model_len() {
+    if prompt_tokens > server.active().text_engine().max_model_len() {
         return Err(Refusal::new(
             "context_exceeded",
             format!(
                 "question {:?} renders {prompt_tokens} prompt tokens, past this engine's {} context",
                 question.id,
-                server.active().engine.max_model_len()
+                server.active().text_engine().max_model_len()
             ),
         ));
     }
@@ -3143,13 +3175,13 @@ async fn render(
         // everything after it.
         Some((prefix, schedule)) => {
             prompt_tokens = prompt_tokens.saturating_add(prefix.len() as u32);
-            if prompt_tokens > server.active().engine.max_model_len() {
+            if prompt_tokens > server.active().text_engine().max_model_len() {
                 return Err(Refusal::new(
                     "context_exceeded",
                     format!(
                         "question {:?} renders {prompt_tokens} prompt tokens with its forced prefix, past this engine's {} context",
                         question.id,
-                        server.active().engine.max_model_len()
+                        server.active().text_engine().max_model_len()
                     ),
                 ));
             }
@@ -3279,7 +3311,7 @@ fn place_reuse_boundaries(
     }
     let owner = server.next_fan_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     rendered[0].input.reuse_boundaries.push(ReuseBoundary::fan_out(head, owner));
-    Some(FanOutEnd { engine: server.active().engine.clone(), owner })
+    Some(FanOutEnd { engine: server.active().text_engine().clone(), owner })
 }
 
 /// The **observed fork** (GitHub #270): each question whose `state` begins
@@ -3503,13 +3535,13 @@ fn too_few_segments(id: &str, keys: &[Option<std::ops::Range<usize>>], least: us
 
 /// Refuse a reading prompt past the engine's context.
 fn within_context(server: &crate::Server, id: &str, prompt: &LocatePrompt) -> Result<(), Refusal> {
-    match prompt.ready.prompt_tokens > server.active().engine.max_model_len() {
+    match prompt.ready.prompt_tokens > server.active().text_engine().max_model_len() {
         true => Err(Refusal::new(
             "context_exceeded",
             format!(
                 "question {id:?} renders {} prompt tokens with its forced scaffold, past this engine's {} context",
                 prompt.ready.prompt_tokens,
-                server.active().engine.max_model_len()
+                server.active().text_engine().max_model_len()
             ),
         )),
         false => Ok(()),
@@ -3674,7 +3706,7 @@ async fn ask(
     // prefill is nothing.
     // The engine the question is submitted to is the one its cancel guard
     // must reach, whatever a model switch does meanwhile.
-    let engine = server.active().engine.clone();
+    let engine = server.active().text_engine().clone();
     let submitted = engine.submit_with_media(ready.input.clone(), class, ready.media).await;
     let (id, mut events) = match submitted {
         Ok(pair) => pair,

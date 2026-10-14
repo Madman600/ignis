@@ -29,6 +29,7 @@ use serde_json::Value as JsonValue;
 use ignis_artifact::vision::layout::{assign_positions, IMAGE, TEXT};
 use ignis_artifact::vision::{smart_resize, Grid, MERGE, PATCH, PATCH_FEATURES, TEMPORAL};
 use ignis_artifact::{ChatTemplate, Reader, Tokenizer};
+use ignis_core::image::ImageSize;
 
 use crate::image_prompt::ImagePrompt;
 
@@ -101,6 +102,34 @@ impl EncoderFrontend {
         let image_pad_rows = (0..).zip(&input_ids).filter(|&(_, &id)| id == pad).map(|(row, _)| row).collect();
         Ok(EncoderInput { input_ids, drop_idx: self.prompt.drop_idx(), image_pad_rows, positions, images })
     }
+
+    /// What [`EncoderFrontend::input`] builds for `prompt` with condition
+    /// images of `sizes`, counted without preparing an image: the template
+    /// tokenized once, and each image a pad per 2 x 2 of its latent cells.
+    /// Refused for a size the processor would not keep
+    /// ([`ImageProcessor::keeps`]): the image model encodes only those.
+    pub fn count(&self, prompt: &str, sizes: &[ImageSize]) -> Result<ConditionCount, String> {
+        for (k, size) in sizes.iter().enumerate() {
+            self.processor.keeps(*size).map_err(|why| format!("condition image {k} is {size}: {why}"))?;
+        }
+        let text = self.prompt.rows(prompt, sizes.len())?.saturating_sub(sizes.len()) as u64;
+        let cells: u64 = sizes.iter().map(|size| size.latent_cells() as u64).sum();
+        let pads = cells / 4;
+        Ok(ConditionCount { encoder_rows: text + pads, pads, prefix: text.saturating_sub(self.prompt.drop_idx() as u64) + cells })
+    }
+}
+
+/// A condition's shape, as [`EncoderFrontend::count`] counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConditionCount {
+    /// The encoder's sequence: the template's tokens, each image's pads
+    /// expanded.
+    pub encoder_rows: u64,
+    /// Its image pads, one per merged token of the vision tower.
+    pub pads: u64,
+    /// The condition prefix (spec image-model/04): the text rows from
+    /// `drop_idx` on, and each image's latent cells.
+    pub prefix: u64,
 }
 
 /// The Qwen3-VL image processor, from the artifact's `image_model.json`
@@ -153,6 +182,23 @@ impl ImageProcessor {
             mean: triple("image_mean", f64::MIN)?,
             std: triple("image_std", f64::MIN_POSITIVE)?,
         })
+    }
+
+    /// Whether the processor keeps a condition image of `size` as it is:
+    /// `smart_resize` leaves it (sides multiples of 32 within the pixel
+    /// bounds, at most 200:1). Only then does its every 2 x 2 of latent cells
+    /// meet one vision token, as the image model's condition prefix lays them
+    /// out (spec image-model/04); Err says what the processor would do.
+    pub fn keeps(&self, size: ImageSize) -> Result<(), String> {
+        match smart_resize(size.height, size.width, self.min_pixels, self.max_pixels) {
+            Ok(kept) if (kept.width, kept.height) == (size.width, size.height) => Ok(()),
+            Ok(kept) => Err(format!(
+                "the encoder's processor resizes it to {}x{} (it keeps sides that are multiples of 32 within {} to {} pixels), so its \
+                 vision tokens would not line up with its latents",
+                kept.width, kept.height, self.min_pixels, self.max_pixels
+            )),
+            Err(e) => Err(format!("the encoder's processor refuses it ({e:?}: at most 200:1)")),
+        }
     }
 
     /// One condition image as the processor prepares it: on white,
@@ -208,11 +254,17 @@ impl ImageProcessor {
 /// the pipeline flattens it (Pillow's `paste` with the alpha as mask:
 /// `BLEND` and `DIV255` of `Paste.c`, exact for every value and alpha).
 pub fn on_white(rgba: &[u8]) -> Vec<u8> {
-    let blend = |v: u8, a: u32| {
-        let t = 255 * (255 - a) + v as u32 * a + 128;
-        (((t >> 8) + t) >> 8) as u8
-    };
-    rgba.chunks_exact(4).flat_map(|px| [blend(px[0], px[3] as u32), blend(px[1], px[3] as u32), blend(px[2], px[3] as u32)]).collect()
+    rgba.chunks_exact(4).flat_map(|px| [blend_on_white(px[0], px[3]), blend_on_white(px[1], px[3]), blend_on_white(px[2], px[3])]).collect()
+}
+
+/// One colour `value` at `alpha` over white, as [`on_white`] flattens it:
+/// `(value · alpha + 255 · (255 − alpha)) / 255` rounded to the nearest byte
+/// (`DIV255`). An image answered `background: opaque` is composited by it
+/// too (`images::job::on_white`).
+pub fn blend_on_white(value: u8, alpha: u8) -> u8 {
+    let a = u32::from(alpha);
+    let t = 255 * (255 - a) + u32::from(value) * a + 128;
+    (((t >> 8) + t) >> 8) as u8
 }
 
 // Ported from PyTorch 2.13.0, aten/src/ATen/native/cpu/UpSampleKernel.cpp
@@ -404,6 +456,58 @@ mod tests {
                 assert!((sum - (1 << precision)).abs() <= weights.len() as i32, "{input}->{output} at {first}: {sum}");
                 assert!(first + weights.len() <= input);
             }
+        }
+    }
+
+    /// The count the server fits condition images by (`ImageRunner::condition_tokens`) is the one
+    /// the leaf refuses by: the input this front end builds, laid out as the leaf lays it out
+    /// (`PrefixLayout`), for text-to-image, empty and literal prompts, and one to three images.
+    #[test]
+    fn the_count_is_the_condition_prefix_the_leaf_lays_out() {
+        use ignis_core::image_leaf::PrefixLayout;
+        let frontend = EncoderFrontend { prompt: crate::image_prompt::tests::prompt(), processor: ImageProcessor { min_pixels: 1, ..processor() } };
+        let cases: [(&str, Vec<ImageSize>); 5] = [
+            ("a red fox in the snow", vec![]),
+            ("", vec![]),
+            ("make it {} blue <image1>", vec![ImageSize::new(64, 64)]),
+            ("the two together", vec![ImageSize::new(96, 64), ImageSize::new(64, 128)]),
+            ("x", vec![ImageSize::new(32, 32), ImageSize::new(128, 32), ImageSize::new(64, 96)]),
+        ];
+        for (prompt, sizes) in cases {
+            let pixels: Vec<Vec<u8>> = sizes.iter().map(|s| vec![200; (s.width * s.height * 4) as usize]).collect();
+            let images: Vec<ConditionImage> =
+                sizes.iter().zip(&pixels).map(|(s, rgba)| ConditionImage { width: s.width, height: s.height, rgba }).collect();
+            let input = frontend.input(prompt, &images).unwrap();
+            let shapes: Vec<(u32, u32)> = sizes.iter().map(|s| (s.height / 16, s.width / 16)).collect();
+            let layout = PrefixLayout::new(input.input_ids.len(), input.drop_idx, &input.image_pad_rows, &shapes).unwrap();
+            let count = frontend.count(prompt, &sizes).unwrap();
+            assert_eq!(
+                count,
+                ConditionCount {
+                    encoder_rows: input.input_ids.len() as u64,
+                    pads: input.image_pad_rows.len() as u64,
+                    prefix: u64::from(layout.tokens),
+                },
+                "{prompt:?} with {sizes:?}"
+            );
+        }
+    }
+
+    /// A condition size the processor would not keep is not counted: its vision tokens would not
+    /// line up with its latents, and the leaf refuses it. The budget's fit scales a panorama until
+    /// its rounded sides pass 200:1 (13088x64), which `smart_resize` refuses; a size off the
+    /// 32-pixel grid or below the pixel floor is resized.
+    #[test]
+    fn the_count_refuses_a_size_the_processor_would_not_keep() {
+        let frontend = EncoderFrontend { prompt: crate::image_prompt::tests::prompt(), processor: processor() };
+        assert!(frontend.count("x", &[ImageSize::new(13120, 96)]).is_ok(), "136:1 within the bounds");
+        for (size, says) in [
+            (ImageSize::new(13088, 64), "refuses"),
+            (ImageSize::new(224, 192), "resizes it to 288x256"),
+            (ImageSize::new(1024, 1008), "resizes it to 1024x1024"),
+        ] {
+            let refused = frontend.count("x", &[ImageSize::new(1024, 1024), size]).unwrap_err();
+            assert!(refused.contains(&format!("condition image 1 is {size}")) && refused.contains(says), "{size}: {refused}");
         }
     }
 

@@ -86,7 +86,7 @@ one container, verified against its provenance sidecar (`.graft.json` or
 ### The catalog
 
 The models the server knows how to fetch are its **catalog**
-([ADR 0047](../adr/0047-a-catalog-the-operator-can-extend.md)). Three are built
+([ADR 0047](../adr/0047-a-catalog-the-operator-can-extend.md)). Four are built
 into the binary, each pinned file by file — byte count and SHA-256 — at a fixed
 revision of its Hugging Face repository:
 
@@ -95,6 +95,7 @@ revision of its Hugging Face repository:
 | `qwen3.8-27b` (the default) | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer) | 18.1 GiB |
 | `qwen3.8-27b-abliterated` | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer) | 18.1 GiB |
 | `qwen3.8-flash-next` | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | 67.8 GiB (with its MTP companion) |
+| `ignis-image-2.1-turbo` | [`gpillon/ignis-image-2.1-turbo`](https://huggingface.co/gpillon/ignis-image-2.1-turbo) | 15.6 GiB (the [image model](#image-generation); non-commercial licence) |
 
 The id is the **served id**: what `--model-id` names, what `/v1/models`
 reports and what a request puts in `model`. `ignis-server model list` shows
@@ -630,6 +631,8 @@ not.
 | `/v1/models` | GET | The loaded model, and `status`: `serving`, `switching` or `failed` ([below](#switching-models)). |
 | `/v1/models/switch` | POST | Replace the loaded model on the running process ([below](#switching-models)). |
 | `/v1/models/catalog` | GET | Every model the server can switch to or fetch, with its state on disk ([below](#switching-models)). |
+| `/v1/images/generations` | POST | Generate images with the image model ([below](#image-generation)). |
+| `/v1/images/edits` | POST | Edit images from 1 to 10 condition images, multipart ([below](#image-generation)). |
 | `/v1/config` | GET, PATCH | The running configuration, and a change to it ([configuration](#configuration)). |
 | `/v1/config/fields` | GET | What each visible configuration field is: kind, default, rule, families, whether a change reloads. |
 | `/v1/config/origins` | GET | Where each visible value in force comes from, shared and per model family: default, profile, file, env, flag or live. |
@@ -919,6 +922,124 @@ text to NFC, so a decomposed `e` + accent comes back as the composed `é` (the
 `text` a call returns is the rendered prompt as sent, before that).
 Neither route enters the scheduler; the count of calls is
 `ignis_tokenize_requests_total{route}` with `--server-metrics`.
+
+### Image generation
+
+The server also serves an image model, **`ignis-image-2.1-turbo`** (Qwen-Image-2.1-Turbo,
+[ADR 0050](../adr/0050-ignis-serves-an-image-model.md)), fetched with
+`ignis-server model download ignis-image-2.1-turbo`. Like every model it is
+one loaded at a time: a text model and the image model replace each other by a
+full reload ([switching](#switching-models)). A route of the wrong kind for the
+loaded model answers `409 model_kind_mismatch`, naming both kinds and the loaded
+id; a `model` that names a known model of the route's kind switches to it under
+`--switch-allow-implicit`, as for text.
+
+**Licence.** The weights are under the **Qwen Research License: non-commercial
+use only**, with a "Built with Qwen" notice. Do not serve the image model in a
+commercial product. The weights' terms are the model repository's own:
+[`LICENSE`](https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/LICENSE) and
+[`NOTICE`](https://huggingface.co/gpillon/ignis-image-2.1-turbo/blob/d6912417aa47320cd71c78e19d99872faa5cb63b/NOTICE) at the pinned
+revision. The repository's [`NOTICE`](../../NOTICE) covers the third-party code
+and text the image path carries (Pillow's resize, Qwen's enhancement prompts).
+
+| Route | Body |
+|---|---|
+| `POST /v1/images/generations` | JSON: `prompt`, `n`, `size`, `seed`, `prompt_enhancement`, `background`, `stream`, `model`. |
+| `POST /v1/images/edits` | Multipart: the same fields plus `image[]`, from 1 to `image.max_condition_images` PNG / JPEG / WebP files. |
+
+The answer is `{created, data: [{b64_json, revised_prompt?}], seed, warnings?,
+condition_sizes?}`: RGBA 8-bit PNGs, `b64_json` only (`response_format: url`, any
+`output_format` but `png` and `mask` are each a `400`). `n` images are made one
+after another. An absent `seed` is drawn and returned. `background: opaque`
+composites on white; `auto` and `transparent` keep the generated alpha.
+`stream: true` sends Server-Sent Events: `image_generation.progress` with
+`{phase, image, step, total}` (`phase` is `enhancing`, `switching`, `loading`,
+`encoding`, `denoising` or `decoding`) and one `image_generation.completed` per
+image; an edit names them `image_edit.progress` and `image_edit.completed`. No
+partial images are sent. The full schema is in `/v1/openapi.json`.
+
+```bash
+curl http://127.0.0.1:8000/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"ignis-image-2.1-turbo","prompt":"a lighthouse at dusk","size":"2048x2048"}'
+```
+
+**Sizes.** `size` is one of `image.sizes`: 2048x2048, 2400x1792, 1792x2400,
+2528x1696, 1696x2528, 2752x1536, 1536x2752 (the checkpoint's presets) and
+1024x1024 (the size OpenAI clients often send); anything else is a `400` that
+lists them. Every side is a multiple of 32, at most 16384. The load makes room
+for the largest of them within `image.max_target_cells` (2400x1792 by
+default); a size past that is not served, and the load warns of it. A request
+for it is a `400` too, listing the sizes served. `auto` is 2048x2048 for a
+generation and, for an edit, the preset whose aspect ratio is nearest the last
+condition image's, always among the sizes served.
+
+**Condition images.** Each is resized to about 1024x1024 of area, keeping its
+aspect ratio, as soon as it is decoded. When the prompt and all of them exceed
+the condition budget, or the room the image model has for them, they are
+scaled down together, never below `image.condition_floor_px` squared; below
+that the request is a `400` (`condition_budget_exceeded`) naming the budget or
+the room. A condition image that is not a PNG, JPEG or WebP (a GIF, say), that
+does not decode, or that decodes to more than `image.max_condition_mipx` is a
+`400`. `image.max_condition_decodes` edits decode at a time; the others wait
+their turn. The image model itself refuses, as `400 image_refused` in its own
+words and before anything is encoded, a prompt too long for its positions
+(about 8,000 tokens) and a condition image its encoder would not take at its
+condition size (a panorama past 200:1).
+
+**The queue.** One image job runs at a time and `image.queue_depth` wait in
+order; a full queue answers `503 engine_full` with `Retry-After`. A client that
+disconnects cancels its job before it starts or between denoising steps. A
+running or queued job counts as use for [idle unload](#idle-unload).
+
+| Setting (`--image-<name>`, `IGNIS_IMAGE_<NAME>`, `image.<name>` in the file) | Default | Meaning |
+|---|---|---|
+| `queue_depth` | `4` | Jobs that may wait behind the running one (0..64). |
+| `max_n` | `10` | The most images one request may ask for (1..64). |
+| `max_condition_images` | `10` | The most condition images one edit may send (1..10). |
+| `max_condition_mipx` | `16` | The largest a condition image may decode to, in Mi pixels of 1,048,576 each (1..64); a larger one is refused. 16 takes any phone camera and bounds each image's frame at 64 MiB; an edit decodes up to `max_condition_images` of them. |
+| `max_condition_decodes` | `1` | The most edits that decode their condition images at once (1..16); the others wait their turn. |
+| `sizes` | the eight above | The sizes a request may ask for, each side a multiple of 32 up to 16384. The load sizes the image model's working memory for the largest within `max_target_cells`, so a larger size added live is served after the next load. |
+| `max_target_cells` | `16800` | The largest image the image model's load makes room for, in latent cells of 16x16 pixels (1..1048576): 16,800 is 2400x1792, the largest preset. A size in `sizes` past it is not served, and the load warns. Read by the load, so a change holds from the next one. |
+| `condition_budget_tokens` | `0` | Lowers the condition budget (0 is the whole budget the load planned). |
+| `min_condition_budget_tokens` | `8191` | The least condition budget the image model's load accepts (0..1048576); a load whose VRAM leaves less is refused, naming the shortfall. 8,191 is the longest text-to-image prompt the model's positions admit; 0 takes any. Read by the load, so a change holds from the next one. |
+| `condition_floor_px` | `512` | The smallest a condition image may be scaled to, as the side of a square of the same area (32..1024). |
+| `prompt_enhancement` | `false` | Whether a request that does not say has its prompt rewritten first. |
+| `prompt_enhancer` | `qwen3.8-27b` | The text model that rewrites prompts. |
+| `prompt_enhancer_max_tokens` | `1024` | The most tokens one rewrite may take (16..8192); a longer answer is cut and used as it is. |
+
+All of them are live: `PATCH /v1/config` changes them without a reload.
+
+**Prompt enhancement.** With `prompt_enhancement: true` on a request (or the
+setting on), a text model rewrites the prompt with Qwen's own system prompts
+before the image model reads it; the result comes back as `data[].revised_prompt`.
+It is not free:
+
+- With a text model loaded, the job is rewritten first when that model is the
+  enhancer; otherwise the server switches to the enhancer, rewrites, then
+  switches to the image model, and `GET /v1/models`' `last_switch` records
+  both switches. An enhancer the idle clock unloaded is loaded for the rewrite,
+  then the server switches once: two loads.
+- With the **image model loaded, each job makes a visit: two reloads** (image
+  model to enhancer, and back). During the visit every other request gets
+  `503 model_switching` with `Retry-After`, and `GET /v1/models` reads
+  `switching`; the visit leaves `last_switch` as it was.
+- The visit waits its **turn in the queue**: the jobs admitted before the
+  enhanced request finish on the image model, and the visit begins with none
+  running (a full queue is `503 engine_full`, as for a job). The jobs admitted
+  behind it run while the visit drains the image model, as for any switch:
+  past `switch.drain_timeout` they end `503 model_stopped`.
+- `image.prompt_enhancer` must be a **known model**: listed in
+  `--switch-known-models`, the model the server started with, or a catalog
+  entry already downloaded (or the text model loaded). The default
+  `qwen3.8-27b` is none of those on a server that knows no text model: the
+  start warns (`ignis.config.prompt_enhancer_unknown`), and every enhanced
+  request falls back. A `PATCH /v1/config` naming an enhancer that is none is
+  refused (`400 config_invalid`). An enhancer that cannot be reached, or a
+  rewrite that fails, never fails the request: the prompt is used as sent and
+  the response carries `warnings`.
+- An edit shows the enhancer its condition images only when its vision tower is
+  loaded; otherwise it reads text only, with a warning.
 
 ### Canary check
 
@@ -1254,6 +1375,13 @@ Git for Windows' `usr\bin` on `PATH`). `make` alone lists every target.
 Knobs go on the command line (`make dev CUDA=0 PROFILE=dev`,
 `make dev-ui SPEC=off MAX_CONTEXT=40960`) or in an untracked `local.mk`
 (`local.mk.example`). `make config` prints what is in force.
+
+`make MODEL=image` serves the [image model](#image-generation) from
+`F:/ai/models/ignis-image-2.1-turbo/ignis_image_2_1_turbo-v2.ninfer` (`ARTIFACT`
+names another) as `ignis-image-2.1-turbo`. It has no context, lanes, prefill
+chunk, speculation, KV format or vision, so `make` passes none of those flags;
+the settings every model shares (`BIND`, `API_KEY`, `IDLE_UNLOAD`, ...) apply as
+before. `make config MODEL=image` prints the server command.
 
 With `CUDA=1` the server starts with `MAX_CONTEXT=524288` and
 `ROPE_SCALING=yarn:2` -- twice the checkpoint's trained 262,144 positions,

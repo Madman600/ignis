@@ -50,6 +50,28 @@ pub enum ModelFamily {
     QwenImage21,
 }
 
+/// What a model produces (ADR 0050, `CONTEXT.md`): a **text model** tokens,
+/// an **image model** pixels. Above the [`ModelFamily`]: every family is of
+/// one kind, and a server route serves one kind — a request of the other is
+/// refused, or switches models (spec image-model/05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelKind {
+    /// The 27B and Flash-Next: an engine, lanes, a KV pool.
+    Text,
+    /// The image model: an image runner and its job queue.
+    Image,
+}
+
+impl ModelKind {
+    /// The kind as the API names it: `text` or `image`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelKind::Text => "text",
+            ModelKind::Image => "image",
+        }
+    }
+}
+
 /// Flash-Next's mixture-of-experts block, one per layer: the router picks
 /// `experts_per_token` of `num_experts` routed SwiGLU experts, and the shared
 /// expert runs for every token behind a sigmoid gate.
@@ -827,6 +849,14 @@ impl ModelFamily {
         }
     }
 
+    /// What the model produces (ADR 0050).
+    pub fn kind(self) -> ModelKind {
+        match self {
+            ModelFamily::Qwen38_27b | ModelFamily::FlashNext => ModelKind::Text,
+            ModelFamily::QwenImage21 => ModelKind::Image,
+        }
+    }
+
     /// Whether the model has a vision tower to take image parts with.
     pub fn takes_images(self) -> bool {
         self == ModelFamily::Qwen38_27b
@@ -1029,6 +1059,16 @@ impl ModelConfig {
 mod tests {
     use super::*;
     use crate::kv_format::{KvFormat, KvGeometry};
+
+    /// ADR 0050: the two text families are text models, the image family the
+    /// one image model, and the API spells each kind one way.
+    #[test]
+    fn every_family_is_of_one_kind() {
+        assert_eq!(ModelFamily::Qwen38_27b.kind(), ModelKind::Text);
+        assert_eq!(ModelFamily::FlashNext.kind(), ModelKind::Text);
+        assert_eq!(ModelFamily::QwenImage21.kind(), ModelKind::Image);
+        assert_eq!((ModelKind::Text.as_str(), ModelKind::Image.as_str()), ("text", "image"));
+    }
 
     /// The layer pattern of `fn_config.json` (the checkpoint's text config):
     /// `full_attention` at every fourth layer, 3, 7, ..., 47, and

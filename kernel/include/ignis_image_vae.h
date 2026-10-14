@@ -23,8 +23,9 @@
  *   IGNIS_IMAGE_VAE_CONV_3X3_S2  3 x 3, stride 2 after zero padding (0, 1, 0, 1): one column on
  *                                the right and one row at the bottom (the encoder's downsample);
  *   IGNIS_IMAGE_VAE_CONV_1X1     1 x 1 (the shortcuts, quant_conv, post_quant_conv, to_qkv, proj).
- * Weights are packed once at load from PyTorch's [out][in][ky][kx] to [out][ky][kx][in]
- * (ignis_image_vae_pack_conv_weight); the bias is BF16 [out].
+ * Weights are packed from PyTorch's [out][in][ky][kx] to [out][ky][kx][in]
+ * (ignis_image_vae_pack_conv_weight) by the caller before the calls that use them (the image leaf
+ * packs the 3x3 weights per call, into its workspace); the bias is BF16 [out].
  *
  * Row windows (for bands). `x` holds input rows [x_row0, x_row0 + x_rows) of an input image of
  * height x width (before the upsample), and the call computes output rows [y_row0, y_row0 + y_rows)

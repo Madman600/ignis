@@ -25,6 +25,10 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# The image leaf's GPU test (spec image-model/04 acceptance 6 and 9) reads the
+# oracle's PNGs and writes the free-run ones. Already in the lock through
+# ignis-artifact.
+png = "0.18"
 
 [features]
 # Forwards to the artifact crate's `cuda` feature (the VRAM materialization

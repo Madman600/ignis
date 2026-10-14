@@ -10,8 +10,9 @@
 //! idle socket does not pin the model. A count, not a timestamp of admission:
 //! between admission and the engine's submit lie the template render and the
 //! media decode, which a timestamp alone would see as idle. And any work
-//! still waiting or running on the engine ([`crate::engine::Engine::interval_counters`],
-//! a plain read). The routes that only report state — `GET /v1/models`, the
+//! still waiting or running on the model ([`crate::ActiveModel::in_flight`],
+//! a plain read): a text model's lanes, the image model's jobs, queued or
+//! running (spec image-model/05). The routes that only report state — `GET /v1/models`, the
 //! config and catalog reads, `/metrics`, preflights — are not counted: a
 //! page polling them neither keeps the model loaded nor loads it again.
 //!
@@ -19,7 +20,7 @@
 //! second and reads `model.idle_unload` off the live knobs at every tick, so
 //! a live `PATCH` takes effect with no reload. The model is unloaded when the
 //! knob is above zero, the status is `serving`, nothing is in flight, the
-//! engine is empty, and the last use is at least the knob ago. While the
+//! model has no work, and the last use is at least the knob ago. While the
 //! knob is zero, or the model is in use, or anything but serving, the last
 //! use is now: the clock starts when the model is serving and unused, never
 //! from a timestamp gone stale meanwhile. The unload itself and the load that
@@ -176,10 +177,7 @@ async fn tick_once(server: &Server) {
     let after = server.live().idle_unload;
     let model = server.active();
     let serving = matches!(*server.status(), ModelStatus::Serving);
-    let busy = serving && {
-        let counters = model.engine.interval_counters();
-        counters.waiting > 0 || counters.running > 0
-    };
+    let busy = serving && !model.in_flight().is_idle();
     if after.is_zero() || !serving || busy || model.source.is_none() {
         server.usage.touch();
         return;
@@ -188,6 +186,6 @@ async fn tick_once(server: &Server) {
         .usage
         .when_idle(after, |idle| crate::model_switch::claim_unload(server).map(|unloading| (unloading, idle)));
     if let Some((unloading, idle)) = due {
-        crate::model_switch::unload(server, unloading, idle).await;
+        crate::model_switch::unload(server, unloading, crate::model_switch::UnloadCause::Idle(idle)).await;
     }
 }

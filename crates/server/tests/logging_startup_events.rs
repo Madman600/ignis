@@ -253,6 +253,25 @@ fn a_developer_policy_that_rerenders_history_warns_at_start() {
     }
 }
 
+/// Spec image-model/05 §Prompt enhancement (review-322cf M3): a start whose
+/// `image.prompt_enhancer` names no text model it can switch to warns once,
+/// naming it — from the flag, which the live knobs now carry from the start
+/// — and goes on; one naming the model it serves says nothing.
+#[test]
+fn an_enhancer_no_switch_reaches_warns_at_start() {
+    let records = run_until(&["--image-prompt-enhancer", "nobody"], &[], &["ignis.process.started"]);
+    let warning = find(&records, "ignis.config.prompt_enhancer_unknown");
+    assert_eq!(warning["severity_text"], "WARN");
+    assert_eq!(warning["attributes"]["enhancer"], "nobody");
+    assert!(warning["attributes"]["reason"].as_str().unwrap().contains("switch.known_models"), "{warning}");
+    let served = find(&records, "ignis.process.started");
+    let records = run_until(&[], &[], &["ignis.process.started"]);
+    assert!(
+        !records.iter().any(|r| r["event_name"] == "ignis.config.prompt_enhancer_unknown"),
+        "the default enhancer is the model this start serves: {served}"
+    );
+}
+
 /// GitHub #260: the load says how `point` will be answered before the first
 /// request. A load with no artifact binds no vision, so it says neither
 /// method; `chain` and the served artifact's `head` need a `--vision-enabled` load,
