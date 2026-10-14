@@ -1,0 +1,17 @@
+{
+  "image_processor": {
+    "patch_size": 4,
+    "merge_size": 2,
+    "temporal_patch_size": 2,
+    "image_mean": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "image_std": [
+      0.5,
+      0.5,
+      0.5
+    ]
+  }
+}

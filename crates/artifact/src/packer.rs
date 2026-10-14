@@ -40,6 +40,10 @@
 //! ([`Family::Mtp`], layout.md §13): one unit, `mtp/`, and a sidecar that
 //! pins the main container it belongs to (`pair.main`, read from the main
 //! container itself, so its hash is the one the binder computes).
+//!
+//! And the image model's container ([`Family::QwenImage21`], spec
+//! image-model/01): `frontend/`, then four units of tensors.json tensors
+//! ([`crate::qwen_image::WORK_UNITS`]), with no Flash-Next geometry.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -88,6 +92,22 @@ pub fn default_identity() -> ArtifactIdentity {
     }
 }
 
+/// The image model's container file name, beside the converter's `work/`
+/// (`tools/image-converter`; "Qwen" is never its primary name, ADR 0050).
+pub const QWEN_IMAGE_ARTIFACT_FILE_NAME: &str = "ignis_image_2_1_turbo-v2.ninfer";
+
+/// The image model's header reservation: its directory is ~0.4 MB.
+pub const QWEN_IMAGE_HEADER_BYTES: u64 = 4 << 20;
+
+/// The image model's identity: FP8 row-scaled linears, BF16 elsewhere, the
+/// vision tower's matrices W8, from revision `fc13ba19`.
+pub fn qwen_image_identity() -> ArtifactIdentity {
+    ArtifactIdentity {
+        model_id: crate::qwen_image::MODEL_ID.into(),
+        weights_id: "fp8rows-bf16-fc13ba1".into(),
+    }
+}
+
 /// The MTP companion container's identity (layout.md §13.2).
 pub fn mtp_identity() -> ArtifactIdentity {
     ArtifactIdentity {
@@ -104,6 +124,9 @@ pub enum Family {
     /// The MTP head's companion (layout.md §13): the one unit `mtp/`,
     /// pinned to the main container `pair_main`.
     Mtp { pair_main: PathBuf },
+    /// The image model (spec image-model/01): `frontend/` and the four
+    /// tensor units of [`crate::qwen_image::WORK_UNITS`].
+    QwenImage21,
 }
 
 /// What one [`pack`] call is asked to do.
@@ -113,8 +136,9 @@ pub struct PackOptions {
     pub work_dir: PathBuf,
     /// The container to write.
     pub artifact: PathBuf,
-    /// Shapes and the layer count (a dry run packs fewer layers).
-    pub geometry: FlashNextGeometry,
+    /// Flash-Next's shapes and layer count (a dry run packs fewer layers);
+    /// `None` for the image model, whose units are fixed.
+    pub geometry: Option<FlashNextGeometry>,
     pub identity: ArtifactIdentity,
     /// Header reservation for a new container (a resume keeps its own).
     pub header_bytes: u64,
@@ -134,7 +158,7 @@ impl PackOptions {
         Self {
             work_dir,
             artifact,
-            geometry,
+            geometry: Some(geometry),
             identity: default_identity(),
             header_bytes: DEFAULT_HEADER_BYTES,
             keep_work: false,
@@ -153,6 +177,26 @@ impl PackOptions {
             family: Family::Mtp { pair_main },
             ..Self::new(work_dir, artifact, geometry)
         }
+    }
+
+    /// The defaults for the image model: `work_dir` → `artifact`.
+    pub fn qwen_image(work_dir: PathBuf, artifact: PathBuf) -> Self {
+        Self {
+            work_dir,
+            artifact,
+            geometry: None,
+            identity: qwen_image_identity(),
+            header_bytes: QWEN_IMAGE_HEADER_BYTES,
+            keep_work: false,
+            delete_batch_bytes: DEFAULT_DELETE_BATCH_BYTES,
+            accept_status: vec!["complete".into()],
+            family: Family::QwenImage21,
+        }
+    }
+
+    /// The layer count the state records: Flash-Next's, 0 for the image model.
+    fn layers(&self) -> usize {
+        self.geometry.as_ref().map_or(0, |g| g.layers)
     }
 }
 
@@ -195,6 +239,9 @@ pub fn family_units(family: &Family, layers: usize) -> Vec<String> {
     match family {
         Family::Main => unit_names(layers),
         Family::Mtp { .. } => vec!["mtp".into()],
+        Family::QwenImage21 => {
+            std::iter::once("frontend").chain(crate::qwen_image::WORK_UNITS).map(String::from).collect()
+        }
     }
 }
 
@@ -222,10 +269,10 @@ struct PackState {
 pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<PackOutcome> {
     let _lock = lock(&options.artifact)?;
     let state_file = state_path(&options.artifact);
-    let units = family_units(&options.family, options.geometry.layers);
+    let units = family_units(&options.family, options.layers());
     let pair = match &options.family {
         Family::Mtp { pair_main } => Some(pair_record(pair_main)?),
-        Family::Main => None,
+        Family::Main | Family::QwenImage21 => None,
     };
 
     let mut state = if state_file.exists() {
@@ -240,12 +287,12 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
                 options.identity.weights_id
             )));
         }
-        if state.layers != options.geometry.layers {
+        if state.layers != options.layers() {
             return Err(fail(format!(
                 "{} packs {} layers, this run asks for {}",
                 state_file.display(),
                 state.layers,
-                options.geometry.layers
+                options.layers()
             )));
         }
         if !units.starts_with(&state.units_done) {
@@ -267,7 +314,7 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
         let writer =
             ContainerWriter::create(&options.artifact, options.identity.clone(), options.header_bytes)?;
         let state = PackState {
-            layers: options.geometry.layers,
+            layers: options.layers(),
             units_done: Vec::new(),
             ngram_source_digest: None,
             finished: false,
@@ -339,7 +386,7 @@ pub fn pack(options: &PackOptions, progress: &mut dyn FnMut(&str)) -> Result<Pac
     let mut writer = ContainerWriter::resume(&options.artifact, state.writer.clone())?;
     let mut largest_unit_directory = 0u64;
     for (position, unit) in units.iter().enumerate().skip(state.units_done.len()) {
-        let Some(plan) = plan_unit(&options.work_dir, unit, &options.geometry)? else {
+        let Some(plan) = plan_unit(&options.work_dir, unit, options.geometry.as_ref())? else {
             return Ok(PackOutcome::Waiting {
                 appended: position,
                 total: units.len(),
@@ -581,12 +628,14 @@ fn read_done(dir: &Path) -> Result<Option<Done>> {
     Ok(Some(done))
 }
 
-/// Plan one unit, or `None` when it is not complete yet.
-fn plan_unit(work_dir: &Path, unit: &str, geometry: &FlashNextGeometry) -> Result<Option<UnitPlan>> {
+/// Plan one unit, or `None` when it is not complete yet. `geometry` is
+/// Flash-Next's, which its expert and n-gram units need.
+fn plan_unit(work_dir: &Path, unit: &str, geometry: Option<&FlashNextGeometry>) -> Result<Option<UnitPlan>> {
     let dir = work_dir.join(unit);
     let Some(done) = read_done(&dir)? else {
         return Ok(None);
     };
+    let flash_next = || geometry.ok_or_else(|| fail(format!("unit {unit} needs Flash-Next's geometry")));
     let mut plan = UnitPlan::new(dir);
     // Only the files layout.md names are read; anything else in a unit
     // directory (a layer's `layer.json`, `route_*.npy`) is the converter's
@@ -607,12 +656,17 @@ fn plan_unit(work_dir: &Path, unit: &str, geometry: &FlashNextGeometry) -> Resul
         "global" => plan_tensors_json(&mut plan, &done, None)?,
         "mtp" => {
             plan_tensors_json(&mut plan, &done, Some(MTP_PREFIX))?;
-            plan_experts(&mut plan, &done, geometry, mtp_expert_name)?;
+            plan_experts(&mut plan, &done, flash_next()?, mtp_expert_name)?;
         }
         "ngram" => {
-            if !plan_ngram(&mut plan, &done, geometry)? {
+            if !plan_ngram(&mut plan, &done, flash_next()?)? {
                 return Ok(None);
             }
+        }
+        // the image model's units: tensors.json only, every name under the
+        // unit's own prefix (`vision/...`, `vae/...`)
+        _ if crate::qwen_image::WORK_UNITS.contains(&unit) => {
+            plan_tensors_json(&mut plan, &done, Some(&format!("{unit}/")))?;
         }
         _ => {
             let layer: usize = unit
@@ -620,7 +674,7 @@ fn plan_unit(work_dir: &Path, unit: &str, geometry: &FlashNextGeometry) -> Resul
                 .and_then(|n| n.parse().ok())
                 .ok_or_else(|| fail(format!("unknown unit {unit}")))?;
             plan_tensors_json(&mut plan, &done, Some(&format!("layers.{layer}.")))?;
-            plan_experts(&mut plan, &done, geometry, |expert, projection| expert_name(layer, expert, projection))?;
+            plan_experts(&mut plan, &done, flash_next()?, |expert, projection| expert_name(layer, expert, projection))?;
         }
     }
     Ok(Some(plan))

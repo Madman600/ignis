@@ -1,0 +1,5 @@
+{
+  "_class_name": "FlowMatchEulerDiscreteScheduler",
+  "shift": 1.0,
+  "use_dynamic_shifting": false
+}

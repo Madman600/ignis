@@ -427,11 +427,14 @@ impl TransferPace {
 
     /// `family`'s pace: [`MOVE_IN_WINDOW_BYTES`] and [`MOVE_OUT_WINDOW_BYTES`]
     /// on Flash-Next, whose experts stream over the link a move shares;
-    /// [`Self::UNPACED`] on the 27B, whose decode rounds put nothing on it.
+    /// [`Self::UNPACED`] on the 27B, whose decode rounds put nothing on it,
+    /// and on the image model, which moves no KV.
     pub fn for_family(family: ignis_core::compute::ModelFamily) -> Self {
         match family {
             ignis_core::compute::ModelFamily::FlashNext => Self::default(),
-            ignis_core::compute::ModelFamily::Qwen38_27b => Self::UNPACED,
+            ignis_core::compute::ModelFamily::Qwen38_27b | ignis_core::compute::ModelFamily::QwenImage21 => {
+                Self::UNPACED
+            }
         }
     }
 

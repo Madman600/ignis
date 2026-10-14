@@ -822,19 +822,28 @@ fn refuse_for_family(patch: &source::Layer, family: ModelFamily) -> Result<(), C
         }
         if (meta.group, meta.name) == ("spec", "backend") {
             if let Ok(SpecChoice::Backend(backend)) = <kind::SpecBackend as kind::FieldKind>::parse(raw) {
-                if backend != family.drafter() {
+                if Some(backend) != family.drafter() {
                     return Err(ConfigError(format!(
-                        "`{} {}`: {} drafts with {}",
+                        "`{} {}`: {} {}",
                         candidate.spelling,
                         backend.as_str(),
                         family.name(),
-                        family.drafter().as_str()
+                        drafts_with(family)
                     )));
                 }
             }
         }
     }
     Ok(())
+}
+
+/// How a refusal says what `family` drafts with: its backend, or that it has
+/// none (the image model decodes no tokens).
+fn drafts_with(family: ModelFamily) -> String {
+    match family.drafter() {
+        Some(backend) => format!("drafts with {}", backend.as_str()),
+        None => "has no drafter".to_owned(),
+    }
 }
 
 /// The patch naming a model switch's target (spec model-switch/01): its
@@ -1272,14 +1281,14 @@ fn fit_family(
         Some(_) => {}
         None => *fitted.model = family.model_id().to_owned(),
     }
-    if let Some(speculation) = fitted.speculation.filter(|s| s.backend() != family.drafter()) {
+    if let Some(speculation) = fitted.speculation.filter(|s| Some(s.backend()) != family.drafter()) {
         if fit == Fit::Start {
             return Err(ConfigError(format!(
-                "`{} {}`: {} drafts with {}",
+                "`{} {}`: {} {}",
                 spelled("spec", "backend"),
                 speculation.backend().as_str(),
                 family.name(),
-                family.drafter().as_str()
+                drafts_with(family)
             )));
         }
         *fitted.speculation = None;
