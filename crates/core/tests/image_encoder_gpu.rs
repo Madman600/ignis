@@ -18,8 +18,9 @@
 //! `$IGNIS_IMAGE_ORACLE`, else `F:/ai/models/ignis-image-2.1-turbo/oracle`. Without either the
 //! AC 3 test prints SKIP, a failure under the profile. With `$IGNIS_IMAGE_ENCODER_LAYERS` naming a
 //! directory of per-layer references (`layer00.npy` .. `layer35.npy`, fp32 [tokens][4096], from
-//! transformers' text model on the t2i case), it also runs the t2i case layer by layer and prints
-//! each layer's error against them: the diagnosis spec 03 asks for when AC 3 is over its bound.
+//! transformers' text model on the t2i case, `tools/image-converter/ref_layers.py`), it also runs the
+//! t2i case one layer at a time, each from the reference's previous layer, and prints that layer's
+//! own error against its reference: the diagnosis spec 03 asks for when AC 3 is over its bound.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1` a missing GPU, a
 //! missing fixture or a kernel error is a skip, under it a hard failure (`ignis_core::gpu_profile`).
@@ -148,16 +149,26 @@ fn the_t2i_encoder_output_is_within_the_oracle_bound() {
         return;
     }
     let thresholds: serde_json::Value = serde_json::from_slice(&std::fs::read(&thresholds_path).unwrap()).unwrap();
-    // The bound was measured on this artifact: its size stands in for the sha256 thresholds.json records.
-    let bytes = std::fs::metadata(&artifact).unwrap().len();
-    assert_eq!(Some(bytes), thresholds["artifact"]["bytes"].as_u64(), "{artifact} is not the artifact thresholds.json was measured on");
     let Some(mut dev) = device() else { return };
 
     let reader = Reader::open(Path::new(&artifact)).expect("the artifact opens");
+    // The bound was measured on this artifact. The sha256 thresholds.json records would read all 16.7
+    // GB each run: the size and the header's identity (model id, weights id) say it is the same pack.
+    let recorded = &thresholds["artifact"];
+    assert_eq!(Some(reader.file_bytes()), recorded["bytes"].as_u64(), "{artifact} is not the artifact thresholds.json was measured on");
+    let identity = reader.identity();
+    assert_eq!(Some(identity.model_id.as_str()), recorded["identity"]["model_id"].as_str(), "{artifact}'s model id");
+    assert_eq!(Some(identity.weights_id.as_str()), recorded["identity"]["weights_id"].as_str(), "{artifact}'s weights id");
     let geometry = QwenImageGeometry::qwen_image_21_turbo().text;
     let bound = qwen_image::bind_text_encoder(&reader, &geometry).expect("the text encoder binds");
     let start = Instant::now();
-    let materialized = materialize(&reader, &bound.plan, &mut dev, None).expect("the text encoder materializes");
+    let materialized = match materialize(&reader, &bound.plan, &mut dev, None) {
+        Ok(m) => m,
+        Err(e) => {
+            gpu_profile::skip_or_fail(&format!("materialize the text encoder on the device: {e}"));
+            return;
+        }
+    };
     let load_s = start.elapsed().as_secs_f64();
     let config = TextEncoderConfig::parse(materialized.resource_bytes(bound.handles[qwen_image::TEXT_ENCODER_CONFIG]).unwrap(), &geometry)
         .expect("the artifact's text config");
@@ -202,7 +213,13 @@ fn the_t2i_encoder_output_is_within_the_oracle_bound() {
         let d_x = upload(&mut dev, &x0_bytes);
         let d_pos = upload(&mut dev, &positions.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
         let ws_bytes = image_encoder::workspace_bytes(tokens as u32);
-        let d_ws = dev.allocate(ws_bytes).expect("the workspace");
+        let d_ws = match dev.allocate(ws_bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                gpu_profile::skip_or_fail(&format!("{case}: the {ws_bytes}-byte workspace: {e}"));
+                return;
+            }
+        };
         let host_s = host_start.elapsed().as_secs_f64();
         let run = |first: u32, end: u32| unsafe {
             image_encoder::forward(&desc, first, end, ptr(&d_x) as *mut f32, tokens as u32, ptr(&d_pos) as *const i32, None, ptr(&d_ws), ws_bytes, null)
@@ -247,10 +264,18 @@ fn the_t2i_encoder_output_is_within_the_oracle_bound() {
 
         if case == "t2i" {
             if let Some(refs) = std::env::var("IGNIS_IMAGE_ENCODER_LAYERS").ok().filter(|s| !s.is_empty()) {
-                // The diagnosis: layer by layer against transformers' text model.
-                dev.copy_h2d(&d_x, 0, &x0_bytes).expect("upload");
-                dev.synchronize().expect("upload sync");
+                // The diagnosis: layer by layer against transformers' text model, teacher-forced. Each
+                // layer starts from the reference's input (the embedding rows, then the reference's
+                // layer l-1) and is compared with the reference's output, so a row's error is that
+                // layer's own: the errors of a free-running stack accumulate, cancel and amplify.
                 for l in 0..layers {
+                    if l == 0 {
+                        dev.copy_h2d(&d_x, 0, &x0_bytes).expect("upload");
+                    } else {
+                        let (_, input) = load_npy(&Path::new(&refs).join(format!("layer{:02}.npy", l - 1)));
+                        dev.copy_h2d(&d_x, 0, &input).expect("upload");
+                    }
+                    dev.synchronize().expect("upload sync");
                     if !ran(run(l, l + 1), &format!("layer {l}")) {
                         return;
                     }
@@ -259,7 +284,7 @@ fn the_t2i_encoder_output_is_within_the_oracle_bound() {
                     let reference = as_f32(&reference);
                     let all: Vec<usize> = (0..tokens).collect();
                     println!(
-                        "  layer {l:2}: text rows from row 1 {:.3}%, row 0 {:.3}%, every row {:.3}%",
+                        "  layer {l:2} alone: text rows from row 1 {:.3}%, row 0 {:.3}%, every row {:.3}%",
                         rms_rel(&got, &reference, &text_rows) * 100.0,
                         rms_rel(&got, &reference, &[drop]) * 100.0,
                         rms_rel(&got, &reference, &all) * 100.0

@@ -56,6 +56,10 @@ impl TextEncoderConfig {
         if text.get("hidden_act").and_then(|v| v.as_str()) != Some("silu") {
             return Err("text_config.hidden_act is not silu".into());
         }
+        // The artifact binds no projection biases (the bind plan skips objects it does not name).
+        if text.get("attention_bias").and_then(|v| v.as_bool()) == Some(true) {
+            return Err("text_config.attention_bias is true: the leaf runs no projection biases".into());
+        }
         let rms_norm_eps =
             text.get("rms_norm_eps").and_then(|v| v.as_f64()).ok_or("text_config.rms_norm_eps is missing")? as f32;
         let (rope, theta) = match text.get("rope_parameters") {
@@ -458,6 +462,7 @@ mod tests {
         assert!(refused(|t| t["hidden_size"] = 2048.into()).contains("text_config.hidden_size is 2048"));
         assert!(refused(|t| t["num_hidden_layers"] = 28.into()).contains("num_hidden_layers is 28"));
         assert!(refused(|t| t["hidden_act"] = "gelu".into()).contains("hidden_act"));
+        assert!(refused(|t| t["attention_bias"] = true.into()).contains("attention_bias"));
         assert!(refused(|t| t["rope_scaling"]["mrope_interleaved"] = false.into()).contains("not interleaved"));
         assert!(refused(|t| t["rope_scaling"]["mrope_section"] = serde_json::json!([24, 20])).contains("three integers"));
         assert!(refused(|t| t["rope_scaling"]["mrope_section"] = serde_json::json!([24, 20, 24])).contains("does not cover"));
