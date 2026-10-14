@@ -654,7 +654,8 @@ async fn error_of(refused: Response) -> ApiError {
 }
 
 /// A request past its first checks, to its job: the load of a model the idle
-/// clock unloaded, prompt enhancement ([`enhance`]) and the implicit switch
+/// clock unloaded — the enhancer itself when it is the one unloaded and the
+/// prompt is to be rewritten — prompt enhancement ([`enhance`]) and the implicit switch
 /// to the image model it names, each phase sent to `events` as it starts
 /// (ADR 0049's rules); then, on the
 /// image model, pinned for the rest of the request, the size against what
@@ -669,10 +670,22 @@ async fn admit(
     events: &mpsc::UnboundedSender<Streamed>,
 ) -> Result<(), Response> {
     let named = split_model_lane(request.model.clone()).0;
-    if server.status().is_unloaded() {
+    // What `ensure_loaded` waits on: the load of an unloaded model, or the
+    // one another request began.
+    let status = server.status();
+    if status.is_unloaded() || matches!(*status, ModelStatus::Loading) {
         let _ = events.send(progress(Phase::Loading, 1, 1));
     }
-    crate::model_switch::ensure_loaded(&server, named.as_deref()).await.map_err(|reason| load_failed(&server, &reason))?;
+    // A request to be rewritten on the unloaded enhancer loads the enhancer
+    // rather than the image model it names: the rewrite on it, then one
+    // switch — two loads, not three.
+    let unloaded = server.active();
+    let enhancer_unloaded = request.enhance
+        && status.is_unloaded()
+        && unloaded.kind() == ModelKind::Text
+        && unloaded.model_id() == server.live().image.prompt_enhancer;
+    let load = if enhancer_unloaded { None } else { named.as_deref() };
+    crate::model_switch::ensure_loaded(&server, load).await.map_err(|reason| load_failed(&server, &reason))?;
     // Drawn now, so that the rewrite is seeded with it too.
     let seed = request.seed.or(server.seedless_seed).unwrap_or_else(crate::api::fresh_seed);
     let enhanced = match request.enhance {

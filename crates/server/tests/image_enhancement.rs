@@ -158,6 +158,42 @@ async fn send_chat(app: &axum::Router) -> (StatusCode, Value) {
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
+/// Review-322cf L3: a request to be rewritten on the enhancer the idle clock
+/// unloaded loads the enhancer, not the image model it names — the rewrite on
+/// it, then one switch: two loads, not three. A streamed request that comes
+/// while another's load runs waits on it, and hears `loading` too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enhanced_request_on_the_unloaded_enhancer_loads_it_and_switches_once() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]).with_idle_unload(IDLE);
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    let _clock = server.spawn_idle_clock(TICK).expect("a clock");
+    until(&server, "unloaded", IDLE * 5).await;
+    let body = json!({ "prompt": "a red fox", "model": IMAGE, "size": "1024x1024", "seed": 4, "prompt_enhancement": true, "stream": true });
+    let events = events_of(&app, body).await;
+    assert_eq!(phases(&events), then_the_job(&["loading 1/1", "enhancing 1/1", "switching 1/1", "loading 1/1"]));
+    assert!(events.last().unwrap().1["revised_prompt"].is_string(), "{:?}", events.last());
+    assert_eq!(loader.loads(), ["mock-a", IMAGE], "the enhancer, then the image model");
+
+    until(&server, "unloaded", IDLE * 5).await;
+    let hold = loader.hold_next_load();
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move { send_generation(&app, json!({ "prompt": "first", "size": "1024x1024" })).await }
+    });
+    until(&server, "loading", PATIENT).await;
+    let response = app.clone().oneshot(generation(json!({ "prompt": "second", "size": "1024x1024", "stream": true }))).await.unwrap();
+    let mut stream = response.into_body();
+    let heard = tokio::time::timeout(Duration::from_secs(5), stream.frame()).await.expect("an event while the load runs");
+    let heard = String::from_utf8(heard.unwrap().unwrap().into_data().unwrap().to_vec()).unwrap();
+    assert!(heard.contains("\"phase\":\"loading\""), "{heard}");
+    hold.send(()).unwrap();
+    assert_eq!(first.await.unwrap().0, StatusCode::OK);
+    while stream.frame().await.is_some() {}
+    assert_eq!(loader.loads(), ["mock-a", IMAGE, IMAGE]);
+}
+
 // ── the visit (model_switch::visit) ───────────────────────────────────────
 
 /// What a visit's switches told, in order.
