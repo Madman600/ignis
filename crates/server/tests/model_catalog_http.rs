@@ -137,7 +137,7 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
     assert_eq!(
         ids,
         [
-            "qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", // the built-in catalog, then the operator's
+            "qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", // the built-in catalog, then the operator's
             "acme-full", "acme-part", "acme-none",
             "mock-a", "mock-gone", "mock-k", // the known models that are not entries, the start model among them
         ]
