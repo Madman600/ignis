@@ -57,7 +57,8 @@ because the text tokens after an image attend to it.
 - **The vision tower:** `vision_encode.cu` reused, parametrised instead of
   forked:
   - the merger's output width (4096 here, 5120 on the 27B);
-  - the segment bound (10 condition images of up to 1024 merged tokens each);
+  - the segment bound (10 condition images of up to 1,230 merged tokens each, see
+    the defaults);
   - DeepStack: the features after tower layers 8, 16 and 24, each through its
     own merger, which the text model adds after its layers 0, 1 and 2.
 - **mrope positions:** the Qwen3-VL rule for text and vision tokens
@@ -289,18 +290,29 @@ the hooks they fill are below.
 
   - The error is the sim yardstick's (9.75%): W8A8 quantization, as
     expected, not a bug.
-  - **Per layer**, against transformers' text model run layer by layer in
-    fp32 on the CPU, on the checkpoint's bf16 weights
-    (`.scratch/320a/ref/ref_layers.py`). That reference's last layer is
-    within 1.1e-5 of the oracle per row, so it reproduces the oracle's
-    computation.
-    - Over the text rows from row 1: 2.4% after layer 0, 2.6-5.4% through
-      layer 33, then 5.9% and 9.6% after layers 34 and 35.
-    - Row 0: 2.4-4.5% through layer 33, then 21.6% and 28.8%.
-    - No layer before the last adds more than 0.6 points to the text rows;
-      layer 35 adds 3.7, and the last two carry most of row 0's.
-    - The test prints this table when `IGNIS_IMAGE_ENCODER_LAYERS` names the
-      reference's directory.
+  - **Per layer**, teacher-forced, against transformers' text model run
+    layer by layer in fp32 on the CPU, on the checkpoint's bf16 weights
+    (`tools/image-converter/ref_layers.py`, run with the venv
+    `F:/ai/venvs/ignis-image/Scripts/python.exe ref_layers.py <snapshot>
+    <oracle>/t2i <out dir>`; its last layer is within 1.1e-5 of the oracle
+    per row, so it reproduces the oracle's computation). The GPU test, with
+    `IGNIS_IMAGE_ENCODER_LAYERS` naming `<out dir>`, runs each layer alone:
+    it loads the reference's layer l-1 output (the embedding rows for layer
+    0) into x, runs layer l, and compares with the reference's layer l
+    output. Each figure is that layer's own error, not an accumulation.
+    - Text rows from row 1: 1.25-2.4% per layer through layer 33 (2.4% at
+      layer 0, 1.25-2.3% in the middle), then 1.9% at layer 34 and
+      3.3% at layer 35.
+    - Row 0: 1.0-3.4% through layer 16, 0.004-0.22% from layer 17 to 33, then 4.7% at
+      layer 34 and 7.2% at layer 35.
+    - So the 9.6% of the free-running stack is a per-layer W8A8 error of
+      about 1.5-2% that accumulates over 36 layers, with the last layer
+      (3.3%, and 7.2% for row 0) the one layer that stands out.
+    - An earlier version of this section read the free-running stack's
+      per-layer errors and subtracted them to attribute "what a layer adds"
+      (3.7 points for layer 35); those errors are cumulative, including
+      cancellations and the amplification of earlier error, so the figures
+      above replace it.
 - **AC 7, t2i.** The GPU lock in normal mode, nothing else on the card; wall
   clock around the forward's launches and a stream sync.
   - **The forward: 21.6-22.0 ms** for 36 layers on 45 tokens, the median
@@ -385,13 +397,19 @@ Where the tower chose what the sections above leave open.
   It is neither an ADR 0031 bottleneck nor an ADR 0037 bug, and its record
   says so: whether registry extensions become a standing reason is the
   owner's call. `ignis_kernel_w8_linear_tests` covers the six shapes from T
-  1 up to 40,960 (qkv) or 10,240 (the mergers' fc2), and throws without the
-  patch.
+  1 up to 49,200 (qkv and the four other patch-rate shapes) or 12,300 (the
+  mergers' fc2), ten images of the 1,230-token worst case, and throws without
+  the patch.
 - **Defaults taken** (the owner may revisit):
-  1. **No per-image token bound**, only the 10 segments (and 2^20
-     patches). A condition image near 1024² at an aspect ratio can exceed
-     1,024 merged tokens: 1376 × 768 is 1,032. The caller's workspace bounds
-     the call.
+  1. **No per-image token bound**, only the 10 segments and 131,072
+     patches (32,768 merged tokens, where the mergers' fc2 has no W8 arm; a
+     larger call is refused before anything is enqueued). A condition image
+     near 1024² at an extreme aspect ratio exceeds 1,024 merged tokens. The
+     worst case is **1,230** (96 × 13,120: diffusers' `calculate_dimensions`
+     rounds each side to 32, and the processor's `smart_resize` refuses
+     ratios over 200:1), so ten images are 12,300 tokens, 49,200 patches and
+     about 0.68 GB of tower workspace. The caller sizes its arenas for 1,230
+     tokens per condition image (#321, #322) or adds a bound of its own.
   2. **`pixel_values` are rounded to BF16 on the host**, to nearest even
      (`vision_call`), since the 27B's tower reads BF16 patches.
   3. **The DeepStack taps come from the config's `vision_config`**, not
@@ -454,7 +472,9 @@ Where the tower chose what the sections above leave open.
   `IGNIS_IMAGE_VISION_REF` names the references). The references are
   transformers' tower on the CPU in fp32, on the checkpoint's weights and on
   the artifact's W8 weights decoded (`vision_probe.outputs`, through
-  agent-320b's `.scratch/320b/ref_vision.py`).
+  `tools/image-converter/ref_vision.py`, run with the same venv:
+  `ref_vision.py <snapshot> <oracle> <out dir>`, and `IGNIS_IMAGE_VISION_REF`
+  naming `<out dir>`).
 
   | output | vs fp32 weights | vs W8 weights | spec 01's bf16 yardstick |
   |---|---|---|---|
@@ -502,3 +522,30 @@ Where the tower chose what the sections above leave open.
     among them. The 27B's embedding was not compared bit for bit before and
     after the change: "the same ops in the same order" holds by
     construction.
+
+## Close-out (320d, 2026-10-14: the reviews' fixes)
+
+The "As built" status lines above stand; this adds what the reviews of 320a and
+320c asked for.
+- **The diagnosis scripts** are in `tools/image-converter/` (`ref_layers.py`,
+  `ref_vision.py`), with the invocations above.
+- **Per layer, teacher-forced** (AC 3's diagnosis): see the table's section in
+  320a; the earlier cumulative reading is withdrawn.
+- **The artifact is identified** by its size and its header's identity (model
+  id and weights id) against `thresholds.json`, not by the sha256 it records:
+  hashing 16.7 GB on every run is not worth it, and the weights id names the
+  checkpoint's revision. A different artifact is a skip (a failure under the
+  profile).
+- **The per-image ceiling is 1,230 merged tokens**, not 1,032 (the defaults
+  above). The vendor patch's tests now reach T 49,200 on the five patch-rate
+  shapes and T 12,300 on the mergers' fc2 (the patch record is refreshed). A
+  call over 131,072 patches is refused up front, and
+  `ignis_image_vision_workspace_bytes` returns 0 for a size the forward
+  refuses.
+- **Tests added:** the ten-image run's segments equal the one-image run's
+  merger and DeepStack rows bit for bit (real weights, T 40,960); the CTest
+  taps pin DeepStack 1 and 2 (blocks 16/17 and 24/25); `TextEncoderWeights`
+  reads a full `qwen_image::bind`'s handles and `VisionWeights::new` refuses a
+  geometry or head count the leaf does not run (`crates/core/tests/
+  image_weights_cpu.rs`, on a `CpuDevice`); the text config parse refuses
+  `attention_bias: true`.
