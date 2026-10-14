@@ -1,0 +1,99 @@
+{
+ "recorded": "2026-10-14T01:58:58+00:00",
+ "torch": "2.13.0+cu130",
+ "diffusers": "0.41.0",
+ "device": "cpu, torch.set_num_threads(1)",
+ "oracle": "diffusers.models.autoencoders.autoencoder_kl_qwenimage21: QwenImage21AvgDown3D, QwenImage21DupUp3D(first_chunk=True), QwenImage21Upsample(nearest-exact 2x), one frame",
+ "cases": [
+  {
+   "name": "avg_96_96_t1_s2",
+   "kind": 0,
+   "in": 96,
+   "out": 96,
+   "factor_t": 1,
+   "factor_s": 2,
+   "height": 4,
+   "width": 6
+  },
+  {
+   "name": "avg_96_192_t2_s2",
+   "kind": 0,
+   "in": 96,
+   "out": 192,
+   "factor_t": 2,
+   "factor_s": 2,
+   "height": 4,
+   "width": 6
+  },
+  {
+   "name": "avg_192_384_t2_s2",
+   "kind": 0,
+   "in": 192,
+   "out": 384,
+   "factor_t": 2,
+   "factor_s": 2,
+   "height": 4,
+   "width": 6
+  },
+  {
+   "name": "avg_384_768_t2_s2",
+   "kind": 0,
+   "in": 384,
+   "out": 768,
+   "factor_t": 2,
+   "factor_s": 2,
+   "height": 4,
+   "width": 6
+  },
+  {
+   "name": "avg_768_768_t1_s1",
+   "kind": 0,
+   "in": 768,
+   "out": 768,
+   "factor_t": 1,
+   "factor_s": 1,
+   "height": 2,
+   "width": 3
+  },
+  {
+   "name": "dup_1152_1152_t2_s2",
+   "kind": 1,
+   "in": 1152,
+   "out": 1152,
+   "factor_t": 2,
+   "factor_s": 2,
+   "height": 2,
+   "width": 3
+  },
+  {
+   "name": "dup_1152_576_t2_s2",
+   "kind": 1,
+   "in": 1152,
+   "out": 576,
+   "factor_t": 2,
+   "factor_s": 2,
+   "height": 2,
+   "width": 3
+  },
+  {
+   "name": "dup_576_288_t1_s2",
+   "kind": 1,
+   "in": 576,
+   "out": 288,
+   "factor_t": 1,
+   "factor_s": 2,
+   "height": 2,
+   "width": 3
+  },
+  {
+   "name": "upsample_8",
+   "kind": 2,
+   "in": 8,
+   "out": 8,
+   "factor_t": 1,
+   "factor_s": 2,
+   "height": 3,
+   "width": 5
+  }
+ ]
+}

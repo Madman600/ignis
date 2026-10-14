@@ -31,6 +31,87 @@ practice: those kernels and their host-pointer surfaces are deleted by
 GitHub #39, and their replacements are vendored under the manifest. A port
 claim that is not a manifest entry is not a port claim.
 
+## Adapted ops (ADR 0051)
+
+An adapted op is our code containing parts copied from a named upstream: ours
+to change, no parity claim, tested against our own fp64 references. Each file
+header names the upstream repo, commit, path and licence; this section lists
+the same. Only MIT, BSD or Apache-2.0 code is copied (never CUTLASS 3.x, never
+FlashInfer's `csrc/fmha_v2`).
+
+### `kernel/src/image/attn8.cu` (spec image-model/02 acceptance 4, GitHub #319)
+The image model's 8-bit DiT attention kernel (`ignis_image_attn`).
+- Upstream: `thu-ml/SageAttention`, commit
+  `d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5`, Apache-2.0, "Copyright (c) 2024
+  by SageAttention team": `csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh` (the kernel's
+  structure and pipeline) and `csrc/qattn/attn_utils.cuh` (the online softmax,
+  the P fragment packing, the masks, the MMA row sum).
+- Through SageAttention: `csrc/permuted_smem.cuh`, `csrc/cp_async.cuh` and
+  `csrc/mma.cuh`, which say "Adapted from Flashinfer"
+  (`flashinfer-ai/flashinfer` v0.1.5 `include/flashinfer/{permuted_smem,
+  cp_async,mma}.cuh`, "Copyright (c) 2023 by FlashInfer team", Apache-2.0):
+  the shared-memory swizzles, cp.async and ldmatrix. They now live in
+  `kernel/src/image/attn_smem.cuh`, whose header gives the same chain, and
+  the encoder attention below uses them too, as does the VAE convolution
+  (`kernel/src/image/vae_conv.cu`, otherwise our own: spec image-model/02
+  acceptance 6).
+- Changed here: torch removed, one geometry (D = 128, 32 heads), FP32
+  accumulation on `kind::mxf8f6f4`, the row sum of the E4M3 P, two K/V runs
+  with a per-channel rescale, causal aligned bottom-right. The file header
+  lists the changes.
+
+The quantizers beside it (`kernel/src/image/attn8_quant.cu`) and the layout
+header (`attn8_layout.cuh`) are our own; they follow SageAttention2's scheme
+and V layout, with nothing copied.
+
+### `kernel/src/image/encoder_attn.cu` (spec image-model/02 acceptance 5, GitHub #319)
+The image model's encoder attention (`ignis_image_encoder_attn`): the text
+encoder's causal GQA 32/8 attention, FlashAttention-2's forward.
+- Upstream: `Dao-AILab/flash-attention` v2.8.3, commit
+  `060c9188beec3a8b62b33a3bfa6d5d2d44975fab`, BSD-3-Clause, "Copyright (c)
+  2022, the respective contributors, as shown by the AUTHORS file. All rights
+  reserved." (the files say "Copyright (c) 2024, Tri Dao", and `utils.h` and
+  `flash_fwd_launch_template.h` "Copyright (c) 2023, Tri Dao"):
+  - `csrc/flash_attn/src/flash_fwd_kernel.h`: `compute_attn_1rowblock`, the
+    walk over key blocks from the last one down and its load order;
+  - `softmax.h`: the online softmax's operation forms (`softmax_rescale_o`,
+    `scale_apply_exp2`, `normalize_softmax_lse`);
+  - `mask.h`: the causal limit;
+  - `utils.h`: the S accumulator reused as P V's A fragment;
+  - `flash_fwd_launch_template.h`: the 64 × 64 causal tile for consumer SMs.
+- FlashAttention-2 is CuTe code, which is CUTLASS 3.x, and nothing of CUTLASS
+  3.x is copied. The kernel takes FA2's structure and its operation forms;
+  CuTe's tensors, tiled copies and tiled MMAs are replaced by explicit
+  `mma.sync`, `ldmatrix` and `cp.async` (`image_mma.cuh`, `attn_smem.cuh`).
+- Changed here: one geometry (BF16, GQA 32/8, D = 128, one sequence); no
+  dropout, ALiBi, softcap, window, paging, split-KV, LSE output or c10; the
+  row sum of the BF16-rounded P; Q, K and V zero-filled past the sequence;
+  causal CTAs launched heaviest first. The file header lists the changes.
+- FlashAttention's licence, whose conditions apply to the parts taken:
+
+  > Redistribution and use in source and binary forms, with or without
+  > modification, are permitted provided that the following conditions are
+  > met: (1) Redistributions of source code must retain the above copyright
+  > notice, this list of conditions and the following disclaimer.
+  > (2) Redistributions in binary form must reproduce the above copyright
+  > notice, this list of conditions and the following disclaimer in the
+  > documentation and/or other materials provided with the distribution.
+  > (3) Neither the name of the copyright holder nor the names of its
+  > contributors may be used to endorse or promote products derived from this
+  > software without specific prior written permission.
+  >
+  > THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+  > IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+  > THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+  > PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+  > CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+  > EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+  > PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+  > PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+  > LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+  > NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+  > SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 ## Per-file provenance (pre-#42 adaptations, superseded by ADR 0010)
 
 ### `kernel/src/nvfp4_gemm_decode.cuh` (ticket 03)

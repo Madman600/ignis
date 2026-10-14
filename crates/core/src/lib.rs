@@ -52,6 +52,16 @@ pub mod gqa_layer;
 pub mod gpu_profile;
 pub mod host;
 pub mod hq_ring;
+#[cfg(feature = "cuda")]
+pub mod image_attn;
+#[cfg(feature = "cuda")]
+pub mod image_dit;
+#[cfg(feature = "cuda")]
+pub mod image_encoder_attn;
+#[cfg(feature = "cuda")]
+pub mod image_gemm;
+#[cfg(feature = "cuda")]
+pub mod image_vae;
 pub mod identity;
 pub mod kv;
 pub mod kv_format;
