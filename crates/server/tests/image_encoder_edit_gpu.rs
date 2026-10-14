@@ -293,10 +293,19 @@ fn fixtures() -> Option<(Reader, PathBuf, serde_json::Value)> {
         return None;
     }
     let thresholds: serde_json::Value = serde_json::from_slice(&std::fs::read(oracle.join("thresholds.json")).unwrap()).unwrap();
-    // The bound was measured on this artifact: its size stands in for the sha256 thresholds.json records.
-    let bytes = std::fs::metadata(&artifact).unwrap().len();
-    assert_eq!(Some(bytes), thresholds["artifact"]["bytes"].as_u64(), "{} is not the artifact thresholds.json was measured on", artifact.display());
-    Some((Reader::open(&artifact).expect("the artifact opens"), oracle, thresholds))
+    let reader = Reader::open(&artifact).expect("the artifact opens");
+    // The bound was measured on this artifact. The sha256 thresholds.json records would read all 16.7
+    // GB each run: the size and the header's identity (model id, weights id) say it is the same pack.
+    let recorded = &thresholds["artifact"];
+    let identity = reader.identity();
+    if Some(reader.file_bytes()) != recorded["bytes"].as_u64()
+        || Some(identity.model_id.as_str()) != recorded["identity"]["model_id"].as_str()
+        || Some(identity.weights_id.as_str()) != recorded["identity"]["weights_id"].as_str()
+    {
+        gpu_profile::skip_or_fail(&format!("the edit encoder: {} is not the artifact thresholds.json was measured on", artifact.display()));
+        return None;
+    }
+    Some((reader, oracle, thresholds))
 }
 
 /// The real condition image: `condition.png` decoded to RGBA8, checked against the VAE's input
@@ -458,6 +467,27 @@ fn a_ten_image_edit_encodes_and_its_wall_time_is_printed() {
     let Some(mut encoded) = encoder.encode(&inputs, 3) else { return };
     encoded.front_ms = front_ms;
     assert!(encoded.on.iter().all(|v| v.is_finite()), "a non-finite output");
+    // The segments are independent: the ten identical images' tower rows are the one-image run's, ten
+    // times over, bit for bit (real weights at T 40,960, past where the vendor cases stop at 4,096).
+    let first = frontend.input(case["case"]["prompt"].as_str().unwrap(), &images[..1]).expect("the front end, one image");
+    let first = Inputs {
+        ids: first.input_ids,
+        positions: first.positions,
+        pad_rows: first.image_pad_rows,
+        images: first.images.into_iter().map(|v| (v.grid, v.pixels)).collect(),
+    };
+    let Some(single) = encoder.encode(&first, 1) else { return };
+    for (name, ten, one) in [
+        ("merger", &encoded.embeds, &single.embeds),
+        ("deepstack0", &encoded.deep[0], &single.deep[0]),
+        ("deepstack1", &encoded.deep[1], &single.deep[1]),
+        ("deepstack2", &encoded.deep[2], &single.deep[2]),
+    ] {
+        assert_eq!(ten.len(), one.len() * image_vision::MAX_SEGMENTS as usize, "{name}: ten segments' rows");
+        for (segment, rows) in ten.chunks(one.len()).enumerate() {
+            assert!(rows == &one[..], "{name}: segment {segment}'s rows are not the one-image run's, bit for bit");
+        }
+    }
     let patches: u64 = inputs.images.iter().map(|(g, _)| g.raw_patches()).sum();
     println!(
         "ten images: {} tokens ({} image pads, {patches} patches); front end {:.1} ms (CPU), tower {:.2} ms, text encoder {:.2} ms (warm medians of 3); \
