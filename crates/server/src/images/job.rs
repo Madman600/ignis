@@ -231,13 +231,15 @@ pub fn spawn<E: From<JobEvent> + Send + 'static>(model: ImageModel, job: ImageJo
     });
 }
 
-/// `image` composited on white, alpha 255: each colour `(c·a + 255·(255 −
-/// a) + 127) / 255`, the blend rounded to the nearest byte.
+/// `image` composited on white, alpha 255: each colour blended as the
+/// encoder flattens a condition image
+/// ([`crate::image_encoder_input::blend_on_white`]), `(c·a + 255·(255 − a))
+/// / 255` rounded to the nearest byte.
 pub fn on_white(image: &mut RgbaImage) {
     for px in image.pixels.chunks_exact_mut(4) {
-        let alpha = u32::from(px[3]);
+        let alpha = px[3];
         for colour in &mut px[..3] {
-            *colour = ((u32::from(*colour) * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
+            *colour = crate::image_encoder_input::blend_on_white(*colour, alpha);
         }
         px[3] = 255;
     }
@@ -360,6 +362,17 @@ mod tests {
         // (200·128 + 255·127 + 127) / 255 = 227.9, (255·127 + 127) / 255 =
         // 127.5, (100·128 + 255·127 + 127) / 255 = 177.7, each truncated.
         assert_eq!(pixel.pixels, [227, 127, 177, 255]);
+        // Every colour at every alpha: the nearest byte, which is also the
+        // encoder's copy of a condition image (one blend for both).
+        let every: Vec<u8> = (0..=255u8).flat_map(|alpha| (0..=255u8).flat_map(move |colour| [colour, colour, colour, alpha])).collect();
+        let mut image = RgbaImage { size: ImageSize::new(256, 256), pixels: every.clone() };
+        on_white(&mut image);
+        for (px, after) in every.chunks_exact(4).zip(image.pixels.chunks_exact(4)) {
+            let (c, a) = (u32::from(px[0]), u32::from(px[3]));
+            assert_eq!(u32::from(after[0]), (c * a + 255 * (255 - a) + 127) / 255, "colour {c} at alpha {a}");
+        }
+        let encoder = crate::image_encoder_input::on_white(&every);
+        assert!(image.pixels.chunks_exact(4).zip(encoder.chunks_exact(3)).all(|(px, rgb)| px[..3] == *rgb), "the encoder's blend");
     }
 
     /// AC 7: a closed model stops the job between steps, a request gone

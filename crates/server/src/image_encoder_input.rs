@@ -254,11 +254,17 @@ impl ImageProcessor {
 /// the pipeline flattens it (Pillow's `paste` with the alpha as mask:
 /// `BLEND` and `DIV255` of `Paste.c`, exact for every value and alpha).
 pub fn on_white(rgba: &[u8]) -> Vec<u8> {
-    let blend = |v: u8, a: u32| {
-        let t = 255 * (255 - a) + v as u32 * a + 128;
-        (((t >> 8) + t) >> 8) as u8
-    };
-    rgba.chunks_exact(4).flat_map(|px| [blend(px[0], px[3] as u32), blend(px[1], px[3] as u32), blend(px[2], px[3] as u32)]).collect()
+    rgba.chunks_exact(4).flat_map(|px| [blend_on_white(px[0], px[3]), blend_on_white(px[1], px[3]), blend_on_white(px[2], px[3])]).collect()
+}
+
+/// One colour `value` at `alpha` over white, as [`on_white`] flattens it:
+/// `(value · alpha + 255 · (255 − alpha)) / 255` rounded to the nearest byte
+/// (`DIV255`). An image answered `background: opaque` is composited by it
+/// too (`images::job::on_white`).
+pub fn blend_on_white(value: u8, alpha: u8) -> u8 {
+    let a = u32::from(alpha);
+    let t = 255 * (255 - a) + u32::from(value) * a + 128;
+    (((t >> 8) + t) >> 8) as u8
 }
 
 // Ported from PyTorch 2.13.0, aten/src/ATen/native/cpu/UpSampleKernel.cpp
