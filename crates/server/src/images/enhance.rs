@@ -133,7 +133,15 @@ pub async fn rewrite(server: &Server, prompt: &str, images: &[RgbaImage], seed: 
             "prompt enhancement: {enhancer} has no vision tower loaded, so it rewrote the edit's prompt without seeing its condition images"
         ));
     }
-    let messages = task.messages(prompt, if sees { images } else { &[] });
+    // An edit's images are PNG-encoded off the async workers.
+    let messages = if sees {
+        let (prompt, images) = (prompt.to_owned(), images.to_vec());
+        tokio::task::spawn_blocking(move || task.messages(&prompt, &images))
+            .await
+            .map_err(|panicked| format!("encoding the condition images for {enhancer} panicked: {panicked}"))?
+    } else {
+        task.messages(prompt, &[])
+    };
     let thinking = ThinkingOptions { enable_thinking: false, ..ThinkingOptions::default() };
     let limits = server.live();
     let params = crate::api::SamplingRequestFields::default().resolve(Some(limits.image.prompt_enhancer_max_tokens), false, false, Some(seed))?;

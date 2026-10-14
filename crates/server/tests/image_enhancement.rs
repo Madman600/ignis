@@ -29,6 +29,9 @@ use tower::ServiceExt;
 mod switch_support;
 use switch_support::{source, MockLoader};
 
+#[path = "support/media.rs"]
+mod media_support;
+
 /// The image model's served id: its family's own.
 const IMAGE: &str = "ignis-image-2.1-turbo";
 
@@ -448,14 +451,8 @@ async fn a_failing_enhancer_falls_back_to_the_prompt_as_sent_with_a_warning() {
     assert_eq!((loader.loads(), loader.encoded_prompts()), (vec![IMAGE.to_owned()], vec!["engine fault".to_owned()]));
 }
 
-/// An edit's enhancer with no vision tower rewrites the instruction from its
-/// text alone, and the answer says so beside the rewrite.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_edit_rewritten_without_a_vision_tower_says_so() {
-    let loader = MockLoader::new();
-    let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]);
-    enhancing_with(&server, "mock-a");
-    let app = server.app();
+/// An enhanced edit naming the image model, with one 64x64 condition image.
+fn enhanced_edit() -> Request<Body> {
     const BOUNDARY: &str = "ignis-enhancement-boundary";
     let image = ignis_core::image::RgbaImage { size: ignis_core::image::ImageSize::new(64, 64), pixels: vec![90; 64 * 64 * 4] };
     let png = ignis_server::images::job::encode_png(&image);
@@ -466,18 +463,63 @@ async fn an_edit_rewritten_without_a_vision_tower_says_so() {
     body.extend(format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n").bytes());
     body.extend_from_slice(&png);
     body.extend(format!("\r\n--{BOUNDARY}--\r\n").bytes());
-    let request = Request::builder()
+    Request::builder()
         .method(Method::POST)
         .uri("/v1/images/edits")
         .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={BOUNDARY}"))
         .body(Body::from(body))
-        .unwrap();
-    let response = app.clone().oneshot(request).await.unwrap();
+        .unwrap()
+}
+
+/// An edit's enhancer with no vision tower rewrites the instruction from its
+/// text alone, and the answer says so beside the rewrite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_rewritten_without_a_vision_tower_says_so() {
+    let loader = MockLoader::new();
+    let server = implicit_on(&loader, "mock-a", &["mock-a", IMAGE]);
+    enhancing_with(&server, "mock-a");
+    let response = server.app().oneshot(enhanced_edit()).await.unwrap();
     let status = response.status();
     let answer: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(status, StatusCode::OK, "{answer}");
     assert!(answer["data"][0]["revised_prompt"].is_string(), "{answer}");
     let warning = answer["warnings"][0].as_str().unwrap_or_default();
     assert!(warning.contains("no vision tower") && warning.contains("without seeing its condition images"), "{answer}");
+    assert_eq!(loader.loads(), [IMAGE]);
+}
+
+/// An edit's enhancer with a vision tower is shown the condition images —
+/// PNG-encoded off the async workers (review-322cf L6) — before the
+/// instruction, and the answer has nothing to say of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_rewritten_with_a_vision_tower_shows_it_the_images() {
+    let loader = MockLoader::new();
+    let compute = Arc::new(MockCompute::new());
+    let limits = ignis_artifact::vision::ProcessorOptions {
+        min_pixels: 32 * 32,
+        max_pixels: 128 * 128,
+        max_encoded_media_bytes: 256 << 20,
+        max_decoded_pixels: 1 << 24,
+        max_raw_patches: 1 << 17,
+        max_vision_tokens: 1 << 15,
+    };
+    let acquirer = ignis_server::media::MediaAcquirer::new(
+        Arc::new(media_support::processor(limits.clone())),
+        limits,
+        ignis_server::media::MediaPolicy::new(false, 0),
+    );
+    let server = Server::from_active(loader.model_over("mock-a", Arc::clone(&compute) as _))
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_known_models(known(&["mock-a", IMAGE])))
+        .with_media(Arc::new(acquirer));
+    enhancing_with(&server, "mock-a");
+    let response = server.app().oneshot(enhanced_edit()).await.unwrap();
+    let status = response.status();
+    let answer: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer["data"][0]["revised_prompt"].is_string(), "{answer}");
+    assert!(answer.get("warnings").is_none(), "{answer}");
+    let rewrites = prefilled(&compute);
+    assert_eq!(rewrites.len(), 1, "one rewrite");
+    assert!(rewrites[0].1.contains(&ignis_artifact::vision::IMAGE_PAD_ID), "the rewrite saw the condition image");
     assert_eq!(loader.loads(), [IMAGE]);
 }
