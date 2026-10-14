@@ -314,7 +314,7 @@ users.
 ```
 podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
   -v /path/to/models:/models \
-  ghcr.io/gpillon/ignis:0.1.2 --download-path /models
+  ghcr.io/gpillon/ignis:latest --download-path /models
 ```
 
 (`docker`: `--gpus all` in place of `--device`.) With no model in that

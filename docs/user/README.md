@@ -26,9 +26,9 @@ it serves, and what it reports. The project overview is the
 ### The container image
 
 A `v*` tag publishes a `linux/amd64` image to `ghcr.io/gpillon/ignis`, tagged
-with the version. The image carries the CUDA runtime but no driver: the host's
-NVIDIA driver is injected by the container runtime, and the model is mounted,
-never baked in.
+with the version and `latest`. The image carries the CUDA runtime but no
+driver: the host's NVIDIA driver is injected by the container runtime, and the
+model is mounted, never baked in.
 
 Every push to `main` also publishes the image as `ghcr.io/gpillon/ignis:develop`
 (and a rolling `develop` prerelease on the Releases page holding the matching
@@ -39,7 +39,7 @@ push, replaced by the next one, and never tagged `latest` or with a version.
 podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
   -v /path/to/models:/models:ro \
   -e IGNIS_MODEL_ARTIFACT=/models/qwen3_8_27b_nvfp4full-v2.ninfer \
-  ghcr.io/gpillon/ignis:0.1.2
+  ghcr.io/gpillon/ignis:latest
 ```
 
 (`docker`: `--gpus all` in place of `--device`.) Every flag has an `IGNIS_*`
@@ -54,14 +54,14 @@ directory and point the download at it to keep what it fetches:
 ```
 podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
   -v /path/to/models:/models \
-  ghcr.io/gpillon/ignis:0.1.2 --download-path /models
+  ghcr.io/gpillon/ignis:latest --download-path /models
 ```
 
 To smoke-test the image with no GPU and no model — the deterministic CPU mock
 ([ADR 0006](../adr/0006-exclusive-gpu-testing.md)) — say so:
 
 ```
-podman run --rm -p 8000:8000 ghcr.io/gpillon/ignis:0.1.2 --download-enabled false
+podman run --rm -p 8000:8000 ghcr.io/gpillon/ignis:latest --download-enabled false
 ```
 
 `Containerfile` builds the same thing locally (`podman build -t ignis:dev .`).
