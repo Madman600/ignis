@@ -29,6 +29,7 @@ use serde_json::Value as JsonValue;
 use ignis_artifact::vision::layout::{assign_positions, IMAGE, TEXT};
 use ignis_artifact::vision::{smart_resize, Grid, MERGE, PATCH, PATCH_FEATURES, TEMPORAL};
 use ignis_artifact::{ChatTemplate, Reader, Tokenizer};
+use ignis_core::image::ImageSize;
 
 use crate::image_prompt::ImagePrompt;
 
@@ -101,6 +102,30 @@ impl EncoderFrontend {
         let image_pad_rows = (0..).zip(&input_ids).filter(|&(_, &id)| id == pad).map(|(row, _)| row).collect();
         Ok(EncoderInput { input_ids, drop_idx: self.prompt.drop_idx(), image_pad_rows, positions, images })
     }
+
+    /// What [`EncoderFrontend::input`] builds for `prompt` with condition
+    /// images of `sizes`, counted without preparing an image: the template
+    /// tokenized once, and each image at a condition size (sides multiples of
+    /// 32, which the processor keeps) a pad per 2 x 2 of its latent cells.
+    pub fn count(&self, prompt: &str, sizes: &[ImageSize]) -> Result<ConditionCount, String> {
+        let text = self.prompt.rows(prompt, sizes.len())?.saturating_sub(sizes.len()) as u64;
+        let cells: u64 = sizes.iter().map(|size| size.latent_cells() as u64).sum();
+        let pads = cells / 4;
+        Ok(ConditionCount { encoder_rows: text + pads, pads, prefix: text.saturating_sub(self.prompt.drop_idx() as u64) + cells })
+    }
+}
+
+/// A condition's shape, as [`EncoderFrontend::count`] counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConditionCount {
+    /// The encoder's sequence: the template's tokens, each image's pads
+    /// expanded.
+    pub encoder_rows: u64,
+    /// Its image pads, one per merged token of the vision tower.
+    pub pads: u64,
+    /// The condition prefix (spec image-model/04): the text rows from
+    /// `drop_idx` on, and each image's latent cells.
+    pub prefix: u64,
 }
 
 /// The Qwen3-VL image processor, from the artifact's `image_model.json`
@@ -404,6 +429,40 @@ mod tests {
                 assert!((sum - (1 << precision)).abs() <= weights.len() as i32, "{input}->{output} at {first}: {sum}");
                 assert!(first + weights.len() <= input);
             }
+        }
+    }
+
+    /// The count the server fits condition images by (`ImageRunner::condition_tokens`) is the one
+    /// the leaf refuses by: the input this front end builds, laid out as the leaf lays it out
+    /// (`PrefixLayout`), for text-to-image, empty and literal prompts, and one to three images.
+    #[test]
+    fn the_count_is_the_condition_prefix_the_leaf_lays_out() {
+        use ignis_core::image_leaf::PrefixLayout;
+        let frontend = EncoderFrontend { prompt: crate::image_prompt::tests::prompt(), processor: ImageProcessor { min_pixels: 1, ..processor() } };
+        let cases: [(&str, Vec<ImageSize>); 5] = [
+            ("a red fox in the snow", vec![]),
+            ("", vec![]),
+            ("make it {} blue <image1>", vec![ImageSize::new(64, 64)]),
+            ("the two together", vec![ImageSize::new(96, 64), ImageSize::new(64, 128)]),
+            ("x", vec![ImageSize::new(32, 32), ImageSize::new(128, 32), ImageSize::new(64, 96)]),
+        ];
+        for (prompt, sizes) in cases {
+            let pixels: Vec<Vec<u8>> = sizes.iter().map(|s| vec![200; (s.width * s.height * 4) as usize]).collect();
+            let images: Vec<ConditionImage> =
+                sizes.iter().zip(&pixels).map(|(s, rgba)| ConditionImage { width: s.width, height: s.height, rgba }).collect();
+            let input = frontend.input(prompt, &images).unwrap();
+            let shapes: Vec<(u32, u32)> = sizes.iter().map(|s| (s.height / 16, s.width / 16)).collect();
+            let layout = PrefixLayout::new(input.input_ids.len(), input.drop_idx, &input.image_pad_rows, &shapes).unwrap();
+            let count = frontend.count(prompt, &sizes).unwrap();
+            assert_eq!(
+                count,
+                ConditionCount {
+                    encoder_rows: input.input_ids.len() as u64,
+                    pads: input.image_pad_rows.len() as u64,
+                    prefix: u64::from(layout.tokens),
+                },
+                "{prompt:?} with {sizes:?}"
+            );
         }
     }
 

@@ -110,6 +110,12 @@ impl ImagePrompt {
         template.replacen("{}", prompt, 1)
     }
 
+    /// The rows of `prompt` with `images` condition images before the pads are
+    /// expanded: the raw template tokenized, one pad a slot.
+    pub fn rows(&self, prompt: &str, images: usize) -> Result<usize, String> {
+        Ok(self.tokenizer.encode(&self.text(prompt, images)).map_err(|e| e.to_string())?.len())
+    }
+
     /// The token ids of `prompt` with condition images of `image_tokens`
     /// merged tokens each: the raw template tokenized, each slot's pad
     /// repeated for its image. A prompt that writes an image pad itself is
@@ -133,7 +139,7 @@ impl ImagePrompt {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A word-level tokenizer with the template's special tokens split out
@@ -160,7 +166,8 @@ mod tests {
         {%- for content in message.content %}{{- content.text }}{%- endfor %}{{- '<|im_end|>\n' }}{%- endfor %}
         {%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- endif %}";
 
-    fn prompt() -> ImagePrompt {
+    /// The checkpoint's templates over a word-level tokenizer.
+    pub(crate) fn prompt() -> ImagePrompt {
         let system = "Comprehend and analyze the provided prompt.";
         let json = serde_json::json!({
             "system": system,
