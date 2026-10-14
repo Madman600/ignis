@@ -215,6 +215,11 @@ pub fn on_white(rgba: &[u8]) -> Vec<u8> {
     rgba.chunks_exact(4).flat_map(|px| [blend(px[0], px[3] as u32), blend(px[1], px[3] as u32), blend(px[2], px[3] as u32)]).collect()
 }
 
+// Ported from PyTorch 2.13.0, aten/src/ATen/native/cpu/UpSampleKernel.cpp
+// (BSD-style licence, quoted in NOTICE), not copied verbatim: `resize_bicubic`,
+// `convolve`, `cubic` and `int16_weights` restate its antialiased uint8 path
+// in Rust.
+
 /// torchvision's `resize(BICUBIC, antialias=True)` of a uint8 RGB image:
 /// ATen's separable antialiased filter (Keys cubic, a = −0.5) in integer
 /// arithmetic, a horizontal pass into a uint8 intermediate, then a vertical

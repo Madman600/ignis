@@ -113,6 +113,8 @@ Where the CPU front end chose what the sections above leave open.
   - `positions` (i32, axis-major (3, L), the oracle's layout);
   - `images`: per condition image its `grid` and f32 `pixel_values`, rows
     of 1536. The 27B's tower reads BF16; the rounding is the uploader's.
+    So `EncoderInput.images` holds f32 pixels until then: about 25 MB for
+    a 1024² image (4,096 rows), about 250 MB for 10.
 - **drop_idx.** `ChatTemplate::render` always adds the generation prompt, so
   the system message is the render less `<|im_start|>assistant\n`: 14
   tokens. The load refuses templates that do not open with it, or that lack
@@ -132,7 +134,9 @@ Where the CPU front end chose what the sections above leave open.
   uint8, which runs ATen's integer path: Keys cubic a = −0.5, separable,
   horizontal then vertical through a uint8 intermediate, the f64 weights
   scaled to int16 at the largest precision that fits. The 27B's resize is
-  ninfer's float filter, a different one.
+  ninfer's float filter, a different one. The filter is ported from PyTorch
+  2.13.0's `aten/src/ATen/native/cpu/UpSampleKernel.cpp` (BSD-style, quoted
+  in the root `NOTICE`), restated in Rust rather than copied.
 - **Normalize.** The processor fuses rescale and normalize:
   `(v − mean/r) / (std/r)` in f32, with `mean/r` and `std/r` taken in f32
   (127.5 here).
@@ -158,7 +162,10 @@ Where the CPU front end chose what the sections above leave open.
     9:16.
 - **The fixture.** `crates/server/tests/fixtures/image_encoder_input.json`
   (107 kB) comes from `tools/image-converter/record_encoder_input.py`
-  (command in its docstring), run in the venv on the pinned processor. It
+  (command in its docstring), run in the venv on the pinned processor: its
+  `recipe.versions` record diffusers 0.41.0, transformers 5.17.0, torch
+  2.13.0+cu130, torchvision 0.28.0+cu130, Pillow 12.3.0 and numpy 2.5.3, on
+  snapshot `fc13ba19` (`Qwen2VLImageProcessor`, CPU capability AVX2). It
   calls the pipeline's own `_get_qwen_prompt_embeds` with a tiny seeded
   text encoder, hooking its inputs and its rotary embedding's positions. It
   covers:
