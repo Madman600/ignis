@@ -1,5 +1,5 @@
 //! The image leaf on the real artifact against spec 01's recordings (spec image-model/04, GitHub
-//! #321): acceptance 1, 2, 3 at 1024² and 2048², 4, 5 and 7.
+//! #321): acceptance 1, 2, 3 at 1024² and 2048², 4, 5, 6, 7, 8 and 9.
 //!
 //! - **Load and plan (AC 1).** The family loads from the artifact (`ImageLeaf::load`: the full
 //!   bind, the text encoder, the vision tower and the DiT's descriptors, the arena) and prints its
@@ -23,6 +23,19 @@
 //! - **The diagnosis (AC 5).** The residual stream after blocks 0, 15 and 31 beside the recorded
 //!   ones, no threshold: the prefix's rows after `encode_condition` against step 0's first rows,
 //!   step 0's target rows against the rest of step 0's dumps, step 1's against step 1's.
+//! - **VAE decode (AC 6).** `vae_decode` of each case's recorded final latents (step 7's output)
+//!   against the recorded `image.png` (diffusers' fp32 decode), at least 40 dB PSNR per channel,
+//!   alpha included. At 1024² the arena's banded decode equals the unbanded one bit for bit; at
+//!   2048² the decode runs in the arena, and two band heights give the same image bit for bit.
+//! - **n = 3, release and cancel (AC 8).** One condition, three images (the second from other
+//!   noise, the third from the first's noise: the same bytes as the first, so the prefix outlived
+//!   the image between them unchanged); then a job cancelled after three steps. Releasing each leaves
+//!   the device's free memory where it was before the job, measured.
+//! - **Free run, for the eye (AC 9).** Each case end to end from its noise file: encode_condition,
+//!   the 8 steps on the leaf's own latents, vae_decode; the PNG goes to
+//!   `$IGNIS_IMAGE_FREERUN/<case>/ignis.png` (else `F:/ai/models/ignis-image-2.1-turbo/freerun`),
+//!   beside a copy of diffusers' fp32 `image.png`. Its PSNR and the final latents' distance from
+//!   the recorded ones are printed, no threshold.
 //!
 //! The artifact is `$IGNIS_IMAGE_ARTIFACT`, else
 //! `F:/ai/models/ignis-image-2.1-turbo/ignis_image_2_1_turbo-v2.ninfer`; the oracle
@@ -399,4 +412,264 @@ fn the_edit_steps_are_within_the_oracle_bound() {
     assert_eq!(condition.blocks(), &[(8, (64, 64))], "the condition image's block");
     assert_eq!(condition.prefix_chunk(), None, "a 4122-token prefix runs whole");
     teacher_forced(&mut leaf, &dir, &thresholds, "edit", &case, condition, prefix_taps, encode_s);
+}
+
+fn read_case(dir: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(dir.join("case.json")).unwrap()).unwrap()
+}
+
+/// A case's target, (height, width) in latent tokens: the last of `img_shapes`.
+fn target_shape(case: &serde_json::Value) -> (u32, u32) {
+    let last = case["img_shapes"].as_array().unwrap().last().unwrap();
+    (last[1].as_u64().unwrap() as u32, last[2].as_u64().unwrap() as u32)
+}
+
+/// A case's noise file, packed (`packed[y * w + x][c] = noise[c][y][x]`).
+fn packed_noise(dir: &Path, h: u32, w: u32) -> Vec<f32> {
+    let target = (h * w) as usize;
+    let noise = npy_f32(&dir.join("noise.npy"), &[1, 64, h as usize, w as usize]);
+    (0..target * 64).map(|i| noise[(i % 64) * target + i / 64]).collect()
+}
+
+/// A case's condition through `encode_condition`: ignis's encoder on the recorded sequence, and
+/// for the edit case the recorded tower input and the VAE input's bytes, as AC 4 builds it.
+fn encode_case(leaf: &mut ImageLeaf, dir: &Path) -> Option<Condition> {
+    let case = read_case(dir);
+    let drop = case["drop_idx"].as_u64().unwrap() as usize;
+    let (ids, positions) = recorded_sequence(dir);
+    if !dir.join("condition_vae_input.npy").is_file() {
+        let text = ConditionText { input_ids: &ids, positions: &positions, drop_idx: drop, image_pad_rows: &[] };
+        return ran(leaf.encode_condition(&text, &[]), "encode_condition");
+    }
+    let types = i64s(&load_npy(&dir.join("mm_token_type_ids.npy")).1);
+    let pad_rows: Vec<u32> = (0..).zip(types).filter(|&(_, t)| t == 1).map(|(r, _)| r).collect();
+    let grid_thw = i64s(&load_npy(&dir.join("image_grid_thw.npy")).1);
+    let grid = Grid { t: grid_thw[0] as u32, h: grid_thw[1] as u32, w: grid_thw[2] as u32 };
+    let pixels = f32s(&load_npy(&dir.join("pixel_values.npy")).1);
+    let (width, height, rgba) = condition_rgba(dir);
+    let image = ConditionImage { grid, pixels: &pixels, width, height, rgba: &rgba };
+    let text = ConditionText { input_ids: &ids, positions: &positions, drop_idx: drop, image_pad_rows: &pad_rows };
+    ran(leaf.encode_condition(&text, &[image]), "encode_condition")
+}
+
+/// An 8-bit RGBA PNG's width, height and pixels.
+fn read_png(path: &Path) -> (u32, u32, Vec<u8>) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut pixels = vec![0u8; reader.output_buffer_size().expect("a PNG frame that fits")];
+    let info = reader.next_frame(&mut pixels).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!((info.color_type, info.bit_depth), (png::ColorType::Rgba, png::BitDepth::Eight), "{} is 8-bit RGBA", path.display());
+    pixels.truncate(info.buffer_size());
+    (info.width, info.height, pixels)
+}
+
+fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().unwrap().write_image_data(rgba).unwrap();
+    }
+    std::fs::write(path, out).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
+/// The PSNR of RGBA8 `got` against `want` per channel (R, G, B, A), in dB: infinite where they are
+/// equal.
+fn psnr(got: &[u8], want: &[u8]) -> [f64; 4] {
+    assert_eq!(got.len(), want.len());
+    let mut se = [0f64; 4];
+    for (i, (a, b)) in got.iter().zip(want).enumerate() {
+        se[i % 4] += (*a as f64 - *b as f64).powi(2);
+    }
+    let pixels = (got.len() / 4) as f64;
+    se.map(|s| if s == 0.0 { f64::INFINITY } else { 10.0 * (255.0f64.powi(2) / (s / pixels)).log10() })
+}
+
+/// The bytes where two decodes differ.
+fn mismatches(a: &[u8], b: &[u8]) -> usize {
+    assert_eq!(a.len(), b.len());
+    a.iter().zip(b).filter(|(x, y)| x != y).count()
+}
+
+#[test]
+#[ignore = "GPU: run under scripts/gpu-profile.ps1"]
+fn the_vae_decode_of_the_final_latents_is_the_recorded_png() {
+    let Some((reader, oracle, _)) = fixtures() else { return };
+    let Some(mut leaf) = load(&reader) else { return };
+    // The decode reads the image slot alone: one text condition serves every case's shape.
+    let Some(condition) = encode_case(&mut leaf, &oracle.join("t2i")) else { return };
+    let mut low = Vec::new();
+    for name in ["t2i", "edit", "t2i-2k"] {
+        let dir = oracle.join(name);
+        let (h, w) = target_shape(&read_case(&dir));
+        let last = leaf.sampler().steps() - 1;
+        let latents = npy_f32(&dir.join(format!("step{last}/latents_out.npy")), &[1, (h * w) as usize, 64]);
+        if ran(leaf.start_image(&condition, h, w, &packed_noise(&dir, h, w)), "start_image").is_none()
+            || ran(leaf.set_latents(&latents), "set_latents").is_none()
+        {
+            return;
+        }
+        let Some(free) = ran(leaf.device_free_bytes(), "the free memory") else { return };
+        let t = Instant::now();
+        let Some(rgba) = ran(leaf.vae_decode(), "vae_decode") else { return };
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let Some(free_after) = ran(leaf.device_free_bytes(), "the free memory") else { return };
+        assert_eq!(free_after, free, "{name}: vae_decode allocates nothing (it runs in the arena)");
+        let (pw, ph, want) = read_png(&dir.join("image.png"));
+        assert_eq!((pw, ph), (16 * w, 16 * h), "{name}: the recorded image's size");
+        let db = psnr(&rgba, &want);
+        let Some((_, planned)) = ran(leaf.vae_decode_in_bands(16 * h), "the band plan") else { return };
+        println!(
+            "{name}: vae_decode {}x{} in bands of {planned} rows, {ms:.0} ms (the first at this size): PSNR R {:.2} G {:.2} B {:.2} A {:.2} dB against \
+             diffusers' fp32 image.png",
+            16 * w,
+            16 * h,
+            db[0],
+            db[1],
+            db[2],
+            db[3]
+        );
+        if db.iter().any(|&d| d < 40.0) {
+            low.push(name);
+        }
+        if name == "t2i" {
+            // The unbanded decode needs ~2.4 GB, more than the arena: its workspace is allocated for the call.
+            let Some((unbanded, _)) = ran(leaf.vae_decode_in_bands(16 * h), "the unbanded decode") else { return };
+            assert!(planned < 16 * h, "the arena's 1024² decode runs in bands ({planned} rows)");
+            assert_eq!(mismatches(&rgba, &unbanded), 0, "t2i: the decode in {planned}-row bands equals the unbanded one bit for bit");
+        }
+        if name == "t2i-2k" {
+            let other = (planned / 2).div_ceil(16) * 16;
+            let Some((half, _)) = ran(leaf.vae_decode_in_bands(other), "the decode in other bands") else { return };
+            assert_eq!(mismatches(&rgba, &half), 0, "t2i-2k: the decode in {planned}-row bands equals the one in {other}-row bands bit for bit");
+        }
+    }
+    ran(leaf.release_condition(condition), "release_condition");
+    assert!(low.is_empty(), "the cases {low:?} decode below 40 dB in a channel");
+}
+
+#[test]
+#[ignore = "GPU: run under scripts/gpu-profile.ps1"]
+fn a_job_of_three_images_and_a_cancelled_job_leave_the_device_memory_where_it_was() {
+    let Some((reader, oracle, _)) = fixtures() else { return };
+    let Some(mut leaf) = load(&reader) else { return };
+    let (t2i, edit) = (oracle.join("t2i"), oracle.join("edit"));
+    let (h, w) = target_shape(&read_case(&t2i));
+    assert_eq!(target_shape(&read_case(&edit)), (h, w), "the edit case's noise fits the t2i target");
+    let (a, b) = (packed_noise(&t2i, h, w), packed_noise(&edit, h, w));
+    let steps = leaf.sampler().steps();
+
+    // A first job, one step and a decode: the process's first launch of a kernel loads its module
+    // (CUDA's lazy loading), device memory that stays. Measured: 2 MiB here, none with
+    // CUDA_MODULE_LOADING=EAGER. The jobs after it launch no new kernel.
+    let Some(first) = ran(leaf.device_free_bytes(), "the free memory") else { return };
+    let Some(condition) = encode_case(&mut leaf, &t2i) else { return };
+    if ran(leaf.start_image(&condition, h, w, &a), "start_image").is_none()
+        || ran(leaf.denoise_step(&condition, 0), "denoise_step").is_none()
+        || ran(leaf.vae_decode(), "vae_decode").is_none()
+    {
+        return;
+    }
+    ran(leaf.release_condition(condition), "release_condition");
+    let Some(before) = ran(leaf.device_free_bytes(), "the free memory") else { return };
+    println!(
+        "the first job: {} bytes less free after its release (kernel modules loaded at first launch; CUDA_MODULE_LOADING={})",
+        first as i64 - before as i64,
+        std::env::var("CUDA_MODULE_LOADING").unwrap_or_else(|_| "unset, lazy".into())
+    );
+
+    // n = 3: one prefix, three images, the third from the first's noise.
+    let Some(condition) = encode_case(&mut leaf, &t2i) else { return };
+    let Some(held) = ran(leaf.device_free_bytes(), "the free memory") else { return };
+    let mut images = Vec::new();
+    for noise in [&a, &b, &a] {
+        if ran(leaf.start_image(&condition, h, w, noise), "start_image").is_none() {
+            return;
+        }
+        for step in 0..steps {
+            if ran(leaf.denoise_step(&condition, step), "denoise_step").is_none() {
+                return;
+            }
+        }
+        let Some(rgba) = ran(leaf.vae_decode(), "vae_decode") else { return };
+        images.push(rgba);
+    }
+    assert_eq!(
+        mismatches(&images[0], &images[2]),
+        0,
+        "the third image, from the first's noise, is the first's bytes: the prefix outlived the image between unchanged"
+    );
+    assert!(mismatches(&images[0], &images[1]) > 0, "the second image, from other noise, differs");
+    ran(leaf.release_condition(condition), "release_condition");
+    let Some(after) = ran(leaf.device_free_bytes(), "the free memory") else { return };
+    println!(
+        "n = 3: free {before} bytes before the job, {held} with its prefix ({:.1} MiB), {after} after release_condition",
+        (before - held) as f64 / (1u64 << 20) as f64
+    );
+    assert_eq!(after, before, "n = 3: release_condition leaves the device's memory where it was before the job");
+
+    // A job cancelled between denoising steps 2 and 3: its prefix released there.
+    let Some(condition) = encode_case(&mut leaf, &t2i) else { return };
+    if ran(leaf.start_image(&condition, h, w, &a), "start_image").is_none() {
+        return;
+    }
+    for step in 0..3 {
+        if ran(leaf.denoise_step(&condition, step), "denoise_step").is_none() {
+            return;
+        }
+    }
+    ran(leaf.release_condition(condition), "release_condition");
+    let Some(cancelled) = ran(leaf.device_free_bytes(), "the free memory") else { return };
+    println!("cancelled after 3 steps: free {cancelled} bytes after release_condition");
+    assert_eq!(cancelled, before, "a cancelled job's release leaves the device's memory where it was before the job");
+}
+
+#[test]
+#[ignore = "GPU: run under scripts/gpu-profile.ps1"]
+fn each_case_runs_free_from_its_noise_file() {
+    let Some((reader, oracle, _)) = fixtures() else { return };
+    let Some(mut leaf) = load(&reader) else { return };
+    let out = machine_local("IGNIS_IMAGE_FREERUN", "F:/ai/models/ignis-image-2.1-turbo/freerun");
+    let steps = leaf.sampler().steps();
+    for name in ["t2i", "t2i-2k", "edit"] {
+        let dir = oracle.join(name);
+        let (h, w) = target_shape(&read_case(&dir));
+        let t = Instant::now();
+        let Some(condition) = encode_case(&mut leaf, &dir) else { return };
+        let encode_ms = t.elapsed().as_secs_f64() * 1e3;
+        if ran(leaf.start_image(&condition, h, w, &packed_noise(&dir, h, w)), "start_image").is_none() {
+            return;
+        }
+        let t = Instant::now();
+        for step in 0..steps {
+            if ran(leaf.denoise_step(&condition, step), "denoise_step").is_none() {
+                return;
+            }
+        }
+        let steps_ms = t.elapsed().as_secs_f64() * 1e3;
+        let Some(latents) = ran(leaf.latents(), "latents") else { return };
+        assert!(latents.iter().all(|v| v.is_finite()), "{name}: a non-finite latent");
+        let recorded = npy_f32(&dir.join(format!("step{}/latents_out.npy", steps - 1)), &[1, (h * w) as usize, 64]);
+        let t = Instant::now();
+        let Some(rgba) = ran(leaf.vae_decode(), "vae_decode") else { return };
+        let decode_ms = t.elapsed().as_secs_f64() * 1e3;
+        ran(leaf.release_condition(condition), "release_condition");
+        let case_out = out.join(name);
+        write_png(&case_out.join("ignis.png"), 16 * w, 16 * h, &rgba);
+        std::fs::copy(dir.join("image.png"), case_out.join("diffusers-fp32.png")).unwrap();
+        let (_, _, want) = read_png(&dir.join("image.png"));
+        let db = psnr(&rgba, &want);
+        println!(
+            "{name} free run: {} ({encode_ms:.0} ms encode_condition, {steps_ms:.0} ms for {steps} steps, {decode_ms:.0} ms vae_decode); final latents \
+             {:.2}% from diffusers' fp32 run; PSNR against its image R {:.2} G {:.2} B {:.2} A {:.2} dB (information)",
+            case_out.join("ignis.png").display(),
+            rel_l2(&latents, &recorded) * 100.0,
+            db[0],
+            db[1],
+            db[2],
+            db[3]
+        );
+    }
 }

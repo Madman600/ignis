@@ -1059,6 +1059,7 @@ name = "ignis-core"
 version = "0.6.2"
 dependencies = [
  "ignis-artifact",
+ "png",
  "regex",
  "serde_json",
  "sha2",
