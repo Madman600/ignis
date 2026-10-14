@@ -86,6 +86,12 @@ will not overwrite a patched file unless it is told to.
 A patch is admitted for one of two reasons, and its `reason` says which: a
 measured bottleneck (ADR 0031), or a demonstrated correctness bug (ADR 0037),
 in which case the `reason` also names the test that fails without the patch.
+One patch has neither reason and says so: the W8 dispatch's arms for the
+image model's vision tower (`src/ops/linear/w8/w8_dispatch.cpp` and its test
+cases, spec image-model/03, GitHub #320), a registry extension sanctioned as
+that ticket's one vendor edit. Its `reason` names the new problems and the
+test cases that throw without it; whether such extensions become a third
+standing reason is the owner's call.
 
 ### Ignis-patched behaviours
 
@@ -201,6 +207,9 @@ P1-10 (GitHub #46) vendors the BF16 and W8G32 linear families:
   launch table spans geometries beyond this model's own (it is the
   reference's one dispatcher for the whole W8 family), so the family is
   vendored whole rather than picking out only the shapes G1 needs.
+  `w8_dispatch.cpp` is **patched** (and `tests/ops/linear/test_w8_a16.cpp`,
+  below): the six W8 problems of the image model's vision tower, see the
+  patch policy above.
 - **their reference op tests** — `tests/ops/linear/test_bf16_a16.cpp` +
   `tests/ops/direct_bf16_weight.h`, and `tests/ops/linear/test_w8_a16.cpp` +
   `tests/ops/linear/linear_test_common.{h,cpp}` + `tests/ops/quantized_weight.h`,

@@ -467,17 +467,35 @@ pub struct QwenImagePlan {
     pub handles: BTreeMap<String, ObjectHandle>,
 }
 
-/// Bind a Qwen-Image artifact: every frontend resource and every inventory
-/// tensor is required with its exact format, layout and shape (a missing one
-/// is refused by name), placed by its role, and any object the inventory does
-/// not name fails the bind (ADR 0002).
-pub fn bind(reader: &Reader, geometry: &QwenImageGeometry) -> Result<QwenImagePlan> {
+/// Refuses an artifact whose identity is not this family's.
+fn require_family(reader: &Reader) -> Result<()> {
     if reader.identity().model_id != MODEL_ID {
         return Err(fail(format!(
             "artifact model_id {} is not a Qwen-Image-2.1 artifact ({MODEL_ID})",
             reader.identity().model_id
         )));
     }
+    Ok(())
+}
+
+/// Requires `entry`'s tensor with its exact format, layout and shape and
+/// places it by its role.
+fn require_entry(binder: &mut Binder, entry: Entry, handles: &mut BTreeMap<String, ObjectHandle>) -> Result<()> {
+    let handle = binder.require_tensor(&entry.name, entry.format, entry.layout, &entry.shape)?;
+    match entry.role {
+        Role::Device => binder.materialize_on_device(handle)?,
+        Role::Host => binder.retain_tensor_on_host(handle)?,
+    }
+    handles.insert(entry.name, handle);
+    Ok(())
+}
+
+/// Bind a Qwen-Image artifact: every frontend resource and every inventory
+/// tensor is required with its exact format, layout and shape (a missing one
+/// is refused by name), placed by its role, and any object the inventory does
+/// not name fails the bind (ADR 0002).
+pub fn bind(reader: &Reader, geometry: &QwenImageGeometry) -> Result<QwenImagePlan> {
+    require_family(reader)?;
     let mut binder = Binder::new(reader);
     let mut handles = BTreeMap::new();
     for file in FRONTEND_FILES {
@@ -487,14 +505,48 @@ pub fn bind(reader: &Reader, geometry: &QwenImageGeometry) -> Result<QwenImagePl
         handles.insert(name, handle);
     }
     for entry in entries(geometry) {
-        let handle = binder.require_tensor(&entry.name, entry.format, entry.layout, &entry.shape)?;
-        match entry.role {
-            Role::Device => binder.materialize_on_device(handle)?,
-            Role::Host => binder.retain_tensor_on_host(handle)?,
-        }
-        handles.insert(entry.name, handle);
+        require_entry(&mut binder, entry, &mut handles)?;
     }
     Ok(QwenImagePlan { plan: binder.finish()?, handles })
+}
+
+/// The text encoder's config resource: the checkpoint's
+/// `text_encoder/config.json` verbatim (eps, rope theta, mrope section).
+pub const TEXT_ENCODER_CONFIG: &str = "frontend/text_encoder_config.json";
+
+/// Bind the text encoder alone (spec image-model/03): its config resource
+/// and every `text_encoder/` tensor, each with its exact format, layout and
+/// shape and placed by its role. A scoped bind ([`Binder::plan`]): the
+/// vision tower, the DiT, the VAE and the other resources are left alone,
+/// for a test or tool that runs the encoder without the rest.
+pub fn bind_text_encoder(reader: &Reader, geometry: &TextEncoderGeometry) -> Result<QwenImagePlan> {
+    require_family(reader)?;
+    let mut binder = Binder::new(reader);
+    let mut handles = BTreeMap::new();
+    let config = binder.require_resource(TEXT_ENCODER_CONFIG, ResourceEncoding::RawBytesV1)?;
+    binder.retain_on_host(config)?;
+    handles.insert(TEXT_ENCODER_CONFIG.to_string(), config);
+    for entry in text_entries(geometry) {
+        require_entry(&mut binder, entry, &mut handles)?;
+    }
+    Ok(QwenImagePlan { plan: binder.plan(), handles })
+}
+
+/// Bind the vision tower alone (spec image-model/03, GitHub #320): the
+/// config resource (its `vision_config` names the DeepStack taps) and every
+/// `vision/` tensor, the merger's and the DeepStack mergers' among them, as
+/// [`bind_text_encoder`] binds the text model's. A scoped bind.
+pub fn bind_vision(reader: &Reader, geometry: &VisionGeometry) -> Result<QwenImagePlan> {
+    require_family(reader)?;
+    let mut binder = Binder::new(reader);
+    let mut handles = BTreeMap::new();
+    let config = binder.require_resource(TEXT_ENCODER_CONFIG, ResourceEncoding::RawBytesV1)?;
+    binder.retain_on_host(config)?;
+    handles.insert(TEXT_ENCODER_CONFIG.to_string(), config);
+    for entry in vision_entries(geometry) {
+        require_entry(&mut binder, entry, &mut handles)?;
+    }
+    Ok(QwenImagePlan { plan: binder.plan(), handles })
 }
 
 #[cfg(test)]

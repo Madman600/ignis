@@ -56,12 +56,14 @@ pub mod hq_ring;
 pub mod image_attn;
 #[cfg(feature = "cuda")]
 pub mod image_dit;
+pub mod image_encoder;
 #[cfg(feature = "cuda")]
 pub mod image_encoder_attn;
 #[cfg(feature = "cuda")]
 pub mod image_gemm;
 #[cfg(feature = "cuda")]
 pub mod image_vae;
+pub mod image_vision;
 pub mod identity;
 pub mod kv;
 pub mod kv_format;

@@ -856,3 +856,27 @@ add_test(NAME ignis_kernel_image_elementwise_rope_oracle_test
 add_executable(ignis_image_elementwise_bench bench_image_elementwise.cu)
 target_include_directories(ignis_image_elementwise_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_image_elementwise_bench PRIVATE ignis_kernel ignis_vendor)
+
+# --- the image model's text encoder (spec image-model/03, GitHub #320): OURS ----------------------
+#
+# Its three ops (kernel/include/ignis_image_encoder.h) against fp64 references that track their
+# roundings -- the residual add with the RMSNorm and its E4M3 output, the QK RMSNorm with the
+# interleaved mrope on three different position rows (with two layouts as negative controls), the
+# vision rows -- and the forward on synthetic FP8 weights: the vision hooks against the same
+# additions made on the host between one-layer calls, bit for bit. The real model against the
+# oracle is the Rust test crates/core/tests/image_encoder_gpu.rs. GPU (ADR 0006: no
+# SKIP_RETURN_CODE).
+add_executable(ignis_kernel_image_encoder_test test_image_encoder.cu)
+target_include_directories(ignis_kernel_image_encoder_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_image_encoder_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_image_encoder_test COMMAND ignis_kernel_image_encoder_test)
+# The vision tower (kernel/include/ignis_image_vision.h: the 27B's tower program with the image
+# model's parameters) on synthetic W8G32 weights: the merger and the three DeepStack mergers against
+# fp64 that tracks the BF16 stores (with the norm placements swapped as negative controls), the
+# DeepStack taps' blocks, two images in one call against each alone (bit for bit), the refusals.
+# The real tower against transformers is the Rust test
+# crates/server/tests/image_encoder_edit_gpu.rs. GPU (ADR 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_image_vision_test test_image_vision.cu)
+target_include_directories(ignis_kernel_image_vision_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_image_vision_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_image_vision_test COMMAND ignis_kernel_image_vision_test)
