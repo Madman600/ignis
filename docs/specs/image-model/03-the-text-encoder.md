@@ -258,7 +258,7 @@ the hooks they fill are below.
     which the BF16 output's rounding sets.
     - Two wrong layouts fail as negative controls. The axes in chunks
       [24 | 20 | 20] put 63-65% of the outputs over the bound; adjacent
-      pairs (2i, 2i + 1) put 87-90% over.
+      pairs (2i, 2i + 1) put 89-92% over.
     - The t2i case cannot tell the layouts apart (its three position rows
       are equal), so this is the only check of the axes until AC 4;
   - **the rows**, written over and added, exactly, an index past the
@@ -285,20 +285,31 @@ the hooks they fill are below.
   - **Per layer**, against transformers' text model run layer by layer in
     fp32 on the CPU, on the checkpoint's bf16 weights
     (`.scratch/320a/ref/ref_layers.py`). That reference's last layer is
-    within 1.1e-5 of the oracle per row, so it is the oracle's computation.
-    - Over the text rows from row 1: 2.4% after layer 0, 3.0-4.9% through
+    within 1.1e-5 of the oracle per row, so it reproduces the oracle's
+    computation.
+    - Over the text rows from row 1: 2.4% after layer 0, 2.6-5.4% through
       layer 33, then 5.9% and 9.6% after layers 34 and 35.
     - Row 0: 2.4-4.5% through layer 33, then 21.6% and 28.8%.
-    - The growth is smooth, with no step; the last two layers carry most of
-      it, as they do for the yardsticks.
+    - No layer before the last adds more than 0.6 points to the text rows;
+      layer 35 adds 3.7, and the last two carry most of row 0's.
     - The test prints this table when `IGNIS_IMAGE_ENCODER_LAYERS` names the
       reference's directory.
 - **AC 7, t2i.** The GPU lock in normal mode, nothing else on the card; wall
   clock around the forward's launches and a stream sync.
-  - **The forward: 21.7 ms** for 36 layers on 45 tokens, the median of 5
-    warm runs (min 21.7 ms; the first run 22.1 ms).
+  - **The forward: 21.6-22.0 ms** for 36 layers on 45 tokens, the median
+    of 5 warm runs, measured four times (t2i and t2i-2k, two runs of the
+    test; min 21.6 ms; a first run 21.9-22.4 ms).
   - The host's embedding rows and uploads: 1-2 ms. The text encoder's
-    6.47 GiB materialize in 4.4 s from a warm page cache.
-  - At 45 tokens the GEMM is SM-bound: its 128-token tile gives 4 to 48
-    CTAs on 170 SMs, each computing a full tile. A split-K or a narrower
-    token tile would help; neither was built (speed is information here).
+    6.47 GiB materialize in 4.1-4.4 s from a warm page cache.
+  - At 45 tokens the GEMM is likely SM-bound (an estimate, not profiled):
+    its 128-token tile gives 4 to 48 CTAs on 170 SMs, each computing a full
+    tile. A split-K or a narrower token tile would help; neither was built
+    (speed is information here).
+- **Gates** (5a6790c and this section): `kernel/build.ps1 -Test` with
+  `IGNIS_GPU_PROFILE=1`, 121 of 122. The one failure,
+  `ignis_kernel_residency_trace_test` (Flash-Next residency, four eviction
+  checks; nothing here touches it), passed in three direct runs and in
+  `ctest -R residency` (5 of 5). The Rust `image_encoder_gpu` tests pass
+  under the profile (2 of 2). `CARGO_INCREMENTAL=0 cargo test --workspace`:
+  2,857 passed, 0 failed, 6 ignored. `cargo check -p ignis-server --features
+  cuda --tests` passes (one earlier warning, in `openapi.rs`).
