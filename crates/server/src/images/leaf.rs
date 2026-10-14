@@ -49,6 +49,28 @@ pub fn max_target_cells(sizes: &[ImageSize], cap: u32) -> usize {
     sizes.iter().map(|size| size.latent_cells()).filter(|&cells| cells <= cap).max().unwrap_or(cap)
 }
 
+/// The image leaf's plan at load (spec image-model/04 §Load and plan) as
+/// one `ignis.image.plan` event, as the text models' plans are: the VRAM
+/// budget and its mode, what it holds — the weights, the arena (sized for
+/// `max_target_cells`), the condition budget in tokens and bytes — the
+/// memory free at start and the load's time; its message the plan's line.
+pub fn log_plan(plan: &ignis_core::image_leaf::ImagePlan, max_target_cells: usize, load_s: f64) {
+    tracing::info!(
+        name: "ignis.image.plan",
+        mode = plan.mode.as_str(),
+        free_at_start_bytes = plan.free_at_start_bytes,
+        budget_bytes = plan.budget_bytes,
+        weights_bytes = plan.weights_bytes,
+        arena_bytes = plan.arena_bytes,
+        condition_budget_tokens = plan.condition_budget_tokens,
+        condition_budget_bytes = plan.condition_budget_bytes,
+        max_target_cells,
+        load_s,
+        "{}",
+        plan.line()
+    );
+}
+
 /// The joint sequence a target starts over, for the leaf's RoPE rule
 /// (`ignis_core::image_dit::rope_positions`, which `ImageLeaf::start_image`
 /// runs): a prefix of `prefix` tokens with condition images of `images`
@@ -199,7 +221,9 @@ mod device {
                 prefix_chunk: None,
             };
             let dev = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
+            let start = std::time::Instant::now();
             let leaf = ImageLeaf::load(&reader, dev, &options).map_err(|e| e.to_string())?;
+            super::log_plan(leaf.plan(), max_target, start.elapsed().as_secs_f64());
             let sampler = leaf.sampler();
             let plan = ImagePlan {
                 condition_budget_tokens: leaf.plan().condition_budget_tokens,
@@ -427,6 +451,41 @@ mod tests {
         assert_eq!((tokens, starts, shapes), (4123, vec![26, 4122], vec![(64, 64), (1, 1)]));
         let (_, starts, shapes) = target_rope_layout(9 + 2048 + 64, &[ImageSize::new(512, 1024), ImageSize::new(128, 128)]);
         assert_eq!((starts, shapes), (vec![9, 9 + 2048, 9 + 2048 + 64], vec![(64, 32), (8, 8), (1, 1)]));
+    }
+
+    /// Review-321d L3: the load's plan is one `ignis.image.plan` event, its
+    /// bytes and tokens as fields, as the text models' plans are; its
+    /// message is the plan's line.
+    #[test]
+    fn the_plan_is_one_named_event_with_its_bytes() {
+        const GIB: u64 = 1 << 30;
+        let plan = ignis_core::image_leaf::ImagePlan {
+            mode: ignis_core::VramMode::Derived { headroom_bytes: 4 * GIB },
+            free_at_start_bytes: 31 * GIB,
+            budget_bytes: 27 * GIB,
+            weights_bytes: 13 * GIB,
+            arena_bytes: 3 * GIB,
+            condition_budget_tokens: 45_184,
+            condition_budget_bytes: 11 * GIB,
+        };
+        use tracing_subscriber::layer::SubscriberExt;
+        let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+        let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+        tracing::subscriber::with_default(subscriber, || log_plan(&plan, 16_800, 9.5));
+        let records: Vec<serde_json::Value> = sink.lines().iter().map(|line| serde_json::from_str(line).expect("json")).collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let event = &records[0];
+        assert_eq!(event["event_name"], "ignis.image.plan", "{event}");
+        let field = |name: &str| event.get(name).or_else(|| event["attributes"].get(name)).cloned().unwrap_or_else(|| panic!("no `{name}` in {event}"));
+        assert_eq!(field("budget_bytes"), 27 * GIB);
+        assert_eq!(field("weights_bytes"), 13 * GIB);
+        assert_eq!(field("arena_bytes"), 3 * GIB);
+        assert_eq!(field("condition_budget_tokens"), 45_184);
+        assert_eq!(field("condition_budget_bytes"), 11 * GIB);
+        assert_eq!(field("free_at_start_bytes"), 31 * GIB);
+        assert_eq!(field("max_target_cells"), 16_800);
+        assert_eq!(field("mode"), plan.mode.as_str());
+        assert!(event.to_string().contains(&plan.line()), "the plan's line: {event}");
     }
 
     /// A target is whole latent cells, a value a channel a cell.

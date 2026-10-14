@@ -410,7 +410,8 @@ impl ImagePlan {
         })
     }
 
-    /// The plan line the load prints: weights, arena and condition budget.
+    /// The plan's line: weights, arena and condition budget. The server's load prints it as the
+    /// message of its `ignis.image.plan` event, the bytes as its fields.
     pub fn line(&self) -> String {
         format!(
             "image plan: weights {:.2} GiB, arena {:.2} GiB, condition budget {} tokens ({:.2} GiB); budget {:.2} GiB of \
@@ -916,7 +917,6 @@ mod device {
             })
             .map_err(ImageLeafError::Plan)?;
 
-            let start = Instant::now();
             let mut artifact = materialize(reader, &bound.plan, &mut dev, None).map_err(|e| failed("materialize")(e.to_string()))?;
             let built = (|| -> Result<_, ImageLeafError> {
                 let resource = |name: &str| artifact.resource_bytes(bound.handles[name]).map_err(|e| failed(name)(e.to_string()));
@@ -951,7 +951,6 @@ mod device {
                     return Err(failed("the arena")(e.to_string()));
                 }
             };
-            tracing::info!(load_s = start.elapsed().as_secs_f64(), "{}", plan.line());
             Ok(Self {
                 artifact,
                 embed_tokens: bound.handles["text_encoder/embed_tokens.weight"],
