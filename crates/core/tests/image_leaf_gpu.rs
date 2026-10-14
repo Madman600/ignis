@@ -277,3 +277,49 @@ fn t2i_case(leaf: &mut ImageLeaf, oracle: &Path, thresholds: &serde_json::Value,
     ran(leaf.release_condition(condition), "release_condition");
     assert!(over.is_empty(), "{name}: steps {over:?} are over their velocity bound");
 }
+
+/// The edit case's condition image as RGBA8 bytes, from the recorded VAE input (`[1][4][1][h][w]`,
+/// the pipeline's `2 (u / 255) - 1` of the bytes): each value's byte, checked to map back exactly.
+fn condition_rgba(dir: &Path) -> (u32, u32, Vec<u8>) {
+    let (shape, planes) = load_npy(&dir.join("condition_vae_input.npy"));
+    assert_eq!((shape.len(), shape[1], shape[2]), (5, 4, 1), "condition_vae_input is [1][4][1][h][w]");
+    let (h, w) = (shape[3], shape[4]);
+    let planes = f32s(&planes);
+    let rgba: Vec<u8> = (0..h * w * 4)
+        .map(|i| {
+            let v = planes[(i % 4) * h * w + i / 4];
+            let u = ((v + 1.0) / 2.0 * 255.0).round() as u8;
+            assert_eq!(2.0f32 * (u as f32 / 255.0f32) - 1.0f32, v, "the VAE input's value {v} is not a byte's");
+            u
+        })
+        .collect();
+    (w as u32, h as u32, rgba)
+}
+
+#[test]
+#[ignore = "GPU: run under scripts/gpu-profile.ps1"]
+fn the_edit_condition_image_encodes_within_the_oracle_bound() {
+    let Some((reader, oracle, thresholds)) = fixtures() else { return };
+    let dir = oracle.join("edit");
+    let Some(mut leaf) = load(&reader) else { return };
+    // AC 7: the VAE encode of the condition image against the recorded (fp32) condition latents.
+    let (width, height, rgba) = condition_rgba(&dir);
+    let tokens = (width / 16 * height / 16) as usize;
+    let want = npy_f32(&dir.join("condition_latents.npy"), &[1, tokens, 64]);
+    let start = Instant::now();
+    let Some(got) = ran(leaf.vae_encode(width, height, &rgba), "vae_encode") else { return };
+    let ms = start.elapsed().as_secs_f64() * 1e3;
+    assert!(got.iter().all(|v| v.is_finite()), "a non-finite latent");
+    let yard = &thresholds["cases"]["edit"]["condition_latents"];
+    let (bound, bf16) = (yard["bound"].as_f64().unwrap(), yard["bf16_error"].as_f64().unwrap());
+    let err = rel_l2(&got, &want);
+    println!(
+        "edit: vae_encode of the {width} x {height} condition image: {:.3}% against the recorded condition latents (bound {:.3}% = 5 x bf16's \
+         {:.3}%; {:.2} x bf16) in {ms:.1} ms (first call)",
+        err * 100.0,
+        bound * 100.0,
+        bf16 * 100.0,
+        err / bf16
+    );
+    assert!(err <= bound, "edit: the condition latents' error {:.3}% is over the bound {:.3}%", err * 100.0, bound * 100.0);
+}

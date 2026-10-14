@@ -113,6 +113,49 @@ pub fn euler_step(latents: &mut [f32], velocity: &[f32], sigma: f32, sigma_next:
     }
 }
 
+/// The pipeline's latent normalization (`image_model.json`'s `latents_mean` and `latents_std`, the
+/// VAE config's): the DiT reads a condition image's latents as `(z − mean) / std`, per channel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatentNorm {
+    /// Per channel, each the f32 of the config's number (`torch.tensor` of the Python list).
+    pub mean: Vec<f32>,
+    pub std: Vec<f32>,
+}
+
+impl LatentNorm {
+    /// Reads the two lists, `channels` finite numbers each, every std positive.
+    pub fn parse(image_model_json: &[u8], channels: usize) -> Result<Self, String> {
+        let json: serde_json::Value =
+            serde_json::from_slice(image_model_json).map_err(|e| format!("image_model.json is not JSON: {e}"))?;
+        let list = |key: &str| -> Result<Vec<f32>, String> {
+            json.get(key)
+                .and_then(|v| v.as_array())
+                .ok_or(format!("image_model.json has no {key}"))?
+                .iter()
+                .map(|v| v.as_f64().map(|x| x as f32).filter(|x| x.is_finite()).ok_or(format!("a {key} entry is not a finite number")))
+                .collect()
+        };
+        let (mean, std) = (list("latents_mean")?, list("latents_std")?);
+        if mean.len() != channels || std.len() != channels {
+            return Err(format!("image_model.json has {} latents_mean and {} latents_std, the VAE has {channels} channels", mean.len(), std.len()));
+        }
+        if !std.iter().all(|&s| s > 0.0) {
+            return Err("a latents_std entry is not positive".into());
+        }
+        Ok(Self { mean, std })
+    }
+
+    /// Packed latents `[tokens][channels]`, in place: `(z − mean) / std`, the difference rounded,
+    /// then the quotient, as the pipeline's fp32 path computes them.
+    pub fn normalize(&self, latents: &mut [f32]) {
+        let channels = self.mean.len();
+        for (i, z) in latents.iter_mut().enumerate() {
+            let c = i % channels;
+            *z = (*z - self.mean[c]) / self.std[c];
+        }
+    }
+}
+
 /// What the image leaf's load knows before it allocates anything but its weights.
 pub struct ImagePlanRequest<'a> {
     pub mode: VramMode,
@@ -267,7 +310,8 @@ mod device {
     use ignis_artifact::qwen_image::{self, QwenImageGeometry};
     use ignis_artifact::{materialize, CudaDevice, Device, DeviceBuffer, MaterializedArtifact, ObjectHandle, Reader};
 
-    use super::{ImagePlan, ImagePlanError, ImagePlanRequest, Sampler, MAX_TARGET_TOKENS};
+    use super::{ImagePlan, ImagePlanError, ImagePlanRequest, LatentNorm, Sampler, MAX_TARGET_TOKENS};
+    use crate::image_autoencoder::{self as autoencoder, VaeConfig, VaeEncoderWeights};
     use crate::image_encoder::{self, embed_rows, TextEncoderConfig, TextEncoderWeights};
     use crate::image_transformer::{self as transformer, ffi as tffi, TransformerConfig, TransformerWeights};
     use crate::image_vision::{VisionTowerConfig, VisionWeights};
@@ -443,6 +487,27 @@ mod device {
         }
     }
 
+    /// `vae_encode`'s phase of the sequential region, from where it starts: the input image (BF16
+    /// NHWC RGBA), the latents (fp32), then the encoder's workspace.
+    struct VaePhase {
+        input: u64,
+        latents: u64,
+        workspace: u64,
+        workspace_bytes: u64,
+        bytes: u64,
+    }
+
+    impl VaePhase {
+        fn new(geometry: &ignis_artifact::qwen_image::VaeGeometry, width: u32, height: u32) -> Self {
+            let pixels = width as u64 * height as u64;
+            let input = 0;
+            let latents = input + align(pixels * 4 * 2);
+            let workspace = latents + align(pixels / 256 * LATENT as u64 * 4);
+            let workspace_bytes = autoencoder::encode_workspace_bytes(geometry, height, width);
+            Self { input, latents, workspace, workspace_bytes, bytes: workspace + workspace_bytes }
+        }
+    }
+
     fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
         unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     }
@@ -460,7 +525,9 @@ mod device {
         text: TextEncoderWeights,
         vision: VisionWeights,
         transformer: TransformerWeights,
+        vae: VaeEncoderWeights,
         sampler: Sampler,
+        latent_norm: LatentNorm,
         plan: ImagePlan,
         layout: Layout,
         arena: Option<DeviceBuffer>,
@@ -510,13 +577,17 @@ mod device {
                 let transformer_config =
                     TransformerConfig::parse(resource(qwen_image::TRANSFORMER_CONFIG)?, &geometry.dit).map_err(failed("the transformer config"))?;
                 let sampler = Sampler::parse(resource(qwen_image::IMAGE_MODEL)?).map_err(failed("the sampler"))?;
+                let latent_norm =
+                    LatentNorm::parse(resource(qwen_image::IMAGE_MODEL)?, geometry.vae.z_dim as usize).map_err(failed("the latent normalization"))?;
+                VaeConfig::parse(resource(qwen_image::VAE_CONFIG)?, &geometry.vae).map_err(failed("the VAE config"))?;
                 let text = TextEncoderWeights::new(&artifact, &bound.handles, &geometry.text, text_config).map_err(failed("the text encoder"))?;
                 let vision = VisionWeights::new(&artifact, &bound.handles, &geometry.vision, &tower_config).map_err(failed("the vision tower"))?;
                 let transformer = TransformerWeights::new(&artifact, &bound.handles, &geometry.dit, transformer_config).map_err(failed("the DiT"))?;
+                let vae = VaeEncoderWeights::new(&artifact, &bound.handles, &geometry.vae).map_err(failed("the VAE encoder"))?;
                 image_gemm::prepare().map_err(failed("image_gemm::prepare"))?;
-                Ok((text, vision, transformer, sampler))
+                Ok((text, vision, transformer, vae, sampler, latent_norm))
             })();
-            let (text, vision, transformer, sampler) = match built {
+            let (text, vision, transformer, vae, sampler, latent_norm) = match built {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = artifact.release_arena(&mut dev);
@@ -537,7 +608,9 @@ mod device {
                 text,
                 vision,
                 transformer,
+                vae,
                 sampler,
+                latent_norm,
                 plan,
                 layout,
                 arena: Some(arena),
@@ -778,6 +851,52 @@ mod device {
             Ok(tapped)
         }
 
+        /// `vae_encode` (spec image-model/04): an RGBA8 image (`[height][width][4]`, row-major, sides
+        /// multiples of 16) to its condition latents as the DiT reads them, packed fp32 `[height / 16
+        /// · width / 16][64]` (token `y · w + x`), normalized. It runs in the sequential region.
+        pub fn vae_encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<f32>, ImageLeafError> {
+            let seq = self.layout.seq;
+            self.vae_latents(width, height, rgba, seq)
+        }
+
+        /// The VAE encode with its phase from arena offset `at` (within the sequential region):
+        /// the normalized latents, on the host.
+        fn vae_latents(&mut self, width: u32, height: u32, rgba: &[u8], at: u64) -> Result<Vec<f32>, ImageLeafError> {
+            let geometry = self.vae.geometry().clone();
+            autoencoder::check_size(&geometry, height, width).map_err(ImageLeafError::Refused)?;
+            if rgba.len() as u64 != width as u64 * height as u64 * 4 {
+                return Err(ImageLeafError::Refused(format!("{} bytes for a {width} x {height} RGBA image", rgba.len())));
+            }
+            let phase = VaePhase::new(&geometry, width, height);
+            let end = self.layout.seq + self.layout.seq_bytes;
+            if at + phase.bytes > end {
+                return Err(ImageLeafError::Refused(format!(
+                    "the VAE encode of a {width} x {height} image needs {} bytes of arena, {} are left",
+                    phase.bytes,
+                    end.saturating_sub(at)
+                )));
+            }
+            sync()?;
+            self.upload(at + phase.input, bytes_of(&autoencoder::input_bf16(rgba)))?;
+            self.dev.synchronize().map_err(|e| failed("the image's upload")(e.to_string()))?;
+            unsafe {
+                autoencoder::encode(
+                    &self.vae,
+                    self.at(at + phase.input),
+                    height,
+                    width,
+                    self.at(at + phase.latents) as *mut f32,
+                    self.at(at + phase.workspace),
+                    phase.workspace_bytes,
+                )
+            }
+            .map_err(failed("the VAE encoder"))?;
+            let tokens = (width / 16) as usize * (height / 16) as usize;
+            let mut latents = self.download_f32(at + phase.latents, tokens * LATENT)?;
+            self.latent_norm.normalize(&mut latents);
+            Ok(latents)
+        }
+
         /// Frees a condition prefix.
         pub fn release_condition(&mut self, condition: Condition) -> Result<(), ImageLeafError> {
             sync()?;
@@ -980,6 +1099,21 @@ mod tests {
         let dt = sigma_next - sigma;
         assert_eq!(x[0].to_bits(), 0.0f32.to_bits());
         assert_ne!(dt.mul_add(v, -1.0), 0.0, "the values must tell the two apart");
+    }
+
+    #[test]
+    fn the_latent_normalization_is_read_per_channel_and_rounds_twice() {
+        let json = |mean: serde_json::Value, std: serde_json::Value| serde_json::to_vec(&serde_json::json!({"latents_mean": mean, "latents_std": std})).unwrap();
+        let norm = LatentNorm::parse(&json(serde_json::json!([0.5126, -2.1025]), serde_json::json!([3.2001, 4.0379])), 2).unwrap();
+        assert_eq!(norm.mean, vec![0.5126f32, -2.1025]);
+        // Two tokens of two channels: each value (z - mean[c]) / std[c], two f32 roundings.
+        let mut z = [1.0f32, 1.0, -3.0, 0.25];
+        norm.normalize(&mut z);
+        let want = [(1.0f32 - 0.5126) / 3.2001, (1.0f32 + 2.1025) / 4.0379, (-3.0f32 - 0.5126) / 3.2001, (0.25f32 + 2.1025) / 4.0379];
+        assert_eq!(z.map(f32::to_bits), want.map(f32::to_bits));
+        assert!(LatentNorm::parse(&json(serde_json::json!([0.0]), serde_json::json!([1.0, 1.0])), 2).unwrap_err().contains("1 latents_mean"));
+        assert!(LatentNorm::parse(&json(serde_json::json!([0.0, 0.0]), serde_json::json!([1.0, 0.0])), 2).unwrap_err().contains("not positive"));
+        assert!(LatentNorm::parse(b"{}", 2).unwrap_err().contains("no latents_mean"));
     }
 
     fn request(mode: VramMode, free: u64, cap: Option<u64>) -> ImagePlanRequest<'static> {

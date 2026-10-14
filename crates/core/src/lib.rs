@@ -54,6 +54,7 @@ pub mod host;
 pub mod hq_ring;
 #[cfg(feature = "cuda")]
 pub mod image_attn;
+pub mod image_autoencoder;
 #[cfg(feature = "cuda")]
 pub mod image_dit;
 pub mod image_encoder;
