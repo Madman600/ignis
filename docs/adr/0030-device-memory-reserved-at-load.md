@@ -40,6 +40,9 @@ load and nothing is allocated while serving. A 27B load's plan is unchanged.
 Lines and arithmetic: `crates/core/src/residency/plan.rs`.
 **Amended 2026-10-07 by ADR 0045** (spec `vram-budget/03`): the KV pool line
 follows the **KV pool policy** — see the amendment at the end.
+**Amended 2026-10-15 by GitHub #324**: a later load in the same process adds
+back the device memory the process already holds — see the amendment at the
+end.
 
 ## Context
 
@@ -414,3 +417,39 @@ Spec: `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
 - **§Observability gains the disk gauge**
   `ignis_kv_disk_bytes{state="capacity"|"used"}`, beside the KV-RAM arena's. It
   renders only on a load with the tier.
+
+## Amendment (2026-10-15) — a later load in the same process (GitHub #324)
+
+- **The derived budget still starts from what was free before this process
+  held anything.** A first load reads NVML before its context exists, as #210
+  built it.
+- **A later load reads NVML with the context already held**: a model switch,
+  or the reload after an idle unload. ignis never resets the primary context
+  (`ignis_device_destroy` frees a device's stream and event only), and after a
+  27B load the process also keeps state the 27B's kernels set up once per
+  process. The plan's `cuda_context` line, and the 27B's `residual` line,
+  charged those bytes a second time: the 27B came back from a switch with
+  667,392 KV tokens against 726,848 cold (−8.2%), and a plain reload, what an
+  idle unload's is, lost as much (12,457 → 11,516 pages in `vram_reload_gpu`
+  before the fix).
+- **The load adds back what the process holds** (`held_before_load` in
+  `ignis-runtime`): nothing before the context exists, `CUDA_CONTEXT_BYTES`
+  once it does, and on a 27B plan `QWEN27B_PROCESS_STATE_BYTES` too once a 27B
+  load has run. `free_at_start_bytes` is NVML's reading plus that figure, and
+  `ignis.runtime.vram_plan` and `ignis.runtime.flash_next_plan` carry it as
+  `process_held_bytes`. The lines, their order and the metrics are unchanged.
+- **Measured** with the WDDM counter `CUDA_CONTEXT_BYTES` came from, on an
+  idle-unloaded server (RTX 5090, 2026-10-15): 536,485,888 B after any 27B
+  load, the same at every unload with an image model's in between; 452,595,712
+  B, the context alone, after only the image model. Nothing leaks, and the
+  image leaf leaves nothing behind.
+- **Flash-Next adds back the context only.** Its plan has no residual line,
+  and its own per-process state is not measured: an under-count costs pool,
+  never more memory than the card has.
+- **The image plan is unchanged.** It reads NVML after its context and charges
+  none, so a 27B's state, when one has run, stays outside its budget: about
+  84 MB (0.6% of the condition budget) less than in a process that loaded only
+  the image model.
+- **Result** at the Makefile's 27B shape: cold 11,129 pages, then image, then
+  27B 11,105 (−0.2%, the desktop's own drift between the two readings), and
+  `vram_loaded`'s delta within 15 MB of `allocated_at_load` on both loads.
