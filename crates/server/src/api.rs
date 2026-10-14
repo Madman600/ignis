@@ -217,9 +217,14 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
 /// nor miss one it does. A `#[utoipa::path]` description is a literal, which
 /// is why this is added to the generated document rather than written there.
 fn describe_fields(document: &mut utoipa::openapi::OpenApi) {
-    for (path, surface) in [("/v1/chat/completions", Surface::Chat), ("/v1/responses", Surface::Responses)] {
+    for (path, surface) in [
+        ("/v1/chat/completions", Surface::Chat),
+        ("/v1/responses", Surface::Responses),
+        ("/v1/images/generations", Surface::Images),
+        ("/v1/images/edits", Surface::Images),
+    ] {
         let operation = document.paths.paths.get_mut(path).and_then(|item| item.post.as_mut());
-        let operation = operation.expect("the completion operations are documented");
+        let operation = operation.expect("the operations with a field table are documented");
         let description = operation.description.get_or_insert_with(String::new);
         description.push_str("\n\n");
         description.push_str(&openai_fields::describe(surface));

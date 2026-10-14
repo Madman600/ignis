@@ -184,7 +184,12 @@ fn every_refused_field_is_named_in_its_operation_description() {
     // cannot be added without the document saying so.
     use ignis_server::openai_fields::{table, Surface};
     let document = document();
-    for (path, surface) in [("/v1/chat/completions", Surface::Chat), ("/v1/responses", Surface::Responses)] {
+    for (path, surface) in [
+        ("/v1/chat/completions", Surface::Chat),
+        ("/v1/responses", Surface::Responses),
+        ("/v1/images/generations", Surface::Images),
+        ("/v1/images/edits", Surface::Images),
+    ] {
         let description = document["paths"][path]["post"]["description"].as_str().unwrap_or_default();
         for rule in table(surface) {
             assert!(description.contains(&format!("`{}`", rule.name)), "{path}: `{}` not named", rule.name);

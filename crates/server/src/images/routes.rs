@@ -31,9 +31,10 @@ use super::budget::{self, Fitted};
 use super::job::{self, Background, ImageJob, JobEnd, JobEvent, Progress};
 use super::ImageModel;
 use crate::api::{
-    bad_request_param, check_served_kind, error_response, error_response_naming, split_model_lane,
+    bad_request_param, check_served_kind, error_response, error_response_naming, refused_field, split_model_lane,
     switch_to_named_model, ApiError, ENGINE_ERROR_MESSAGE,
 };
+use crate::openai_fields::{self, Surface};
 use crate::config::schema::ImageGroup;
 use crate::Server;
 
@@ -71,6 +72,10 @@ pub(crate) struct GenerationRequest {
     /// `true`: Server-Sent Events, the progress and each image as it is made.
     #[serde(default)]
     stream: bool,
+    /// Every field not named above, for `crate::openai_fields` to classify.
+    #[serde(flatten)]
+    #[schema(ignore)]
+    other: serde_json::Map<String, serde_json::Value>,
 }
 
 /// `POST /v1/images/edits`'s form (`multipart/form-data`): the condition
@@ -214,8 +219,13 @@ struct ImageRequest {
     stream: bool,
 }
 
-/// The fields' rules (spec image-model/05 §Image routes) against `limits`.
+/// The fields' rules (spec image-model/05 §Image routes) against `limits`,
+/// and OpenAI's fields the routes do not read against their table
+/// (`crate::openai_fields`).
 fn checked(fields: GenerationRequest, limits: &ImageGroup) -> Result<ImageRequest, Response> {
+    if let Err(refusal) = openai_fields::check(&fields.other, Surface::Images) {
+        return Err(refused_field(refusal));
+    }
     let Some(prompt) = fields.prompt else {
         return Err(bad_request_param("prompt is required", "prompt"));
     };
@@ -347,7 +357,7 @@ struct Prepared {
 
 `size` is one of `image.sizes` (by default the checkpoint's presets 2048x2048, 2400x1792, 1792x2400, 2528x1696, 1696x2528, 2752x1536, 1536x2752, and 1024x1024) or `auto`, 2048x2048. `response_format` is `b64_json` only (`url` is a 400), `output_format` `png` only. `background: opaque` composites the image on white with alpha 255; `auto` and `transparent` keep the alpha as generated.
 
-ignis adds `seed` (image `i` starts from `seed + i`; absent, one is drawn and returned in `seed`) and `prompt_enhancement`. Accepted and inert: `quality`, `style`, `moderation`, `output_compression`, `partial_images` (no partial image is ever sent), `user`; any other field is ignored.
+ignis adds `seed` (image `i` starts from `seed + i`; absent, one is drawn and returned in `seed`) and `prompt_enhancement`. OpenAI's other fields are listed at the end.
 
 One job runs at a time and up to `image.queue_depth` wait, in order; past that the answer is `503 engine_full` with `Retry-After`. A client that disconnects cancels its job, while it waits or between two denoising steps.
 
@@ -360,7 +370,7 @@ One job runs at a time and up to `image.queue_depth` wait, in order; past that t
             (ImagesResponse = "application/json"),
             (ImageStreamEvent = "text/event-stream"),
         )),
-        (status = 400, description = "A field outside its rule: no `prompt`, `n` outside 1..`image.max_n`, a `size` not in `image.sizes`, or past the largest image the loaded model makes (the message lists the sizes), `response_format: url`, an `output_format` other than `png`, an unknown `background`; or a prompt longer than the condition budget (`condition_budget_exceeded`).", body = ApiError),
+        (status = 400, description = "A field outside its rule: no `prompt`, `n` outside 1..`image.max_n`, a `size` not in `image.sizes`, or past the largest image the loaded model makes (the message lists the sizes), `response_format: url`, an `output_format` other than `png`, an unknown `background`, `partial_images` above 0; or a prompt longer than the condition budget (`condition_budget_exceeded`).", body = ApiError),
         (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
         (status = 404, description = "The request named a model this server neither loads nor may switch to.", body = ApiError),
         (status = 409, description = "The model that would serve the request is a text model (`model_kind_mismatch`, naming both kinds and the loaded id).", body = ApiError),
@@ -443,8 +453,9 @@ pub(crate) async fn create_image_edit(State(server): State<Arc<Server>>, multipa
 }
 
 /// An edit's form: the image parts in order, the mask's presence, and the
-/// text parts as the generation's fields. Parts it does not know are
-/// skipped, OpenAI's inert ones among them.
+/// text parts as the generation's fields — one the routes do not read as
+/// the JSON value it spells (a string when it spells none), for
+/// `crate::openai_fields` to classify as a JSON body's would be.
 async fn read_form(mut multipart: Multipart) -> Result<EditForm, Response> {
     let malformed = |error: axum::extract::multipart::MultipartError| {
         bad_request_param(&format!("the multipart form could not be read: {}", error.body_text()), "image")
@@ -481,7 +492,10 @@ fn set_field(fields: &mut GenerationRequest, name: &str, text: String) -> Result
         "seed" => fields.seed = Some(parse(name, &text, "an unsigned integer")?),
         "prompt_enhancement" => fields.prompt_enhancement = Some(parse(name, &text, "true or false")?),
         "stream" => fields.stream = parse(name, &text, "true or false")?,
-        _ => {}
+        _ => {
+            let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+            fields.other.insert(name.to_owned(), value);
+        }
     }
     Ok(())
 }
@@ -743,6 +757,7 @@ mod tests {
             (serde_json::json!({ "prompt": "x", "response_format": "xml" }), "response_format", "xml"),
             (serde_json::json!({ "prompt": "x", "output_format": "webp" }), "output_format", "png only"),
             (serde_json::json!({ "prompt": "x", "background": "green" }), "background", "green"),
+            (serde_json::json!({ "prompt": "x", "partial_images": 2 }), "partial_images", "comes whole"),
         ] {
             let (status, body) = refusal(request(fields.clone())).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{fields}");
@@ -779,5 +794,12 @@ mod tests {
         let refused = set_field(&mut fields, "n", "three".to_owned()).unwrap_err();
         let (status, body) = refusal(Err(refused)).await;
         assert_eq!((status, body["error"]["param"].as_str()), (StatusCode::BAD_REQUEST, Some("n")));
+        // A part the routes do not read is the JSON value it spells, for the
+        // field table: `quality` passes, `partial_images: 1` is refused.
+        assert_eq!(fields.other["quality"], "high");
+        set_field(&mut fields, "partial_images", "1".to_owned()).unwrap();
+        assert_eq!(fields.other["partial_images"], 1);
+        let (status, body) = refusal(checked(fields, &limits())).await;
+        assert_eq!((status, body["error"]["param"].as_str()), (StatusCode::BAD_REQUEST, Some("partial_images")), "{body}");
     }
 }
