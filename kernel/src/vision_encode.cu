@@ -61,6 +61,9 @@ constexpr std::size_t kVisionWorkspaceAlignment = 256;
 constexpr std::int32_t kVisionHeadDim = kVisionHidden / kVisionHeads;
 constexpr float kVisionRopeTheta = 10'000.0F;
 constexpr float kVisionNormEps = 1.0e-6F;
+// The image model's tower takes at most this many patches (32,768 merged tokens): the W8 dispatch's
+// K 4608 arm (the mergers' fc2) throws above that, after the blocks have been enqueued.
+constexpr std::uint32_t kImageVisionMaxPatches = 131072;
 
 struct VisionWorkspaceLayout {
   ninfer::TensorRegion position_ids;
@@ -458,9 +461,10 @@ std::string image_vision_refusal(const ignis_image_vision_weights *weights,
     return "segments must be 1 .. " + std::to_string(IGNIS_IMAGE_VISION_MAX_SEGMENTS);
   }
   if (input->patches == 0 || input->patches % IGNIS_IMAGE_VISION_MERGE_UNIT != 0 ||
-      input->patches > (1u << 20)) {
+      input->patches > kImageVisionMaxPatches) {
     return "patches must be a positive multiple of " +
-           std::to_string(IGNIS_IMAGE_VISION_MERGE_UNIT) + ", at most 2^20";
+           std::to_string(IGNIS_IMAGE_VISION_MERGE_UNIT) + ", at most " +
+           std::to_string(kImageVisionMaxPatches);
   }
   if (input->patch_rows == nullptr || input->position_ids == nullptr ||
       input->cu_seqlens == nullptr || input->position_table_indices == nullptr ||
@@ -654,13 +658,18 @@ extern "C" const char *ignis_media_last_error(void) {
 }
 
 extern "C" uint64_t ignis_image_vision_workspace_bytes(uint32_t tokens, uint32_t segments) {
-  if (tokens == 0 || segments == 0) {
+  if (tokens == 0 || segments == 0 || tokens > kImageVisionMaxPatches / static_cast<std::uint32_t>(kVisionMergeUnit) ||
+      segments > IGNIS_IMAGE_VISION_MAX_SEGMENTS) {
     return 0;
   }
-  return build_workspace_layout(static_cast<std::int32_t>(tokens * kVisionMergeUnit),
-                                static_cast<std::int32_t>(tokens),
-                                static_cast<std::int32_t>(segments))
-      .bytes;
+  try {
+    return build_workspace_layout(static_cast<std::int32_t>(tokens * kVisionMergeUnit),
+                                  static_cast<std::int32_t>(tokens),
+                                  static_cast<std::int32_t>(segments))
+        .bytes;
+  } catch (...) {
+    return 0;
+  }
 }
 
 // GitHub #320: the image model's tower is the program above with its own

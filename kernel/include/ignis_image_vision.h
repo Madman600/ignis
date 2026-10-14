@@ -99,9 +99,11 @@ struct ignis_image_vision_weights {
  *     every segment a positive multiple of IGNIS_IMAGE_VISION_MERGE_UNIT;
  *   - position_table_indices int32 and position_table_weights f32 [patches][4]: the bilinear
  *     corners in the 48 x 48 table and their weights.
- * `patches` is IGNIS_IMAGE_VISION_MERGE_UNIT x the merged tokens the call emits, at most 2^20. No
- * segment has a bound of its own: a condition image near 1024^2 at an aspect ratio can exceed 1024
- * merged tokens (1376 x 768 is 1,032); the caller's workspace bounds the call. */
+ * `patches` is IGNIS_IMAGE_VISION_MERGE_UNIT x the merged tokens the call emits, at most 131,072
+ * (32,768 tokens: the mergers' fc2 has no W8 arm above that). No segment has a bound of its own: a
+ * condition image near 1024^2 at an extreme aspect ratio can exceed 1024 merged tokens, up to
+ * 1,230 (96 x 13,120, after the pipeline's rounding and the processor's 200:1 limit); the caller's
+ * workspace bounds the call. */
 struct ignis_image_vision_input {
   uint32_t patches;
   uint32_t segments;
@@ -113,7 +115,8 @@ struct ignis_image_vision_input {
 };
 
 /* The workspace a call of `tokens` merged tokens over `segments` segments needs, in bytes (the
- * 27B's layout: ignis_vision_workspace_bytes). 0 for tokens or segments 0. */
+ * 27B's layout: ignis_vision_workspace_bytes). 0 for tokens or segments 0, and for a size the
+ * forward refuses: more than 32,768 tokens or IGNIS_IMAGE_VISION_MAX_SEGMENTS segments. */
 uint64_t ignis_image_vision_workspace_bytes(uint32_t tokens, uint32_t segments);
 
 /* Runs the tower on `input` (1 .. IGNIS_IMAGE_VISION_MAX_SEGMENTS segments): the merger's output

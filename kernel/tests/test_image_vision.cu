@@ -364,6 +364,14 @@ void case_taps(Tower &t) {
         "taps: with block 9 live, DeepStack 1 and 2 (after blocks 16, 24) see it");
   check(!same(at9.embeds, neutral.embeds), "taps: with block 9 live, the merger sees it");
   check(!same(at8.deep[0], neutral.deep[0]), "taps: with block 8 live, DeepStack 0 (after block 8) sees it");
+  // DeepStack 1 and 2 are pinned by the same pairs: a live block 16 is seen by the tap after block
+  // 16 and one at 17 is not; a live block 24 is seen by the tap after block 24, a 25 is not.
+  const Outputs at16 = run(t.weights(16), c, kAll), at17 = run(t.weights(17), c, kAll);
+  check(!same(at16.deep[1], neutral.deep[1]) && same(at17.deep[1], neutral.deep[1]) && !same(at17.deep[2], neutral.deep[2]),
+        "taps: DeepStack 1 sees block 16 and not block 17 (DeepStack 2 does)");
+  const Outputs at24 = run(t.weights(24), c, kAll), at25 = run(t.weights(25), c, kAll);
+  check(!same(at24.deep[2], neutral.deep[2]) && same(at25.deep[2], neutral.deep[2]) && !same(at25.embeds, neutral.embeds),
+        "taps: DeepStack 2 sees block 24 and not block 25 (the merger does)");
   const Outputs bare = run(t.weights(9), c, kAll, true);
   check(same(bare.embeds, at9.embeds), "taps: the merger's output is the same without DeepStack (NULL)");
   const bool only1[kDeep] = {false, true, false};
@@ -405,6 +413,10 @@ void case_refusals(Tower &t) {
   std::printf("refusals\n");
   check(ignis_image_vision_workspace_bytes(0, 1) == 0 && ignis_image_vision_workspace_bytes(4, 0) == 0,
         "refusals: no workspace for no tokens or no segments");
+  check(ignis_image_vision_workspace_bytes(32769, 1) == 0 && ignis_image_vision_workspace_bytes(4, 11) == 0 &&
+            ignis_image_vision_workspace_bytes(0xFFFFFFFFu, 1) == 0,
+        "refusals: no workspace past the patch cap, the segment cap, or an overflowing token count");
+  check(ignis_image_vision_workspace_bytes(12300, 10) > 0, "refusals: ten 1,230-token images have a workspace");
   for (const auto &[tokens, segments] : {std::pair<uint32_t, uint32_t>{4, 1}, {1024, 1}, {10240, 10}}) {
     const uint64_t got = ignis_image_vision_workspace_bytes(tokens, segments);
     std::printf("  workspace for %u merged tokens over %u segments: %llu bytes\n", tokens, segments,
@@ -451,6 +463,8 @@ void case_refusals(Tower &t) {
   bin = in;
   bin.patches = 18;
   expect_refusal(call(&w, &bin, outs, deep, ws_bytes), "positive multiple", "18 patches");
+  bin.patches = 131076;
+  expect_refusal(call(&w, &bin, outs, deep, ws_bytes), "at most 131072", "131,076 patches");
   expect_refusal(call(&w, &in, outs, deep, ws_bytes - 256), "workspace must hold", "a workspace too small");
   expect_refusal(call(&w, &in, static_cast<char *>(outs) + 2, deep, ws_bytes), "16-byte aligned", "a misaligned output");
   void *overlap[kDeep] = {static_cast<char *>(outs) + 16, nullptr, nullptr};
