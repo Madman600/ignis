@@ -13,14 +13,16 @@
 //! An id of the image family (`ignis-image-2.1-turbo`, spec image-model/05)
 //! builds the image model over a `FakeImageRunner` instead, resident until
 //! its runner is dropped, the prompt of every condition prefix it encodes
-//! logged.
+//! logged — and, for the server's first one, each denoising step behind a
+//! [`StepGate`] if the test asks ([`MockLoader::gated_image_model`]).
 
 #![allow(dead_code)]
 
 use std::collections::HashSet;
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use ignis_core::compute::ModelFamily;
 use ignis_core::image::{ConditionId, FakeImageRunner, ImageCondition, ImageError, ImagePlan, ImageRunner, ImageSize, RgbaImage, TargetLatents};
@@ -105,6 +107,16 @@ impl MockLoader {
         let (gated, controller) = GatedCompute::new(Arc::new(MockCompute::new()));
         let model = build(&self.state, id, Arc::clone(&gated) as Arc<dyn Compute>);
         (model, gated, controller)
+    }
+
+    /// [`MockLoader::model`] for the image model `id`, each denoising step
+    /// of its runner waiting at the returned gate, shut.
+    pub fn gated_image_model(&self, id: &str) -> (ActiveModel, Arc<StepGate>) {
+        let gate = Arc::new(StepGate::default());
+        let runner = FakeImageRunner::default();
+        self.state.built_images.lock().unwrap().push(Arc::downgrade(&runner.held_conditions()));
+        let runner = Logged { inner: runner, encoded: Arc::clone(&self.state.encoded), gate: Some(Arc::clone(&gate)) };
+        (ActiveModel::image(ImageModel::new(id, Box::new(runner))).with_source(source(id)), gate)
     }
 
     /// [`MockLoader::model`] over `compute`, a test's own (counted as
@@ -201,7 +213,7 @@ fn build(state: &State, id: &str, compute: Arc<dyn Compute>) -> ActiveModel {
     if ModelFamily::of_model_id(id) == Some(ModelFamily::QwenImage21) {
         let runner = FakeImageRunner::default();
         state.built_images.lock().unwrap().push(Arc::downgrade(&runner.held_conditions()));
-        let runner = Logged { inner: runner, encoded: Arc::clone(&state.encoded) };
+        let runner = Logged { inner: runner, encoded: Arc::clone(&state.encoded), gate: None };
         return ActiveModel::image(ImageModel::new(id, Box::new(runner))).with_source(source(id));
     }
     state.built.lock().unwrap().push(Arc::downgrade(&compute));
@@ -257,10 +269,36 @@ impl PreparedLoad for MockPrepared {
     }
 }
 
-/// `FakeImageRunner`, logging the prompt of each prefix it encodes.
+/// Shut, an image runner's denoising step waits at it; open, every step
+/// passes. A step waits 30 s at most, so a failed test leaves no thread
+/// behind.
+#[derive(Default)]
+pub struct StepGate {
+    open: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl StepGate {
+    pub fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+
+    fn pass(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut open = self.open.lock().unwrap();
+        while !*open && Instant::now() < deadline {
+            open = self.changed.wait_timeout(open, Duration::from_millis(50)).unwrap().0;
+        }
+    }
+}
+
+/// `FakeImageRunner`, logging the prompt of each prefix it encodes, each
+/// denoising step behind `gate` when there is one.
 struct Logged {
     inner: FakeImageRunner,
     encoded: Arc<Mutex<Vec<String>>>,
+    gate: Option<Arc<StepGate>>,
 }
 
 impl ImageRunner for Logged {
@@ -285,6 +323,9 @@ impl ImageRunner for Logged {
         sigma_next: f32,
         velocity: Option<&mut Vec<f32>>,
     ) -> Result<(), ImageError> {
+        if let Some(gate) = &self.gate {
+            gate.pass();
+        }
         self.inner.denoise_step(condition, latents, sigma, sigma_next, velocity)
     }
 

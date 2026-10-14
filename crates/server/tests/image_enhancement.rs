@@ -400,6 +400,58 @@ async fn during_a_visit_other_requests_are_answered_model_switching() {
     assert_eq!(server.status().as_str(), "serving");
 }
 
+/// Review-322cf M1: an enhanced request on the loaded image model takes its
+/// turn in the queue before it visits the enhancer. The job running and the
+/// one waiting before it run to their end on the image model — past the
+/// drain window, which would have cut them had the visit begun — and the
+/// visit comes after them; the enhanced job then runs on the image model
+/// loaded again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enhanced_request_visits_only_once_the_jobs_admitted_before_it_have_run() {
+    let loader = MockLoader::new();
+    let (model, gate) = loader.gated_image_model(IMAGE);
+    let drain = Duration::from_millis(200);
+    let server = Server::from_active(model)
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, drain).with_known_models(known(&["mock-a", IMAGE])));
+    enhancing_with(&server, "mock-a");
+    let app = server.app();
+    let jobs = Arc::clone(&server.active().image_model().expect("the image model").jobs);
+    let send = |body: Value| {
+        let app = app.clone();
+        tokio::spawn(async move { send_generation(&app, body).await })
+    };
+    let in_flight = |waiting: u32, running: u32| {
+        let jobs = Arc::clone(&jobs);
+        async move {
+            let deadline = Instant::now() + PATIENT;
+            while (jobs.in_flight().waiting, jobs.in_flight().running) != (waiting, running) {
+                assert!(Instant::now() < deadline, "never {waiting} waiting and {running} running: {:?}", jobs.in_flight());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    };
+    let first = send(json!({ "prompt": "first", "size": "1024x1024" }));
+    in_flight(0, 1).await;
+    let second = send(json!({ "prompt": "second", "size": "1024x1024" }));
+    in_flight(1, 1).await;
+    let enhanced = send(json!({ "prompt": "third", "size": "1024x1024", "prompt_enhancement": true }));
+    in_flight(2, 1).await;
+    tokio::time::sleep(drain + drain / 2).await;
+    assert_eq!((server.status().as_str(), loader.loads().len()), ("serving", 0), "no visit while jobs before it remain");
+
+    gate.open();
+    for (name, answer) in [("first", first), ("second", second)] {
+        let (status, answer) = answer.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{name}: {answer}");
+    }
+    let (status, answer) = enhanced.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let revised = answer["data"][0]["revised_prompt"].as_str().expect("revised_prompt").to_owned();
+    assert_eq!(loader.encoded_prompts(), ["first".to_owned(), "second".to_owned(), revised], "the visit after both jobs");
+    assert_eq!(loader.loads(), ["mock-a", IMAGE]);
+    assert_eq!(server.status().as_str(), "serving");
+}
+
 /// AC 9: a failing enhancer falls back to the prompt as sent, with a
 /// warning — refused before anything stopped, failed to load (the image
 /// model loaded again), an id that names no model, an engine that refuses

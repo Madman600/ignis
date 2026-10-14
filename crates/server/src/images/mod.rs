@@ -117,9 +117,8 @@ impl ImageJobs {
 
     /// One job counted as waiting, at the back of the queue, whatever the
     /// depth ([`ImageJobs::admit`] without its bound): it waits until
-    /// [`Waiting::start`] or [`Waiting::turn`], and leaves the count when the
-    /// guard is dropped — run, refused or cancelled alike. The queue must be
-    /// open.
+    /// [`Waiting::turn`], and leaves the count when the guard is dropped —
+    /// run, refused or cancelled alike. The queue must be open.
     pub fn wait(self: &Arc<Self>) -> Waiting {
         self.admit(u32::MAX).expect("an open queue admits without a bound")
     }
@@ -159,7 +158,7 @@ impl ImageJobs {
 }
 
 /// A job counted as waiting ([`ImageJobs::wait`], [`ImageJobs::admit`]),
-/// until dropped or started.
+/// until dropped or its turn comes.
 #[derive(Debug)]
 pub struct Waiting {
     jobs: Option<Arc<ImageJobs>>,
@@ -167,20 +166,10 @@ pub struct Waiting {
 }
 
 impl Waiting {
-    /// The job runs now, whatever its place: counted as running until the
-    /// returned guard is dropped, and never as neither nor both in between.
-    pub fn start(mut self) -> Running {
-        let jobs = self.jobs.take().expect("a waiting job starts once");
-        let mut queue = jobs.queue();
-        queue.waiting.retain(|&ticket| ticket != self.ticket);
-        queue.running += 1;
-        drop(queue);
-        Running(jobs)
-    }
-
     /// Wait for the job's turn — no job running, and every job admitted
-    /// before it run or gone — and start it ([`Waiting::start`]). `None` once
-    /// the queue is closed. Dropping the future leaves the queue.
+    /// before it run or gone — and start it: counted as running until the
+    /// returned guard is dropped, and never as neither nor both in between.
+    /// `None` once the queue is closed. Dropping the future leaves the queue.
     pub async fn turn(mut self) -> Option<Running> {
         let jobs = Arc::clone(self.jobs.as_ref().expect("a waiting job"));
         loop {
@@ -216,7 +205,7 @@ impl Drop for Waiting {
     }
 }
 
-/// A job counted as running ([`Waiting::start`]), until dropped.
+/// A job counted as running ([`Waiting::turn`]), until dropped.
 #[derive(Debug)]
 pub struct Running(Arc<ImageJobs>);
 
@@ -288,12 +277,12 @@ mod tests {
 
     /// A job is counted from its admission until its guard goes, waiting then
     /// running, and is never between the two.
-    #[test]
-    fn a_job_counts_as_waiting_then_running_until_its_guard_goes() {
+    #[tokio::test]
+    async fn a_job_counts_as_waiting_then_running_until_its_guard_goes() {
         let jobs = Arc::new(ImageJobs::default());
         let (first, second) = (jobs.wait(), jobs.wait());
         assert_eq!(jobs.in_flight(), InFlight { waiting: 2, running: 0 });
-        let running = first.start();
+        let running = first.turn().await.expect("the first's turn at once");
         assert_eq!(jobs.in_flight(), InFlight { waiting: 1, running: 1 });
         drop(second);
         drop(running);
@@ -305,10 +294,10 @@ mod tests {
 
     /// Spec image-model/05 §The queue: `depth` jobs wait behind the running
     /// one and one more is refused; a closed queue admits none.
-    #[test]
-    fn the_queue_admits_up_to_its_depth_behind_the_running_job() {
+    #[tokio::test]
+    async fn the_queue_admits_up_to_its_depth_behind_the_running_job() {
         let jobs = Arc::new(ImageJobs::default());
-        let running = jobs.admit(2).expect("an empty queue admits").start();
+        let running = jobs.admit(2).expect("an empty queue admits").turn().await.expect("its turn at once");
         let waiting: Vec<Waiting> = (0..2).map(|_| jobs.admit(2).expect("room to wait")).collect();
         assert_eq!(jobs.in_flight(), InFlight { waiting: 2, running: 1 });
         assert!(jobs.admit(2).is_none(), "a third would wait past the depth");
@@ -317,7 +306,7 @@ mod tests {
         let again = jobs.admit(2);
         assert!(again.is_some(), "room again");
         drop((again, waiting));
-        let one = jobs.admit(0).map(Waiting::start);
+        let one = jobs.admit(0).expect("depth 0 runs one").turn().await;
         assert!(one.is_some(), "depth 0 runs one");
         assert!(jobs.admit(0).is_none(), "with none waiting");
         drop(one);
@@ -359,7 +348,7 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), [0, 2, 3]);
         assert!(jobs.in_flight().is_idle());
 
-        let running = jobs.admit(8).unwrap().start();
+        let running = jobs.admit(8).unwrap().turn().await.expect("an empty queue's turn at once");
         let waiting = jobs.admit(8).unwrap();
         let closed = tokio::spawn(async move { waiting.turn().await.is_none() });
         tokio::task::yield_now().await;

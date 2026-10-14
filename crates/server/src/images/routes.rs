@@ -35,7 +35,7 @@ use utoipa::ToSchema;
 use super::budget::{self, Fitted};
 use super::enhance::Rewritten;
 use super::job::{self, Background, ImageJob, JobEnd, JobEvent, Phase, Progress};
-use super::ImageModel;
+use super::{ImageModel, Running, Waiting};
 use crate::api::{
     bad_request_param, check_kind, check_served_kind, error_response, error_response_naming, implicit_switch_refused,
     load_failed, refused_field, split_model_lane, unknown_model, unswitchable_named, ApiError, ENGINE_ERROR_MESSAGE,
@@ -394,7 +394,7 @@ One job runs at a time and up to `image.queue_depth` wait, in order; past that t
 
 `model` absent, or the loaded image model's id, is served as it is; another known image model is switched to first when `switch.allow_implicit` is on. With a text model loaded and no `model` naming the image model, the answer is `409 model_kind_mismatch`.
 
-Prompt enhancement (`prompt_enhancement: true`, or `image.prompt_enhancement` when absent): the text model `image.prompt_enhancer` rewrites the prompt first with Qwen's own system prompts (a prompt holding a CJK ideograph in Chinese, any other in English; reasoning off; seeded with `seed`), and the images are made from the rewrite, returned as each image's `revised_prompt`. With the enhancer loaded it rewrites, and the request then switches to the image model it names. Otherwise the request visits the enhancer: a switch to it and one on to the image model, during which every other request is answered `503 model_switching`; the visit does not change `GET /v1/models`' `last_switch`. A rewrite that cannot be had -- an enhancer the server cannot switch to, a switch to it that does not land, a rewrite that fails -- leaves the prompt as sent, and `warnings` says why.",
+Prompt enhancement (`prompt_enhancement: true`, or `image.prompt_enhancement` when absent): the text model `image.prompt_enhancer` rewrites the prompt first with Qwen's own system prompts (a prompt holding a CJK ideograph in Chinese, any other in English; reasoning off; seeded with `seed`), and the images are made from the rewrite, returned as each image's `revised_prompt`. With the enhancer loaded it rewrites, and the request then switches to the image model it names. Otherwise the request visits the enhancer: a switch to it and one on to the image model, during which every other request is answered `503 model_switching`. From the image model it first takes its turn in the queue, so the jobs admitted before it finish there; the ones admitted behind it run in the visit's drain, as in any switch's. The visit does not change `GET /v1/models`' `last_switch`. A rewrite that cannot be had -- an enhancer the server cannot switch to, a switch to it that does not land, a rewrite that fails -- leaves the prompt as sent, and `warnings` says why.",
     request_body = GenerationRequest,
     responses(
         (status = 200, description = "The images. `application/json` when `stream` is false or absent; `text/event-stream` when it is true.", content(
@@ -710,16 +710,7 @@ async fn admit(
             None => return Err(bad_request_param("size auto has no size to pick: image.sizes names none this image model makes", "size")),
         },
     };
-    let Some(waiting) = model.jobs.admit(limits.queue_depth) else {
-        if model.jobs.is_closed() {
-            return Err(model_stopped());
-        }
-        return Err(unavailable(
-            "engine_full",
-            "engine_full",
-            format!("the image queue is full: one job runs and {} wait (image.queue_depth); retry", limits.queue_depth),
-        ));
-    };
+    let waiting = admitted(&model, limits.queue_depth)?;
     let ImageRequest { n, background, .. } = request;
     let Enhanced { prompt, revised, warnings } = enhanced;
     let prepared = {
@@ -741,6 +732,27 @@ async fn admit(
     }));
     job::spawn(model, job, waiting, events.clone());
     Ok(())
+}
+
+/// A place at the back of `model`'s queue, at most `depth`
+/// (`image.queue_depth`) waiting behind the job running; else the refusal,
+/// `503 model_stopped` for a closed queue and `503 engine_full` for a full
+/// one.
+fn admitted(model: &ImageModel, depth: u32) -> Result<Waiting, Response> {
+    model.jobs.admit(depth).ok_or_else(|| {
+        if model.jobs.is_closed() {
+            return model_stopped();
+        }
+        unavailable("engine_full", "engine_full", format!("the image queue is full: one job runs and {depth} wait (image.queue_depth); retry"))
+    })
+}
+
+/// A turn on `model` for a request about to visit the enhancer from it
+/// (review-322cf M1): admitted as a job is ([`admitted`]), then its turn once
+/// every job admitted before it has run, so that the visit's drain never
+/// cuts one of them. `503 model_stopped` when the queue closes first.
+async fn queue_turn(model: &ImageModel, depth: u32) -> Result<Running, Response> {
+    admitted(model, depth)?.turn().await.ok_or_else(model_stopped)
 }
 
 /// The prompt a job runs on, and what its answer says of it.
@@ -787,7 +799,10 @@ impl Enhanced {
 /// - otherwise a visit to it ([`crate::model_switch::visit`]): from the image
 ///   model and back, or from another text model on to the image model the
 ///   request names (`named`) — two switches, the gate closed throughout,
-///   `last_switch` left as it was.
+///   `last_switch` left as it was. From the image model the request first
+///   takes its turn in the queue ([`queue_turn`]): the jobs admitted before
+///   it run to their end there, and the visit begins with none running; the
+///   ones admitted behind it run in the visit's drain, as for any switch.
 ///
 /// Each phase is sent to `events`. A rewrite that cannot be had — an
 /// enhancer the server cannot switch to, a visit that does not get there,
@@ -802,10 +817,12 @@ async fn enhance(
     events: &mpsc::UnboundedSender<Streamed>,
 ) -> Result<Enhanced, Response> {
     let enhancer = server.live().image.prompt_enhancer.clone();
-    let loaded = server.active();
+    // The model the check reads is the one the rewrite runs on.
+    let pinned = server.pinned();
+    let loaded = pinned.active();
     if loaded.kind() == ModelKind::Text && loaded.model_id() == enhancer {
         let _ = events.send(progress(Phase::Enhancing, 1, 1));
-        let rewritten = super::enhance::rewrite(&server.pinned(), &prompt, images, seed).await;
+        let rewritten = super::enhance::rewrite(&pinned, &prompt, images, seed).await;
         return Ok(Enhanced::of(prompt, &enhancer, rewritten));
     }
     let Some(switcher) = server.switcher.as_ref() else {
@@ -824,11 +841,17 @@ async fn enhance(
         return Ok(Enhanced::without(prompt, &enhancer, "the image model has no artifact to load again after a visit"));
     };
     let to = then.model.clone();
+    let turn = match loaded.image_model() {
+        Some(model) => Some(queue_turn(model, server.live().image.queue_depth).await?),
+        None => None,
+    };
     let mut visit = match crate::model_switch::visit(server, via, then, Some(switch_steps(events.clone(), 2))) {
         Ok(visit) => visit,
         Err(SwitchRefusal::InProgress(running)) => return Err(implicit_switch_refused(ImplicitRefusal::Switching(running))),
         Err(refused) => return Ok(Enhanced::without(prompt, &enhancer, &format!("a visit to it could not begin ({refused:?})"))),
     };
+    // The gate is closed: what waits behind this request runs in the drain.
+    drop(turn);
     let rewritten = match visit.arrived().await {
         Some(visited) => {
             let _ = events.send(progress(Phase::Enhancing, 1, 1));
