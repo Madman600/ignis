@@ -870,3 +870,224 @@ branch merged `image-serving-322` first (d7447b4; the conflicts were additive:
     `vision_prefix_reuse_gpu`, `classify_vision_readout_gpu`,
     `classify_pointing_gpu`).
   - `npm test` in `web/`: 855 passed.
+
+## As built (321e, 2026-10-14: the close-out, ACs 10 and 11; the edit's background)
+
+Status, one line per AC (the AC 11 run, below, on dbc760e):
+
+1. **Done.** The load prints the plan line (condition budget 44,096 tokens
+   in this run). An 8 GiB budget is refused naming the shortfall. A plan
+   that leaves less than `image.min_condition_budget_tokens` is refused too
+   (321e).
+2. **Done.** The sigmas, the timesteps and now the DiT's timesteps
+   (`dit_timesteps.npy`) equal the recordings bit for bit. The host's Euler
+   update and the device's are bit for bit.
+3. **Done.** All 16 steps at 1024² and 2048² are within their bound, at
+   most 51% of it.
+4. **Done.** All 8 steps are within their bound, at most 53% of it (step
+   1).
+5. **Written** (the AC 11 run's report is below). The edit's image rows at
+   26.3% after block 15 are the simulated W8A8's own: 26.2%.
+6. **Done.** 50.8-56.1 dB per channel, alpha 63.1-66.0 dB. The banded
+   decode equals the unbanded one at 1024². At 2048², 224- and 208-row bands
+   agree bit for bit. Every default size decodes within the arena.
+7. **Done.** 1.074% against a bound of 7.376%. A 1024x768 crop encodes
+   finite.
+8. **Done**, to the byte: n = 3, and the cancel after 3 steps. Under
+   `CUDA_MODULE_LOADING=EAGER` the first job leaves 0 bytes too.
+9. **Done.** The AC 11 run rewrote the PNGs, now with the DiT's timestep.
+   Added: a free run at 2752x1536.
+10. **Done**, for information: below, and in
+    [the finding](../../findings/2026-10-14-image-model-on-the-5090.md).
+11. **Done.** ACs 3-10 ran once under the GPU lock in timing mode on dbc760e,
+    with nothing else on the card or the CPU. No step is over its bound, so
+    nothing goes to the owner from ACs 3-4. The edit's background (below)
+    goes to the owner as information.
+
+- **The step-0 items**
+  - **Review-321ab L1, the DiT's timestep.** It is
+    `Sampler::dit_timestep`: fl(fl(1000σ) · fl(1/1000)). That is torch's
+    `timestep / 1000` on the GPU, a product by the reciprocal. It equals
+    the recorded `dit_timesteps` bit for bit; σ and a true division by 1000
+    are each 1 ulp off at steps 1, 2, 3 and 6 (CPU test). The AC 3/4
+    numbers moved by at most 0.1 point.
+  - **Review-321ab M1, chunked against whole on real weights.**
+    `ImageLeafOptions::prefix_chunk` is a test knob, and the server passes
+    None. In chunks of 1,024, the edit's image block is cut in four. The
+    prefix's rows after blocks 0, 15 and 31 equal the whole pass's bit for
+    bit, and so do step 0's target rows and velocity over the chunked
+    prefix (`the_chunked_prefix_pass_equals_the_whole_one_on_the_edit`).
+  - **Review-321ab L2, a minimum condition budget.** The field is
+    `image.min_condition_budget_tokens`, default 8,191
+    (`DEFAULT_MIN_CONDITION_BUDGET_TOKENS`), 0..=2^20, 0 taking any.
+    - Why 8,191: it is the longest text-to-image prefix the DiT's
+      positions admit. The text takes 0 .. P, and the target's block starts
+      at P < 8,192.
+    - A plan whose budget, before the cap, is below it is refused with
+      `ImagePlanError::BelowMinCondition`. The message names the tokens, the
+      bytes short and the way out. The CPU test that enshrined a 0-token
+      load now does so only with a minimum of 0.
+  - **Review-321ab L4, review-321c L2: non-square.**
+    - A 1024x768 crop of the condition image encodes to 48x64 finite
+      latents. Its top 24 rows are 6.1% from the square's, and 21.2% from
+      the square's rows one lower (the control).
+    - `decode_band_rows` (host-side) says each default size decodes in the
+      arena the load sizes for 16,800 cells: bands of 160 rows (2752x1536)
+      to 512 (1024²). The server's test checks all eight.
+    - 2752x1536 runs free from the server's noise (seed 7, the t2i prompt):
+      8 steps in 5.93 s, the decode 682 ms in the arena, nothing allocated.
+      The picture is the fox and a legible sign,
+      [ignis.png](file:///F:/ai/models/ignis-image-2.1-turbo/freerun/t2i-2752x1536/ignis.png).
+      It is the first non-square target run on the GPU.
+  - **Review-321c L1, L4.** The 2K bit-equal check uses 208-row bands
+    against the planned 224: lcm 2,912 > 2,048, asserted, so no band edge is
+    shared. `AC6_MIN_PSNR_DB` names AC 6's 40 dB.
+  - **Review-321c I1.** The EAGER run of AC 8 is kept in the worktree at
+    `.scratch/321e/ac8-eager.log`, untracked.
+  - **Review-321c I3.** `image_vision::to_bf16` is the leaf's one host
+    rounding, for the patches, the VAE's input and the decoder's latents. A
+    NaN becomes torch's 0x7FC0. Before, a NaN became a zero, or overflowed
+    in debug.
+  - **Review-321ab L5, I1, nit.** The VAE header says the caller packs the
+    3x3 weights. §Seams' largest preset is 2400x1792. The unused
+    `ImageLeaf::vision()` is gone.
+- **The edit's background (review-321c M1): W8A8's, not a bug.** diffusers
+  was run free on the edit case from its noise file, as `bf16_floor.py`
+  runs, but end to end. Two precisions:
+  - the bf16 pipeline;
+  - the simulated W8A8: `record.py`'s yardstick sim, fp32 compute on the
+    artifact's stored values.
+
+  The scripts are `.scratch/321e/ghost*.py` in this worktree, untracked.
+  The mask is review-321c's. It takes the pixels where diffusers' fp32
+  alpha is at most 4 and that lie at least 8 px from any pixel above 4:
+  249,856 in the condition's band (rows ≥ 780), 423,126 above it.
+
+  | run | band alpha max / p99.9 / mean | band row mean, top to bottom | hidden RGB in the band | alpha above the band, max | final latents from fp32 |
+  |---|---|---|---|---|---|
+  | diffusers fp32 (the oracle) | 4 / 2 / 1.00 | 1.0 1.0 1.0 1.0 | 164, 57, 208 | 2 | 0 |
+  | diffusers bf16 | 5 / 3 / 0.85 | 0.8 1.0 0.9 0.8 | 161, 58, 205 | 2 | 1.37% |
+  | **simulated W8A8** | **59 / 58 / 13.39** | **8.8 12.0 15.6 17.1** | 73, 85, 156 | 14 | 10.92% |
+  | ignis (AC 11 run) | 18 / 18 / 4.88 | 3.1 3.9 5.5 7.1 | 97, 77, 159 | 5 | 7.83% |
+
+  Teacher-forced at step 0, relative L2 against the recorded fp32 dumps,
+  in %:
+
+  | | image rows, blocks 0 / 15 / 31 | target, blocks 0 / 15 / 31 | velocity |
+  |---|---|---|---|
+  | bf16 | 0.38 / 16.88 / 5.81 | 0.44 / 5.40 / 2.70 | 2.08 |
+  | simulated W8A8 | 0.62 / **26.21** / 12.46 | 1.04 / 13.72 / 6.92 | 6.89 |
+  | ignis | 0.71 / **26.30** / 12.42 | 1.09 / 13.75 / 6.81 | 6.49 |
+
+  - **The verdict.** bf16 keeps the background clean. The W8A8 model, run
+    in fp32 on the artifact's own values, leaks the band three times as
+    much as ignis does. So the ghost is the FP8 quantization's, and ignis's
+    fewer roundings make it smaller, not larger.
+  - **321ab's open item is closed.** The image rows' 26% at block 15 is the
+    sim's 26.21% to a tenth of a point. Block 31 and the target agree as
+    closely.
+  - **What was not done.** Nothing was tuned. A lever, if the owner wants
+    the background clean, would be a finer precision on the condition
+    image's path (its img_in and early blocks). It is not built.
+  - **For the owner's eye**, in
+    `F:/ai/models/ignis-image-2.1-turbo/freerun/edit/`:
+    [ignis](file:///F:/ai/models/ignis-image-2.1-turbo/freerun/edit/ignis.png),
+    [bf16](file:///F:/ai/models/ignis-image-2.1-turbo/freerun/edit/diffusers-bf16.png),
+    [sim](file:///F:/ai/models/ignis-image-2.1-turbo/freerun/edit/diffusers-sim.png),
+    [fp32](file:///F:/ai/models/ignis-image-2.1-turbo/freerun/edit/diffusers-fp32.png).
+- **AC 10, the timing run.** It ran on dbc760e under the GPU lock in
+  timing mode, with no build or other GPU client running. The board sat at
+  its 575 W limit, SM clocks 2.4-2.9 GHz. The test is
+  `crates/server/tests/image_leaf_timing_gpu.rs` (`IGNIS_IMAGE_TIMING=1`).
+  Each job is timed on its second run (the first warms), with the calls the
+  server makes.
+
+  | job | prefix tokens | encode_condition, ms (VAE / tower / text encoder / txt_in+img_in / prefix pass) | a step, ms (min-max) | the DiT loop | vae_decode | the job |
+  |---|---|---|---|---|---|---|
+  | t2i 1024² | 31 | 42 (0 / 0.7 / 21.6 / 0.2 / 19.3) | 145-152 | **1.20 s** (bar ~1.1 s) | 134 ms | 1.37 s |
+  | t2i 2048² | 31 | 42 (0 / 0.7 / 21.6 / 0.2 / 19.2) | 747-802 | **6.11 s** (bar ~6 s) | 646 ms | 6.79 s |
+  | edit, 1 image, 2048² | 4,122 | 469 (37 / 219 / 41 / 0.4 / 157) | 809-816 | 6.50 s | 646 ms | 7.62 s |
+  | edit, 4 images, 2048² | 16,428 (chunks of 15,488) | 2,162 (150 / 1,040 / 163 / 0.9 / 749) | 982-991 | 7.91 s | 645 ms | 10.72 s |
+
+  - **The tower's column includes the encoder's input upload**, its
+    embedding rows. For text to image, that upload is the whole 0.7 ms.
+  - **Run to run.** The dry run 40 minutes earlier read 1.18 s and 5.94 s
+    for the DiT loop. AC 9's free runs read 1.18 s and 5.91 s. That puts the
+    noise at about ±3%.
+  - **Per kernel class**, from the kernel leaf's benches at the leaf's
+    shapes, run in the same hold:
+
+    | class | bench case | throughput | literature bar | of the bar |
+    |---|---|---|---|---|
+    | FP8 W8A8 GEMM | a DiT block's 7 linears + 4 quantizations, 4,096 / 16,384 tokens | 498 / 507 TFLOPS (each GEMM alone 479-517 / 511-556) | 690-740 | 67-73% (each 65-81%) |
+    | 8-bit attention | the target call at 1024², no condition image | 496 TOPS | 620-640 | 78-80% |
+    | | at 2048², 0 / 1 / 10 condition images | 564 / 567 / 575 TOPS | | 88-93% |
+    | BF16 (the VAE's convolutions) | the decoder at 1024² / 2048², the encoder at 1024² | 173 / 177 / 169 TFLOPS (the best stages 190-197) | 210-240 | 70-84% |
+
+  - **A step, rebuilt from the benches** (ms: GEMM + attention target
+    calls + elementwise, against the median step measured):
+    - t2i 1024²: 114.8 + 21.6 (with its quantizers) + 8.2 = 144.6, against
+      150.0;
+    - t2i 2048²: 450.9 + 252.6 + 55.6 = 759.1, against 758.0;
+    - edit with 1 image, 2048²: 450.9 + 312.8 + 55.6 = 819.3, against
+      813.2;
+    - edit with 4 images, 2048²: 450.9 + about 493 (interpolated between
+      the bench's 1 and 10 images) + 55.6 = about 999, against 988.6.
+
+    At 2048² a step is 59% FP8 GEMM, 33% attention and 7% elementwise.
+    The linears at the GEMM bar would take the step to about 630 ms and
+    the loop to about 5.0 s.
+  - **The VAE decode** at 2048² takes 646 ms against its convolutions'
+    383 ms alone. The halo's recompute (1.33x, 321c) accounts for about
+    509 ms of that. The rest is the per-band weight packing, the norms, the
+    mid block and the image's trip to the host.
+  - **The edit's encode is the tower's.** The tower is 47-48% of
+    `encode_condition` at 1 and at 4 images, at about 22 TFLOPS effective
+    (spec 03's 320c). The prefix pass is 33-35%.
+  - Information, not a gate. Nothing was tuned.
+- **Defaults taken** (the owner may revisit):
+  1. **The DiT's timestep is the recorded one**, the product by the
+     reciprocal. Review-321ab wrote fl(fl(1000σ)/1000), but a true division
+     is 1 ulp off the recording at four steps.
+  2. **`image.min_condition_budget_tokens` is `[Visible, Patchable]` and
+     not `ReloadRequired`, like `image.sizes`.** The load reads it, so a
+     change holds from the next load. A reload on its change would reload
+     whatever model is loaded, a text model included, for an image-only
+     field. The minimum is checked against the planned budget before the
+     cap.
+  3. **AC 10's "edit with 4 condition images at 2048²"** is four 1024²
+     condition images and a 2048² target. The server encodes a condition
+     image at about 1024² of area, and four 2048² conditions would be
+     65,536 tokens, past this card's budget.
+  4. **The timed encode drains the stream between phases**
+     (`encode_condition_timed`); the server's call does not. Each drain
+     costs microseconds against phases of milliseconds.
+  5. **The kernel classes come from the benches**, standalone at the
+     leaf's shapes, not from inside the leaf: nsys hangs on Windows. Their
+     sum lands within 1-4% of each measured step.
+  6. **The timing test runs only under `IGNIS_IMAGE_TIMING=1`**, so the
+     GPU sweep does not spend a minute on it.
+- **For the live run (spec 05 AC 14)** and the next agent:
+  - Through HTTP, a 1024² generation takes 1.64 s and an edit 2.21 s
+    (`image_runner_gpu`, this run).
+  - The background of an edit that asks to keep its transparency shows the
+    condition's band faintly, alpha ≤ 18 (above). The sim says that is
+    W8A8's.
+  - Still open, from 322g: a runner that panicked keeps serving. With the
+    real leaf, a panic may leave device state behind, and the adapter could
+    then fail the model.
+  - Still open, from 321d: spec 05's fit corner (ten 16380x100 panoramas).
+- **Gates** (on dbc760e; the docs commit follows):
+  - The CTest under the profile (`kernel/build.ps1 -Test`,
+    `IGNIS_GPU_PROFILE=1`): 124/124.
+  - `CARGO_INCREMENTAL=0 cargo test --workspace`: 2973 passed, 0 failed,
+    6 ignored.
+  - `cargo check -p ignis-server --features cuda --tests` and `-p
+    ignis-core --features cuda --tests`: ok, with only the old warnings.
+  - Under the profile, the image GPU tests 23/23: core's `image_attn_gpu`,
+    `image_elementwise_gpu`, `image_encoder_attn_gpu`, `image_encoder_gpu`
+    (2), `image_gemm_gpu`, `image_vae_gpu`, `image_leaf_gpu` (9); the
+    server's `image_encoder_edit_gpu` (2), `image_leaf_ten_images_gpu`,
+    `image_runner_gpu` (3), `image_leaf_timing_gpu`.
+  - The 27B's vision tests 7/7 under the profile.
+  - `npm test` in `web/`: 860 passed.
