@@ -880,3 +880,17 @@ add_executable(ignis_kernel_image_vision_test test_image_vision.cu)
 target_include_directories(ignis_kernel_image_vision_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_image_vision_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_image_vision_test COMMAND ignis_kernel_image_vision_test)
+
+# --- the image model's diffusion transformer (spec image-model/04, GitHub #321): OURS -------------
+#
+# The program's ops of its own (kernel/include/ignis_image_transformer.h) against fp64 references
+# that track their roundings -- the gated residual with the modulated LayerNorm and its E4M3
+# output, the BF16 linear, the fp32 quantization, the timestep embedding's chain -- and the program
+# on synthetic FP8 weights: txt_in and img_in per row, the prefix and target passes split by block
+# against whole (bit for bit), the target reading the prefix, the Euler update against the host.
+# The real model against the oracle is the Rust test crates/core/tests/image_leaf_gpu.rs. GPU
+# (ADR 0006: no SKIP_RETURN_CODE).
+add_executable(ignis_kernel_image_transformer_test test_image_transformer.cu)
+target_include_directories(ignis_kernel_image_transformer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_image_transformer_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_image_transformer_test COMMAND ignis_kernel_image_transformer_test)
