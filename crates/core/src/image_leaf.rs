@@ -8,12 +8,17 @@
 //! - [`ImagePlan`]: the load's device-memory plan: the weights, one sequential arena, and the
 //!   **condition budget** (whatever the budget leaves, counted in condition-prefix tokens). A load
 //!   whose weights and arena do not fit is refused, naming the shortfall.
+//! - [`LatentNorm`]: the latents' per-channel normalization the DiT reads a condition image in.
+//! - [`PrefixLayout`]: where the encoder's text rows and each condition image's latents go in the
+//!   condition prefix, and its attention segments.
 //!
 //! With the `cuda` feature, [`ImageLeaf`] loads the family and runs its calls:
-//! `encode_condition` (the text encoder, `txt_in` and the DiT over the prefix tokens at t = 0,
-//! storing the condition prefix's K/V in 8 bits) and `denoise_step` (the DiT over the target
-//! tokens, attending to the stored prefix, then the Euler update on the device). The DiT's program
-//! is the kernel leaf's (`kernel/include/ignis_image_transformer.h`, [`crate::image_transformer`]).
+//! `encode_condition` (the condition images' VAE encodes, the vision tower and the text encoder,
+//! `txt_in` and `img_in`, and the DiT over the prefix tokens at t = 0, storing the condition
+//! prefix's K/V in 8 bits), `denoise_step` (the DiT over the target tokens, attending to the stored
+//! prefix, then the Euler update on the device) and `vae_encode`. The DiT's program is the kernel
+//! leaf's (`kernel/include/ignis_image_transformer.h`, [`crate::image_transformer`]); the VAE
+//! encoder is [`crate::image_autoencoder`]'s.
 
 use crate::vram::VramMode;
 
