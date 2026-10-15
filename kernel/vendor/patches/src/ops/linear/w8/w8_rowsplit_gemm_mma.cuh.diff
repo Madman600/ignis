@@ -1,0 +1,27 @@
+diff --git a/reference/src/ops/linear/w8/w8_rowsplit_gemm_mma.cuh b/vendor/src/ops/linear/w8/w8_rowsplit_gemm_mma.cuh
+index 5ee115a..edce076 100644
+--- a/reference/src/ops/linear/w8/w8_rowsplit_gemm_mma.cuh
++++ b/vendor/src/ops/linear/w8/w8_rowsplit_gemm_mma.cuh
+@@ -165,7 +165,21 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
+                 const int grow =
+                     kSwiGlu ? m0 + (row % (BM / 2)) + (row >= BM / 2 ? m / 2 : 0) : m0 + row;
+                 auto* dst = &Sr[row * Cfg::SCALE_CACHE_BYTES];
+-                if constexpr (Full) {
++                if ((kg % 8) != 0) {
++                    // ignis #324: padded K an odd multiple of 128 (K 1152) makes a row of scales
++                    // a multiple of 8 bytes but not of 16, so the window is two 8-byte copies of
++                    // four groups each; a half past the row's last group is zero-filled.
++                    const bool valid_row  = Full || output_tile.valid(grow, m);
++                    const std::int64_t gr = static_cast<std::int64_t>(valid_row ? grow : 0) * kg;
++#pragma unroll
++                    for (int half = 0; half < 2; ++half) {
++                        const int g      = g0 + half * 4;
++                        const bool valid = valid_row && g < kg;
++                        ninfer::ops::cp_async_zfill<8>(dst + half * 8,
++                                                       &scales[(gr + (valid ? g : 0)) * 2],
++                                                       valid ? 8 : 0);
++                    }
++                } else if constexpr (Full) {
+                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
+                     cp_async<16, Cache::cg>(dst, &scales[gi * 2]);
+                 } else {
