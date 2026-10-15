@@ -3,7 +3,7 @@
 - Kind: experiment
 - Status: current
 - Observed: 2026-10-14
-- Last verified: 2026-10-14
+- Last verified: 2026-10-15 (the timing test again, after #324 moved the tower's K-1152 linears to MMA)
 - Scope: kernel / the image leaf's denoising step, condition encode and VAE decode on the RTX 5090 (sm_120)
 - Related: spec [image-model/04](../specs/image-model/04-the-image-leaf.md) AC 10 (GitHub #321), [Image-model kernels on the 5090](2026-10-13-image-model-kernels-on-the-5090.md), [ADR 0050](../adr/0050-ignis-serves-an-image-model.md)
 - Superseded by: none
@@ -49,6 +49,17 @@ Two questions:
 | t2i 2048² | 31 | 42 (0 / 0.7 / 21.6 / 0.2 / 19.2) | 747-802 | 6.11 s | 646 ms | 6.79 s |
 | edit, 1 image, 2048² | 4,122 | 469 (37 / 219 / 41 / 0.4 / 157) | 809-816 | 6.50 s | 646 ms | 7.62 s |
 | edit, 4 images, 2048² | 16,428 | 2,162 (150 / 1,040 / 163 / 0.9 / 749) | 982-991 | 7.91 s | 645 ms | 10.72 s |
+
+**After #324** (2026-10-15, branch `followups-324-gpu` at 0dfc97c, the same
+test and artifact, the GPU lock in timing mode): the tower's K-1152 linears
+run on MMA. Only the edits' encode moved:
+
+| job | encode_condition, ms (VAE / tower / text encoder / txt_in+img_in / prefix pass) | DiT loop | job |
+|---|---|---|---|
+| t2i 1024² | 42 (0 / 0.7 / 21.7 / 0.2 / 19.4) | 1.19 s | 1.36 s |
+| t2i 2048² | 42 (0 / 0.8 / 21.6 / 0.2 / 19.2) | 5.99 s | 6.69 s |
+| edit, 1 image, 2048² | 286 (34 / 45 / 40 / 0.4 / 154) | 6.63 s | 7.57 s |
+| edit, 4 images, 2048² | 1,258 (146 / 169 / 156 / 0.9 / 727) | 7.89 s | 9.79 s |
 
 The DiT loop's run-to-run spread is about ±3%:
 - a dry run 40 minutes earlier: 1.18 s and 5.94 s;
@@ -106,6 +117,9 @@ Raw output (untracked, in the `image-kernels-319` worktree's `.scratch/321e/`):
   at 1 and 4 images, 219 ms an image. That is about 22 TFLOPS effective,
   the K-1152 linears on SIMT that spec 03 (320c) names, and the farthest of
   any kernel from a bar. The prefix pass is 33-35%.
+  - **Since #324** those linears run on MMA: the tower is 42-45 ms an
+    image, 13-16% of `encode_condition`, and the prefix pass (54-58%) leads
+    it. The 4-image edit's job drops from 10.72 s to 9.79 s.
 - **The VAE decode** at 2048² is 646 ms against its convolutions' 383 ms
   alone. The halo's recompute in bands (1.33x) explains about 509 ms. The
   convolutions themselves run at 70-84% of the bf16 bar.
@@ -120,7 +134,8 @@ Raw output (untracked, in the `image-kernels-319` worktree's `.scratch/321e/`):
   the bar is worth about 1 s of the 6 s loop. The attention has little
   left.
 - For edits, the tower is the next cost after the loop. With four
-  condition images it is a second of a 10.7 s job.
+  condition images it is a second of a 10.7 s job. Since #324 it is
+  0.17 s, and the prefix pass (0.73 s with four images) is next.
 - The decode's halo recompute and its per-band weight packing are a
   bounded ~0.2 s at 2K. Carrying halo rows between bands would remove most
   of it.
@@ -147,5 +162,5 @@ Raw output (untracked, in the `image-kernels-319` worktree's `.scratch/321e/`):
 None required (AC 10 is information, not a gate). The candidates, should
 the owner want speed:
 - the GEMM tile configuration at 16K tokens;
-- the tower's K-1152 linears;
+- the tower's K-1152 linears (done, #324);
 - halo carrying in the decode.
