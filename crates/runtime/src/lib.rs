@@ -98,14 +98,28 @@ pub fn auto_kv_pool_bytes(format: ignis_core::KvFormat, max_context: u32) -> u64
 pub const CUDA_CONTEXT_BYTES: u64 = 452_595_712;
 
 /// What a 27B load leaves on the device beside the CUDA context once it is
-/// torn down (GitHub #324): state its kernels set up once per process, which
-/// the plan charges as part of [`LOAD_RESIDUAL_BYTES`]. Read from the same
-/// WDDM counter as [`CUDA_CONTEXT_BYTES`], on the RTX 5090 on 2026-10-15: an
-/// idle-unloaded server that has loaded the 27B holds 536,485,888 B (the same
-/// to the byte at every unload, an image model's in between included), one
-/// that has only loaded the image model holds 452,595,712 B, the context
-/// alone.
-pub const QWEN27B_PROCESS_STATE_BYTES: u64 = 83_890_176;
+/// torn down (GitHub #324), which the plan charges as part of
+/// [`LOAD_RESIDUAL_BYTES`]. Read from the same WDDM counter as
+/// [`CUDA_CONTEXT_BYTES`], on the RTX 5090 (driver 610.88) on 2026-10-15, at
+/// the Makefile's 27B shape: an idle-unloaded server that has loaded the 27B
+/// holds 536,489,984 B (the same to the byte at every unload, an image model's
+/// in between included), one that has only loaded the image model holds
+/// 452,595,712 B, the context alone. Two parts, told apart by a run under
+/// `CUDA_MODULE_LOADING=EAGER`, which loads every module with the context (the
+/// image-only server then holds 72 MiB more):
+/// - 6 MiB + 8 KiB is module code: CUDA loads the 27B's kernels lazily, on
+///   their first launch, and keeps them. Under eager loading this part is gone.
+/// - 74 MiB survives eager loading: state the driver sets up for this context
+///   on the 27B's first load and keeps for the context's life. What it is is
+///   not identified. It is not the stack reservation (the stack limit stays at
+///   its 1 KiB default, and a probe kernel with a 512 B frame grows nothing),
+///   the stream-ordered or graph memory pools (both reserve 0 after the
+///   teardown, and trimming them frees nothing), freed small allocations or
+///   pinned host mappings (the driver hands both back).
+///
+/// The figure moves with the kernels a load runs: `vram_reload_gpu`'s shape
+/// leaves 81,793,024 B, and the build before #324's vision patch 4 KiB less.
+pub const QWEN27B_PROCESS_STATE_BYTES: u64 = 83_894_272;
 
 /// Set once a 27B load has run in this process (GitHub #324).
 static QWEN27B_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -141,14 +155,18 @@ pub fn held_before_load(context_created: bool, qwen27b_state_charged: bool) -> u
 
 /// What a load holds beyond every reservation the VRAM plan names (GitHub
 /// #210): allocator rounding, the decode graph captures, handles the kernel
-/// creates lazily. Measured on the RTX 5090 on 2026-09-17 at the Makefile
-/// defaults with `--vision-enabled` (262K hq-e8-2b, DFlash2/7): the server's WDDM
-/// dedicated usage right after load minus the context and every line the load
-/// allocates (the plan's total less the retained checkpoint ledger line, which
-/// that load did not allocate) -- 30,047,830,016 B held against a 4,653,252,608 B KV pool, in a
-/// run planned with no context or residual line. The confirming run, with
-/// both lines, held 30,704,246,784 B against 30,704,304,128 B planned.
-pub const LOAD_RESIDUAL_BYTES: u64 = 88_028_656;
+/// creates lazily, and on a process's first 27B load
+/// [`QWEN27B_PROCESS_STATE_BYTES`], which a later load adds back. Measured on
+/// the RTX 5090 on 2026-10-15 (GitHub #324) at the Makefile defaults (512K
+/// hq-e8-2b, YaRN 2, DFlash2/7): the server's WDDM dedicated usage right after
+/// load minus the context and every line the load allocates -- 123,684,272 B
+/// on a cold start, 124,474,800 B on the reload after a switch to the image
+/// model and back; the larger is the figure. The confirming cold start, with
+/// it, held 29,530,902,528 B against 29,530,451,968 B planned. NVML's
+/// free-memory delta does not measure it: it moves with every process on the
+/// card (14 MB over the plan on 2026-10-14, 86 MB on this run). It was
+/// 88,028,656 B on 2026-09-17, at 262K with `--vision-enabled`.
+pub const LOAD_RESIDUAL_BYTES: u64 = 124_474_800;
 
 /// Device bytes a load holds beside its weights, line by line as the VRAM
 /// plan lays them out (GitHub #210): planned before the load, read back off
