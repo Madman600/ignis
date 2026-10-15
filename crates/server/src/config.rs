@@ -332,7 +332,8 @@ pub struct Config {
     /// What Flash-Next's host plan must leave of the physical memory
     /// available at load (`--model-host-margin-bytes`,
     /// [`DEFAULT_HOST_MARGIN_BYTES`]): a load whose pinned lines leave less
-    /// is refused, naming the line to shrink. The 27B makes no host plan.
+    /// is refused, naming the line to shrink. The 27B and the image model
+    /// make no host plan: their starts carry it for a switch to Flash-Next.
     pub host_margin_bytes: u64,
     /// Cross-request state reuse (`--reuse-prompt`, GitHub #186, ADR 0029).
     /// On by default. Off means a request captures no prompt checkpoint and

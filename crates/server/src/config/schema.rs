@@ -332,7 +332,8 @@ config_group! {
         /// available at load (free plus standby): a load whose pinned lines
         /// — experts, n-gram hot rows, staging, retained host slots, the
         /// KV-RAM arena — leave less is refused, naming the line to shrink,
-        /// so the desktop is never paged out. The 27B makes no host plan.
+        /// so the desktop is never paged out. The 27B and the image model make
+        /// no host plan: their starts carry it for a switch to Flash-Next.
         host_margin_bytes: Bytes = super::DEFAULT_HOST_MARGIN_BYTES, NO_RULE, ALL, [Visible, Patchable, ReloadRequired, Scoped];
     }
 }

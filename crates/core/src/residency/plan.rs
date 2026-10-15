@@ -146,8 +146,8 @@ impl std::fmt::Display for HostPlanError {
                 "The experts fit, the n-gram hot rows do not: hold fewer (--ngram-hot-bytes) or close other applications",
             ),
             "staging" => f.write_str(
-                "The experts and the n-gram hot rows fit, KV-disk's staging buffers do not: --kv-disk-bytes 0 drops them, \
-                 or close other applications",
+                "The experts and the n-gram hot rows fit, KV-disk's staging buffers do not: \
+                 --qwen38flashnext-kv-disk-bytes 0 drops them, or close other applications",
             ),
             "retained_host_slots" => f.write_str(
                 "The model fits, prompt reuse's retained host slots do not: fewer of them \

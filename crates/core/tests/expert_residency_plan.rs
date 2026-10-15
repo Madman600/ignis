@@ -139,7 +139,9 @@ fn the_staging_line_crossing_names_staging_and_its_own_remedy() {
     let message = err.to_string();
     let HostPlanError::BelowMargin { crossing_line, .. } = err;
     assert_eq!(crossing_line, "staging");
-    assert!(message.contains("KV-disk's staging buffers do not: --kv-disk-bytes 0 drops them"), "{message}");
+    // Flash-Next's own flag, as every other remedy names: a 27B start's
+    // general `--kv-disk-bytes` cannot shadow it.
+    assert!(message.contains("KV-disk's staging buffers do not: --qwen38flashnext-kv-disk-bytes 0 drops them"), "{message}");
     assert!(!message.contains("--ngram-hot-bytes"), "{message}");
 }
 

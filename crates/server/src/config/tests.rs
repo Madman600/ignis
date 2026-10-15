@@ -973,6 +973,36 @@ fn a_27b_start_carries_flash_nexts_own_margin_to_the_switch() {
     assert_eq!(crate::runtime::EngineShape::from(&switched).host_margin_bytes, 3 * GIB);
 }
 
+/// The image model makes no host plan either (its arena is VRAM), and its
+/// start takes Flash-Next's own margin and KV-RAM arena — make passes the
+/// arena on every start — for a switch to Flash-Next, where they arrive.
+#[test]
+fn an_image_start_carries_flash_nexts_margin_and_arena_to_the_switch() {
+    let config = config(&[
+        "--profile",
+        "none",
+        "--qwen38flashnext-model-host-margin-bytes",
+        "3G",
+        "--qwen38flashnext-reuse-kv-host-pool-bytes",
+        "2G",
+    ]);
+    let image = config.for_family(ModelFamily::QwenImage21).expect("an image start takes Flash-Next's values");
+    assert_eq!(image.host_margin_bytes, DEFAULT_HOST_MARGIN_BYTES, "the image model's is the default");
+    let (switched, dropped) = fit_to_family(&image, ModelFamily::FlashNext).unwrap();
+    assert!(dropped.is_empty(), "{dropped:?}");
+    let shape = crate::runtime::EngineShape::from(&switched);
+    assert_eq!((shape.host_margin_bytes, shape.host_pool_bytes), (3 * GIB, 2 * GIB));
+}
+
+/// ADR 0046: the margin's third spelling, the file key, scoped too.
+#[test]
+fn the_host_margin_reads_from_a_file_per_family() {
+    let files = MemFiles::with(&[("c.yaml", "model:\n  host_margin_bytes: 5G\n  qwen38flashnext:\n    host_margin_bytes: 3G\n")]);
+    let config = with_files(&["--profile", "none", "--config", "c.yaml"], no_env, &files).unwrap();
+    assert_eq!(config.host_margin_bytes, 5 * GIB, "the general value");
+    assert_eq!(config.for_family(ModelFamily::FlashNext).unwrap().host_margin_bytes, 3 * GIB, "Flash-Next's own");
+}
+
 #[test]
 fn a_malformed_host_pool_budget_is_a_usage_error() {
     assert!(refused(&["--reuse-kv-host-pool-bytes", "not-a-size"]).contains("--reuse-kv-host-pool-bytes"));
