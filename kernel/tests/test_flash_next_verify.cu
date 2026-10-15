@@ -140,14 +140,17 @@ struct Pool {
   }
   std::vector<uint8_t> conv_bytes() const { return download<uint8_t>(conv.p, conv.bytes); }
   std::vector<uint8_t> state_bytes() const { return download<uint8_t>(recurrent.p, recurrent.bytes); }
+  // Landed when they return, like upload() (GitHub #324): the calls run on a non-blocking stream.
   void restore(const std::vector<uint8_t> &c, const std::vector<uint8_t> &r) {
     MOE_CUDA(cudaMemcpy(conv.p, c.data(), c.size(), cudaMemcpyHostToDevice));
     MOE_CUDA(cudaMemcpy(recurrent.p, r.data(), r.size(), cudaMemcpyHostToDevice));
+    MOE_CUDA(cudaDeviceSynchronize());
   }
 };
 
 void upload_to(ninfer::DeviceBuffer &buffer, const std::vector<int32_t> &v) {
   MOE_CUDA(cudaMemcpy(buffer.p, v.data(), v.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+  MOE_CUDA(cudaDeviceSynchronize());
 }
 
 bool same_slot(const std::vector<uint8_t> &a, const std::vector<uint8_t> &b, int slot, std::size_t slot_bytes) {

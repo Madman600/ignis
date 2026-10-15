@@ -130,6 +130,9 @@ int main() {
   }
   cudaStream_t stream;
   CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  // The router's weights went up on the legacy stream, which the steps' stream does not wait for
+  // (GitHub #324): landed before the first step. What each step reads goes up on its stream.
+  CUDA_OK(cudaDeviceSynchronize());
 
   // One step on residency i: the router and the demand step (0), or the routed step (1).
   const auto step = [&](int i, uint32_t layer, uint32_t tokens, cudaStream_t s) {
@@ -175,10 +178,10 @@ int main() {
     std::vector<uint16_t> x = random_bf16(static_cast<std::size_t>(s.tokens) * kHidden, 1.0F, seed++);
     if (s.kind == 1) std::fill(x.begin(), x.end(), uint16_t{0});
     if (s.kind == 2) x[17] = 0x7FC0;  // NaN
-    CUDA_OK(cudaMemcpy(d_x, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpyAsync(d_x, x.data(), x.size() * 2, cudaMemcpyHostToDevice, stream));
     for (int i = 0; i < 2; ++i) {
-      CUDA_OK(cudaMemset(d_ids[i], 0xFF, kMaxTokens * kTopK * 4));
-      CUDA_OK(cudaMemset(d_weights[i], 0xFF, kMaxTokens * kTopK * 4));
+      CUDA_OK(cudaMemsetAsync(d_ids[i], 0xFF, kMaxTokens * kTopK * 4, stream));
+      CUDA_OK(cudaMemsetAsync(d_weights[i], 0xFF, kMaxTokens * kTopK * 4, stream));
       if (step(i, s.layer, s.tokens, stream) != 0) {
         std::fprintf(stderr, "%s: %s / %s\n", at.c_str(), ignis_moe_last_error(), ignis_residency_last_error());
         return 1;
