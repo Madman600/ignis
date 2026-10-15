@@ -260,7 +260,7 @@ pub trait ImageRunner: Send {
 
     /// The device bytes of the condition prefixes it holds now: what of the
     /// condition budget is in use (GitHub #324). Host-side and cheap: the job
-    /// reads it after each encode and release, for `/metrics`.
+    /// reads it after each encode and release, for the server to publish.
     fn condition_bytes(&self) -> u64;
 }
 
