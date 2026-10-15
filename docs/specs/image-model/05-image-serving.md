@@ -1145,7 +1145,10 @@ three loads, where the server already had the text-first path (one load).
   and *In use now* has a *Condition prefixes* row. A text load shows neither.
 - **Defaults taken.** The arena is `workspace`, not a new line; the condition
   budget is reported in bytes only (its tokens stay in `ignis.image.plan`).
-  The gauge is rendered on every load, 0 on a text one, so its name is not an
+  The `condition_budget` line is the plan's, set at load: a live
+  `image.condition_budget_tokens` lowers what each request may hold
+  (`images::budget`), not the line, so a PATCH of it leaves the Monitor's plan
+  as it was. The gauge is rendered on every load, 0 on a text one, so its name is not an
   `ignis_image_*` one: those families are absent until a job. The Monitor
   keeps the KV pool, KV-RAM and retained-slot rows on an image load; they
   read "this load has none of it to give".
