@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, IMAGE_EXPOSITION, KV_DISK_EXPOSITION } from "./fixture.ts";
+import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, IMAGE_EXPOSITION, IMAGE_LOAD_EXPOSITION, KV_DISK_EXPOSITION } from "./fixture.ts";
 import { MonitorView } from "./MonitorView.tsx";
 import { applyScrape, initialMonitor } from "./scrape.ts";
 
@@ -181,6 +181,27 @@ describe("MonitorView", () => {
     expect(html).toContain("Time denoising");
     const text = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, now, 2)} />);
     expect(text).not.toContain("Image jobs");
+  });
+
+  it("lays an image load's plan out by its condition budget, not a KV pool, and reads the prefixes held against it (GitHub #324)", () => {
+    const state = applyScrape(initialMonitor(), { kind: "ok", text: IMAGE_LOAD_EXPOSITION }, Date.now(), 2);
+    const html = renderToStaticMarkup(<MonitorView state={state} />).replace(/<!-- -->/g, "");
+    // 15.46 GB of weights, a 1.32 GB arena and a 12.3 GB condition budget in a 29.1 GB budget.
+    for (const segment of ["Weights · 14.4 GiB", "Workspace · 1.23 GiB", "Condition budget · 11.46 GiB"]) expect(html).toContain(segment);
+    expect(html).toContain("27.08 GiB");
+    expect(html).toContain("reserved of a 27.1 GiB budget");
+    expect(html).toContain("the condition budget took what the weights and the arena left");
+    expect(html).not.toContain("left for the KV pool");
+    expect(html).not.toContain("The pool is");
+    expect(html).not.toContain("KV pool ·");
+    // A running job's 1.12 GB prefix of the 12.3 GB budget.
+    expect(html).toContain("Condition prefixes");
+    expect(html).toContain("1.04 GiB");
+    expect(html).toContain("9.1% in use");
+    // A text load has neither.
+    const text = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: IGNIS_EXPOSITION }, Date.now(), 2)} />);
+    expect(text).not.toContain("Condition budget");
+    expect(text).not.toContain("Condition prefixes");
   });
 
   it("says when the key is wanted instead of drawing charts", () => {

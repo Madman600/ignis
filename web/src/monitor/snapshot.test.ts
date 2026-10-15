@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseExposition } from "./exposition.ts";
-import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, IMAGE_EXPOSITION, KV_DISK_EXPOSITION } from "./fixture.ts";
+import { FLASH_NEXT_EXPOSITION, IGNIS_EXPOSITION, IMAGE_EXPOSITION, IMAGE_LOAD_EXPOSITION, KV_DISK_EXPOSITION } from "./fixture.ts";
 import { emptySnapshot, readSnapshot, counterValues, RETAINED_FAMILY_KEYS } from "./snapshot.ts";
 
 describe("readSnapshot", () => {
@@ -55,6 +55,20 @@ describe("readSnapshot", () => {
     // GitHub #281: of the ten, eight on the host, in their pinned block.
     expect(memory.retainedHost).toEqual({ slots: 8, bytes: 1_860_257_792 });
     expect(memory.slotSkips).toEqual({ publish_skipped_no_slot: 12, capture_skipped_no_slot: 5, capture_skipped_no_page: 1 });
+  });
+
+  it("reads the image model's condition budget and the prefixes its jobs hold, and leaves them null on a server without them (GitHub #324)", () => {
+    const { memory, unknown } = readSnapshot(parseExposition(IMAGE_LOAD_EXPOSITION));
+    expect([memory.reserved.weights, memory.reserved.workspace, memory.reserved.condition_budget]).toEqual([15_460_000_000, 1_320_000_000, 12_300_000_000]);
+    expect([memory.reserved.cuda_context, memory.reserved.residual, memory.kvPoolPages]).toEqual([0, 0, 0]);
+    expect(memory.budgetBytes).toBe(29_100_000_000);
+    expect(memory.conditionBudgetUsedBytes).toBe(1_120_000_000);
+    expect(unknown).toEqual([]);
+
+    const text = readSnapshot(parseExposition(IGNIS_EXPOSITION)).memory;
+    expect([text.reserved.condition_budget, text.conditionBudgetUsedBytes]).toEqual([0, 0]);
+    const older = readSnapshot(parseExposition('ignis_vram_reserved_bytes{line="weights"} 1\n')).memory;
+    expect([older.reserved.condition_budget, older.conditionBudgetUsedBytes]).toEqual([null, null]);
   });
 
   it("reads the KV-disk tier when the scrape carries it, and leaves it null when not (spec vram-budget/03)", () => {

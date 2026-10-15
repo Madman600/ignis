@@ -684,6 +684,7 @@ const LINE_LABEL: Record<VramLine, string> = {
   residual: "Residual",
   residency: "Residency",
   expert_cache: "Expert cache",
+  condition_budget: "Condition budget",
 };
 
 const FAMILY_LABEL: Record<RetainedFamily, string> = {
@@ -736,7 +737,10 @@ function planSegments(memory: Memory): PlanSegment[] {
       label: "Unspent budget",
       bytes: memory.spareBytes,
       color: "var(--line)",
-      note: "what the pages did not buy, the pool's own tables included",
+      note:
+        memory.conditionBudgetBytes > 0
+          ? "what the condition budget's whole tokens did not buy"
+          : "what the pages did not buy, the pool's own tables included",
     });
   }
   return segments;
@@ -761,7 +765,10 @@ function PlanCard({ memory }: { memory: Memory }) {
               reserved of a {formatBytes(budget)} budget ·{" "}
               {memory.oversubscribed
                 ? `${formatBytes(Math.abs(memory.spareBytes ?? 0))} over it`
-                : memory.expertCacheBytes > 0
+                : memory.conditionBudgetBytes > 0
+                  ? // The image model (GitHub #324): no KV pool; its condition budget takes what the weights and the arena leave.
+                    "the condition budget took what the weights and the arena left"
+                  : memory.expertCacheBytes > 0
                   ? // Flash-Next sizes its pool by context and lanes; the expert cache takes whatever that leaves.
                     `${formatBytes(memory.kvRoomBytes)} for the KV pool${
                       memory.kvPool.tokens === null ? "" : ` (${formatCount(memory.kvPool.tokens)} tokens)`
@@ -788,13 +795,22 @@ function PlanCard({ memory }: { memory: Memory }) {
               </li>
             ))}
           </ul>
-          <p className="text-[11px] text-ash">
-            The pool is {formatCount(memory.kvPool.pages)} pages of {formatBytes(memory.kvPool.pageBytes)}, {TOKENS_PER_KV_PAGE} tokens to a page: the tokens
-            beside the room above are those pages multiplied, the whole pool rather than what is free at this moment. What the budget left beyond those pages
-            is the rounding a whole page forces, plus the pool's own block tables — neither is exported apart, so it is shown as one unspent remainder rather
-            than split into a figure nothing measured.
-            {memory.oversubscribed && " This load reserved more than its budget (--vram-allow-oversubscription), so the bar is the plan, not the budget."}
-          </p>
+          {memory.conditionBudgetBytes > 0 ? (
+            <p className="text-[11px] text-ash">
+              The image model has no KV pool. Its condition budget is the room its jobs' condition prefixes — the prompt and the condition images, encoded
+              once a job — are allocated from as each job encodes, and freed as it ends; In use now reads what they hold. Its weights and its one arena are
+              the plan's other lines, and the budget is what was free with its CUDA context already held, so no context line is charged.
+              {memory.oversubscribed && " This load reserved more than its budget (--vram-allow-oversubscription), so the bar is the plan, not the budget."}
+            </p>
+          ) : (
+            <p className="text-[11px] text-ash">
+              The pool is {formatCount(memory.kvPool.pages)} pages of {formatBytes(memory.kvPool.pageBytes)}, {TOKENS_PER_KV_PAGE} tokens to a page: the tokens
+              beside the room above are those pages multiplied, the whole pool rather than what is free at this moment. What the budget left beyond those pages
+              is the rounding a whole page forces, plus the pool's own block tables — neither is exported apart, so it is shown as one unspent remainder rather
+              than split into a figure nothing measured.
+              {memory.oversubscribed && " This load reserved more than its budget (--vram-allow-oversubscription), so the bar is the plan, not the budget."}
+            </p>
+          )}
         </>
       )}
     </Card>
@@ -871,6 +887,17 @@ function OccupancyCard({ memory, win }: { memory: Memory; win: string }) {
   return (
     <Card title="In use now" subtitle="Each live figure against the constant that bounds it">
       <div className="flex flex-col gap-4">
+        {memory.conditionInUse && (
+          <MeterRow
+            label="Condition prefixes"
+            meter={memory.conditionInUse}
+            format={formatBytes}
+            color="var(--series-3)"
+            aside="what the image jobs' encoded prompts and condition images hold, against the condition budget"
+          >
+            <Sparkline values={memory.conditionInUse.series} color="var(--series-3)" height={30} />
+          </MeterRow>
+        )}
         <MeterRow
           label="KV pool pages"
           meter={memory.pagesInUse}

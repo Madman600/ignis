@@ -246,7 +246,7 @@ describe("deriveMemory", () => {
     const reserved = Object.fromEntries(Object.keys(emptySnapshot().memory.reserved).map((line) => [line, 0])) as MemorySeries["reserved"];
     Object.assign(reserved, { weights: 600, residency: 100, expert_cache: 500 });
     const m = deriveMemory([memoryAt(0, { reserved, budgetBytes: 2000, kvPoolPages: 8, kvPageBytes: 100 })], 0);
-    expect(m.lines.slice(-2).map((l) => l.line)).toEqual(["residency", "expert_cache"]);
+    expect(m.lines.slice(-3).map((l) => l.line)).toEqual(["residency", "expert_cache", "condition_budget"]);
     expect(m.linesBytes).toBe(1200);
     expect(m.expertCacheBytes).toBe(500);
     expect(m.kvRoomBytes).toBe(800);
@@ -257,6 +257,26 @@ describe("deriveMemory", () => {
     expect(o.planned).toBe(true);
     expect(o.linesBytes).toBe(600);
     expect(o.expertCacheBytes).toBe(0);
+  });
+
+  it("lays an image load's plan out: the condition budget takes what the weights and the arena leave, and the prefixes held read against it (GitHub #324)", () => {
+    const reserved = Object.fromEntries(Object.keys(emptySnapshot().memory.reserved).map((line) => [line, 0])) as MemorySeries["reserved"];
+    Object.assign(reserved, { weights: 600, workspace: 100, condition_budget: 280 });
+    const image = { reserved, budgetBytes: 1000, kvPoolPages: 0, kvPageBytes: 0 };
+    const m = deriveMemory([memoryAt(0, { ...image, conditionBudgetUsedBytes: 0 }), memoryAt(60_000, { ...image, conditionBudgetUsedBytes: 70 })], 0);
+    expect(m.planned).toBe(true);
+    expect(m.lines.at(-1)).toEqual({ line: "condition_budget", bytes: 280 });
+    expect(m.linesBytes).toBe(980);
+    expect(m.conditionBudgetBytes).toBe(280);
+    expect(m.kvPool.bytes).toBe(0);
+    expect(m.spareBytes).toBe(20);
+    expect(m.conditionInUse).toMatchObject({ used: 70, capacity: 280, share: 0.25, series: [0, 70] });
+    // A text load's condition budget is 0, and a server that predates it exports none: no
+    // condition row either way, and the plan is whole without the line.
+    const text = deriveMemory([memoryAt(0, { ...image, reserved: { ...reserved, condition_budget: 0 }, conditionBudgetUsedBytes: 0 })], 0);
+    expect([text.conditionBudgetBytes, text.conditionInUse]).toEqual([0, null]);
+    const older = deriveMemory([memoryAt(0, { ...image, reserved: { ...reserved, condition_budget: null } })], 0);
+    expect([older.planned, older.linesBytes, older.conditionBudgetBytes, older.conditionInUse]).toEqual([true, 700, 0, null]);
   });
 
   it("will not add a plan up unless the scrape carries all twelve lines", () => {
@@ -274,9 +294,9 @@ describe("deriveMemory", () => {
     // was laid out in, and the panel has to be able to say so.
     const reserved = Object.fromEntries(Object.keys(emptySnapshot().memory.reserved).map((line) => [line, 100]));
     const m = deriveMemory([memoryAt(0, { reserved: reserved as MemorySeries["reserved"], budgetBytes: 900, kvPoolPages: 2, kvPageBytes: 50 })], 0);
-    expect(m.linesBytes).toBe(1400);
-    expect(m.kvRoomBytes).toBe(-500);
-    expect(m.spareBytes).toBe(-600);
+    expect(m.linesBytes).toBe(1500);
+    expect(m.kvRoomBytes).toBe(-600);
+    expect(m.spareBytes).toBe(-700);
     expect(m.oversubscribed).toBe(true);
   });
 
