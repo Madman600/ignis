@@ -74,8 +74,8 @@ The encode, wall time against kernel time:
 - **Attention at 4096²:** one segment of 65,536 patches costs
   4 · S² · 72 · 16 heads · 27 blocks = 5.34e14 FLOP. That runs in 3.24 s, or
   165 TFLOPS. At 1024² the attention runs at 145 TFLOPS.
-- **Elementwise kernels at 65,536 patches:** `add_bias` and GELU pass the
-  vendor's cache-size gate (`kBf16x8CacheSizedMaxElements`) and run their
+- **Elementwise kernels at 65,536 patches:** `add_bias` and GELU exceed the
+  vendor's cache-size gate (`kBf16x8CacheSizedMaxElements`) and fall to their
   bf16x2 kernels. That costs 68 ms an encode (1.8%).
 
 Raw logs, the harness and the scratch timing test are in
@@ -85,7 +85,7 @@ Raw logs, the harness and the scratch timing test are in
 
 The 27B's tower has no bottleneck of item 5's kind:
 
-- **Linears:** every one runs on an MMA arm at 165-212 TFLOPS. That is at or
+- **Linears:** every one runs on an MMA arm at 160-212 TFLOPS. That is at or
   above the W8 tower after #324, and the dispatch already picks the faster arm
   at every tower width.
 - **A 1024² image** encodes in 40 ms, 10% under the image model's 44 ms. Of its
