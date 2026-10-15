@@ -1041,6 +1041,10 @@ int32_t ignis_residency_warm_start(ignis_residency *r, const uint32_t *keys, uin
   state.clock += chosen.size();
   RESIDENCY_CUDA(cudaMemcpy(r->dev.slot_of, slot_of.data(), nkeys * 4, cudaMemcpyHostToDevice));
   RESIDENCY_CUDA(cudaMemcpy(r->dev.st, &state, sizeof(State), cudaMemcpyHostToDevice));
+  // A pageable copy may return before its bytes land, and the first step may run on a stream
+  // that does not wait for the legacy one (GitHub #324): it would read the pools as they were
+  // before the warm start.
+  RESIDENCY_CUDA(cudaDeviceSynchronize());
   *admitted = static_cast<uint32_t>(chosen.size());
   return 0;
 }

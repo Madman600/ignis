@@ -217,10 +217,12 @@ __global__ void spin_kernel(unsigned long long ns) {
 
 // What a step reads goes up on the stream the step runs on (GitHub #324, item 7). A pageable
 // cudaMemcpy on the legacy stream may return before its bytes land, and a cudaStreamNonBlocking
-// stream does not wait for the legacy one: the eviction check's step read a lookahead that was not
-// there yet, now and then, and failed its four checks. IGNIS_RESIDENCY_UPLOAD_DELAY_US puts a
-// spin that long ahead of every upload, on the upload's stream: a step not ordered after its
-// upload then reads the old bytes every time.
+// stream does not wait for the legacy one; the eviction check failed its four checks now and then,
+// and an upload or the warm start's last copies landing late are what can make it (the cause is
+// inferred, not reproduced). IGNIS_RESIDENCY_UPLOAD_DELAY_US puts a spin that long ahead of every
+// upload, on the upload's stream: an upload a step is not ordered after then fails every run. It
+// guards this file's uploads only: a synchronous cudaMemcpy plus the spin passed, and the library's
+// own legacy copies are the warm start's trailing device sync's to close.
 void upload(void *dst, const void *src, size_t bytes, cudaStream_t stream) {
   static const unsigned long long delay_ns = [] {
     const char *us = std::getenv("IGNIS_RESIDENCY_UPLOAD_DELAY_US");
