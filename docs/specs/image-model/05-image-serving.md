@@ -1109,3 +1109,54 @@ three loads, where the server already had the text-first path (one load).
   switch to it (`Switcher::text_model`); otherwise the old path (the image
   model loads, the rewrite is skipped with a warning). The view was not
   looked at in a browser.
+
+## As built (324 image VRAM, 2026-10-15, branch `image-vram-324`: the image model's VRAM on `/metrics` and the Monitor)
+
+- **Why it read empty.** 322c F3 had `observe_load` zero a text model's
+  reservations for a model with no engine, and the image load reported none
+  of its own (`LoadedModel::reservations` was `None`): with the image model
+  loaded the VRAM plan read no load.
+- **The plan's lines.** `LoadReservations::image` maps the leaf's
+  `ImagePlan` into ADR 0030's family: weights as `line="weights"`, the arena
+  as `line="workspace"`, the condition budget as a new
+  `line="condition_budget"` (always rendered, 0 on a text load), inside
+  `ignis_vram_budget_bytes`. No KV pool, no `cuda_context` or `residual`
+  line: the image plan charges neither (ADR 0030's #324 amendment).
+  `cuda_image_runner` returns them beside the runner (`LeafRunner::leaf_plan`),
+  so the start (`with_load_reservations`) and a switch (`observe_load`, after
+  its `set_unloaded`) publish them by the paths a text load takes. The fake
+  runner plans no device memory and reports none, as `MockCompute`.
+- **What is in use.** `ignis_condition_budget_used_bytes` (ADR 0017): the
+  bytes of the condition prefixes held, the counterpart of
+  `ignis_kv_pool_used_pages`. `ImageRunner::condition_bytes` gives them (the
+  leaf runner sums `Condition::bytes`; the fake charges
+  `FAKE_PREFIX_TOKEN_BYTES`, 256 KiB, a token); the job publishes them
+  through the queue's gauge (`ImageJobs::publish_conditions`) with the runner
+  held, right after `encode_condition` and after the release in `Held`'s drop.
+  Every `set_load_reservations` resets the gauge to 0, so a switch either way
+  and an unload leave nothing stale, and a job of a model shut down cannot
+  publish after it (its runner is gone).
+- **The Monitor.** `snapshot.ts` reads the line and the gauge (both in the
+  contract); `derive.ts` counts `condition_budget` as a line a server may
+  predate (as Flash-Next's two) and gives `conditionBudgetBytes` and a
+  `conditionInUse` meter on a load with a condition budget. On an image load
+  the *VRAM plan* card lays out weights, workspace and the condition budget,
+  says the budget took what the weights and the arena left (not a KV pool),
+  and *In use now* has a *Condition prefixes* row. A text load shows neither.
+- **Defaults taken.** The arena is `workspace`, not a new line; the condition
+  budget is reported in bytes only (its tokens stay in `ignis.image.plan`).
+  The gauge is rendered on every load, 0 on a text one, so its name is not an
+  `ignis_image_*` one: those families are absent until a job. The Monitor
+  keeps the KV pool, KV-RAM and retained-slot rows on an image load; they
+  read "this load has none of it to give".
+- **Tests.** `metrics.rs`:
+  `an_image_load_reserves_its_plan_lines_and_its_prefixes_read_against_the_condition_budget`
+  (the lines, the gauge, a text load's and an unload's reset), the line order
+  and the declared families. `tests/model_kind.rs`:
+  `the_image_models_vram_plan_and_the_prefixes_its_jobs_hold_show_on_metrics_and_go_with_it`
+  (start on the image model, a gated job holds its prefix, the end releases
+  it, a switch to a text model and back; `MockLoader::reserve` gives each id
+  its reservations). `image.rs`: the fake's bytes follow encode and release.
+  Monitor: `snapshot.test.ts`, `derive.test.ts`, `MonitorView.test.tsx`
+  (`IMAGE_LOAD_EXPOSITION`). The real leaf's numbers were not seen live here:
+  no GPU run (another agent held the card).

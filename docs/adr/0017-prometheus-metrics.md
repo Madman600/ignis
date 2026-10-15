@@ -146,6 +146,24 @@ Each ended job also writes one `ignis.image.job` log line (id, kind, model,
 milliseconds of enhancing, switching, queueing, encoding, denoising,
 decoding, the run and the total). The Playground's Monitor reads the families
 (an *Image jobs* card, shown once they exist).
+Amended again 2026-10-15 (#324, the image model's VRAM, spec image-model/05):
+the image model's load reports what its plan reserved, into ADR 0030's
+memory gauges rather than a family of its own: its weights as
+`ignis_vram_reserved_bytes{line="weights"}`, its one arena as `workspace`, and
+its condition budget as a new `line="condition_budget"` (always rendered, 0 on
+a text load, as Flash-Next's two lines are on the 27B), inside
+`ignis_vram_budget_bytes`; it has no KV pool, and no `cuda_context` or
+`residual` line. One family joins them, `ignis_condition_budget_used_bytes`:
+the bytes of the condition prefixes the image model's jobs hold, read against
+the `condition_budget` line as `ignis_kv_pool_used_pages` is against
+`ignis_kv_pool_pages`. Like the image job families it is recorded by the job,
+not projected from a telemetry fact: the job sets it, with the runner held, as
+it encodes its prefix and releases it, and every load's reservations reset it.
+Unlike them it is **rendered from the first scrape, 0 on a text load** --
+a memory gauge's zero is a reading -- which is why its name stays outside the
+`ignis_image_` families that are absent until a job. The Monitor's *VRAM plan*
+lays an image load out by its condition budget, and *In use now* reads the
+prefixes against it.
 
 ## Context
 
@@ -316,6 +334,7 @@ The initial stable metric contract is:
 | `ignis_image_job_duration_seconds` | histogram | none | A **completed** job's time from its turn to its last image, buckets 0.1 s to 600 s (#324) |
 | `ignis_image_job_phase_seconds_total` | counter | `phase=queued\|encoding\|denoising\|decoding` | Seconds the jobs of every outcome spent waiting for their turn, encoding the condition, denoising and decoding (#324). A phase's share of the total is computed by the reader |
 | `ignis_image_queue_jobs` | gauge | `state=waiting\|running` | Image jobs waiting for their turn behind the running one, and the one running (#324); set as a job is admitted, takes its turn or ends |
+| `ignis_condition_budget_used_bytes` | gauge | none | Bytes of the condition prefixes the image model's jobs hold now, against `ignis_vram_reserved_bytes{line="condition_budget"}` (#324, the image model's VRAM); set by the job as it encodes and releases its prefix, reset by every load. **Rendered from the first scrape**, 0 on a text load |
 | `ignis_responses_sockets` | gauge | none | Open Responses API WebSocket connections (#282) |
 | `ignis_responses_queued_requests` | gauge | none | Responses WebSocket requests waiting in the server-wide **socket admission queue**; a request the engine found full is counted here rather than in `ignis_requests_rejected_total` (#282) |
 | `ignis_expert_cache_hits_total` | counter | `class`, `phase=decode\|prefill` | Flash-Next: selected expert projections already resident in the VRAM expert cache, or staged for their layer (#301). A decode hit rate is hits over hits plus misses of `phase="decode"` |
@@ -338,7 +357,8 @@ The initial stable metric contract is:
 | `ignis_speculative_position_accepted_total` | counter | `position=1..k` | Rounds that committed the draft at that position (#307). **Absent until the first round** |
 
 ADR 0030 §Observability adds the memory gauges to this contract: the plan's
-reserved lines (eleven, twelve since #257 added `hq_residual_window`), the budget, the KV pool's pages and page bytes, the
+reserved lines (eleven, twelve since #257 added `hq_residual_window`, then
+Flash-Next's two and the image model's `condition_budget`), the budget, the KV pool's pages and page bytes, the
 pages occupied of it, the KV-RAM arena's capacity and use, the retained slots'
 capacity and use, and the retained-slot skips. Every one is bytes, pages or
 slots; no percentage is exported.
