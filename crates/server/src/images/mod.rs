@@ -105,7 +105,8 @@ pub struct ImageJobs {
     /// left, the queue closed.
     changed: tokio::sync::Notify,
     closed: AtomicBool,
-    /// Where the queue's depth is published ([`ImageJobs::report_to`]).
+    /// Where the queue's depth, and the condition prefixes' bytes its jobs
+    /// hold, are published ([`ImageJobs::report_to`]).
     gauge: std::sync::OnceLock<Arc<crate::metrics::Metrics>>,
 }
 
@@ -129,6 +130,17 @@ impl ImageJobs {
     /// the gauge shows, whichever way a job leaves (GitHub #324).
     pub fn report_to(&self, metrics: &Arc<crate::metrics::Metrics>) {
         let _ = self.gauge.set(Arc::clone(metrics));
+    }
+
+    /// The bytes of the condition prefixes `runner` holds now, to the
+    /// gauge (GitHub #324). Called with the runner held, right after an
+    /// encode or a release: the last figure a runner gives is the last the
+    /// gauge shows, and none lands once its model was shut down and the next
+    /// load's reservations reset it.
+    pub fn publish_conditions(&self, runner: &dyn ImageRunner) {
+        if let Some(metrics) = self.gauge.get() {
+            metrics.set_condition_budget_used(runner.condition_bytes());
+        }
     }
 
     /// The queue as it stands, to the gauge. Called with the lock held.
@@ -451,6 +463,10 @@ mod tests {
 
         fn release_condition(&mut self, condition: ConditionId) {
             self.0.release_condition(condition);
+        }
+
+        fn condition_bytes(&self) -> u64 {
+            self.0.condition_bytes()
         }
     }
 

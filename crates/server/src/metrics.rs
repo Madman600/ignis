@@ -52,6 +52,11 @@ pub struct LoadReservations {
     /// VRAM expert cache that takes what the plan leaves. 0 on a 27B load.
     pub residency_bytes: u64,
     pub expert_cache_bytes: u64,
+    /// The image model's condition budget (GitHub #324, spec image-model/05):
+    /// the bytes its plan sets aside for the condition prefixes its jobs
+    /// encode, beside its weights (`lines.weights`) and its arena
+    /// (`lines.workspace`). 0 on a text load.
+    pub condition_budget_bytes: u64,
     /// `--reuse-kv-host-pool-bytes`, pinned whole at start.
     pub kv_ram_arena_bytes: u64,
     /// The retained slots this load hands out — the effective count, which
@@ -85,12 +90,32 @@ impl LoadReservations {
             kv_page_bytes: 0,
             residency_bytes: 0,
             expert_cache_bytes: 0,
+            condition_budget_bytes: 0,
             kv_ram_arena_bytes: 0,
             retained_slots: 0,
             retained_host_slots: 0,
             retained_host_bytes: 0,
             kv_disk_bytes: None,
             flash_next: None,
+        }
+    }
+
+    /// What the image model's load reserved (GitHub #324): its plan's three
+    /// lines in the text models' family -- the weights as `weights`, the one
+    /// arena its calls share as `workspace`, and the condition budget --
+    /// inside the plan's budget. It has no KV pool, and no `cuda_context` or
+    /// `residual` line: its plan reads the free memory with its context
+    /// already held and charges neither (ADR 0030's #324 amendment).
+    pub fn image(plan: &ignis_core::image_leaf::ImagePlan) -> Self {
+        Self {
+            lines: ignis_core::VramLines {
+                weights: plan.weights_bytes,
+                workspace: plan.arena_bytes,
+                ..Default::default()
+            },
+            budget_bytes: plan.budget_bytes,
+            condition_budget_bytes: plan.condition_budget_bytes,
+            ..Self::none()
         }
     }
 }
@@ -511,6 +536,10 @@ pub struct Metrics {
     /// Flash-Next's `residency` and `expert_cache` lines (GitHub #306), in
     /// [`FLASH_NEXT_VRAM_LINES`] order: exported beside the plan's own.
     flash_next_vram_reserved: [AtomicU64; 2],
+    /// The image model's `condition_budget` line, and the bytes of the
+    /// condition prefixes its jobs hold now (GitHub #324).
+    condition_budget_bytes: AtomicU64,
+    condition_budget_used_bytes: AtomicU64,
     vram_budget_bytes: AtomicU64,
     kv_pool_pages: AtomicU64,
     kv_page_bytes: AtomicU64,
@@ -691,6 +720,8 @@ impl Metrics {
             retained_host_bytes: AtomicU64::new(0),
             vram_reserved: Default::default(),
             flash_next_vram_reserved: Default::default(),
+            condition_budget_bytes: AtomicU64::new(0),
+            condition_budget_used_bytes: AtomicU64::new(0),
             vram_budget_bytes: AtomicU64::new(0),
             kv_pool_pages: AtomicU64::new(0),
             kv_page_bytes: AtomicU64::new(0),
@@ -848,6 +879,13 @@ impl Metrics {
         self.image_running.store(u64::from(running), Ordering::Relaxed);
     }
 
+    /// The bytes of the condition prefixes the image model holds now
+    /// (GitHub #324): set by the job as it encodes its prefix and releases
+    /// it, with the runner held.
+    pub fn set_condition_budget_used(&self, bytes: u64) {
+        self.condition_budget_used_bytes.store(bytes, Ordering::Relaxed);
+    }
+
     /// A submission was rejected, for `reason`.
     pub fn record_rejected(&self, reason: Rejection) {
         // `ALL` lists the reasons in declaration order, so a reason's
@@ -950,6 +988,10 @@ impl Metrics {
         }
         self.flash_next_vram_reserved[0].store(reserved.residency_bytes, Ordering::Relaxed);
         self.flash_next_vram_reserved[1].store(reserved.expert_cache_bytes, Ordering::Relaxed);
+        // No load holds a condition prefix yet: a text load has none, and an
+        // image load's jobs set theirs from here (GitHub #324).
+        self.condition_budget_bytes.store(reserved.condition_budget_bytes, Ordering::Relaxed);
+        self.condition_budget_used_bytes.store(0, Ordering::Relaxed);
         self.vram_budget_bytes.store(reserved.budget_bytes, Ordering::Relaxed);
         self.kv_pool_pages.store(u64::from(reserved.kv_pool_pages), Ordering::Relaxed);
         self.kv_page_bytes.store(reserved.kv_page_bytes, Ordering::Relaxed);
@@ -1173,6 +1215,13 @@ impl Metrics {
         for (line, series) in FLASH_NEXT_VRAM_LINES.iter().zip(&self.flash_next_vram_reserved) {
             let _ = writeln!(out, "ignis_vram_reserved_bytes{{line=\"{line}\"}} {}", read(series));
         }
+        // The image model's condition budget (GitHub #324): always exported,
+        // 0 on a text load, as Flash-Next's two are on the 27B.
+        let _ = writeln!(
+            out,
+            "ignis_vram_reserved_bytes{{line=\"condition_budget\"}} {}",
+            read(&self.condition_budget_bytes)
+        );
         let plain_gauges = [
             (
                 "ignis_vram_budget_bytes",
@@ -1185,6 +1234,14 @@ impl Metrics {
                 "ignis_kv_pool_used_pages",
                 "KV pool pages reserved by running requests and retained state.",
                 &self.kv_pool_used_pages,
+            ),
+            // The image model's counterpart (GitHub #324), read against the
+            // `condition_budget` line: 0 on a text load, as the pages are on
+            // an image load.
+            (
+                "ignis_condition_budget_used_bytes",
+                "Bytes of the condition prefixes the image model's jobs hold now.",
+                &self.condition_budget_used_bytes,
             ),
             (
                 "ignis_retained_host_slots",
@@ -1741,6 +1798,7 @@ mod tests {
             kv_page_bytes: 0,
             residency_bytes: 0,
             expert_cache_bytes: 0,
+            condition_budget_bytes: 0,
             kv_ram_arena_bytes: 0,
             retained_slots: 0,
             retained_host_slots: 0,
@@ -1842,6 +1900,7 @@ mod tests {
             ("ignis_kv_pool_pages", "gauge"),
             ("ignis_kv_page_bytes", "gauge"),
             ("ignis_kv_pool_used_pages", "gauge"),
+            ("ignis_condition_budget_used_bytes", "gauge"),
             ("ignis_kv_ram_arena_bytes", "gauge"),
             ("ignis_retained_slots", "gauge"),
             ("ignis_retained_host_slots", "gauge"),
@@ -2072,6 +2131,7 @@ mod tests {
             kv_page_bytes: 1_048_576,
             residency_bytes: 2_000_000_000,
             expert_cache_bytes: 15_000_000_000,
+            condition_budget_bytes: 0,
             kv_ram_arena_bytes: 8 << 30,
             retained_slots: 9,
             retained_host_slots: 7,
@@ -2082,7 +2142,8 @@ mod tests {
 
         let text = metrics.render();
         // The twelve lines are the plan's, in the plan's order and spelling,
-        // then Flash-Next's two (GitHub #306).
+        // then Flash-Next's two (GitHub #306) and the image model's condition
+        // budget (GitHub #324).
         let exported: Vec<String> = samples(&text)
             .into_iter()
             .filter(|(name, _, _)| name == "ignis_vram_reserved_bytes")
@@ -2092,7 +2153,7 @@ mod tests {
             .entries()
             .iter()
             .map(|(line, _)| format!("line=\"{line}\""))
-            .chain(["line=\"residency\"".to_owned(), "line=\"expert_cache\"".to_owned()])
+            .chain(["line=\"residency\"".to_owned(), "line=\"expert_cache\"".to_owned(), "line=\"condition_budget\"".to_owned()])
             .collect();
         assert_eq!(exported, expected, "{text}");
         assert_eq!(value(&text, "ignis_vram_reserved_bytes", "line=\"residency\""), "2000000000");
@@ -2113,6 +2174,71 @@ mod tests {
         assert_eq!(value(&text, "ignis_kv_pool_used_pages", ""), "0");
         assert_eq!(value(&text, "ignis_kv_ram_arena_bytes", "state=\"used\""), "0");
         assert_eq!(value(&text, "ignis_retained_slots", "state=\"in_use\""), "0");
+    }
+
+    /// GitHub #324: the image model's load reserves into the text models'
+    /// family -- its weights as `weights`, its arena as `workspace`, its
+    /// condition budget as `condition_budget` -- inside its budget, with no
+    /// KV pool and no CUDA context or residual line (its plan charges
+    /// neither); the condition prefixes held read against the budget's line,
+    /// and a text load's reservations, or none, take every image figure back
+    /// to zero.
+    #[test]
+    fn an_image_load_reserves_its_plan_lines_and_its_prefixes_read_against_the_condition_budget() {
+        let plan = ignis_core::image_leaf::ImagePlan {
+            mode: ignis_core::VramMode::Derived { headroom_bytes: 4 << 30 },
+            free_at_start_bytes: 33_400_000_000,
+            budget_bytes: 29_100_000_000,
+            weights_bytes: 15_460_000_000,
+            arena_bytes: 1_320_000_000,
+            condition_budget_tokens: 45_184,
+            condition_budget_bytes: 12_300_000_000,
+        };
+        let metrics = Metrics::new();
+        assert_eq!(value(&metrics.render(), "ignis_condition_budget_used_bytes", ""), "0", "a fresh projection holds none");
+        metrics.set_load_reservations(LoadReservations::image(&plan));
+        let text = metrics.render();
+        for (line, bytes) in [
+            ("weights", "15460000000"),
+            ("workspace", "1320000000"),
+            ("condition_budget", "12300000000"),
+            ("cuda_context", "0"),
+            ("residual", "0"),
+            ("expert_cache", "0"),
+        ] {
+            assert_eq!(value(&text, "ignis_vram_reserved_bytes", &format!("line=\"{line}\"")), bytes, "{line}");
+        }
+        assert_eq!(value(&text, "ignis_vram_budget_bytes", ""), "29100000000");
+        assert_eq!(value(&text, "ignis_kv_pool_pages", ""), "0");
+        assert_eq!(value(&text, "ignis_condition_budget_used_bytes", ""), "0", "no prefix is held at load");
+
+        metrics.set_condition_budget_used(1_120_000_000);
+        assert_eq!(value(&metrics.render(), "ignis_condition_budget_used_bytes", ""), "1120000000");
+        metrics.set_condition_budget_used(0);
+        assert_eq!(value(&metrics.render(), "ignis_condition_budget_used_bytes", ""), "0", "released");
+
+        // Back on a text model: its lines replace the image's, whatever a
+        // prefix held when the image model went.
+        metrics.set_condition_budget_used(1_120_000_000);
+        let mut lines = ignis_core::VramLines::default();
+        lines.weights = 21_000_000_000;
+        metrics.set_load_reservations(LoadReservations { lines, budget_bytes: 30_000_000_000, kv_pool_pages: 5_000, ..LoadReservations::none() });
+        let text = metrics.render();
+        assert_eq!(value(&text, "ignis_vram_reserved_bytes", "line=\"weights\""), "21000000000");
+        assert_eq!(value(&text, "ignis_vram_reserved_bytes", "line=\"workspace\""), "0");
+        assert_eq!(value(&text, "ignis_vram_reserved_bytes", "line=\"condition_budget\""), "0");
+        assert_eq!(value(&text, "ignis_condition_budget_used_bytes", ""), "0");
+
+        // Unloaded from an image load, the same.
+        metrics.set_load_reservations(LoadReservations::image(&plan));
+        metrics.set_condition_budget_used(1_120_000_000);
+        metrics.set_unloaded();
+        let text = metrics.render();
+        for line in ["weights", "workspace", "condition_budget"] {
+            assert_eq!(value(&text, "ignis_vram_reserved_bytes", &format!("line=\"{line}\"")), "0", "{line}");
+        }
+        assert_eq!(value(&text, "ignis_vram_budget_bytes", ""), "0");
+        assert_eq!(value(&text, "ignis_condition_budget_used_bytes", ""), "0");
     }
 
     #[test]

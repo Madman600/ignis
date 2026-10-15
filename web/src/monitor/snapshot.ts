@@ -20,7 +20,10 @@ export type RejectReason = (typeof REJECT_REASONS)[number];
  * the expert residency's fixed bytes, and `expert_cache`, the VRAM cache of
  * experts; 0 on the 27B, absent from a server that predates them), in the order `VramLines::entries()` lays them out
  * — which is the order the load itself reserves them in, so the panel reads
- * down the plan rather than down an alphabet.
+ * down the plan rather than down an alphabet — then the image model's
+ * `condition_budget` (GitHub #324: 0 on a text load, absent from a server
+ * that predates it). The image model's weights are `weights` and its arena
+ * `workspace`.
  */
 export const VRAM_LINES = [
   "weights",
@@ -37,6 +40,7 @@ export const VRAM_LINES = [
   "residual",
   "residency",
   "expert_cache",
+  "condition_budget",
 ] as const;
 export type VramLine = (typeof VRAM_LINES)[number];
 
@@ -104,6 +108,8 @@ export type Memory = {
   kvPoolPages: number | null;
   kvPageBytes: number | null;
   kvPoolUsedPages: number | null;
+  /** The bytes of the condition prefixes the image model's jobs hold now, against the `condition_budget` line (GitHub #324). */
+  conditionBudgetUsedBytes: number | null;
   kvRamArena: { capacity: number | null; used: number | null };
   retainedSlots: { capacity: number | null; inUse: number | null };
   /** Of the retained slots, those in the pinned host block, and the block (GitHub #281). */
@@ -252,6 +258,7 @@ const MEMORY_GAUGES = {
   kvPoolPages: "ignis_kv_pool_pages",
   kvPageBytes: "ignis_kv_page_bytes",
   kvPoolUsedPages: "ignis_kv_pool_used_pages",
+  conditionBudgetUsedBytes: "ignis_condition_budget_used_bytes",
 } as const;
 
 /** The expert residency families (GitHub #301). */
@@ -344,6 +351,7 @@ export function emptySnapshot(): Snapshot {
       kvPoolPages: null,
       kvPageBytes: null,
       kvPoolUsedPages: null,
+      conditionBudgetUsedBytes: null,
       kvRamArena: { capacity: null, used: null },
       retainedSlots: { capacity: null, inUse: null },
       retainedHost: { slots: null, bytes: null },

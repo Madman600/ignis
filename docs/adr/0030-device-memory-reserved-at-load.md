@@ -41,8 +41,8 @@ Lines and arithmetic: `crates/core/src/residency/plan.rs`.
 **Amended 2026-10-07 by ADR 0045** (spec `vram-budget/03`): the KV pool line
 follows the **KV pool policy** — see the amendment at the end.
 **Amended 2026-10-15 by GitHub #324**: a later load in the same process adds
-back the device memory the process already holds — see the amendment at the
-end.
+back the device memory the process already holds, and the image model's load
+reports its plan into the memory gauges — see the amendment at the end.
 
 ## Context
 
@@ -162,7 +162,7 @@ again. They add no serving work of any kind.
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `ignis_vram_reserved_bytes` | gauge | `line=weights\|cuda_context\|workspace\|media_embedding\|sampling\|decode_graph\|verify_round\|drafter_round\|lane_state\|retained_slots\|hq_residual_window\|residual\|residency\|expert_cache` | the plan's twelve lines (`hq_residual_window` since #257), the same set and spelling the `ignis.runtime.vram_plan` event carries, then Flash-Next's two (#306): `residency`, the expert residency's fixed bytes (ring and tables), and `expert_cache`, the VRAM expert cache that takes the budget the weights, program, pool and residency leave (the `residency_fixed_bytes` and `expert_cache_bytes` of `ignis.runtime.flash_next_plan`). Both are 0 on the 27B, and the KV pool is no line, so the budget less every line is the pool plus its page rounding |
+| `ignis_vram_reserved_bytes` | gauge | `line=weights\|cuda_context\|workspace\|media_embedding\|sampling\|decode_graph\|verify_round\|drafter_round\|lane_state\|retained_slots\|hq_residual_window\|residual\|residency\|expert_cache\|condition_budget` | the plan's twelve lines (`hq_residual_window` since #257), the same set and spelling the `ignis.runtime.vram_plan` event carries, then Flash-Next's two (#306): `residency`, the expert residency's fixed bytes (ring and tables), and `expert_cache`, the VRAM expert cache that takes the budget the weights, program, pool and residency leave (the `residency_fixed_bytes` and `expert_cache_bytes` of `ignis.runtime.flash_next_plan`). Both are 0 on the 27B, and the KV pool is no line, so the budget less every line is the pool plus its page rounding. Then the image model's `condition_budget` (#324): the bytes its plan sets aside for its jobs' condition prefixes, 0 on a text load; its weights are `weights` and its arena `workspace` |
 | `ignis_vram_budget_bytes` | gauge | none | the budget the plan was laid out inside, derived or explicit |
 | `ignis_kv_pool_pages` | gauge | none | the pool's page count, leaf-verified at load |
 | `ignis_kv_page_bytes` | gauge | none | one page's bytes |
@@ -463,3 +463,20 @@ Spec: `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
   eager loading and is not identified. It is not the stack reservation, the
   stream-ordered or graph memory pools, freed small allocations or pinned
   host mappings (the constants' docs say how each was ruled out).
+- **The image model's load reports its plan** (#324, the image model's VRAM;
+  spec image-model/05): until then it reported nothing, and with it loaded
+  §Observability's gauges read no load. Its plan's three lines go into
+  `ignis_vram_reserved_bytes` — the weights as `weights`, the one arena its
+  calls share as `workspace`, the condition budget as `condition_budget`, a
+  line no text plan has (0 there, as Flash-Next's two are on the 27B) — inside
+  `ignis_vram_budget_bytes`. It has no KV pool (`ignis_kv_pool_pages` 0), and
+  no `cuda_context` or `residual` line: the plan reads NVML with its context
+  already held and charges neither, as above. The condition budget is
+  set aside, not allocated: each job's prefix is allocated from it as the job
+  encodes and freed as it ends, so `ignis_condition_budget_used_bytes`
+  (ADR 0017) reads what the jobs hold against the line, the image model's
+  counterpart of `ignis_kv_pool_used_pages`. The job sets it with the runner
+  held, and every load's reservations reset it to 0, so a switch in either
+  direction leaves nothing of the other model's. The meter reads below 100% at a full budget by
+  `prefix_kv_bytes(n)`: the line includes the encode's transient chunked-pass
+  BF16 K/V, which `condition_bytes` (the runs alone) does not count.

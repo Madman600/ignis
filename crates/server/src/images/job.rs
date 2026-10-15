@@ -131,7 +131,8 @@ fn call<T>(model: &ImageModel, calls: impl FnOnce(&mut dyn ImageRunner) -> Resul
 }
 
 /// A condition prefix the job holds, released when dropped — the job ended,
-/// failed or was cancelled alike.
+/// failed or was cancelled alike — and what the runner then holds published
+/// (GitHub #324).
 struct Held<'a> {
     model: &'a ImageModel,
     id: ignis_core::image::ConditionId,
@@ -139,7 +140,10 @@ struct Held<'a> {
 
 impl Drop for Held<'_> {
     fn drop(&mut self) {
-        self.model.with_runner(|runner| runner.release_condition(self.id));
+        self.model.with_runner(|runner| {
+            runner.release_condition(self.id);
+            self.model.jobs.publish_conditions(runner);
+        });
     }
 }
 
@@ -218,7 +222,13 @@ pub fn run_timed<E: From<JobEvent>>(
     };
     go_on()?;
     progress(Phase::Encoding, 0, 1, 1);
-    let encoded = timed(&mut phases.encoding, || call(model, |runner| runner.encode_condition(&job.condition)));
+    let encoded = timed(&mut phases.encoding, || {
+        call(model, |runner| {
+            let encoded = runner.encode_condition(&job.condition);
+            model.jobs.publish_conditions(runner);
+            encoded
+        })
+    });
     let held = Held { model, id: encoded? };
     let sigmas = &model.plan().sample_sigmas;
     let total = sigmas.len() as u32;
@@ -597,6 +607,10 @@ mod tests {
 
         fn release_condition(&mut self, condition: ignis_core::image::ConditionId) {
             self.inner.release_condition(condition);
+        }
+
+        fn condition_bytes(&self) -> u64 {
+            self.inner.condition_bytes()
         }
     }
 

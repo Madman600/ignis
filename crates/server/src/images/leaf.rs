@@ -232,6 +232,12 @@ mod device {
             };
             Ok(Self { leaf, frontend, plan, conditions: BTreeMap::new(), next: 0, started: None })
         }
+
+        /// The leaf's own plan, in bytes: what the load reserved, for
+        /// `/metrics` (GitHub #324).
+        pub fn leaf_plan(&self) -> &ignis_core::image_leaf::ImagePlan {
+            self.leaf.plan()
+        }
     }
 
     impl ImageRunner for LeafRunner {
@@ -350,6 +356,8 @@ mod device {
         }
 
         fn release_condition(&mut self, condition: ConditionId) {
+            // A failed leaf release is logged (`ignis.image.release_failed`), but the
+            // entry is already gone, so the gauge counts those bytes as freed.
             if let Some(prefix) = self.conditions.remove(&condition) {
                 // The leaf's image slot goes with a released prefix.
                 self.started = None;
@@ -357,6 +365,11 @@ mod device {
                     tracing::error!(name: "ignis.image.release_failed", %error, "a condition prefix was not freed");
                 }
             }
+        }
+
+        /// Each prefix's own device bytes, as the leaf allocated them.
+        fn condition_bytes(&self) -> u64 {
+            self.conditions.values().map(Condition::bytes).sum()
         }
     }
 

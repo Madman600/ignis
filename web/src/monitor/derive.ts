@@ -30,8 +30,11 @@ import {
   type VramLine,
 } from "./snapshot.ts";
 
-/** The two plan lines only a Flash-Next load has (GitHub #306). */
-const FLASH_NEXT_LINES: readonly VramLine[] = ["residency", "expert_cache"];
+/**
+ * The plan lines a server may predate, counted as 0 when absent: Flash-Next's
+ * two (GitHub #306) and the image model's condition budget (GitHub #324).
+ */
+const LATER_LINES: readonly VramLine[] = ["residency", "expert_cache", "condition_budget"];
 
 // Everything the Monitor shows, derived from the scrape history for one
 // window: counter gains and rates, scheduler load, latency quantiles and
@@ -96,17 +99,19 @@ export type Memory = {
   /** Whether this load laid a plan out at all — the placeholder load has none. */
   planned: boolean;
   budgetBytes: number | null;
-  /** The plan's twelve lines in plan order, then Flash-Next's residency and expert cache. */
+  /** The plan's twelve lines in plan order, then Flash-Next's residency and expert cache, then the image model's condition budget. */
   lines: { line: VramLine; bytes: number | null }[];
   /**
-   * The twelve lines added up, or null when the scrape does not carry all
-   * twelve. A partial sum would understate the plan and overstate the room
+   * The twelve lines added up (on an image load: its weights and arena beside
+   * the zeroed rest), or null when the scrape does not carry all twelve. A partial sum would understate the plan and overstate the room
    * left beside it, and the server writes the twelve together or not at all.
    */
   linesBytes: number | null;
   /** The expert cache's bytes: 0 on a load without one (the 27B), where the room left is all the KV pool's. */
   expertCacheBytes: number;
-  /** The budget less the lines: the room the plan left the KV pool. Negative on an oversubscribed load. */
+  /** The image model's condition budget (GitHub #324): 0 on a text load, which has a KV pool instead. */
+  conditionBudgetBytes: number;
+  /** The budget less the lines: the room the plan left the KV pool (on an image load, its condition budget). Negative on an oversubscribed load. */
   kvRoomBytes: number | null;
   /** The pool the room bought: its pages, one page, the two multiplied, and the tokens those pages hold. */
   kvPool: { pages: number | null; pageBytes: number | null; bytes: number | null; tokens: number | null };
@@ -118,6 +123,8 @@ export type Memory = {
   arenaInUse: Meter;
   /** The KV-disk tier's bytes against its budget (spec vram-budget/03); null on a load without the tier. */
   diskInUse: Meter | null;
+  /** The condition prefixes the image model's jobs hold, against its condition budget (GitHub #324); null on a load without one. */
+  conditionInUse: Meter | null;
   slotsInUse: Meter;
   /**
    * Where the retained slots live (GitHub #281): how many in the pinned host
@@ -599,9 +606,10 @@ export function deriveMemory(points: Point[], since: number): Memory {
   const tally = (pick: CounterPick): Tally => ({ total: pick(last), window: increaseOver(points, pick, since) });
 
   const lines = VRAM_LINES.map((line) => ({ line, bytes: mem.reserved[line] }));
-  // The twelve plan lines come together or not at all; Flash-Next's two (GitHub
-  // #306) are absent from a server that predates them, and count as 0 then.
-  const linesBytes = lines.filter((l) => !FLASH_NEXT_LINES.includes(l.line)).every((l) => l.bytes !== null) ? sumKnown(lines.map((l) => l.bytes)) : null;
+  // The twelve plan lines come together or not at all; the later ones (GitHub
+  // #306, #324) are absent from a server that predates them, and count as 0 then.
+  const linesBytes = lines.filter((l) => !LATER_LINES.includes(l.line)).every((l) => l.bytes !== null) ? sumKnown(lines.map((l) => l.bytes)) : null;
+  const conditionBudgetBytes = mem.reserved.condition_budget ?? 0;
   const kvPoolBytes = mem.kvPoolPages !== null && mem.kvPageBytes !== null ? mem.kvPoolPages * mem.kvPageBytes : null;
   const kvPoolTokens = mem.kvPoolPages === null ? null : mem.kvPoolPages * TOKENS_PER_KV_PAGE;
   const byReason = Object.fromEntries(
@@ -614,6 +622,7 @@ export function deriveMemory(points: Point[], since: number): Memory {
     lines,
     linesBytes,
     expertCacheBytes: mem.reserved.expert_cache ?? 0,
+    conditionBudgetBytes,
     kvRoomBytes: mem.budgetBytes !== null && linesBytes !== null ? mem.budgetBytes - linesBytes : null,
     kvPool: { pages: mem.kvPoolPages, pageBytes: mem.kvPageBytes, bytes: kvPoolBytes, tokens: kvPoolTokens },
     spareBytes: mem.budgetBytes === null || linesBytes === null ? null : mem.budgetBytes - linesBytes - (kvPoolBytes ?? 0),
@@ -621,6 +630,7 @@ export function deriveMemory(points: Point[], since: number): Memory {
     pagesInUse: meter(mem.kvPoolUsedPages, mem.kvPoolPages, (s) => s.memory.kvPoolUsedPages),
     arenaInUse: meter(mem.kvRamArena.used, mem.kvRamArena.capacity, (s) => s.memory.kvRamArena.used),
     diskInUse: last.kvDisk ? meter(last.kvDisk.used, last.kvDisk.capacity, (s) => s.kvDisk?.used ?? null) : null,
+    conditionInUse: conditionBudgetBytes > 0 ? meter(mem.conditionBudgetUsedBytes, conditionBudgetBytes, (s) => s.memory.conditionBudgetUsedBytes) : null,
     slotsInUse: meter(mem.retainedSlots.inUse, mem.retainedSlots.capacity, (s) => s.memory.retainedSlots.inUse),
     slotHomes: {
       hostSlots: mem.retainedHost.slots,

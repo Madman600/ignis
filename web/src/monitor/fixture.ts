@@ -92,6 +92,7 @@ ignis_vram_reserved_bytes{line="hq_residual_window"} 570427392
 ignis_vram_reserved_bytes{line="residual"} 268435456
 ignis_vram_reserved_bytes{line="residency"} 0
 ignis_vram_reserved_bytes{line="expert_cache"} 0
+ignis_vram_reserved_bytes{line="condition_budget"} 0
 # HELP ignis_vram_budget_bytes The device budget the plan was laid out inside.
 # TYPE ignis_vram_budget_bytes gauge
 ignis_vram_budget_bytes 31138512896
@@ -104,6 +105,9 @@ ignis_kv_page_bytes 1835008
 # HELP ignis_kv_pool_used_pages KV pool pages reserved by running requests and retained state.
 # TYPE ignis_kv_pool_used_pages gauge
 ignis_kv_pool_used_pages 1536
+# HELP ignis_condition_budget_used_bytes Bytes of the condition prefixes the image model's jobs hold now.
+# TYPE ignis_condition_budget_used_bytes gauge
+ignis_condition_budget_used_bytes 0
 # HELP ignis_kv_ram_arena_bytes The pinned host KV-RAM arena: what it holds, and what is used of it.
 # TYPE ignis_kv_ram_arena_bytes gauge
 ignis_kv_ram_arena_bytes{state="capacity"} 8589934592
@@ -262,11 +266,10 @@ ignis_kv_disk_failures_total{op="write"} 1
 ignis_kv_disk_failures_total{op="read"} 0
 `;
 
-// A server that ran image jobs (GitHub #324, ADR 0017): the 27B-shaped
-// exposition plus the image families, which the server renders from the first
-// admitted job (zeros included) and only then. Twelve jobs ended: ten
-// completed (twenty images, 2 s median), one cancelled, one failed.
-export const IMAGE_EXPOSITION = `${IGNIS_EXPOSITION}# HELP ignis_image_jobs_total Image jobs ended, by outcome.
+// The image families (GitHub #324, ADR 0017), which the server renders from
+// the first admitted job (zeros included) and only then. Twelve jobs ended:
+// ten completed (twenty images, 2 s median), one cancelled, one failed.
+const IMAGE_JOB_FAMILIES = `# HELP ignis_image_jobs_total Image jobs ended, by outcome.
 # TYPE ignis_image_jobs_total counter
 ignis_image_jobs_total{outcome="completed"} 10
 ignis_image_jobs_total{outcome="cancelled"} 1
@@ -304,3 +307,37 @@ ignis_image_job_phase_seconds_total{phase="decoding"} 3
 ignis_image_queue_jobs{state="waiting"} 2
 ignis_image_queue_jobs{state="running"} 1
 `;
+
+// A server that ran image jobs: the 27B-shaped exposition plus the image families.
+export const IMAGE_EXPOSITION = `${IGNIS_EXPOSITION}${IMAGE_JOB_FAMILIES}`;
+
+/**
+ * The image model's load as the server renders it (GitHub #324): its plan's
+ * lines in the text models' family -- 15.46 GB of weights, a 1.32 GB arena
+ * (`workspace`), a 12.3 GB condition budget -- in a 29.1 GB budget, every
+ * other line, the KV pool, the KV-RAM arena and the retained slots at zero,
+ * and a running job's 1.12 GB condition prefix; then its job families.
+ */
+const IMAGE_LOAD: Record<string, number> = {
+  'ignis_vram_reserved_bytes{line="weights"}': 15_460_000_000,
+  'ignis_vram_reserved_bytes{line="workspace"}': 1_320_000_000,
+  'ignis_vram_reserved_bytes{line="condition_budget"}': 12_300_000_000,
+  ignis_vram_budget_bytes: 29_100_000_000,
+  ignis_kv_pool_pages: 0,
+  ignis_kv_page_bytes: 0,
+  ignis_kv_pool_used_pages: 0,
+  ignis_condition_budget_used_bytes: 1_120_000_000,
+  'ignis_kv_ram_arena_bytes{state="capacity"}': 0,
+  'ignis_kv_ram_arena_bytes{state="used"}': 0,
+  'ignis_retained_slots{state="capacity"}': 0,
+  'ignis_retained_slots{state="in_use"}': 0,
+  ignis_retained_host_slots: 0,
+  ignis_retained_host_bytes: 0,
+};
+export const IMAGE_LOAD_EXPOSITION = `${IGNIS_EXPOSITION.split("\n")
+  .map((line) => {
+    const series = line.slice(0, line.lastIndexOf(" "));
+    if (series in IMAGE_LOAD) return `${series} ${IMAGE_LOAD[series]}`;
+    return series.startsWith("ignis_vram_reserved_bytes{") ? `${series} 0` : line;
+  })
+  .join("\n")}${IMAGE_JOB_FAMILIES}`;
