@@ -571,9 +571,9 @@ The "As built" status lines above stand; this adds what the reviews of 320a and
   zero-fills a half past the row. Any other row takes the unchanged 16-byte
   copy. The artifact is unchanged.
 - **The measurement that opened it.** An nsys capture of the ten-image
-  test (`image_encoder_edit_gpu`, the whole test: six tower runs) showed
-  `w8_rowsplit_gemm_simt_kernel` as 73% of all kernel time (9.99 of
-  13.63 s). The bound: at T 40,960 the
+  test (`image_encoder_edit_gpu`, the whole test: four ten-image and two
+  one-image tower runs) showed `w8_rowsplit_gemm_simt_kernel` as 73% of all
+  kernel time (9.99 of 13.63 s). The bound: at T 40,960 the
   three linears are 22.7 TFLOP per tower, about 0.11 s at the bf16 bar of
   ~210 TFLOPS, against about 2.3 s on SIMT.
 - **Which layers moved, and by how much** (one block, synthetic weights,
