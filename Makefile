@@ -109,7 +109,7 @@ SERVER_FLAGS = --server-bind $(BIND) \
   $(if $(filter 1,$(CUDA)),$(GPU_ENGINE_FLAGS)) \
   $(if $(SERVED_MODEL),--model-id $(SERVED_MODEL)) \
   $(if $(filter 1,$(UI)),--server-ui,--server-ui false) \
-  $(if $(filter 1,$(METRICS)),--server-metrics $(if $(METRICS_BIND),--server-metrics-bind $(METRICS_BIND))) \
+  $(if $(filter 0,$(METRICS)),--server-metrics false,$(if $(METRICS_BIND),--server-metrics-bind $(METRICS_BIND))) \
   $(if $(API_KEY),--server-api-key $(API_KEY)) \
   $(if $(EXPOSE),--server-expose $(EXPOSE)) \
   $(if $(SYSTEM_MESSAGE_POLICY),--server-system-message-policy $(SYSTEM_MESSAGE_POLICY)) \
@@ -198,7 +198,7 @@ config: ## Print the resolved knobs and paths
 	@echo "CUDA            $(CUDA)  (backend=$(BACKEND))"
 	@echo "PROFILE         $(PROFILE)  (dir=$(PROFILE_DIR))"
 	@echo "UI              $(UI)"
-	@echo "METRICS         $(METRICS)  $(if $(filter 1,$(METRICS)),(Prometheus: $(METRICS_URL)/metrics; Playground: /ui/metrics$(if $(or $(API_KEY),$(EXPOSE)), behind the API key)),(off))"
+	@echo "METRICS         $(METRICS)  $(if $(filter 0,$(METRICS)),(off),(Prometheus: $(METRICS_URL)/metrics; Playground: /ui/metrics$(if $(or $(API_KEY),$(EXPOSE)), behind the API key)))"
 	@echo "ARTIFACT        $(ARTIFACT)"
 	@echo "UNCENSORED      $(if $(filter 1,$(UNCENSORED)),1  (default ARTIFACT is the huihui-abliterated image, served as qwen3.8-27b-abliterated),off)"
 	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(KV_POOL_PLAN) host_pool=$(or $(KV_HOST_POOL_BYTES),default) (flash-next $(or $(FN_KV_HOST_POOL_BYTES),default)) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),$(if $(filter flash-next,$(MODEL_FAMILY)),off (SPEC=mtp turns the MTP head on),server default (the rtx5090 profile: dflash2)))$(if $(filter-out off,$(SPEC)),/$(DRAFT_TOKENS)$(if $(DRAFT_HEAD),/$(DRAFT_HEAD)))$(if $(DRAFT_ROWS), rows=$(DRAFT_ROWS)) rope=$(or $(ROPE_SCALING),none)"
@@ -354,7 +354,7 @@ else
 endif
 
 .PHONY: metrics
-metrics: ## Scrape the metrics listener (a server started with METRICS=1; no key)
+metrics: ## Scrape the metrics listener (on by default; METRICS=0 starts a server without it; no key)
 	curl -fsS "$(METRICS_URL)/metrics"
 
 .PHONY: canary

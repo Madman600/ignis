@@ -251,10 +251,14 @@ config_group! {
         /// set.
         expose: Opt<ExposeKind> = None, Validator::OneOf(super::Expose::NAMES), ALL, [Visible];
         /// Serve Prometheus metrics on their own listener (`metrics_bind`),
-        /// and at /ui/metrics unless the Playground is off.
-        metrics: Bool = false, NO_RULE, ALL, [Visible];
-        /// The metrics listener's address. Needs `metrics` on; never the
-        /// API's `bind`; no API key, never exposed.
+        /// and at /ui/metrics unless the Playground is off. On by default;
+        /// `false` serves neither.
+        metrics: Bool = super::DEFAULT_METRICS, NO_RULE, ALL, [Visible];
+        /// The metrics listener's address: loopback by default, no API key,
+        /// never exposed, never the API's `bind`; refused with `metrics` off.
+        /// The default address taken (a second server on the host) is a
+        /// warning, and the server starts without the listener; another
+        /// address that cannot be bound refuses the start.
         metrics_bind: Text = super::DEFAULT_METRICS_BIND.to_owned(), NO_RULE, ALL, [Visible];
         /// Serve the Playground at /ui/. A binary built without web/dist
         /// serves a page saying how to build it.

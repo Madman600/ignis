@@ -111,7 +111,11 @@ ENV IGNIS_SERVER_BIND=0.0.0.0:8000
 # the mounted artifact to serve the real model on the GPU.
 
 # The OpenAI-compatible API + the Playground, and the Prometheus listener
-# (ADR 0017) for a server started with --server-metrics --server-metrics-bind 0.0.0.0:9464.
+# (ADR 0017). Metrics are on by default, but the listener stays on the
+# container's own loopback (127.0.0.1:9464): it asks for no key, so it is never
+# published unasked. The Playground reads them at /ui/metrics on 8000, behind
+# the API key when one is set. To scrape from outside, name it:
+# -e IGNIS_SERVER_METRICS_BIND=0.0.0.0:9464 -p 9464:9464.
 EXPOSE 8000 9464
 
 USER ignis

@@ -1959,26 +1959,55 @@ fn a_relative_catalog_path_resolves_against_the_config_file_that_set_it() {
 
 // ── Prometheus metrics (GitHub #89, ADR 0017) ────────────────────────────
 
+/// On by default since 2026-10-15 (the owner's call, ADR 0017), on their
+/// own loopback listener; each of the three spellings turns them off.
 #[test]
-fn metrics_are_off_by_default_and_on_their_own_listener_when_on() {
-    assert_eq!(config(&[]).metrics, None);
+fn metrics_are_on_by_default_on_their_own_listener_and_off_when_asked() {
+    assert!(DEFAULT_METRICS);
+    assert_eq!(config(&[]).metrics, Some(DEFAULT_METRICS_BIND.to_owned()));
     assert_eq!(config(&["--server-metrics"]).metrics, Some(DEFAULT_METRICS_BIND.to_owned()));
     assert_ne!(DEFAULT_METRICS_BIND, DEFAULT_BIND);
+    assert!(DEFAULT_METRICS_BIND.starts_with("127.0.0.1:"), "loopback, never exposed");
+    for off in ["false", "off", "0"] {
+        assert_eq!(config(&["--server-metrics", off]).metrics, None, "{off}");
+    }
+    let env = env_map(&[("IGNIS_SERVER_METRICS", "false")]);
+    assert_eq!(expect_config(resolve(&[], env).expect("resolve")).metrics, None);
+    let files = MemFiles::with(&[("c.yaml", "server:\n  metrics: false\n")]);
+    assert_eq!(with_files(&["--config", "c.yaml"], no_env, &files).unwrap().metrics, None);
 }
 
 #[test]
-fn metrics_bind_moves_the_metrics_listener_in_either_order() {
+fn metrics_bind_moves_the_metrics_listener_in_either_order_or_alone() {
     for argv in [
-        ["--server-metrics", "--server-metrics-bind", "127.0.0.1:9100"],
-        ["--server-metrics-bind", "127.0.0.1:9100", "--server-metrics"],
+        &["--server-metrics", "--server-metrics-bind", "127.0.0.1:9100"][..],
+        &["--server-metrics-bind", "127.0.0.1:9100", "--server-metrics"],
+        &["--server-metrics-bind", "127.0.0.1:9100"],
     ] {
-        assert_eq!(config(&argv).metrics.as_deref(), Some("127.0.0.1:9100"), "{argv:?}");
+        assert_eq!(config(argv).metrics.as_deref(), Some("127.0.0.1:9100"), "{argv:?}");
     }
 }
 
+/// A default address another process holds (a second server on the host)
+/// costs a start its listener, never the start; one the operator named is
+/// theirs, and refuses it (ADR 0017's 2026-10-15 amendment). Named means an
+/// address other than the default, from any of the three spellings.
 #[test]
-fn metrics_bind_without_metrics_or_value_or_on_the_api_address_is_refused() {
-    assert!(refused(&["--server-metrics-bind", "127.0.0.1:9100"]).contains("--server-metrics"));
+fn only_a_metrics_address_other_than_the_default_counts_as_named() {
+    assert!(!config(&[]).metrics_bind_named);
+    assert!(!config(&["--server-metrics"]).metrics_bind_named);
+    assert!(!config(&["--server-metrics-bind", DEFAULT_METRICS_BIND]).metrics_bind_named, "the default, named");
+    assert!(config(&["--server-metrics-bind", "127.0.0.1:9100"]).metrics_bind_named);
+    let env = env_map(&[("IGNIS_SERVER_METRICS_BIND", "127.0.0.1:9100")]);
+    assert!(expect_config(resolve(&[], env).expect("resolve")).metrics_bind_named);
+    let files = MemFiles::with(&[("c.yaml", "server:\n  metrics_bind: 127.0.0.1:9100\n")]);
+    assert!(with_files(&["--config", "c.yaml"], no_env, &files).unwrap().metrics_bind_named);
+}
+
+#[test]
+fn metrics_bind_with_metrics_off_or_without_value_or_on_the_api_address_is_refused() {
+    let err = refused(&["--server-metrics", "false", "--server-metrics-bind", "127.0.0.1:9100"]);
+    assert!(err.contains("`--server-metrics-bind`") && err.contains("(`--server-metrics` is false)"), "{err}");
     assert!(resolve(&args(&["--server-metrics", "--server-metrics-bind"]), no_env).is_err());
     let err = refused(&["--server-metrics", "--server-bind", "127.0.0.1:7000", "--server-metrics-bind", "127.0.0.1:7000"]);
     assert!(err.contains("--server-bind"), "{err}");
@@ -1993,7 +2022,7 @@ fn metrics_has_its_env_var_now_and_no_alias() {
     assert_eq!(expect_config(resolve(&[], env).expect("resolve")).metrics.as_deref(), Some("127.0.0.1:9100"));
     for name in ["IGNIS_METRICS", "IGNIS_PROMETHEUS", "IGNIS_METRICS_BIND"] {
         let env = move |key: &str| (key == name).then(|| "127.0.0.1:9100".to_owned());
-        assert_eq!(expect_config(resolve(&[], env).expect("resolve")).metrics, None, "{name}");
+        assert_eq!(expect_config(resolve(&[], env).expect("resolve")).metrics.as_deref(), Some(DEFAULT_METRICS_BIND), "{name}");
     }
     for alias in ["-M", "--prometheus", "--server-metrics=true", "--metrics"] {
         assert!(resolve(&args(&[alias]), no_env).is_err(), "`{alias}` is not a metrics alias");

@@ -146,6 +146,29 @@ Each ended job also writes one `ignis.image.job` log line (id, kind, model,
 milliseconds of enhancing, switching, queueing, encoding, denoising,
 decoding, the run and the total). The Playground's Monitor reads the families
 (an *Image jobs* card, shown once they exist).
+Amended 2026-10-15 (owner decision): **metrics are on by default.** The reason
+they were opt-in -- #90 had to show they cost the inference path nothing -- is
+closed, and every server the owner runs carried them. `server.metrics`
+defaults to `true` (ADR 0046 spells the flag `--server-metrics`, its env
+var `IGNIS_SERVER_METRICS`, its file key `server.metrics`);
+`--server-metrics false`, `IGNIS_SERVER_METRICS=false` or
+`server.metrics: false` turns them off, and then neither the projection nor a
+route to it exists, as below. `--server-metrics-bind` no longer needs
+`--server-metrics` beside it; it is refused only beside an explicit `false`.
+Everything else stands: the listener's default is still `127.0.0.1:9464`, it
+asks for no key and is never exposed, and the Playground's `/ui/metrics` is
+behind the API key when one is set -- the same key that guards `/v1` on the
+same listener. Since the default address is a fixed port, a second server on
+the host finds it taken, and refusing that start would make a default feature
+a reason not to start: **a default address that cannot be bound is a warning**
+(`ignis.server.metrics_unavailable`, with the address and the error), and the
+server serves without the listener; the projection stays, so `/ui/metrics`
+still answers. An address other than the default that the operator named --
+`server.metrics_bind` from a flag, its env var or a file -- is theirs, and a
+bind failure on it still refuses the start (`ignis.server.failed`).
+`ignis.process.started` names the address the listener bound (the port a `:0`
+bind was given), or `off`. The user stories below and "disabled by default" in
+the decisions read with this amendment.
 
 ## Context
 
@@ -227,10 +250,14 @@ critical-path performance regression. The only numerical allowance is at most
   layer, formatter, or consumer of rendered log output.
 - Metrics are disabled by default and enabled only by the boolean CLI flag
   `--metrics`. There is no short alias, environment variable, or config-file
-  key in this scope.
+  key in this scope. (Superseded: ADR 0046 gave the field its env var and
+  file key, and since 2026-10-15 metrics are on unless `--server-metrics
+  false` -- see Status.)
 - When enabled, `GET /metrics` is served by a second `ignis-server` listener
   of its own, at `--metrics-bind <addr>` (flag only, default
-  `127.0.0.1:9464`; refused without `--metrics` or on the API's `--bind`). It
+  `127.0.0.1:9464`; refused without `--metrics` or on the API's `--bind`;
+  since 2026-10-15 refused beside `--server-metrics false`, and a default
+  address that cannot be bound is a warning, not a refusal). It
   serves nothing else and asks for no API key: it is kept private by its bind
   address, and `--expose` (ADR 0028) only ever tunnels the API listener. One
   shutdown stops both listeners.

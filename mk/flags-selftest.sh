@@ -182,9 +182,14 @@ out="$(flags MODEL=image)"
 has "MODEL=image arena" "$out" "--qwen38flashnext-reuse-kv-host-pool-bytes 2G"
 lacks "MODEL=image arena" "$out" "--reuse-kv-host-pool-bytes 8G"
 has "MODEL=image HOST_MARGIN_BYTES=3G" "$(flags MODEL=image HOST_MARGIN_BYTES=3G)" "--model-host-margin-bytes 3G"
-# Metrics on by default (the owner, 2026-10-13); METRICS=0 turns them off.
-has "metrics default" "$(flags)" "--server-metrics"
-lacks "METRICS=0" "$(flags METRICS=0)" "--server-metrics"
+# Metrics are on by default in the server itself (the owner, 2026-10-15):
+# METRICS=1 passes nothing, so a second server on the host whose default
+# listener is taken still starts; METRICS=0 turns them off.
+lacks "metrics default" "$(flags)" "--server-metrics"
+has "METRICS=0" "$(flags METRICS=0)" "--server-metrics false"
+has "METRICS_BIND" "$(flags METRICS_BIND=127.0.0.1:9100)" "--server-metrics-bind 127.0.0.1:9100"
+lacks "METRICS=0 METRICS_BIND" "$(flags METRICS=0 METRICS_BIND=127.0.0.1:9100)" "--server-metrics-bind"
+case "$(make config CUDA=1 METRICS=0 2>/dev/null | sed -n 's/^METRICS  *//p')" in "0  (off)") ;; *) fail "METRICS=0 config line" ;; esac
 # The host plan's margin: the server's 4G unless named.
 lacks "margin default" "$(flags MODEL=flash-next)" "--model-host-margin-bytes"
 has "HOST_MARGIN_BYTES=3G" "$(flags HOST_MARGIN_BYTES=3G)" "--model-host-margin-bytes 3G"

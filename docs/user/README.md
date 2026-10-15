@@ -45,7 +45,10 @@ podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
 (`docker`: `--gpus all` in place of `--device`.) Every flag has an `IGNIS_*`
 environment variable; anything after the image name is passed to the server.
 The image sets no default command, so the Playground is on — the server's own
-default.
+default. So are metrics: the Playground's Monitor reads them at `/ui/metrics`
+on port 8000, while the keyless Prometheus listener stays on the container's
+own loopback. To scrape it from outside, add
+`-e IGNIS_SERVER_METRICS_BIND=0.0.0.0:9464 -p 9464:9464`.
 
 With no `IGNIS_MODEL_ARTIFACT` the image fetches the model into its own working
 directory (`/home/ignis/models`) and loses it with the container. Mount a
@@ -511,7 +514,7 @@ file when that saves at least the restore floor (8,192 tokens on Flash-Next,
 - When the device, KV-RAM and the disk are all full of live work, a new
   request waits in the queue until room returns: nothing is refused or loses
   work for it (the in-flight cap's 503 is unchanged).
-- With `--server-metrics` the tier is `tier="disk"` on the retained-state series and
+- With metrics on (the default) the tier is `tier="disk"` on the retained-state series and
   `ignis_kv_disk_*` (bytes, spills, failures); the Monitor shows a Disk row.
 
 ### Flash-Next n-gram startup cache
@@ -627,8 +630,8 @@ plan leaves, and with about 28 GB more available than the figure above
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `--server-ui <bool>` | `IGNIS_SERVER_UI` | on | Serve the Playground at `/ui/` ([ADR 0026](../adr/0026-playground-embedded-when-built.md)). A binary built without `web/dist` serves the page that says how to build it. |
-| `--server-metrics <bool>` | `IGNIS_SERVER_METRICS` | off | Serve Prometheus metrics on their own listener, and at `/ui/metrics` unless `--server-ui false` ([ADR 0017](../adr/0017-prometheus-metrics.md)). |
-| `--server-metrics-bind <addr>` | `IGNIS_SERVER_METRICS_BIND` | `127.0.0.1:9464` | The metrics listener's address; needs `--server-metrics`. No API key, never exposed. |
+| `--server-metrics <bool>` | `IGNIS_SERVER_METRICS` | on | Serve Prometheus metrics on their own listener, and at `/ui/metrics` unless `--server-ui false` ([ADR 0017](../adr/0017-prometheus-metrics.md)). `--server-metrics false` turns them off. |
+| `--server-metrics-bind <addr>` | `IGNIS_SERVER_METRICS_BIND` | `127.0.0.1:9464` | The metrics listener's address; refused beside `--server-metrics false`. No API key, never exposed. When the default address is taken (a second server on the host), the server warns (`ignis.server.metrics_unavailable`) and serves without the listener (`/ui/metrics` still answers); another address you named that cannot be bound refuses the start. |
 | `--server-api-key <key>` | `IGNIS_SERVER_API_KEY` | unset | Unset: `/v1` needs no key. Set: `Authorization: Bearer <key>`. `auto`: generate one and print it. |
 | `--server-expose <mode>` | `IGNIS_SERVER_EXPOSE` | unset | `cloudflare-quick` publishes a `https://*.trycloudflare.com` URL, printed at start. Always requires an API key — one is generated when none is set ([ADR 0028](../adr/0028-expose-modes-always-keyed.md)). |
 
@@ -660,7 +663,7 @@ not.
 | `/v1/docs/` | GET | Swagger UI over the document, from assets compiled into the binary: no CDN, nothing fetched. Open even with an API key set — it publishes the API's shape, not its load — and *Authorize* is how you drive the keyed routes from the page. |
 | `/v1/openapi.json` | GET | The OpenAPI 3.1 document, generated from the handlers themselves. Monitoring is not in it. |
 | `/ui/` | GET | The Playground — only with `--server-ui`. |
-| `/ui/metrics` | GET | Prometheus text format 0.0.4 for the Playground — only with `--server-ui` and `--server-metrics`. Behind the API key, like `/v1`. |
+| `/ui/metrics` | GET | Prometheus text format 0.0.4 for the Playground — with `--server-ui`, unless `--server-metrics false`. Behind the API key, like `/v1`. |
 
 Every `/v1` route answers a CORS preflight. Prometheus itself scrapes
 `GET /metrics` on the metrics listener (`--server-metrics-bind`), not on the API's
@@ -939,7 +942,7 @@ id outside the vocabulary is a `400` naming its index. The tokenizer normalizes
 text to NFC, so a decomposed `e` + accent comes back as the composed `é` (the
 `text` a call returns is the rendered prompt as sent, before that).
 Neither route enters the scheduler; the count of calls is
-`ignis_tokenize_requests_total{route}` with `--server-metrics`.
+`ignis_tokenize_requests_total{route}` on the metrics listener.
 
 ### Image generation
 
@@ -1309,7 +1312,7 @@ Everything goes through one structured log on stdout, in the format
 
 - The VRAM layout decided at load is the `ignis.runtime.vram_plan` event.
 
-With `--server-metrics`, the Prometheus exposition covers the request lifecycle and
+With metrics on (the default; `--server-metrics false` turns them off), the Prometheus exposition covers the request lifecycle and
 rejections, KV pool pages and evictions, the KV-RAM arena, retained slots and
 what reuse held or gave up, the VRAM plan, decoded tokens, forced thinking
 closes, and decision counters with the answer-mass histogram ([ADR 0017](../adr/0017-prometheus-metrics.md)).

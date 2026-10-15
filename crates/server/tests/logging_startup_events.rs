@@ -64,7 +64,9 @@ fn no_config_file(command: &mut Command) {
         .env("APPDATA", &empty)
         .env("XDG_CONFIG_HOME", &empty)
         .env_remove("IGNIS_CONFIG")
-        .env_remove("IGNIS_PROFILE");
+        .env_remove("IGNIS_PROFILE")
+        .env_remove("IGNIS_SERVER_METRICS")
+        .env_remove("IGNIS_SERVER_METRICS_BIND");
 }
 
 fn run_with_envs(args: &[&str], envs: &[(&str, &str)]) -> serde_json::Value {
@@ -103,12 +105,20 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// [`launch_until`] with metrics off: on by default (ADR 0017), they would
+/// open the fixed 127.0.0.1:9464 at every launch, a real server's. The
+/// metrics tests below launch with them on.
+fn run_until(args: &[&str], envs: &[(&str, &str)], until: &[&str]) -> Vec<serde_json::Value> {
+    let args: Vec<&str> = args.iter().copied().chain(["--server-metrics", "false"]).collect();
+    launch_until(&args, envs, until)
+}
+
 /// Spawn `ignis-server`, read stdout lines until one whose `event_name` is
 /// in `until` appears (or a 10s timeout elapses), then kill the process.
 /// Returns every JSON record observed, in order, up to and including the
 /// match. `--server-bind 127.0.0.1:0` (an OS-assigned ephemeral port) is always
 /// forced so these never collide with each other or with a real server.
-fn run_until(args: &[&str], envs: &[(&str, &str)], until: &[&str]) -> Vec<serde_json::Value> {
+fn launch_until(args: &[&str], envs: &[(&str, &str)], until: &[&str]) -> Vec<serde_json::Value> {
     let exe = env!("CARGO_BIN_EXE_ignis-server");
     let mut command = Command::new(exe);
     command
@@ -228,6 +238,58 @@ fn a_bind_conflict_emits_a_server_failed_event() {
         "the bind error should appear as a typed attribute: {record}"
     );
     drop(held);
+}
+
+// ── the metrics listener, on by default (ADR 0017, amended 2026-10-15) ────
+
+/// No `--server-metrics` and the listener binds; the start line names where
+/// — the port a `:0` bind was given, not the `:0`.
+#[test]
+fn metrics_are_on_by_default_and_the_start_names_the_bound_listener() {
+    // `localhost:0`: ephemeral, and not the API's `127.0.0.1:0` spelling,
+    // which a metrics listener may not share.
+    let records = launch_until(&["--server-metrics-bind", "localhost:0"], &[], &["ignis.process.started"]);
+    let started = find(&records, "ignis.process.started");
+    let at = started["attributes"]["metrics"].as_str().unwrap_or_else(|| panic!("a typed attribute: {started}"));
+    let port = at.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok());
+    assert!(port.is_some_and(|port| port != 0), "the bound address, not {at:?}: {started}");
+    assert!(!records.iter().any(|r| r["event_name"] == "ignis.server.metrics_unavailable"), "{records:?}");
+}
+
+/// A second server on the host finds the default address taken: it warns,
+/// naming the address, and starts without the listener.
+#[test]
+fn a_taken_default_metrics_address_warns_and_the_start_goes_on() {
+    // Held here, unless a real server on this machine already holds it:
+    // taken either way.
+    let _held = std::net::TcpListener::bind(ignis_server::config::DEFAULT_METRICS_BIND).ok();
+    let records = launch_until(&[], &[], &["ignis.process.started"]);
+    let warning = find(&records, "ignis.server.metrics_unavailable");
+    assert_eq!(warning["severity_text"], "WARN");
+    assert_eq!(warning["attributes"]["bind"], ignis_server::config::DEFAULT_METRICS_BIND);
+    assert!(warning["attributes"]["error"].as_str().is_some(), "{warning}");
+    let started = find(&records, "ignis.process.started");
+    assert_eq!(started["attributes"]["metrics"], "off", "{started}");
+}
+
+/// An address the operator named is theirs: taken, it refuses the start.
+#[test]
+fn a_taken_named_metrics_address_refuses_the_start() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+    let addr = held.local_addr().expect("local_addr").to_string();
+    let record = run(&["--server-bind", "127.0.0.1:0", "--server-metrics-bind", &addr]);
+    assert_eq!(record["event_name"], "ignis.server.failed");
+    assert_eq!(record["attributes"]["bind"], addr, "{record}");
+    drop(held);
+}
+
+/// `--server-metrics false`, as every other launch here: no listener, and
+/// nothing to warn about.
+#[test]
+fn metrics_off_starts_with_no_listener_and_no_warning() {
+    let records = run_until(&[], &[], &["ignis.process.started"]);
+    assert_eq!(find(&records, "ignis.process.started")["attributes"]["metrics"], "off");
+    assert!(!records.iter().any(|r| r["event_name"] == "ignis.server.metrics_unavailable"), "{records:?}");
 }
 
 #[test]

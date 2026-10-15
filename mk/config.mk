@@ -13,12 +13,14 @@ PROFILE ?= release
 # unless told not to -- make says which it means rather than relying on that.
 UI ?= 1
 
-# 1 = pass --server-metrics (ADR 0017): Prometheus text at GET /metrics on its own
-# listener (METRICS_BIND, no key, never exposed) and, with UI=1, at
-# /ui/metrics on BIND (behind API_KEY when set). On by default since
-# 2026-10-13 (the owner's call; #90 proved it costs the inference path nothing);
-# METRICS=0 starts without it, as a gate run that must not carry it does.
-# make metrics scrapes the metrics listener.
+# Prometheus metrics (ADR 0017): text at GET /metrics on their own listener
+# (METRICS_BIND, no key, never exposed) and, with UI=1, at /ui/metrics on BIND
+# (behind API_KEY when set). The server's own default since 2026-10-15 (the
+# owner's call; #90 proved they cost the inference path nothing), so 1 passes
+# nothing; METRICS=0 passes --server-metrics false, as a gate run that must
+# not carry them does. A second server on the host finds the default listener
+# taken and starts without it, warning; a METRICS_BIND that is taken refuses
+# the start. make metrics scrapes the metrics listener.
 METRICS ?= 1
 # The metrics listener (--server-metrics-bind). Empty = the server's 127.0.0.1:9464.
 METRICS_BIND ?=
