@@ -448,7 +448,7 @@ Spec: `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
   never more memory than the card has.
 - **The image plan is unchanged.** It reads NVML after its context and charges
   none, so a 27B's state, when one has run, stays outside its budget: about
-  84 MB (0.6% of the condition budget) less than in a process that loaded only
+  84 MB (0.7% of the condition budget) less than in a process that loaded only
   the image model.
 - **Result** at the Makefile's 27B shape: cold 11,129 pages, then image, then
   27B 11,105 (−0.2%, the desktop's own drift between the two readings), and
