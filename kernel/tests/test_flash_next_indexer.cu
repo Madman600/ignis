@@ -764,7 +764,8 @@ int main() {
     void *func[2] = {};
     for (int fused = 0; fused < 2; ++fused) {
       fn::set_fused(fn::Fusion::Score, fused == 1);
-      MOE_CUDA(cudaMemset(d_scores.p, 0xFF, d_scores.bytes));
+      // On the score's stream (GitHub #324): a non-blocking stream does not wait for the legacy one.
+      MOE_CUDA(cudaMemsetAsync(d_scores.p, 0xFF, d_scores.bytes, d.stream));
       IX_OK(ix::score(g, paged, b, 0, kLanes, d_q.as<__nv_bfloat16>(), kMaxBlocks, d_scores.as<float>(), kMaxBlocks,
                       d.stream));
       MOE_CUDA(cudaStreamSynchronize(d.stream));

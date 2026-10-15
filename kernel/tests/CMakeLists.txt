@@ -716,6 +716,12 @@ add_test(NAME ignis_kernel_residency_trace_test COMMAND ignis_kernel_residency_t
 add_test(NAME ignis_kernel_residency_graph_test COMMAND ignis_kernel_residency_trace_test graph)
 add_test(NAME ignis_kernel_residency_split_test COMMAND ignis_kernel_residency_trace_test split)
 add_test(NAME ignis_kernel_residency_graph_split_test COMMAND ignis_kernel_residency_trace_test graph split)
+# GitHub #324 (item 7): every upload a step reads lands 2 ms late on its own stream, so a step not
+# ordered after its upload reads the old bytes every run instead of now and then. A guard on the
+# test's uploads, not a reproduction of the flake: a synchronous copy plus the delay passed.
+add_test(NAME ignis_kernel_residency_upload_order_test COMMAND ignis_kernel_residency_trace_test split)
+set_tests_properties(ignis_kernel_residency_upload_order_test PROPERTIES
+  ENVIRONMENT "IGNIS_RESIDENCY_UPLOAD_DELAY_US=2000")
 # GitHub #306 (decode fusion, step 5): OURS -- residency's routed demand step (the router's selection
 # made in the resolve's launch) against the router and the demand step it replaces, bit for bit.
 # GPU (ADR 0006: no SKIP_RETURN_CODE).

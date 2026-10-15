@@ -105,16 +105,17 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     // ignis #320: the image model's W8 vision tower (Qwen3-VL-8B), on the shape-generic routes:
     // qkv [3456,1152], output [1152,1152], fc1 [4304,1152], the patch embedding [1152,1536] and
-    // fc2 [1152,4304] (stored K 4352, the padded path). K 1152 stays on SIMT at every T: the MMA
-    // kernels stage eight groups' scales as one 16-byte copy, which needs a row of scales (padded
-    // K / 16 bytes) to be a multiple of 16 bytes, and K 1152 gives 72.
+    // fc2 [1152,4304] (stored K 4352, the padded path), on SIMT to T 16, then mma_r64_c128. At
+    // K 1152 a row of scales (padded K / 16 bytes) is 72 bytes, not a multiple of 16: the MMA
+    // kernel stages it in 8-byte halves (ignis #324, its recorded patch).
     case 1152:
         switch (n) {
         case 1152:
         case 3456:
         case 4304:
             if (t <= 4) { return launch_w8_simt_r8_c4; }
-            return launch_w8_simt_r8_c8;
+            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            return launch_w8_mma_r64_c128;
         default:
             break;
         }

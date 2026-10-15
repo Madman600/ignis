@@ -99,7 +99,8 @@ void block_arm(Block &b, int tokens) {
     MOE_CUDA(cudaStreamEndCapture(stream, &graph));
     MOE_CUDA(cudaGraphInstantiate(&exec, graph, 0));
     for (int replay = 0; replay < 2; ++replay) {
-      MOE_CUDA(cudaMemset(out.p, 0, out.bytes));
+      // On the replay's stream (GitHub #324): a non-blocking stream does not wait for the legacy one.
+      MOE_CUDA(cudaMemsetAsync(out.p, 0, out.bytes, stream));
       MOE_CUDA(cudaGraphLaunch(exec, stream));
       MOE_CUDA(cudaStreamSynchronize(stream));
       check(download<uint16_t>(out.p, static_cast<std::size_t>(tokens) * kH) == eager,

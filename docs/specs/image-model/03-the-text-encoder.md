@@ -342,12 +342,14 @@ the hooks they fill are below.
    bit (bound 0), and the CPU tests.
 3. Done (320a): t2i 9.61% against the 19.50% bound.
 4. Done (320c): edit 12.78% after the first image pad against the 25.76%
-   bound; with DeepStack off 29.68%, over it.
+   bound; with DeepStack off 29.68%, over it. 11.70% since the tower's
+   K-1152 linears run on MMA (#324, the section at the end).
 5. Done (320c): the 27B's vision tests pass unchanged (7 GPU tests under
    the profile, and the CTest).
 6. Done (320f): mrope positions bit for bit on the t2i and 3-image tables.
 7. Done, for information: t2i 21.6-22.0 ms (320a); a 10-image edit, tower
-   2.84 s and text model 0.48 s (320c).
+   2.84 s and text model 0.48 s (320c); tower 0.43 s and text model 0.46 s
+   since #324 (324vis).
 
 Where the tower chose what the sections above leave open.
 - **Where.**
@@ -389,7 +391,8 @@ Where the tower chose what the sections above leave open.
     16-byte `cp.async`, which needs a row of scales (padded K / 16 bytes) to
     be a multiple of 16 bytes. K 1152 gives 72: routed to `mma_r64_c128`,
     they gave wrong outputs at T 17 and a misaligned-address fault at T
-    4096.
+    4096. Since #324 they run on SIMT up to T 16, then `mma_r64_c128`, which
+    a second recorded patch lets stage such a row (the section at the end).
   - the patch embedding `[1152, 1536]`, fc2 `[1152, 4304]` (stored K 4352)
     and the mergers' fc2 `[4096, 4608]` on SIMT up to T 16, then
     `mma_r64_c128`.
@@ -458,6 +461,8 @@ Where the tower chose what the sections above leave open.
 
   - **DeepStack on** sits at the sim yardstick, as t2i does: W8A8
     quantization. Its worst row after the pad is 20.7% (" the", row 1056).
+    Since #324 (the K-1152 linears on MMA, another accumulation order):
+    11.70% after the pad, 12.76% on the encoder's rows, row 0 unchanged.
   - **DeepStack off is over the bound**, and the test asserts it (spec 03's
     check). It is as weak as spec 01 measured: rows 1046
     (`<|vision_end|>`, 47.6%) and 1056 (" the", 58.9%) carry it. Without
@@ -504,6 +509,10 @@ Where the tower chose what the sections above leave open.
     work), the route the vendor patch takes because of the MMA's scale
     copy. That is an estimate, not profiled: the tower's linears and
     attention run at about 22 TFLOPS effective.
+  - **Since #324** (measured, the section at the end): the tower takes
+    0.43 s for ten images and 44 ms for one, against 2.68 s and 226 ms for
+    the build before it in the same hold. The text model is unchanged
+    (0.46 s and 41 ms), so the tower is now 48% of the ten-image encode.
 - **Gates** (this section and its code, 4c7e3a1 to cae718e):
   - `kernel/build.ps1 -Test` with `IGNIS_GPU_PROFILE=1`: 123 of 123.
   - The Rust GPU tests under the profile:
@@ -549,3 +558,68 @@ The "As built" status lines above stand; this adds what the reviews of 320a and
   geometry or head count the leaf does not run (`crates/core/tests/
   image_weights_cpu.rs`, on a `CpuDevice`); the text config parse refuses
   `attention_bias: true`.
+
+## #324 item 5 (324vis, 2026-10-15): the tower's K-1152 linears on MMA
+
+- **What changed.** qkv `[3456, 1152]`, output `[1152, 1152]` and fc1
+  `[4304, 1152]` now run on SIMT up to T 16, then `mma_r64_c128`, like the
+  tower's other W8 arms. Their 72-byte rows of scales reach the MMA kernel
+  through a second recorded patch, of
+  `kernel/vendor/src/ops/linear/w8/w8_rowsplit_gemm_mma.cuh` (ADR 0031):
+  when a row of scales is a multiple of 8 bytes but not of 16, the kernel
+  stages its window of eight groups as two 8-byte `cp.async` halves and
+  zero-fills a half past the row. Any other row takes the unchanged 16-byte
+  copy. The artifact is unchanged.
+- **The measurement that opened it.** An nsys capture of the ten-image
+  test (`image_encoder_edit_gpu`, the whole test: four ten-image and two
+  one-image tower runs) showed `w8_rowsplit_gemm_simt_kernel` as 73% of all
+  kernel time (9.99 of 13.63 s). The bound: at T 40,960 the
+  three linears are 22.7 TFLOP per tower, about 0.11 s at the bf16 bar of
+  ~210 TFLOPS, against about 2.3 s on SIMT.
+- **Which layers moved, and by how much** (one block, synthetic weights,
+  CUDA events, T 40,960):
+
+  | linear | SIMT r8_c8 | MMA r64_c128 |
+  |---|---|---|
+  | qkv `[3456, 1152]` | 35.2 ms (9.3 TFLOPS) | 1.81 ms (181 TFLOPS) |
+  | output `[1152, 1152]` | 11.9 ms (9.1 TFLOPS) | 0.59 ms (183 TFLOPS) |
+  | fc1 `[4304, 1152]` | 39.7 ms (10.2 TFLOPS) | 2.45 ms (166 TFLOPS) |
+
+  Over 27 blocks that is 2.34 s against 0.13 s. The patch embedding, fc2
+  and the mergers did not move: they were on MMA already.
+- **The tower** (`image_encoder_edit_gpu`, median of 3 warm runs, before
+  and after in the same hold): ten images 2.68 s → 0.43 s, one image
+  226 ms → 44 ms. The same capture after holds 4.15 s of kernels: the
+  text model's W8A8 GEMMs (1.40 s) and attention (0.75 s) lead, then the
+  tower's MMA linears (0.92 s) and its attention (0.54 s).
+- **Correctness.**
+  - `ignis_kernel_w8_linear_tests`: with the dispatch moved but not the
+    kernel patch, `[3456, 1152]` fails at T 17 and 64 (wrong outputs) and
+    faults at T 128 (misaligned address). With both, every case passes.
+    T 64 and 128 are new at K 1152, a partial and a full column tile.
+  - Every other W8 problem is bit for bit what it was. The FNV-1a hash of
+    the output is equal before and after for the reference's 16 problems
+    (the 27B's among them) and the tower's three earlier MMA arms, at 322
+    (problem, T) pairs that cover each dispatch arm, and for K 1152 up to
+    T 16. Only K 1152 above T 16 changed. The kernel's register counts
+    moved by -6 to +8 per instantiation, with no spills, and a timing of
+    those problems at 4,096 tokens moved within run noise.
+  - AC 4: 11.70% after the first pad (bound 25.76%), 12.76% on the
+    encoder's rows (bound 28.99%). The ten-image segments still equal the
+    one-image run bit for bit.
+- **Default taken.** `mma_r64_c128` from T 17 on all three shapes, as the
+  tower's other arms. Below about 130 columns `mma_r32_c128`, or SIMT for
+  `[1152, 1152]` at T 17, is up to 1.7x faster. The server never runs the
+  tower that narrow: it encodes each condition image at about 1024² of
+  area, 4,096 patches, where `mma_r64_c128` is the fastest of the three.
+- **Gates** (0dfc97c, the GPU lock in timing mode):
+  - `kernel/build.ps1 -Test` with `IGNIS_GPU_PROFILE=1`: 125 of 125.
+  - The Rust GPU tests under the profile, 30 tests in 18 binaries, all
+    passing: the image tests (`image_attn_gpu`, `image_elementwise_gpu`,
+    `image_encoder_attn_gpu`, `image_encoder_gpu`, `image_gemm_gpu`,
+    `image_leaf_gpu`, `image_vae_gpu`, `image_encoder_edit_gpu`,
+    `image_leaf_ten_images_gpu`, `image_leaf_timing_gpu`,
+    `image_runner_gpu`) and the 27B's 7 vision tests.
+  - `CARGO_INCREMENTAL=0 cargo test --workspace`: 2,981 passed, 0 failed,
+    6 ignored. `cargo check -p ignis-server --features cuda --tests`
+    passes, with the earlier warnings only.

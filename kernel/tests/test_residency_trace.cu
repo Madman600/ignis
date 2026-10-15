@@ -206,6 +206,35 @@ struct Round {
   cudaGraphExec_t exec = nullptr;
 };
 
+__global__ void spin_kernel(unsigned long long ns) {
+  unsigned long long start = 0, now = 0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+  do {
+    __nanosleep(1000);
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+  } while (now - start < ns);
+}
+
+// What a step reads goes up on the stream the step runs on (GitHub #324, item 7). A pageable
+// cudaMemcpy on the legacy stream may return before its bytes land, and a cudaStreamNonBlocking
+// stream does not wait for the legacy one; the eviction check failed its four checks now and then,
+// and an upload or the warm start's last copies landing late are what can make it (the cause is
+// inferred, not reproduced). IGNIS_RESIDENCY_UPLOAD_DELAY_US puts a spin that long ahead of every
+// upload, on the upload's stream: an upload a step is not ordered after then fails every run. It
+// guards this file's uploads only: a synchronous cudaMemcpy plus the spin passed, and the library's
+// own legacy copies are the warm start's trailing device sync's to close.
+void upload(void *dst, const void *src, size_t bytes, cudaStream_t stream) {
+  static const unsigned long long delay_ns = [] {
+    const char *us = std::getenv("IGNIS_RESIDENCY_UPLOAD_DELAY_US");
+    return us == nullptr ? 0ull : std::strtoull(us, nullptr, 10) * 1000ull;
+  }();
+  if (delay_ns != 0) {
+    spin_kernel<<<1, 1, 0, stream>>>(delay_ns);
+    CUDA_OK(cudaGetLastError());
+  }
+  CUDA_OK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream));
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -490,7 +519,7 @@ int main(int argc, char **argv) {
             static_cast<float>(f.width - j);
       }
     }
-    CUDA_OK(cudaMemcpyAsync(d_logits, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice, stream));
+    upload(d_logits, logits.data(), logits.size() * 4, stream);
     return true;
   };
 
@@ -525,8 +554,8 @@ int main(int argc, char **argv) {
   {
     const Step &s = f.steps[0];
     check(s.rows > 0 && s.layer + 1 < f.layers, "the fixture's first step has a lookahead");
-    CUDA_OK(cudaMemcpy(d_ids, s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMemcpy(d_look, s.lookahead.data(), s.lookahead.size() * 4, cudaMemcpyHostToDevice));
+    upload(d_ids, s.ids.data(), s.ids.size() * 4, stream);
+    upload(d_look, s.lookahead.data(), s.lookahead.size() * 4, stream);
     CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
     run_step(s.layer, s.phase, d_ids, s.tokens, d_look, s.rows, s.stride);
     cudaGraph_t g = nullptr;
@@ -575,11 +604,8 @@ int main(int argc, char **argv) {
       stall_now(before);
       for (uint32_t l = 0; l < f.layers; ++l) {
         const Step &s = f.steps[si + l];
-        CUDA_OK(cudaMemcpyAsync(round.ids[l], s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice, stream));
-        if (round.lookahead[l]) {
-          CUDA_OK(cudaMemcpyAsync(round.lookahead[l], s.lookahead.data(), s.lookahead.size() * 4,
-                                  cudaMemcpyHostToDevice, stream));
-        }
+        upload(round.ids[l], s.ids.data(), s.ids.size() * 4, stream);
+        if (round.lookahead[l]) upload(round.lookahead[l], s.lookahead.data(), s.lookahead.size() * 4, stream);
       }
       CUDA_OK(cudaGraphLaunch(round.exec, stream));
       CUDA_OK(cudaStreamSynchronize(stream));
@@ -596,10 +622,8 @@ int main(int argc, char **argv) {
     const bool has_look = s.rows > 0;
     uint64_t before[2];
     stall_now(before);
-    CUDA_OK(cudaMemcpyAsync(d_ids, s.ids.data(), s.ids.size() * 4, cudaMemcpyHostToDevice, stream));
-    if (has_look) {
-      CUDA_OK(cudaMemcpyAsync(d_look, s.lookahead.data(), s.lookahead.size() * 4, cudaMemcpyHostToDevice, stream));
-    }
+    upload(d_ids, s.ids.data(), s.ids.size() * 4, stream);
+    if (has_look) upload(d_look, s.lookahead.data(), s.lookahead.size() * 4, stream);
     run_step(s.layer, s.phase, d_ids, s.tokens, has_look ? d_look : nullptr, s.rows, s.stride, &s.lookahead);
     RES_OK(ignis_residency_join(r, stream));
     CUDA_OK(cudaStreamSynchronize(stream));
@@ -640,7 +664,7 @@ int main(int argc, char **argv) {
     check(ignis_residency_step_prefetch_ranked(r, d_look, 1, f.width) != 0,
           "a prefetch half with no open branch must be refused");
     const std::vector<int32_t> first(f.steps[0].ids.begin(), f.steps[0].ids.begin() + f.top_k);
-    CUDA_OK(cudaMemcpy(d_ids, first.data(), first.size() * 4, cudaMemcpyHostToDevice));
+    upload(d_ids, first.data(), first.size() * 4, stream);
     void *side = nullptr;
     RES_OK(ignis_residency_step_demand(r, 0, IGNIS_RESIDENCY_DECODE, d_ids, 1, stream, &side));
     check(side != nullptr, "a split step of layer 0 opens a branch");
@@ -656,7 +680,7 @@ int main(int argc, char **argv) {
     // nothing is prefetched, and the report says INVALID over the demand half's lists.
     std::set<int32_t> distinct(first.begin(), first.end());
     std::vector<int32_t> bad(f.width, static_cast<int32_t>(f.experts));
-    CUDA_OK(cudaMemcpy(d_look, bad.data(), bad.size() * 4, cudaMemcpyHostToDevice));
+    upload(d_look, bad.data(), bad.size() * 4, stream);
     RES_OK(ignis_residency_step_demand(r, 0, IGNIS_RESIDENCY_PREFILL, d_ids, 1, stream, &side));
     RES_OK(ignis_residency_step_prefetch_ranked(r, d_look, 1, f.width));
     RES_OK(ignis_residency_join(r, stream));
@@ -673,8 +697,8 @@ int main(int argc, char **argv) {
   {
     const std::vector<int32_t> first(f.steps[0].ids.begin(), f.steps[0].ids.begin() + f.top_k);
     const std::vector<int32_t> bad(f.width, static_cast<int32_t>(f.experts));
-    CUDA_OK(cudaMemcpy(d_ids, first.data(), first.size() * 4, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMemcpy(d_look, bad.data(), bad.size() * 4, cudaMemcpyHostToDevice));
+    upload(d_ids, first.data(), first.size() * 4, stream);
+    upload(d_look, bad.data(), bad.size() * 4, stream);
     RES_OK(ignis_residency_step_ranked(r, f.layers - 1, IGNIS_RESIDENCY_PREFILL, d_ids, 1, d_look, 1, f.width,
                                        stream));
     RES_OK(ignis_residency_join(r, stream));
@@ -743,8 +767,8 @@ int main(int argc, char **argv) {
     int32_t *d_ids2 = nullptr, *d_look2 = nullptr;
     CUDA_OK(cudaMalloc(&d_ids2, ids2.size() * 4));
     CUDA_OK(cudaMalloc(&d_look2, look2.size() * 4));
-    CUDA_OK(cudaMemcpy(d_ids2, ids2.data(), ids2.size() * 4, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMemcpy(d_look2, look2.data(), look2.size() * 4, cudaMemcpyHostToDevice));
+    upload(d_ids2, ids2.data(), ids2.size() * 4, s2);
+    upload(d_look2, look2.data(), look2.size() * 4, s2);
     if (split_mode) {
       void *side = nullptr;
       RES_OK(ignis_residency_step_demand(r2, 0, IGNIS_RESIDENCY_DECODE, d_ids2, 1, s2, &side));
@@ -810,8 +834,8 @@ int main(int argc, char **argv) {
       int32_t *d_ids4 = nullptr, *d_look4 = nullptr;
       CUDA_OK(cudaMalloc(&d_ids4, ids4.size() * 4));
       CUDA_OK(cudaMalloc(&d_look4, look4.size() * 4));
-      CUDA_OK(cudaMemcpy(d_ids4, ids4.data(), ids4.size() * 4, cudaMemcpyHostToDevice));
-      CUDA_OK(cudaMemcpy(d_look4, look4.data(), look4.size() * 4, cudaMemcpyHostToDevice));
+      upload(d_ids4, ids4.data(), ids4.size() * 4, s2);
+      upload(d_look4, look4.data(), look4.size() * 4, s2);
       for (const uint32_t rows : {1u, 2u}) {
         ignis_residency *r4 = nullptr;
         RES_OK(ignis_residency_create(&d4, k2.data(), offsets2.data(), &r4));

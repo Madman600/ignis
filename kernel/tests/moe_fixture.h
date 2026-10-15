@@ -94,8 +94,14 @@ struct DeviceBytes {
   template <typename T> T *as() const { return static_cast<T *>(p); }
 };
 
+// Synchronous with every stream (GitHub #324): the tests launch on cudaStreamNonBlocking streams,
+// which the legacy stream's cudaMemcpy neither waits for (a launch may still read the old bytes)
+// nor holds back (a pageable copy may return before its bytes land). The trailing sync also lands
+// every legacy copy and memset made before it.
 template <typename T> void upload(DeviceBytes &d, const std::vector<T> &v) {
+  MOE_CUDA(cudaDeviceSynchronize());
   MOE_CUDA(cudaMemcpy(d.p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
+  MOE_CUDA(cudaDeviceSynchronize());
 }
 
 template <typename T> std::vector<T> download(const void *p, std::size_t n) {

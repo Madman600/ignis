@@ -386,8 +386,9 @@ pub struct RetainedSlotsPlan {
 /// was free, the headroom or the budget, whether the plan oversubscribes and
 /// the retained slots of both kinds (GitHub #281) -- then one
 /// `ignis.runtime.vram_oversubscribed` warning per reason the start proceeds
-/// anyway.
-pub fn log_vram_plan(plan: &ignis_core::VramPlan, retained: RetainedSlotsPlan) {
+/// anyway. `process_held_bytes` is what of the free memory this process
+/// already held (GitHub #324, [`ignis_runtime::held_before_load`]).
+pub fn log_vram_plan(plan: &ignis_core::VramPlan, retained: RetainedSlotsPlan, process_held_bytes: u64) {
     let lines = plan.lines;
     macro_rules! vram_plan_event {
         ($($mode_field:ident = $mode_value:expr),*) => {
@@ -396,6 +397,7 @@ pub fn log_vram_plan(plan: &ignis_core::VramPlan, retained: RetainedSlotsPlan) {
                 name: "ignis.runtime.vram_plan",
                 mode = plan.mode.as_str(),
                 free_at_start_bytes = plan.free_at_start_bytes,
+                process_held_bytes,
                 $($mode_field = $mode_value,)*
                 budget_bytes = plan.budget_bytes,
                 weights_bytes = lines.weights,
@@ -450,8 +452,11 @@ pub fn log_vram_warnings(plan: &ignis_core::VramPlan) {
 /// `ignis.runtime.flash_next_plan` event with the budget, the lines the load
 /// reports, the KV pool policy's branch with the pool's pages, tokens and
 /// bytes (ADR 0045), residency's fixed lines, the expert cache and the hit
-/// rate its split expects, the lanes and the speculation.
-pub fn log_flash_next_plan(plan: &ignis_core::VramPlan, expected_hit_rate: f64, lanes: u32, speculation: &str) {
+/// rate its split expects, the lanes and the speculation, and what of the free
+/// memory this process already held (GitHub #324).
+pub fn log_flash_next_plan(
+    plan: &ignis_core::VramPlan, expected_hit_rate: f64, lanes: u32, speculation: &str, process_held_bytes: u64,
+) {
     let lines = plan.lines;
     // hotpath-lint-allow: one line per model load.
     tracing::info!(
@@ -472,6 +477,7 @@ pub fn log_flash_next_plan(plan: &ignis_core::VramPlan, expected_hit_rate: f64, 
         lanes,
         verify_round_bytes = lines.verify_round,
         speculation,
+        process_held_bytes,
         "flash-next vram plan"
     );
 }
@@ -574,8 +580,12 @@ pub fn cuda_scheduler_with_thinking_close(
     // (and so nvidia-smi and Task Manager) reports it, read before the context
     // exists; the context is a plan line. Not `cudaMemGetInfo`, which on
     // Windows ignores the caller's context and reads ~400 MiB optimistic.
-    let (free_at_start_bytes, _) = CudaDevice::nvml_memory(0)
+    // GitHub #324: on a later load the context exists, and what the process
+    // still holds is added back.
+    let (nvml_free_bytes, _) = CudaDevice::nvml_memory(0)
         .map_err(|e| format!("VRAM budget: free memory is unreadable: {e}"))?;
+    let process_held_bytes = ignis_runtime::held_before_load(CudaDevice::context_created(), ignis_runtime::qwen27b_loaded());
+    let free_at_start_bytes = nvml_free_bytes + process_held_bytes;
     let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
     let geometry = ignis_core::KvGeometry::qwen38_27b();
     let planning = leaf_config_for_shape(shape, 0);
@@ -612,6 +622,7 @@ pub fn cuda_scheduler_with_thinking_close(
             host_slots: shape.retained_host_slots,
             host_bytes: reservations.retained_host_bytes,
         },
+        process_held_bytes,
     );
 
     let artifact = materialize(&reader, &plan, &mut device, None)
@@ -640,6 +651,7 @@ pub fn cuda_scheduler_with_thinking_close(
     let leaf = CudaLeaf::new(device, reader, artifact, handles, leaf_config)
         .with_kv_ram_arena(shape.host_pool_bytes)?;
     let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
+    ignis_runtime::note_qwen27b_loaded();
 
     // GitHub #98 (P3-02): do not just trust that formula — ask the leaf
     // what it actually built (`ignis_seq_pool_stats`, surfaced through
@@ -784,8 +796,13 @@ pub fn flash_next_scheduler_with_ngram_cache(
         0 => ignis_core::flash_next::DEFAULT_DECODE_LANES,
         lanes => lanes,
     };
-    let (free_at_start_bytes, _) = CudaDevice::nvml_memory(0)
+    // As the 27B's load reads it (GitHub #210, #324), but for the 27B's
+    // per-process state: no line here charges it, so a 27B's, if one ran,
+    // stays outside this budget.
+    let (nvml_free_bytes, _) = CudaDevice::nvml_memory(0)
         .map_err(|e| format!("VRAM budget: free memory is unreadable: {e}"))?;
+    let process_held_bytes = ignis_runtime::held_before_load(CudaDevice::context_created(), false);
+    let free_at_start_bytes = nvml_free_bytes + process_held_bytes;
 
     // The plan, before anything is on the device.
     let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
@@ -914,7 +931,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
         |s| format!("mtp draft tokens {} rows {} (k at 1/2/3 lanes: {}/{}/{})", s.draft_tokens(), s.row_budget(),
                     s.window(1), s.window(2), s.window(3)),
     );
-    log_flash_next_plan(&vram, cache.expected_hit_rate, lanes, &speculation_text);
+    log_flash_next_plan(&vram, cache.expected_hit_rate, lanes, &speculation_text, process_held_bytes);
     options.kv_pool_pages = Some(vram.kv_page_count);
     options.expert_cache_bytes = vram.expert_cache_bytes;
     // Spec flash-next/05: what one sequence's reusable state costs, derived
@@ -1457,12 +1474,15 @@ mod tests {
         let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
         let subscriber =
             tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
-        tracing::subscriber::with_default(subscriber, || log_vram_plan(plan, DEFAULT_RETAINED));
+        tracing::subscriber::with_default(subscriber, || log_vram_plan(plan, DEFAULT_RETAINED, PROCESS_HELD));
         sink.lines()
             .iter()
             .map(|line| serde_json::from_str(line).expect("valid json"))
             .collect()
     }
+
+    /// What a reload's plan event names as held (GitHub #324).
+    const PROCESS_HELD: u64 = ignis_runtime::CUDA_CONTEXT_BYTES + ignis_runtime::QWEN27B_PROCESS_STATE_BYTES;
 
     fn plan_for(mode: ignis_core::VramMode, free: u64) -> ignis_core::VramPlan {
         let reserved = ignis_runtime::ReservedBytes {
@@ -1505,6 +1525,8 @@ mod tests {
         };
         assert_eq!(field("mode"), "derived");
         assert_eq!(field("free_at_start_bytes"), 30u64 << 30);
+        // GitHub #324: of which this process already held so much when NVML read it.
+        assert_eq!(field("process_held_bytes"), PROCESS_HELD);
         assert_eq!(field("headroom_bytes"), 1u64 << 30);
         assert_eq!(field("budget_bytes"), plan.budget_bytes);
         for (name, bytes) in plan.lines.entries() {
@@ -1577,7 +1599,8 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
         let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
         let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
-        tracing::subscriber::with_default(subscriber, || log_flash_next_plan(&plan, 0.5, 3, "off"));
+        let held = ignis_runtime::CUDA_CONTEXT_BYTES;
+        tracing::subscriber::with_default(subscriber, || log_flash_next_plan(&plan, 0.5, 3, "off", held));
         let records: Vec<serde_json::Value> =
             sink.lines().iter().map(|line| serde_json::from_str(line).expect("json")).collect();
         assert_eq!(records.len(), 1, "{records:?}");
@@ -1596,6 +1619,29 @@ mod tests {
         assert_eq!(field("pool_bytes"), arena(8_192) + (400 << 20));
         assert_eq!(field("lanes"), 3);
         assert_eq!(field("oversubscribed"), false);
+        assert_eq!(field("process_held_bytes"), held);
+    }
+
+    #[test]
+    fn a_reload_plans_the_pool_its_cold_start_planned() {
+        // GitHub #324: after a teardown NVML reads the free memory with the
+        // context, and the 27B's per-process state once a 27B has loaded,
+        // still held. The plan charges both again, so a reload that did not
+        // add them back planned 8.2% fewer pages in the AC 14 live run.
+        use ignis_runtime::{held_before_load, CUDA_CONTEXT_BYTES, QWEN27B_PROCESS_STATE_BYTES};
+        const COLD_FREE: u64 = 31_104_512_000;
+        let mode = ignis_core::VramMode::Derived { headroom_bytes: 1_258_291_200 };
+        let cold = plan_for(mode, COLD_FREE + held_before_load(false, false));
+        for (qwen27b_loaded, held) in
+            [(false, CUDA_CONTEXT_BYTES), (true, CUDA_CONTEXT_BYTES + QWEN27B_PROCESS_STATE_BYTES)]
+        {
+            let reload = plan_for(mode, COLD_FREE - held + held_before_load(true, qwen27b_loaded));
+            assert_eq!((reload.kv_page_count, reload.budget_bytes), (cold.kv_page_count, cold.budget_bytes));
+            let unadded = plan_for(mode, COLD_FREE - held);
+            assert!(unadded.kv_page_count < cold.kv_page_count, "the double charge this adds back");
+        }
+        assert_eq!(held_before_load(false, false), 0, "a first load reads before its context exists");
+        assert_eq!(held_before_load(false, true), 0, "nothing is held without a context");
     }
 
     #[test]
