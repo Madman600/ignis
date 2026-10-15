@@ -65,6 +65,10 @@ impl ImageRunner for Flaky {
     fn release_condition(&mut self, condition: ConditionId) {
         self.inner.release_condition(condition);
     }
+
+    fn condition_bytes(&self) -> u64 {
+        self.inner.condition_bytes()
+    }
 }
 
 async fn post(app: &axum::Router, uri: &str, body: &Value) -> (StatusCode, Value) {

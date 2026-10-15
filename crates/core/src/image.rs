@@ -257,6 +257,11 @@ pub trait ImageRunner: Send {
     /// Free `condition`'s prefix. An id it does not hold is ignored: a
     /// cancelled job releases whatever it got to.
     fn release_condition(&mut self, condition: ConditionId);
+
+    /// The device bytes of the condition prefixes it holds now: what of the
+    /// condition budget is in use (GitHub #324). Host-side and cheap: the job
+    /// reads it after each encode and release, for `/metrics`.
+    fn condition_bytes(&self) -> u64;
 }
 
 /// The [`ImagePlan`] a [`FakeImageRunner`] has by default: room for eight
@@ -271,17 +276,22 @@ pub fn fake_plan() -> ImagePlan {
     }
 }
 
+/// The device bytes [`FakeImageRunner`] charges a condition-prefix token:
+/// about the leaf's own, a K/V run per block.
+pub const FAKE_PREFIX_TOKEN_BYTES: u64 = 256 << 10;
+
 /// A deterministic image runner on the CPU (ADR 0006), for the server's tests
 /// and a build without `cuda`: the same condition and noise give the same
 /// bytes, and the noise — the seed — shows in them. Nothing it computes is
 /// a picture of the prompt. Its prefix costs what the leaf's does in image
 /// tokens (one per latent cell of each condition image), and one token per
-/// word of the prompt.
+/// word of the prompt; [`FAKE_PREFIX_TOKEN_BYTES`] a token.
 #[derive(Debug)]
 pub struct FakeImageRunner {
     plan: ImagePlan,
-    /// Each held prefix's value: what its denoising steps pull towards.
-    conditions: BTreeMap<ConditionId, f32>,
+    /// Each held prefix's value, what its denoising steps pull towards, and
+    /// its tokens.
+    conditions: BTreeMap<ConditionId, (f32, u64)>,
     next: u64,
     held: Arc<AtomicUsize>,
 }
@@ -340,7 +350,7 @@ impl ImageRunner for FakeImageRunner {
         let id = ConditionId(self.next);
         self.next += 1;
         // A value in [-1, 1) from the hash.
-        self.conditions.insert(id, (hash >> 40) as f32 / (1u64 << 23) as f32 - 1.0);
+        self.conditions.insert(id, ((hash >> 40) as f32 / (1u64 << 23) as f32 - 1.0, tokens));
         self.held.store(self.conditions.len(), Ordering::SeqCst);
         Ok(id)
     }
@@ -353,7 +363,7 @@ impl ImageRunner for FakeImageRunner {
         sigma_next: f32,
         velocity: Option<&mut Vec<f32>>,
     ) -> Result<(), ImageError> {
-        let value = *self.conditions.get(&condition).ok_or(ImageError::NoSuchCondition(condition))?;
+        let (value, _) = *self.conditions.get(&condition).ok_or(ImageError::NoSuchCondition(condition))?;
         let cells = latents.size.latent_cells();
         if latents.values.len() != LATENT_CHANNELS * cells {
             return Err(ImageError::Leaf(format!(
@@ -401,6 +411,10 @@ impl ImageRunner for FakeImageRunner {
     fn release_condition(&mut self, condition: ConditionId) {
         self.conditions.remove(&condition);
         self.held.store(self.conditions.len(), Ordering::SeqCst);
+    }
+
+    fn condition_bytes(&self) -> u64 {
+        self.conditions.values().map(|&(_, tokens)| tokens * FAKE_PREFIX_TOKEN_BYTES).sum()
     }
 }
 
@@ -474,8 +488,9 @@ mod tests {
     }
 
     /// A prefix is held from its encode to its release, a released one is
-    /// gone, and the count is readable from outside the runner; a prefix past
-    /// the budget is refused with both numbers.
+    /// gone, and the count is readable from outside the runner, its bytes
+    /// from the runner (GitHub #324); a prefix past the budget is refused
+    /// with both numbers and holds nothing.
     #[test]
     fn prefixes_are_held_until_released_and_refused_past_the_budget() {
         let mut runner = FakeImageRunner::new(ImagePlan { condition_budget_tokens: 4096 + 2, ..fake_plan() });
@@ -487,17 +502,21 @@ mod tests {
             Err(ImageError::OverBudget { tokens: 4096 + 3, budget: 4096 + 2 }),
             "three words and 64 x 64 latent cells"
         );
+        assert_eq!(runner.condition_bytes(), 0);
         let fits = ImageCondition { prompt: "blue".into(), images: vec![image] };
         let id = runner.encode_condition(&fits).unwrap();
         let other = runner.encode_condition(&prompt("x")).unwrap();
         assert_eq!(held.load(Ordering::SeqCst), 2);
+        assert_eq!(runner.condition_bytes(), (4096 + 1 + 1) * (256 << 10), "a word and 4,096 cells, and a word");
         runner.release_condition(id);
         runner.release_condition(id);
         assert_eq!(held.load(Ordering::SeqCst), 1, "a second release is ignored");
+        assert_eq!(runner.condition_bytes(), 256 << 10);
         let mut latents = TargetLatents::zeros(ImageSize::new(32, 32));
         assert_eq!(runner.denoise_step(id, &mut latents, 1.0, 0.0, None), Err(ImageError::NoSuchCondition(id)));
         runner.release_condition(other);
         assert_eq!(held.load(Ordering::SeqCst), 0);
+        assert_eq!(runner.condition_bytes(), 0);
     }
 
     /// The job's noise is a standard normal draw that only its seed decides.

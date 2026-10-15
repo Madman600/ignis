@@ -549,8 +549,8 @@ impl Server {
     /// start does the same through [`Server::with_metrics`] and
     /// [`Server::with_load_reservations`]. The image model has no engine to
     /// feed them (spec image-model/05): what a text model's load reserved and
-    /// occupied reads as no load, as while unloaded. Nothing without
-    /// `--server-metrics`.
+    /// occupied reads as no load, as while unloaded, then its own plan's lines
+    /// replace them (GitHub #324). Nothing without `--server-metrics`.
     pub(crate) fn observe_load(&self, model: &ActiveModel, reserved: Option<metrics::LoadReservations>) {
         let Some(metrics) = &self.metrics else {
             return;

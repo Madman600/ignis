@@ -78,6 +78,9 @@ struct State {
     fitting: Mutex<Option<(Arc<ConfigState>, Vec<(String, ModelFamily)>)>>,
     /// The options each fitted load runs with, in order.
     fitted: Mutex<Vec<ignis_server::config::Config>>,
+    /// What each id's load reports it reserved ([`MockLoader::reserve`]);
+    /// an id not here reserved nothing, as on a build without `cuda`.
+    reservations: Mutex<std::collections::HashMap<String, ignis_server::metrics::LoadReservations>>,
 }
 
 /// The mock loader. Clone the `Arc` into a `Switcher`, keep one to steer it.
@@ -142,6 +145,12 @@ impl MockLoader {
     /// test proves a later attempt is made, and can succeed.
     pub fn mend(&self, id: &str) {
         self.state.broken.lock().unwrap().remove(id);
+    }
+
+    /// Have every load of `id` report `reserved` as what its VRAM plan
+    /// reserved, as the production loader does on a build with `cuda`.
+    pub fn reserve(&self, id: &str, reserved: ignis_server::metrics::LoadReservations) {
+        self.state.reservations.lock().unwrap().insert(id.to_owned(), reserved);
     }
 
     /// Make the next denoising step of an image runner panic, as a leaf
@@ -269,7 +278,8 @@ impl PreparedLoad for MockPrepared {
         if self.state.broken.lock().unwrap().contains(&self.id) {
             return Err(format!("{} failed to load (simulated kernel load error)", self.id));
         }
-        Ok(LoadedModel { model: build(&self.state, &self.id, Arc::new(MockCompute::new())), reservations: None })
+        let reservations = self.state.reservations.lock().unwrap().get(&self.id).cloned();
+        Ok(LoadedModel { model: build(&self.state, &self.id, Arc::new(MockCompute::new())), reservations })
     }
 
     fn options(&self) -> Option<&ignis_server::config::Config> {
@@ -348,5 +358,9 @@ impl ImageRunner for Logged {
 
     fn release_condition(&mut self, condition: ConditionId) {
         self.inner.release_condition(condition);
+    }
+
+    fn condition_bytes(&self) -> u64 {
+        self.inner.condition_bytes()
     }
 }

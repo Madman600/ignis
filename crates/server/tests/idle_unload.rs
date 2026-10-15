@@ -345,6 +345,7 @@ async fn while_unloaded_the_metrics_show_nothing_reserved() {
         kv_page_bytes: 1 << 20,
         residency_bytes: 0,
         expert_cache_bytes: 0,
+        condition_budget_bytes: 0,
         kv_ram_arena_bytes: 4 << 30,
         retained_slots: 4,
         retained_host_slots: 2,

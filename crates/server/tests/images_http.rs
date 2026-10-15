@@ -157,6 +157,10 @@ impl ImageRunner for Recording {
         self.log.lock().unwrap().push(Call::Release);
         self.inner.release_condition(condition);
     }
+
+    fn condition_bytes(&self) -> u64 {
+        self.inner.condition_bytes()
+    }
 }
 
 /// A server on the image model, its runner [`Recording`] behind `gate`, with

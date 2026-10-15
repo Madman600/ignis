@@ -232,6 +232,12 @@ mod device {
             };
             Ok(Self { leaf, frontend, plan, conditions: BTreeMap::new(), next: 0, started: None })
         }
+
+        /// The leaf's own plan, in bytes: what the load reserved, for
+        /// `/metrics` (GitHub #324).
+        pub fn leaf_plan(&self) -> &ignis_core::image_leaf::ImagePlan {
+            self.leaf.plan()
+        }
     }
 
     impl ImageRunner for LeafRunner {
@@ -359,6 +365,11 @@ mod device {
             }
         }
     }
+
+        /// Each prefix's own device bytes, as the leaf allocated them.
+        fn condition_bytes(&self) -> u64 {
+            self.conditions.values().map(Condition::bytes).sum()
+        }
 
     impl Drop for LeafRunner {
         /// Every prefix still held, freed before the leaf drops.

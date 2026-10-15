@@ -250,6 +250,7 @@ async fn metrics_the_tokenize_routes_and_the_models_list_answer_with_the_image_m
         kv_page_bytes: 1 << 20,
         residency_bytes: 0,
         expert_cache_bytes: 0,
+        condition_budget_bytes: 0,
         kv_ram_arena_bytes: 0,
         retained_slots: 0,
         retained_host_slots: 0,
@@ -294,6 +295,103 @@ async fn metrics_the_tokenize_routes_and_the_models_list_answer_with_the_image_m
     let (status, counted) = send(&app, Method::POST, "/v1/tokenize", Some(counted)).await;
     assert_eq!(status, StatusCode::OK, "{counted}");
     assert_eq!(send(&metrics, Method::GET, "/metrics", None).await.0, StatusCode::OK);
+}
+
+/// What a text model's load reserved, for the metrics tests: 21 GiB of
+/// weights and a 1,024-page pool in a 30 GiB budget.
+fn text_reservations() -> ignis_server::metrics::LoadReservations {
+    ignis_server::metrics::LoadReservations {
+        lines: ignis_core::VramLines { weights: 21 << 30, ..Default::default() },
+        budget_bytes: 30 << 30,
+        kv_pool_pages: 1024,
+        kv_page_bytes: 1 << 20,
+        residency_bytes: 0,
+        expert_cache_bytes: 0,
+        condition_budget_bytes: 0,
+        kv_ram_arena_bytes: 0,
+        retained_slots: 0,
+        retained_host_slots: 0,
+        retained_host_bytes: 0,
+        kv_disk_bytes: None,
+        flash_next: None,
+    }
+}
+
+/// GitHub #324: the image model's VRAM on `/metrics`. Its load's plan
+/// lines land in the text models' family, at the start and after a switch
+/// to it; the condition prefix a running job holds reads against the
+/// condition budget, and is gone once the job ends; a switch to a text model
+/// replaces every image figure with the text model's, and back again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_image_models_vram_plan_and_the_prefixes_its_jobs_hold_show_on_metrics_and_go_with_it() {
+    use ignis_core::image::{fake_plan, FAKE_PREFIX_TOKEN_BYTES};
+    let budget_tokens = fake_plan().condition_budget_tokens;
+    let plan = ignis_core::image_leaf::ImagePlan {
+        mode: ignis_core::VramMode::Derived { headroom_bytes: 4 << 30 },
+        free_at_start_bytes: 33_400_000_000,
+        budget_bytes: 29_100_000_000,
+        weights_bytes: 15_460_000_000,
+        arena_bytes: 1_320_000_000,
+        condition_budget_tokens: budget_tokens,
+        condition_budget_bytes: budget_tokens * FAKE_PREFIX_TOKEN_BYTES,
+    };
+    let image = ignis_server::metrics::LoadReservations::image(&plan);
+    let loader = MockLoader::new();
+    loader.reserve(IMAGE, image.clone());
+    loader.reserve("mock-a", text_reservations());
+    let (model, gate) = loader.gated_image_model(IMAGE);
+    let server = Server::from_active(model)
+        .with_switcher(Switcher::new(Arc::clone(&loader) as _, PATIENT).with_known_models(known(&["mock-a", IMAGE])))
+        .with_metrics()
+        .with_load_reservations(image);
+    let (app, metrics) = (server.app(), server.metrics_app().expect("metrics are on"));
+    let scrape = || async { send(&metrics, Method::GET, "/metrics", None).await.1 };
+    let image_figures = |scraped: &Value| {
+        ["weights", "workspace", "condition_budget"]
+            .map(|line| gauge(scraped, &format!("ignis_vram_reserved_bytes{{line=\"{line}\"}}")))
+    };
+    let used = |scraped: &Value| gauge(scraped, "ignis_condition_budget_used_bytes");
+    let image_plan = [Some(15_460_000_000), Some(1_320_000_000), Some(budget_tokens * FAKE_PREFIX_TOKEN_BYTES)];
+
+    let scraped = scrape().await;
+    assert_eq!(image_figures(&scraped), image_plan, "the start's load");
+    assert_eq!(gauge(&scraped, "ignis_vram_budget_bytes"), Some(29_100_000_000));
+    assert_eq!(gauge(&scraped, "ignis_kv_pool_pages"), Some(0), "no KV pool");
+    assert_eq!(used(&scraped), Some(0));
+
+    // A job of four prompt words holds a four-token prefix while it runs.
+    let job = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            send(&app, Method::POST, "/v1/images/generations", Some(json!({ "prompt": "a quiet red fox", "size": "1024x1024" }))).await
+        })
+    };
+    let deadline = Instant::now() + PATIENT;
+    while used(&scrape().await) != Some(4 * FAKE_PREFIX_TOKEN_BYTES) {
+        assert!(Instant::now() < deadline, "the running job's prefix never showed: {:?}", used(&scrape().await));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    gate.open();
+    let (status, answer) = job.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(used(&scrape().await), Some(0), "the ended job released its prefix");
+
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(switch_to("mock-a"))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    until(&server, "serving", PATIENT).await;
+    let scraped = scrape().await;
+    assert_eq!(image_figures(&scraped), [Some(21 << 30), Some(0), Some(0)], "the text model's lines, none of the image's");
+    assert_eq!((gauge(&scraped, "ignis_kv_pool_pages"), gauge(&scraped, "ignis_vram_budget_bytes")), (Some(1024), Some(30 << 30)));
+    assert_eq!(used(&scraped), Some(0));
+
+    let (status, accepted) = send(&app, Method::POST, "/v1/models/switch", Some(switch_to(IMAGE))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    until(&server, "serving", PATIENT).await;
+    let scraped = scrape().await;
+    assert_eq!(image_figures(&scraped), image_plan, "the switch's load");
+    assert_eq!((gauge(&scraped, "ignis_kv_pool_pages"), gauge(&scraped, "ignis_vram_budget_bytes")), (Some(0), Some(29_100_000_000)));
+    assert_eq!(used(&scraped), Some(0));
+    assert_eq!(loader.loads(), ["mock-a", IMAGE]);
 }
 
 /// AC 8: a queued image job, then a running one, is use — the idle clock

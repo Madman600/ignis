@@ -1841,6 +1841,7 @@ mod tests {
             kv_page_bytes: 0,
             residency_bytes: 0,
             expert_cache_bytes: 0,
+            condition_budget_bytes: 0,
             kv_ram_arena_bytes: 0,
             retained_slots: 0,
             retained_host_slots: 0,

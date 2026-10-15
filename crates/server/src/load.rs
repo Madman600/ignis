@@ -360,8 +360,9 @@ pub fn load_model(prepared: PreparedModel) -> Result<LoadedModel, LoadError> {
 /// leaf's under `cuda` ([`cuda_image_runner`]), [`ignis_core::image::FakeImageRunner`]
 /// otherwise, as a build without `cuda` serves `MockCompute`, its largest
 /// target the leaf's ([`crate::images::leaf::max_target_cells`]) — and the
-/// model over it, its source kept for a switch back and for the idle unload.
-/// A size of `image.sizes` past the largest target is not served: the load
+/// model over it, its source kept for a switch back and for the idle unload,
+/// with what the leaf's plan reserved (GitHub #324; nothing on the fake). A
+/// size of `image.sizes` past the largest target is not served: the load
 /// warns of it.
 fn load_image_model(
     artifact: std::path::PathBuf,
@@ -369,19 +370,21 @@ fn load_image_model(
     config: &crate::config::Config,
 ) -> Result<LoadedModel, LoadError> {
     #[cfg(feature = "cuda")]
-    let runner = cuda_image_runner(&artifact, config)?;
+    let (runner, reservations) = cuda_image_runner(&artifact, config)?;
     #[cfg(not(feature = "cuda"))]
-    let runner: Box<dyn ImageRunner> = {
+    let (runner, reservations): (Box<dyn ImageRunner>, _) = {
         tracing::warn!(
             name: "ignis.model.fake_image_runner",
             "built without --features cuda — the fake image runner despite --model-artifact (its images are deterministic noise, not the prompt's)"
         );
         let image = &config.settings().image;
         let max_target_cells = crate::images::leaf::max_target_cells(&image.sizes, image.max_target_cells);
-        Box::new(ignis_core::image::FakeImageRunner::new(ignis_core::image::ImagePlan {
+        let runner = ignis_core::image::FakeImageRunner::new(ignis_core::image::ImagePlan {
             max_target_cells,
             ..ignis_core::image::fake_plan()
-        }))
+        });
+        // The fake plans no device memory, as `MockCompute` plans none.
+        (Box::new(runner), None)
     };
     tracing::info!(
         name: "ignis.model.loaded",
@@ -406,23 +409,25 @@ fn load_image_model(
     }
     let image = crate::images::ImageModel::new(model.clone(), runner);
     let active = crate::ActiveModel::image(image).with_source(crate::ModelSource { artifact, model });
-    Ok(LoadedModel { model: active, reservations: None })
+    Ok(LoadedModel { model: active, reservations })
 }
 
 /// The image leaf's runner for `artifact` (spec image-model/04, GitHub #321):
 /// the adapter in the server over the leaf ([`crate::images::leaf::LeafRunner`])
 /// — the artifact's tokenizer, templates and Qwen3-VL preprocessing on the
-/// host (spec image-model/03 §Seams), the leaf's calls on the device. A load
-/// the leaf's plan refuses names the shortfall.
+/// host (spec image-model/03 §Seams), the leaf's calls on the device — and
+/// what its plan reserved, for `/metrics` (GitHub #324). A load the leaf's
+/// plan refuses names the shortfall.
 #[cfg(feature = "cuda")]
 fn cuda_image_runner(
     artifact: &std::path::Path,
     config: &crate::config::Config,
-) -> Result<Box<dyn ImageRunner>, LoadError> {
+) -> Result<(Box<dyn ImageRunner>, Option<crate::metrics::LoadReservations>), LoadError> {
     let runner = crate::images::leaf::LeafRunner::load(artifact, config).map_err(|why| {
         LoadError::LoadFailed(format!("{} cannot load {}: {why}", ModelFamily::QwenImage21.name(), artifact.display()))
     })?;
-    Ok(Box::new(runner))
+    let reserved = crate::metrics::LoadReservations::image(runner.leaf_plan());
+    Ok((Box::new(runner), Some(reserved)))
 }
 
 /// The GPU-backed scheduler for `artifact` (GitHub #61 / P1-25), logged as
