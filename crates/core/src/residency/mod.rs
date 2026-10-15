@@ -82,7 +82,7 @@ pub use host_memory::available_physical_bytes;
 pub use counters::{ResidencyCounters, ResidencyMirror};
 pub use plan::{
     ClassPool, EXPERT_CACHE_FLOOR_BYTES, ExpertCachePlan, ExpertCachePlanError,
-    ExpertCacheRequest, ExpertTraffic, HOST_MARGIN_BYTES, HOST_PLAN_LINES, HostPlan, HostPlanError,
+    ExpertCacheRequest, ExpertTraffic, DEFAULT_HOST_MARGIN_BYTES, HOST_PLAN_LINES, human_bytes, HostPlan, HostPlanError,
     HostPlanRequest, MEASURED_ONE_ROW_PREFETCH_BUDGET_BYTES, MEASURED_THREE_ROW_PREFETCH_BUDGET_BYTES,
     TrafficMismatch, default_prefetch_budget, min_slots_per_class, ngram_hot_rows_room,
     plan_expert_cache, plan_host, prefill_staging_ring_bytes, residency_table_bytes,

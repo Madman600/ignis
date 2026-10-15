@@ -26,7 +26,9 @@ GitHub, not open questions.
 
 - The miss path is chosen by the stated 80% rule; the measurement is the first
   task.
-- Host refusal margin 6 GB; warm start exists and is off by default.
+- Host refusal margin 6 GB (since 2026-10-12, the owner's call: 4 GiB by
+  default, named by `--model-host-margin-bytes`); warm start exists and is off
+  by default.
 - The prefill staging ring is sized for about two layers of one chunk's touched
   projections and is a plan line.
 - The trace replay uses the routing traces spec 01 records.
@@ -213,7 +215,7 @@ but nothing here may block it.
 - At load the engine computes a host plan: pinned experts, n-gram hot rows
   (spec 04), staging buffers.
 - It refuses to start when available physical memory minus the plan is below a
-  margin of 6 GB.
+  margin of 6 GB (4 GiB by default since 2026-10-12, `--model-host-margin-bytes`).
 - The plan is printed beside the VRAM plan.
 
 **VRAM plan line.**

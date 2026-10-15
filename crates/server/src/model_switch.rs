@@ -117,6 +117,13 @@ pub trait PreparedLoad: Send {
     /// spawns its telemetry consumer).
     fn load(self: Box<Self>) -> Result<LoadedModel, String>;
 
+    /// [`PreparedLoad::load`], with the host plan's refusal kept whole when
+    /// that is what failed it, for `last_switch.host_plan`. The switch loads
+    /// through this; a loader that keeps no refusal leaves it to `load`.
+    fn load_detailed(self: Box<Self>) -> Result<LoadedModel, LoadFailure> {
+        self.load().map_err(LoadFailure::from)
+    }
+
     /// The configuration the load runs with, fitted to its family: what
     /// `GET /v1/config` shows once it serves. `None` for a loader that keeps
     /// none (the tests' mock).
@@ -224,7 +231,11 @@ fn log_flags_dropped(to: &str, family: ignis_core::compute::ModelFamily, dropped
 
 impl PreparedLoad for crate::load::PreparedModel {
     fn load(self: Box<Self>) -> Result<LoadedModel, String> {
-        crate::load::load_model(*self).map_err(|e| e.to_string())
+        self.load_detailed().map_err(|failure| failure.reason)
+    }
+
+    fn load_detailed(self: Box<Self>) -> Result<LoadedModel, LoadFailure> {
+        crate::load::load_model(*self).map_err(LoadFailure::from)
     }
 
     fn options(&self) -> Option<&crate::config::Config> {
@@ -291,6 +302,41 @@ pub struct SwitchTables {
     pub known: BTreeMap<String, PathBuf>,
 }
 
+/// Why a load failed, as a switch reports it: the reason a person reads,
+/// and Flash-Next's host plan refusal whole when that is what failed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadFailure {
+    pub reason: String,
+    pub host_plan: Option<ignis_core::residency::HostPlanError>,
+}
+
+impl From<String> for LoadFailure {
+    fn from(reason: String) -> Self {
+        Self { reason, host_plan: None }
+    }
+}
+
+impl From<ignis_core::residency::HostPlanError> for LoadFailure {
+    fn from(refusal: ignis_core::residency::HostPlanError) -> Self {
+        Self { reason: refusal.to_string(), host_plan: Some(refusal) }
+    }
+}
+
+impl From<crate::load::LoadError> for LoadFailure {
+    fn from(error: crate::load::LoadError) -> Self {
+        match error {
+            crate::load::LoadError::HostPlan(refusal) => refusal.into(),
+            other => other.to_string().into(),
+        }
+    }
+}
+
+impl std::fmt::Display for LoadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
 /// How the last switch or reload since start ended, for `GET /v1/models`
 /// (spec playground/05 §`last_switch`): a page polling the status sees a
 /// refused or rolled-back switch for one tick only, and this is how it learns
@@ -303,6 +349,8 @@ pub struct LastSwitch {
     pub to: String,
     /// How it ended.
     pub outcome: SwitchOutcome,
+    /// The host plan that refused the target, when that is what failed it.
+    pub host_plan: Option<ignis_core::residency::HostPlanError>,
 }
 
 /// Why an id named alone cannot be switched to (`POST /v1/models/switch`
@@ -488,9 +536,20 @@ impl Switcher {
     /// `switching` or `failed`, so a client that reads `serving` finds its
     /// reason already here.
     fn record(&self, from: &str, to: &str, outcome: &SwitchOutcome) {
+        self.record_with(from, to, outcome, None);
+    }
+
+    /// [`Switcher::record`], with the host plan that refused the target.
+    fn record_with(
+        &self,
+        from: &str,
+        to: &str,
+        outcome: &SwitchOutcome,
+        host_plan: Option<ignis_core::residency::HostPlanError>,
+    ) {
         self.settled.store(true, Ordering::SeqCst);
         *self.last.lock().expect("last switch lock") =
-            Some(LastSwitch { from: from.to_owned(), to: to.to_owned(), outcome: outcome.clone() });
+            Some(LastSwitch { from: from.to_owned(), to: to.to_owned(), outcome: outcome.clone(), host_plan });
     }
 
     /// The kind of the model a request naming `model` would be served by, if
@@ -1447,7 +1506,7 @@ async fn run(
             server.status.store(Arc::new(begun.landed));
             SwitchOutcome::Switched
         }
-        Err(reason) if begun.unloaded => {
+        Err(LoadFailure { reason, host_plan }) if begun.unloaded => {
             // Nothing was resident before this load, so there is nothing to
             // reload: `failed` stays, with the process up, until a request
             // (after an unload) or a switch loads a model.
@@ -1469,12 +1528,15 @@ async fn run(
                     %reason,
                     "the target failed to load and no model was loaded before it; nothing is serving"
                 );
-                record(&outcome);
+                if let Some(switch) = &recorded {
+                    switcher.record_with(&switch.from, &switch.to, &outcome, host_plan);
+                }
             }
             server.status.store(Arc::new(ModelStatus::Failed { reason, from_unloaded: true }));
             outcome
         }
-        Err(reason) => {
+        Err(failure) => {
+            let reason = &failure.reason;
             tracing::error!(
                 name: "ignis.model.switch_failed",
                 from = %from,
@@ -1484,7 +1546,7 @@ async fn run(
                 "the target failed to load after the old model was torn down; reloading the old model"
             );
             server.status.store(Arc::new(ModelStatus::Failed { reason: reason.clone(), from_unloaded: false }));
-            restore(server, &switcher, &old, recorded.as_ref(), reason).await
+            restore(server, &switcher, &old, recorded.as_ref(), failure).await
         }
     }
 }
@@ -1569,15 +1631,15 @@ async fn shut_down(model: &Arc<ActiveModel>) {
 /// point `--server-metrics` at it. A model whose warm-up fails is torn down again
 /// and reported as a failed load: better refused than silently cold. Returns
 /// the model and how long its warm-up took.
-async fn load_and_warm(server: &Server, prepared: Box<dyn PreparedLoad>) -> Result<(ActiveModel, Duration), String> {
-    let loaded = tokio::task::spawn_blocking(move || prepared.load())
+async fn load_and_warm(server: &Server, prepared: Box<dyn PreparedLoad>) -> Result<(ActiveModel, Duration), LoadFailure> {
+    let loaded = tokio::task::spawn_blocking(move || prepared.load_detailed())
         .await
-        .unwrap_or_else(|panicked| Err(format!("the load panicked: {panicked}")))?;
+        .unwrap_or_else(|panicked| Err(format!("the load panicked: {panicked}").into()))?;
     let warm_up = match crate::warm_up_model(&loaded.model).await {
         Ok(took) => took,
         Err(error) => {
             shut_down(&Arc::new(loaded.model)).await;
-            return Err(error);
+            return Err(error.into());
         }
     };
     server.observe_load(&loaded.model, loaded.reservations);
@@ -1596,7 +1658,7 @@ fn publish(server: &Server, model: ActiveModel) {
 }
 
 /// After a failed load: load `old` again from where it came from, so a bad
-/// switch ends with the previous model serving. `reason` is why the target
+/// switch ends with the previous model serving. `failure` is why the target
 /// failed; `recorded` is what its end is written to `last_switch` as, if
 /// anything ([`Begun::recorded`]).
 async fn restore(
@@ -1604,11 +1666,12 @@ async fn restore(
     switcher: &Arc<Switcher>,
     old: &ActiveModel,
     recorded: Option<&SwitchStarted>,
-    reason: String,
+    failure: LoadFailure,
 ) -> SwitchOutcome {
+    let LoadFailure { reason, host_plan } = failure;
     let record = |outcome: &SwitchOutcome| {
         if let Some(switch) = recorded {
-            switcher.record(&switch.from, &switch.to, outcome);
+            switcher.record_with(&switch.from, &switch.to, outcome, host_plan.clone());
         }
     };
     let Some(source) = old.source.clone() else {
@@ -1623,7 +1686,7 @@ async fn restore(
     // published its own.
     let restored = match prepare(switcher, source.clone(), None).await {
         Ok(prepared) => load_and_warm(server, prepared).await.map(|(model, _)| model),
-        Err(error) => Err(error),
+        Err(error) => Err(error.into()),
     };
     match restored {
         Ok(model) => {
@@ -1655,6 +1718,29 @@ async fn restore(
 mod tests {
     use super::*;
     use ignis_core::compute::ModelFamily;
+
+    /// The real loader's chain: Flash-Next's host plan refusal reaches the
+    /// switch whole, any other load error as its text alone.
+    #[test]
+    fn a_host_plan_refusal_reaches_the_switch_whole() {
+        let refusal = ignis_core::residency::plan_host(&ignis_core::residency::HostPlanRequest {
+            available_physical_bytes: 41_632_530_432,
+            expert_pool_bytes: 37_795_446_784,
+            ngram_hot_rows_bytes: 1 << 30,
+            staging_bytes: 64 << 20,
+            retained_host_slots_bytes: 1_040_115_712,
+            kv_ram_arena_bytes: 2 << 30,
+            margin_bytes: ignis_core::residency::DEFAULT_HOST_MARGIN_BYTES,
+        })
+        .expect_err("short of RAM");
+        let load = crate::load::LoadError::from(crate::runtime::FlashNextLoadError::HostPlan(refusal.clone()));
+        assert_eq!(load, crate::load::LoadError::HostPlan(refusal.clone()));
+        let failure = LoadFailure::from(load);
+        assert_eq!(failure.host_plan.as_ref(), Some(&refusal));
+        assert_eq!(failure.reason, refusal.to_string());
+        let other = LoadFailure::from(crate::load::LoadError::from(crate::runtime::FlashNextLoadError::from("no MTP head")));
+        assert_eq!(other, LoadFailure { reason: "no MTP head".to_owned(), host_plan: None });
+    }
 
     fn logged(run: impl FnOnce()) -> Vec<serde_json::Value> {
         use tracing_subscriber::layer::SubscriberExt;

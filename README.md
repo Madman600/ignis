@@ -77,14 +77,14 @@ changes code also publishes a rolling development build, **not a release**: the 
 
 ```
 ignis-server --model-max-context 524288 --model-rope-scaling yarn:2 \
-  --spec-backend dflash2 --spec-draft-tokens 7 --vision-enabled --server-metrics
+  --spec-backend dflash2 --spec-draft-tokens 7 --vision-enabled
 ```
 
 No model yet? It offers to fetch one. Those flags set the 512K context `make`
-serves (YaRN x2), DFlash2 speculative decoding, image input, and the Prometheus
-metrics the Playground's Monitor reads. A bare `ignis-server` already gets
-DFlash2 and image input from the built-in `rtx5090` profile, with a 768K
-context (YaRN x4), but not the metrics. Flash-Next is `--model-id
+serves (YaRN x2), DFlash2 speculative decoding and image input; the Prometheus
+metrics the Playground's Monitor reads are on by default. A bare `ignis-server`
+already gets DFlash2 and image input from the built-in `rtx5090` profile, with
+a 768K context (YaRN x4). Flash-Next is `--model-id
 qwen3.8-flash-next`; the flags `make` serves it with are on its
 [weights card](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis).
 
@@ -240,7 +240,7 @@ Every number below is a measurement on a 5090.
 - **The Playground** at `/ui/` — chat with tools and subagents, parallel
   sessions, image input, a Decide tab and a live Monitor. Built into the
   server, not a separate service.
-- **Prometheus** on its own listener (`--server-metrics`), with the VRAM plan, retained
+- **Prometheus** on its own loopback listener, on by default (`--server-metrics false` turns it off), with the VRAM plan, retained
   state, KV pool occupancy, decision counters and request lifecycle.
 - **It fetches its own model.** Started with no artifact, a GPU build asks, then
   downloads and verifies it.

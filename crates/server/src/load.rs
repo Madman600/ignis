@@ -18,7 +18,7 @@ use ignis_core::image::ImageRunner;
 use ignis_core::{ConcreteScheduler, SchedulerConfig, TokenId};
 
 #[cfg(feature = "cuda")]
-use crate::runtime::{cuda_scheduler_with_thinking_close, flash_next_scheduler_with_ngram_cache, EngineShape};
+use crate::runtime::{cuda_scheduler_with_thinking_close, EngineShape};
 
 /// The mock-backed scheduler (ADR 0006, CPU-only): what serves when no
 /// artifact is configured, or the binary was not built with `--features
@@ -71,6 +71,19 @@ pub enum LoadError {
     EosMissing,
     /// The GPU load itself failed (`ignis.model.load_failed`).
     LoadFailed(String),
+    /// Flash-Next's host plan refused the load: not enough RAM for its
+    /// pinned lines and the margin (`ignis.model.load_failed`; the lines in
+    /// bytes are `ignis.runtime.flash_next_host_plan_refused`'s).
+    HostPlan(ignis_core::residency::HostPlanError),
+}
+
+impl From<crate::runtime::FlashNextLoadError> for LoadError {
+    fn from(error: crate::runtime::FlashNextLoadError) -> Self {
+        match error {
+            crate::runtime::FlashNextLoadError::HostPlan(refusal) => Self::HostPlan(refusal),
+            crate::runtime::FlashNextLoadError::Other(message) => Self::LoadFailed(message),
+        }
+    }
 }
 
 impl std::fmt::Display for LoadError {
@@ -85,6 +98,7 @@ impl std::fmt::Display for LoadError {
             | Self::ThinkingInvalid(message)
             | Self::VisionProcessorInvalid(message)
             | Self::LoadFailed(message) => write!(f, "{message}"),
+            Self::HostPlan(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -122,6 +136,7 @@ impl LoadError {
                 "generation_config.json has no eos_token_id — {outcome}"
             ),
             Self::LoadFailed(error) => tracing::error!(name: "ignis.model.load_failed", %artifact, %error, "{outcome}"),
+            Self::HostPlan(error) => tracing::error!(name: "ignis.model.load_failed", %artifact, %error, "{outcome}"),
         }
     }
 }
@@ -451,7 +466,7 @@ fn cuda_scheduler_for(
     };
     // GitHub #302: a Flash-Next artifact runs its own program and leaf.
     let loaded = match family {
-        ModelFamily::FlashNext => flash_next_scheduler_with_ngram_cache(
+        ModelFamily::FlashNext => crate::runtime::flash_next_load(
             artifact,
             model.into(),
             eos,
@@ -459,7 +474,8 @@ fn cuda_scheduler_for(
             thinking_close,
             config.ngram_cache.clone(),
             &config.kv_disk_location,
-        ),
+        )
+        .map_err(LoadError::from),
         ModelFamily::Qwen38_27b => cuda_scheduler_with_thinking_close(
             artifact,
             model.into(),
@@ -467,12 +483,13 @@ fn cuda_scheduler_for(
             shape.with_family_decode_share(ModelFamily::Qwen38_27b),
             thinking_close,
             &config.kv_disk_location,
-        ),
+        )
+        .map_err(LoadError::LoadFailed),
         // The image model has no token scheduler: `load_image_model` loads
         // it, never this.
-        ModelFamily::QwenImage21 => Err(format!("{} has no token scheduler", family.name())),
+        ModelFamily::QwenImage21 => Err(LoadError::LoadFailed(format!("{} has no token scheduler", family.name()))),
     };
-    let (scheduler, reserved) = loaded.map_err(LoadError::LoadFailed)?;
+    let (scheduler, reserved) = loaded?;
     tracing::info!(
         name: "ignis.model.loaded",
         artifact = %artifact.display(),

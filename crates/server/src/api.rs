@@ -1694,9 +1694,63 @@ struct LastSwitchInfo {
     /// model never stopped); `restored` (the target failed to load and the old
     /// model was loaded again); or `failed` (nothing serves).
     outcome: LastOutcome,
-    /// Why, for every outcome but `switched`.
+    /// Why, for every outcome but `switched`: for a person to read.
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// The host plan that refused the target, in exact bytes, when that is
+    /// what failed it: a Qwen3.8-Flash-Next load short of RAM for its pinned
+    /// lines and the margin. `reason` says the same for a person.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_plan: Option<HostPlanInfo>,
+}
+
+/// A refused host plan, in bytes (spec flash-next/03).
+#[derive(Serialize, ToSchema)]
+struct HostPlanInfo {
+    /// Physical memory available at the load (free plus standby).
+    available_bytes: u64,
+    /// What the plan must leave of it (`model.host_margin_bytes`).
+    margin_bytes: u64,
+    /// The lines' sum.
+    planned_bytes: u64,
+    /// The lines and the margin: what had to be available.
+    needed_bytes: u64,
+    /// `needed_bytes` less `available_bytes`.
+    short_bytes: u64,
+    /// The first line, in plan order, the available memory could not hold:
+    /// `expert_pool`, `ngram_hot_rows`, `staging`, `retained_host_slots` or
+    /// `kv_ram_arena`.
+    crossing_line: &'static str,
+    /// Every line, in plan order.
+    lines: Vec<HostPlanLine>,
+}
+
+/// One line of a host plan.
+#[derive(Serialize, ToSchema)]
+struct HostPlanLine {
+    name: &'static str,
+    bytes: u64,
+}
+
+impl HostPlanInfo {
+    fn of(refusal: &ignis_core::residency::HostPlanError) -> Self {
+        let ignis_core::residency::HostPlanError::BelowMargin {
+            available_bytes,
+            planned_bytes,
+            margin_bytes,
+            crossing_line,
+            lines,
+        } = refusal;
+        Self {
+            available_bytes: *available_bytes,
+            margin_bytes: *margin_bytes,
+            planned_bytes: *planned_bytes,
+            needed_bytes: refusal.needed_bytes(),
+            short_bytes: refusal.short_bytes(),
+            crossing_line,
+            lines: lines.iter().map(|&(name, bytes)| HostPlanLine { name, bytes }).collect(),
+        }
+    }
 }
 
 /// How a switch or a reload ended: `switched`; `refused` (refused before
@@ -1721,7 +1775,7 @@ impl LastSwitchInfo {
             SwitchOutcome::Restored { reason } => (LastOutcome::Restored, Some(reason)),
             SwitchOutcome::Failed { reason } => (LastOutcome::Failed, Some(reason)),
         };
-        Self { from: last.from, to: last.to, outcome, reason }
+        Self { from: last.from, to: last.to, outcome, reason, host_plan: last.host_plan.as_ref().map(HostPlanInfo::of) }
     }
 }
 

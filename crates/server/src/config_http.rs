@@ -596,7 +596,12 @@ pub fn shadowed_at_restart(patch: &Layer, running: &Config) -> Vec<String> {
 pub fn needs_reload(running: &Config, next: &Config) -> bool {
     let (before, after) = (running.settings().render(), next.settings().render());
     let value = |groups: &serde_json::Map<String, Value>, meta: &FieldMeta| groups.get(meta.group).and_then(|group| group.get(meta.name)).cloned();
-    all_fields().filter(|meta| meta.reload_required).any(|meta| value(&before, meta) != value(&after, meta))
+    // The host margin is read by Flash-Next's host plan alone; the other
+    // families carry it for a later switch, and are not reloaded for it.
+    let plans_host = running.basis.family().is_none_or(|family| family == ModelFamily::FlashNext);
+    all_fields()
+        .filter(|meta| meta.reload_required && (plans_host || meta.name != "host_margin_bytes"))
+        .any(|meta| value(&before, meta) != value(&after, meta))
 }
 
 /// The checks a start makes on the thinking defaults, made again on the
@@ -859,6 +864,23 @@ mod tests {
         assert!(reloads(&running, json!({ "server": { "request_timeout": 60 }, "reuse": { "qwen38flashnext": { "prompt": false }, "prompt": false } })));
         let own = running.with_patch(&read_patch(&json!({ "reuse": { "qwen38": { "kv_host_pool_bytes": "4G" } } })).unwrap()).unwrap();
         assert!(!reloads(&own, json!({ "reuse": { "kv_host_pool_bytes": "1G" } })), "a group value the running family overrides");
+    }
+
+    /// The host margin is read by Flash-Next's host plan alone: patching it
+    /// reloads that family, and leaves the 27B and the image model running.
+    #[test]
+    fn the_host_margin_reloads_only_the_family_that_plans_host_memory() {
+        let patch = |running: &Config, body: Value| needs_reload(running, &running.with_patch(&read_patch(&body).unwrap()).unwrap());
+        let general = json!({ "model": { "host_margin_bytes": "8G" } });
+        let scoped = json!({ "model": { "qwen38flashnext": { "host_margin_bytes": "8G" } } });
+        let flash_next = config(&["--profile", "none"]).for_family(ModelFamily::FlashNext).unwrap();
+        assert!(patch(&flash_next, general.clone()), "Flash-Next reads the general margin");
+        assert!(patch(&flash_next, scoped.clone()), "and its own");
+        for family in [ModelFamily::Qwen38_27b, ModelFamily::QwenImage21] {
+            let running = config(&["--profile", "none"]).for_family(family).unwrap();
+            assert!(!patch(&running, general.clone()), "{family:?} never reads the margin");
+            assert!(!patch(&running, scoped.clone()), "{family:?}: the other family's key");
+        }
     }
 
     #[test]

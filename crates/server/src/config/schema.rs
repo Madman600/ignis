@@ -251,10 +251,14 @@ config_group! {
         /// set.
         expose: Opt<ExposeKind> = None, Validator::OneOf(super::Expose::NAMES), ALL, [Visible];
         /// Serve Prometheus metrics on their own listener (`metrics_bind`),
-        /// and at /ui/metrics unless the Playground is off.
-        metrics: Bool = false, NO_RULE, ALL, [Visible];
-        /// The metrics listener's address. Needs `metrics` on; never the
-        /// API's `bind`; no API key, never exposed.
+        /// and at /ui/metrics unless the Playground is off. On by default;
+        /// `false` serves neither.
+        metrics: Bool = super::DEFAULT_METRICS, NO_RULE, ALL, [Visible];
+        /// The metrics listener's address: loopback by default, no API key,
+        /// never exposed, never the API's `bind`; refused with `metrics` off.
+        /// The default address taken (a second server on the host) is a
+        /// warning, and the server starts without the listener; another
+        /// address that cannot be bound refuses the start.
         metrics_bind: Text = super::DEFAULT_METRICS_BIND.to_owned(), NO_RULE, ALL, [Visible];
         /// Serve the Playground at /ui/. A binary built without web/dist
         /// serves a page saying how to build it.
@@ -328,6 +332,13 @@ config_group! {
         /// unloads.
         idle_unload: Secs = super::DEFAULT_MODEL_IDLE_UNLOAD_SECS, between(0, super::MAX_MODEL_IDLE_UNLOAD_SECS as i64), ALL,
             [Visible, Patchable];
+        /// What Flash-Next's host plan must leave of the physical memory
+        /// available at load (free plus standby): a load whose pinned lines
+        /// — experts, n-gram hot rows, staging, retained host slots, the
+        /// KV-RAM arena — leave less is refused, naming the line to shrink,
+        /// so the desktop is never paged out. The 27B and the image model make
+        /// no host plan: their starts carry it for a switch to Flash-Next.
+        host_margin_bytes: Bytes = super::DEFAULT_HOST_MARGIN_BYTES, NO_RULE, ALL, [Visible, Patchable, ReloadRequired, Scoped];
     }
 }
 
@@ -575,7 +586,7 @@ config_group! {
         persist_path: Location = CacheLocation::Model, NO_RULE, ALL, [Visible, Patchable, ReloadRequired];
         /// The n-gram rows held in RAM, every other row read from NVMe when a
         /// step needs it: a byte count, or `auto` — what the host plan leaves
-        /// after its other lines and the 6 GiB margin, less 256 MiB for the
+        /// after its other lines and the margin, less 256 MiB for the
         /// load, the whole ~29 GB table when that fits, never below the
         /// default. Unset, 1 GiB.
         hot_bytes: Opt<HotBytes> = None, NO_RULE, FLASH_NEXT_ONLY, [Visible, Patchable, ReloadRequired];

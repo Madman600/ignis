@@ -27,8 +27,22 @@ export type LastSwitch = {
   to: string;
   /** `refused`: nothing was torn down; `restored`: the old model was loaded again; `failed`: nothing serves. */
   outcome: "switched" | "refused" | "restored" | "failed";
-  /** Present for every outcome but `switched`. */
+  /** Present for every outcome but `switched`: for a person, in GiB, with the shortfall. */
   reason?: string;
+  /** The host plan that refused the target in exact bytes, when that is what failed it (Flash-Next short of RAM). */
+  host_plan?: HostPlan;
+};
+
+/** A refused host plan (`last_switch.host_plan`): every figure in bytes. */
+export type HostPlan = {
+  available_bytes: number;
+  margin_bytes: number;
+  planned_bytes: number;
+  needed_bytes: number;
+  short_bytes: number;
+  /** The first line, in plan order, the available memory could not hold. */
+  crossing_line: "expert_pool" | "ngram_hot_rows" | "staging" | "retained_host_slots" | "kv_ram_arena";
+  lines: { name: string; bytes: number }[];
 };
 
 /** What a model makes (`kind` of `GET /v1/models`, spec image-model/05): text answers chat, image answers the image routes. */

@@ -167,6 +167,38 @@ case "$smoke" in *"/v1/images/generations"*'"model":"ignis-image-2.1-turbo"'*) ;
 lacks "smoke MODEL=image" "$smoke" "/v1/chat/completions"
 case "$(make -n smoke 2>/dev/null)" in *"/v1/chat/completions"*) ;; *) fail "smoke: the 27B's chat completion is gone" ;; esac
 
+# Flash-Next's KV-RAM arena is its own (ADR 0046), on every start -- the
+# 27B's included, so a switch to Flash-Next takes 2G, never the 27B's 8G.
+for model in "" "MODEL=flash-next"; do
+    out="$(flags $model)"
+    has "[$model] arena" "$out" "--reuse-kv-host-pool-bytes 8G"
+    has "[$model] arena" "$out" "--qwen38flashnext-reuse-kv-host-pool-bytes 2G"
+done
+has "FN_KV_HOST_POOL_BYTES=0" "$(flags FN_KV_HOST_POOL_BYTES=0)" "--qwen38flashnext-reuse-kv-host-pool-bytes 0"
+has "KV_HOST_POOL_BYTES=16G" "$(flags KV_HOST_POOL_BYTES=16G)" "--qwen38flashnext-reuse-kv-host-pool-bytes 2G"
+# The image model's start carries them too, for a switch to Flash-Next: it
+# makes no host plan of its own, and the 27B's 8G arena goes in its scoped spelling.
+out="$(flags MODEL=image)"
+has "MODEL=image arena" "$out" "--qwen38flashnext-reuse-kv-host-pool-bytes 2G"
+lacks "MODEL=image arena" "$out" "--reuse-kv-host-pool-bytes 8G"
+has "MODEL=image 27B arena" "$out" "--qwen38-reuse-kv-host-pool-bytes 8G"
+has "MODEL=image 27B arena off" "$(flags MODEL=image IMAGE_27B_KV_HOST_POOL_BYTES=0)" "--qwen38-reuse-kv-host-pool-bytes 0"
+for model in "" "MODEL=flash-next"; do
+    lacks "[$model] no scoped 27B arena" "$(flags $model)" "--qwen38-reuse-kv-host-pool-bytes"
+done
+has "MODEL=image HOST_MARGIN_BYTES=3G" "$(flags MODEL=image HOST_MARGIN_BYTES=3G)" "--model-host-margin-bytes 3G"
+# Metrics are on by default in the server itself (the owner, 2026-10-15):
+# METRICS=1 passes nothing, so a second server on the host whose default
+# listener is taken still starts; METRICS=0 turns them off.
+lacks "metrics default" "$(flags)" "--server-metrics"
+has "METRICS=0" "$(flags METRICS=0)" "--server-metrics false"
+has "METRICS_BIND" "$(flags METRICS_BIND=127.0.0.1:9100)" "--server-metrics-bind 127.0.0.1:9100"
+lacks "METRICS=0 METRICS_BIND" "$(flags METRICS=0 METRICS_BIND=127.0.0.1:9100)" "--server-metrics-bind"
+case "$(make config CUDA=1 METRICS=0 2>/dev/null | sed -n 's/^METRICS  *//p')" in "0  (off)") ;; *) fail "METRICS=0 config line" ;; esac
+# The host plan's margin: the server's 4G unless named.
+lacks "margin default" "$(flags MODEL=flash-next)" "--model-host-margin-bytes"
+has "HOST_MARGIN_BYTES=3G" "$(flags HOST_MARGIN_BYTES=3G)" "--model-host-margin-bytes 3G"
+
 if [ "$failed" -ne 0 ]; then
     printf 'flags-selftest: %d failure(s)\n' "$failed" >&2
     exit 1

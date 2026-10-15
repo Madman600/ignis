@@ -151,6 +151,8 @@ async fn main() {
         vram: _,
         allow_expert_cache_below_floor: _,
         host_pool_bytes,
+        // Read through `EngineShape`, like the other load-shape knobs.
+        host_margin_bytes: _,
         prompt_reuse: _,
         retained_device_slots: _,
         retained_host_slots: _,
@@ -174,6 +176,7 @@ async fn main() {
         known_models,
         ui,
         metrics,
+        metrics_bind_named,
         api_key,
         expose,
         // What the options were resolved from: the load fits them again.
@@ -410,8 +413,9 @@ async fn main() {
     } else {
         server
     };
-    // Prometheus metrics (GitHub #89, ADR 0017): without `--server-metrics`, neither
-    // the projection nor any route to it exists.
+    // Prometheus metrics (GitHub #89, ADR 0017), on by default: with
+    // `--server-metrics false`, neither the projection nor any route to it
+    // exists.
     let server = if metrics.is_some() { server.with_metrics() } else { server };
     let server = match load_reservations {
         Some(reserved) => server.with_load_reservations(reserved),
@@ -435,16 +439,37 @@ async fn main() {
     };
 
     // The metrics listener (ADR 0017): its own address, bound before serving
-    // like the API's, and never the one `--server-expose` tunnels.
+    // like the API's, and never the one `--server-expose` tunnels. Metrics are
+    // on by default, so the default address may be a second server's: that
+    // costs this start its listener, never the start (`/ui/metrics` still
+    // serves). An address the operator named is theirs, and refuses it.
     let metrics_listener = match &metrics {
         None => None,
         Some(metrics_bind) => match tokio::net::TcpListener::bind(metrics_bind).await {
             Ok(listener) => Some(listener),
+            Err(err) if !metrics_bind_named => {
+                tracing::warn!(
+                    name: "ignis.server.metrics_unavailable",
+                    bind = %metrics_bind,
+                    error = %err,
+                    "the metrics listener's default address could not be bound (another server on this host holds it?): serving without it; --server-metrics-bind names another address, --server-metrics false turns metrics off"
+                );
+                None
+            }
             Err(err) => {
                 tracing::error!(name: "ignis.server.failed", bind = %metrics_bind, error = %err, "metrics listener could not bind");
                 exit_after_flush(&logging_handle, 1);
             }
         },
+    };
+    // Where the metrics listener is, for the start line: the port a `:0`
+    // bind was given, `off` when metrics are off, or `unavailable` when the
+    // default address was taken (`/ui/metrics` still serves).
+    let metrics_at = match metrics_listener.as_ref().map(tokio::net::TcpListener::local_addr) {
+        Some(Ok(local)) => local.to_string(),
+        Some(Err(_)) => metrics.clone().unwrap_or_default(),
+        None if metrics.is_some() => "unavailable".to_owned(),
+        None => "off".to_owned(),
     };
 
     // `--server-expose` (ADR 0028): opened on the bound port, before serving, so a
@@ -494,7 +519,7 @@ async fn main() {
         model = %server.active().model_id(),
         bind = %bind,
         api_key_required = auth,
-        metrics = metrics.as_deref().unwrap_or("off"),
+        metrics = %metrics_at,
         // GitHub #216: the pinned host arena is locked in RAM from start
         // (ADR 0030), and until now no line anywhere said how large it is.
         kv_host_pool_bytes = host_pool_bytes,

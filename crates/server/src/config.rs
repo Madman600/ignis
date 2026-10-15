@@ -57,6 +57,13 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8000";
 /// API's.
 pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9464";
 
+/// Whether Prometheus metrics are served without anyone saying so (ADR 0017,
+/// amended 2026-10-15, the owner's call): on. #90 showed they cost the
+/// inference path nothing; the listener stays on loopback, keyless and never
+/// exposed, and a start that finds its default address taken goes on without
+/// it.
+pub const DEFAULT_METRICS: bool = true;
+
 /// The server-wide thinking budget a request that sets none runs under, in
 /// reasoning tokens (spec server/08): 32,768, the owner's call of 2026-10-09.
 /// It sits inside the 38,912 default cap less the 2,048-token answer reserve
@@ -197,6 +204,11 @@ pub const MEDIA_CACHE_MIB_LIMIT: u32 = 64 * 1024;
 /// blob by blob while serving, so it is RAM the process holds even idle.
 pub const DEFAULT_HOST_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// `--model-host-margin-bytes`'s default: what Flash-Next's host plan
+/// leaves of the physical memory available at load (4 GiB since
+/// 2026-10-12, the owner's call; spec flash-next/03 set 6).
+pub const DEFAULT_HOST_MARGIN_BYTES: u64 = ignis_core::residency::DEFAULT_HOST_MARGIN_BYTES;
+
 /// `--reuse-prompt`'s default (GitHub #186, ADR 0029): on. Cross-request
 /// reuse is the owner's workload — an agent's tool loop re-sends its whole
 /// history every iteration — so it is what the engine does unless asked not
@@ -324,6 +336,12 @@ pub struct Config {
     /// snapshot's fixed GDN floor (~145 MiB) is paid regardless of prompt
     /// length.
     pub host_pool_bytes: u64,
+    /// What Flash-Next's host plan must leave of the physical memory
+    /// available at load (`--model-host-margin-bytes`,
+    /// [`DEFAULT_HOST_MARGIN_BYTES`]): a load whose pinned lines leave less
+    /// is refused, naming the line to shrink. The 27B and the image model
+    /// make no host plan: their starts carry it for a switch to Flash-Next.
+    pub host_margin_bytes: u64,
     /// Cross-request state reuse (`--reuse-prompt`, GitHub #186, ADR 0029).
     /// On by default. Off means a request captures no prompt checkpoint and
     /// claims none, so a cold bench measures a cold engine and a correctness
@@ -406,10 +424,17 @@ pub struct Config {
     /// serves it, and one that did not serves the page saying how to build
     /// it, so the default costs a route and nothing else.
     pub ui: bool,
-    /// The metrics listener's address when `--server-metrics` is on (GitHub
-    /// #89, ADR 0017): `--server-metrics-bind`, else
-    /// [`DEFAULT_METRICS_BIND`]. `None` = metrics off.
+    /// The metrics listener's address when `--server-metrics` is on — the
+    /// default, [`DEFAULT_METRICS`] (GitHub #89, ADR 0017):
+    /// `--server-metrics-bind`, else [`DEFAULT_METRICS_BIND`]. `None` =
+    /// metrics off.
     pub metrics: Option<String>,
+    /// Whether the operator named an address other than the default for the
+    /// metrics listener (flag, env or file). One they named that cannot be
+    /// bound refuses the start; the default, which a second server on the
+    /// host already holds, only warns, and the start goes on without the
+    /// listener (ADR 0017, amended 2026-10-15).
+    pub metrics_bind_named: bool,
     /// The key every `/v1` request must present as `Authorization: Bearer
     /// <key>` (`--server-api-key`). `None` (the default) keeps the API open,
     /// as it has always been on localhost.
@@ -947,17 +972,20 @@ fn derive(
     let vision = derive_vision(&resolution, &spelled)?;
     let media = derive_media(&resolution, vision.is_some(), &spelled)?;
 
-    // `--server-metrics` (GitHub #89, ADR 0017) opens its own listener;
-    // naming its address without turning metrics on is refused rather than
-    // ignored, and it can never share the API's.
-    if explicit("server", "metrics_bind") && !s.server.metrics {
+    // `--server-metrics` (GitHub #89, ADR 0017, on by default) opens its own
+    // listener; naming its address while turning metrics off is refused
+    // rather than ignored, and a named address can never share the API's (the
+    // default one, taken by the API, costs the listener, not the start).
+    let metrics_bind_named = explicit("server", "metrics_bind");
+    if metrics_bind_named && !s.server.metrics {
         return Err(ConfigError(format!(
-            "`{}` requires `--server-metrics` (metrics are off without it)",
-            spelled("server", "metrics_bind")
+            "`{}` names a metrics listener, but metrics are off (`{}` is false)",
+            spelled("server", "metrics_bind"),
+            spelled("server", "metrics")
         )));
     }
     let metrics = s.server.metrics.then(|| s.server.metrics_bind.clone());
-    if metrics.as_deref() == Some(s.server.bind.as_str()) {
+    if metrics_bind_named && metrics.as_deref() == Some(s.server.bind.as_str()) {
         return Err(ConfigError(format!(
             "`{} {}` is the API's `--server-bind`: metrics need their own listener",
             spelled("server", "metrics_bind"),
@@ -1009,6 +1037,7 @@ fn derive(
         vram,
         allow_expert_cache_below_floor: s.vram.allow_expert_cache_below_floor,
         host_pool_bytes: s.reuse.kv_host_pool_bytes,
+        host_margin_bytes: s.model.host_margin_bytes,
         prompt_reuse,
         retained_device_slots: s
             .reuse
@@ -1038,6 +1067,7 @@ fn derive(
         known_models: s.switch.known_models.clone(),
         ui: s.server.ui,
         metrics,
+        metrics_bind_named,
         api_key,
         expose: s.server.expose,
         basis: Basis(Arc::new(BasisInner { sources: sources.clone(), resolution: resolution.clone(), family })),

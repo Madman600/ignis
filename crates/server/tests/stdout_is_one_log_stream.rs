@@ -72,6 +72,9 @@ fn a_served_request_leaves_no_jsonl_line_on_a_pretty_stdout() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ignis-server"));
     command
         .args(["--server-bind", &format!("127.0.0.1:{port}")])
+        // Metrics are on by default: an ephemeral listener of their own, so
+        // this start never holds a real server's 127.0.0.1:9464.
+        .args(["--server-metrics-bind", "127.0.0.1:0"])
         .env("IGNIS_LOG_FORMAT", "pretty")
         .env("IGNIS_LOG_LEVEL", "info")
         .env_remove("IGNIS_MODEL_ARTIFACT")

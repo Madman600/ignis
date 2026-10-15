@@ -54,6 +54,9 @@ pub struct EngineShape {
     /// P4-07 GitHub #125): pinned host memory for evicted (suspended)
     /// request snapshots, independent of the GPU-resident pool above.
     pub host_pool_bytes: u64,
+    /// What Flash-Next's host plan must leave of the physical memory
+    /// available at load (`--model-host-margin-bytes`).
+    pub host_margin_bytes: u64,
     /// Cross-request state reuse (`--reuse-prompt`, GitHub #186, ADR 0029).
     pub prompt_reuse: bool,
     /// Whether the generation opener's page rides the checkpoint capture (ADR
@@ -122,6 +125,7 @@ impl Default for EngineShape {
             },
             allow_expert_cache_below_floor: false,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
+            host_margin_bytes: crate::config::DEFAULT_HOST_MARGIN_BYTES,
             prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
             opener_page_rides_capture: false,
             retained_device_slots: crate::config::DEFAULT_RETAINED_DEVICE_SLOTS,
@@ -153,6 +157,7 @@ impl From<&crate::config::Config> for EngineShape {
             vram: config.vram,
             allow_expert_cache_below_floor: config.allow_expert_cache_below_floor,
             host_pool_bytes: config.host_pool_bytes,
+            host_margin_bytes: config.host_margin_bytes,
             prompt_reuse: config.prompt_reuse,
             opener_page_rides_capture: false,
             retained_device_slots: config.retained_device_slots,
@@ -437,6 +442,68 @@ pub fn log_vram_plan(plan: &ignis_core::VramPlan, retained: RetainedSlotsPlan, p
         } => vram_plan_event!(allow_oversubscription = allow_oversubscription),
     }
     log_vram_warnings(plan);
+}
+
+/// A Flash-Next load the host plan refused (spec flash-next/03), as an agent
+/// reads it: one `ignis.runtime.flash_next_host_plan_refused` event with
+/// every line, the memory available, the margin, what the plan needed and how
+/// far short it fell, in exact bytes. Its message is the refusal as a person
+/// reads it, the text the load then fails with.
+pub fn log_host_plan_refused(refusal: &ignis_core::residency::HostPlanError) {
+    let ignis_core::residency::HostPlanError::BelowMargin {
+        available_bytes,
+        planned_bytes,
+        margin_bytes,
+        crossing_line,
+        lines,
+    } = refusal;
+    let line = |name: &str| lines.iter().find(|(line, _)| *line == name).map_or(0, |(_, bytes)| *bytes);
+    // hotpath-lint-allow: one line per refused load.
+    tracing::warn!(
+        name: "ignis.runtime.flash_next_host_plan_refused",
+        available_bytes = *available_bytes,
+        planned_bytes = *planned_bytes,
+        margin_bytes = *margin_bytes,
+        needed_bytes = refusal.needed_bytes(),
+        short_bytes = refusal.short_bytes(),
+        crossing_line = *crossing_line,
+        expert_pool_bytes = line("expert_pool"),
+        ngram_hot_rows_bytes = line("ngram_hot_rows"),
+        staging_bytes = line("staging"),
+        retained_host_slots_bytes = line("retained_host_slots"),
+        kv_ram_arena_bytes = line("kv_ram_arena"),
+        "{refusal}"
+    );
+}
+
+/// Why a Flash-Next load failed: its host plan's refusal, kept whole so a
+/// switch can report it in bytes (`GET /v1/models`, `last_switch.host_plan`),
+/// or anything else, as the text it always was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlashNextLoadError {
+    HostPlan(ignis_core::residency::HostPlanError),
+    Other(String),
+}
+
+impl From<String> for FlashNextLoadError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for FlashNextLoadError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.to_owned())
+    }
+}
+
+impl std::fmt::Display for FlashNextLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HostPlan(refusal) => refusal.fmt(f),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
 }
 
 /// One `ignis.runtime.vram_oversubscribed` warning per reason a plan's start
@@ -778,6 +845,19 @@ pub fn flash_next_scheduler_with_ngram_cache(
     ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
     kv_disk_location: &ignis_core::ngram_cache::CacheLocation,
 ) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), String> {
+    flash_next_load(artifact_path, model_id, eos, shape, thinking_close, ngram_cache, kv_disk_location)
+        .map_err(|e| e.to_string())
+}
+
+/// [`flash_next_scheduler_with_ngram_cache`], with a host plan's refusal
+/// kept whole ([`FlashNextLoadError::HostPlan`]): the server's load reads it.
+#[cfg(feature = "cuda")]
+pub(crate) fn flash_next_load(
+    artifact_path: &std::path::Path, model_id: String, eos: TokenId, shape: EngineShape,
+    thinking_close: Option<Arc<ignis_core::thinking_budget::ThinkingClose>>,
+    ngram_cache: ignis_core::ngram_cache::PersistenceOptions,
+    kv_disk_location: &ignis_core::ngram_cache::CacheLocation,
+) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), FlashNextLoadError> {
     use ignis_artifact::flash_next::{self, FlashNextGeometry};
     use ignis_artifact::{CudaDevice, Reader};
     use ignis_core::compute::ModelConfig;
@@ -823,7 +903,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
                 Reader::open(path).map_err(|e| format!("the MTP head: open {}: {e}", path.display()))?;
             Some(flash_next::mtp::bind(&companion_reader, &geometry).map_err(|e| format!("bind the MTP head: {e}"))?)
         }
-        (Some(_), None) => return Err("the MTP head: the artifact path has no directory".to_string()),
+        (Some(_), None) => return Err("the MTP head: the artifact path has no directory".into()),
         (None, _) => None,
     };
     let reserved = ignis_core::model_load::plan_flash_next_reservations(
@@ -963,6 +1043,7 @@ pub fn flash_next_scheduler_with_ngram_cache(
         staging_bytes: kv_disk_staging_bytes,
         retained_host_slots_bytes: pool_plan.retained_host_bytes,
         kv_ram_arena_bytes: options.kv_ram_arena_bytes,
+        margin_bytes: shape.host_margin_bytes,
     });
     // GitHub #306: `--ngram-hot-bytes` as named, or `auto` from the room the
     // other lines leave; the line charges the budget, capped at what the
@@ -982,13 +1063,17 @@ pub fn flash_next_scheduler_with_ngram_cache(
     }
     if let Some(request) = host_request.as_mut() {
         request.ngram_hot_rows_bytes = ngram_hot_rows_bytes;
-        let host = plan_host(request).map_err(|e| e.to_string())?;
+        let host = plan_host(request).map_err(|refusal| {
+            log_host_plan_refused(&refusal);
+            FlashNextLoadError::HostPlan(refusal)
+        })?;
         // hotpath-lint-allow: one line per model load.
         tracing::info!(
             name: "ignis.runtime.flash_next_host_plan",
             available_bytes = request.available_physical_bytes,
             planned_bytes = host.total_bytes,
             left_bytes = host.left_bytes,
+            margin_bytes = request.margin_bytes,
             ngram_hot_budget = %shape.ngram_hot_bytes,
             ngram_hot_budget_bytes = options.ngram.hot_bytes,
             ngram_hot_rows_bytes,
@@ -1335,6 +1420,7 @@ mod tests {
             vram: EngineShape::default().vram,
             allow_expert_cache_below_floor: true,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
+            host_margin_bytes: crate::config::DEFAULT_HOST_MARGIN_BYTES,
             prompt_reuse: true,
             opener_page_rides_capture: false,
             retained_device_slots: 2,
@@ -1483,6 +1569,52 @@ mod tests {
 
     /// What a reload's plan event names as held (GitHub #324).
     const PROCESS_HELD: u64 = ignis_runtime::CUDA_CONTEXT_BYTES + ignis_runtime::QWEN27B_PROCESS_STATE_BYTES;
+
+    /// The host plan refused on 2026-10-13: 41.6 GB available.
+    fn starved_plan() -> ignis_core::residency::HostPlanError {
+        ignis_core::residency::plan_host(&ignis_core::residency::HostPlanRequest {
+            available_physical_bytes: 41_632_530_432,
+            expert_pool_bytes: 37_795_446_784,
+            ngram_hot_rows_bytes: 1 << 30,
+            staging_bytes: 64 << 20,
+            retained_host_slots_bytes: 1_040_115_712,
+            kv_ram_arena_bytes: 2 << 30,
+            margin_bytes: ignis_core::residency::DEFAULT_HOST_MARGIN_BYTES,
+        })
+        .expect_err("short of RAM")
+    }
+
+    #[test]
+    fn a_refused_host_plan_logs_every_line_in_bytes_beside_the_persons_message() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let refusal = starved_plan();
+        let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+        let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+        tracing::subscriber::with_default(subscriber, || log_host_plan_refused(&refusal));
+        let events: Vec<serde_json::Value> =
+            sink.lines().iter().map(|line| serde_json::from_str(line).expect("valid json")).collect();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event["event_name"], "ignis.runtime.flash_next_host_plan_refused");
+        assert_eq!(event["severity_text"], "WARN");
+        assert_eq!(event["body"], refusal.to_string(), "the message a person reads");
+        let attributes = &event["attributes"];
+        for (field, bytes) in [
+            ("available_bytes", 41_632_530_432u64),
+            ("planned_bytes", 42_123_896_832),
+            ("margin_bytes", 4 << 30),
+            ("needed_bytes", 46_418_864_128),
+            ("short_bytes", 4_786_333_696),
+            ("expert_pool_bytes", 37_795_446_784),
+            ("ngram_hot_rows_bytes", 1 << 30),
+            ("staging_bytes", 64 << 20),
+            ("retained_host_slots_bytes", 1_040_115_712),
+            ("kv_ram_arena_bytes", 2 << 30),
+        ] {
+            assert_eq!(attributes[field], bytes, "{field}: {attributes}");
+        }
+        assert_eq!(attributes["crossing_line"], "expert_pool");
+    }
 
     fn plan_for(mode: ignis_core::VramMode, free: u64) -> ignis_core::VramPlan {
         let reserved = ignis_runtime::ReservedBytes {

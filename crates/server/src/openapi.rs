@@ -71,7 +71,7 @@ under Jev's name, so an unmodified Jev client reaches this server by \
 changing the URL alone. OpenAPI has no notion of an alias, so it is named \
 here rather than listed as a second path.\n\n\
 The Prometheus exposition is not part of this document (ADR 0017): it is \
-served on its own listener with `--server-metrics`, and it is monitoring rather \
+served on its own listener (on by default; `--server-metrics false` turns it off), and it is monitoring rather \
 than API.\n\n\
 Every field of an OpenAI request body is honoured, accepted as inert, or \
 refused with a 400 naming it in `param` — never dropped in silence; each \
