@@ -477,4 +477,6 @@ Spec: `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
   (ADR 0017) reads what the jobs hold against the line, the image model's
   counterpart of `ignis_kv_pool_used_pages`. The job sets it with the runner
   held, and every load's reservations reset it to 0, so a switch in either
-  direction leaves nothing of the other model's.
+  direction leaves nothing of the other model's. The meter reads below 100% at a full budget by
+  `prefix_kv_bytes(n)`: the line includes the encode's transient chunked-pass
+  BF16 K/V, which `condition_bytes` (the runs alone) does not count.

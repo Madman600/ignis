@@ -799,7 +799,7 @@ function PlanCard({ memory }: { memory: Memory }) {
             <p className="text-[11px] text-ash">
               The image model has no KV pool. Its condition budget is the room its jobs' condition prefixes — the prompt and the condition images, encoded
               once a job — are allocated from as each job encodes, and freed as it ends; In use now reads what they hold. Its weights and its one arena are
-              the plan's other lines, and the budget is what was free with its CUDA context already held, so no context line is charged.
+              the plan's other lines, and the budget is laid out from what was free (less the headroom, or the explicit figure) with its CUDA context already held, so no context line is charged. The line includes the encode's transient chunked-pass BF16 K/V, so In use reads below 100% at a full budget.
               {memory.oversubscribed && " This load reserved more than its budget (--vram-allow-oversubscription), so the bar is the plan, not the budget."}
             </p>
           ) : (

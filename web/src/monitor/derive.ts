@@ -102,8 +102,8 @@ export type Memory = {
   /** The plan's twelve lines in plan order, then Flash-Next's residency and expert cache, then the image model's condition budget. */
   lines: { line: VramLine; bytes: number | null }[];
   /**
-   * The twelve lines added up, or null when the scrape does not carry all
-   * twelve. A partial sum would understate the plan and overstate the room
+   * The twelve lines added up (on an image load: its weights and arena beside
+   * the zeroed rest), or null when the scrape does not carry all twelve. A partial sum would understate the plan and overstate the room
    * left beside it, and the server writes the twelve together or not at all.
    */
   linesBytes: number | null;
@@ -111,7 +111,7 @@ export type Memory = {
   expertCacheBytes: number;
   /** The image model's condition budget (GitHub #324): 0 on a text load, which has a KV pool instead. */
   conditionBudgetBytes: number;
-  /** The budget less the lines: the room the plan left the KV pool. Negative on an oversubscribed load. */
+  /** The budget less the lines: the room the plan left the KV pool (on an image load, its condition budget). Negative on an oversubscribed load. */
   kvRoomBytes: number | null;
   /** The pool the room bought: its pages, one page, the two multiplied, and the tokens those pages hold. */
   kvPool: { pages: number | null; pageBytes: number | null; bytes: number | null; tokens: number | null };

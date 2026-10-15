@@ -1133,9 +1133,10 @@ three loads, where the server already had the text-first path (one load).
   `FAKE_PREFIX_TOKEN_BYTES`, 256 KiB, a token); the job publishes them
   through the queue's gauge (`ImageJobs::publish_conditions`) with the runner
   held, right after `encode_condition` and after the release in `Held`'s drop.
-  Every `set_load_reservations` resets the gauge to 0, so a switch either way
-  and an unload leave nothing stale, and a job of a model shut down cannot
-  publish after it (its runner is gone).
+  Every `set_load_reservations` resets the gauge to 0, so a load either way
+  starts clean, and a job of a model shut down cannot publish after it (its
+  runner is gone). After a failed drain or restore the gauge can stay stale
+  until the next load, as the text model's KV occupancy already does.
 - **The Monitor.** `snapshot.ts` reads the line and the gauge (both in the
   contract); `derive.ts` counts `condition_budget` as a line a server may
   predate (as Flash-Next's two) and gives `conditionBudgetBytes` and a

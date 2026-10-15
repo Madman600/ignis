@@ -356,6 +356,8 @@ mod device {
         }
 
         fn release_condition(&mut self, condition: ConditionId) {
+            // A failed leaf release is logged (`ignis.image.release_failed`), but the
+            // entry is already gone, so the gauge counts those bytes as freed.
             if let Some(prefix) = self.conditions.remove(&condition) {
                 // The leaf's image slot goes with a released prefix.
                 self.started = None;
