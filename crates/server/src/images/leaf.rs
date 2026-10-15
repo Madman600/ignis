@@ -364,12 +364,12 @@ mod device {
                 }
             }
         }
-    }
 
         /// Each prefix's own device bytes, as the leaf allocated them.
         fn condition_bytes(&self) -> u64 {
             self.conditions.values().map(Condition::bytes).sum()
         }
+    }
 
     impl Drop for LeafRunner {
         /// Every prefix still held, freed before the leaf drops.
