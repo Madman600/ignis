@@ -1,5 +1,5 @@
-//! Prometheus metrics (GitHub #89, ADR 0017): the opt-in exposition
-//! `ignis-server` serves with `--server-metrics` — at `GET /metrics` on its own
+//! Prometheus metrics (GitHub #89, ADR 0017): the exposition
+//! `ignis-server` serves by default (`--server-metrics false` turns it off) — at `GET /metrics` on its own
 //! listener, and at `GET /ui/metrics` on the API listener for the Playground.
 //!
 //! [`Metrics`] is an aggregate projection of facts the model thread already
@@ -7,7 +7,7 @@
 //! `telemetry_task`). That consumer is its only writer; the HTTP task only
 //! reads it, and all text encoding happens there, at scrape time. Nothing in
 //! the scheduler, the model thread, the runtime or the kernel leaf knows it
-//! exists, and without `--server-metrics` it is never built.
+//! exists, and with `--server-metrics false` it is never built.
 //!
 //! Fixed atomics rather than a lock: a scrape can never make the consumer
 //! wait, and the consumer can never make a scrape wait. A scrape therefore

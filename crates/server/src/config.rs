@@ -974,7 +974,8 @@ fn derive(
 
     // `--server-metrics` (GitHub #89, ADR 0017, on by default) opens its own
     // listener; naming its address while turning metrics off is refused
-    // rather than ignored, and it can never share the API's.
+    // rather than ignored, and a named address can never share the API's (the
+    // default one, taken by the API, costs the listener, not the start).
     let metrics_bind_named = explicit("server", "metrics_bind");
     if metrics_bind_named && !s.server.metrics {
         return Err(ConfigError(format!(
@@ -984,7 +985,7 @@ fn derive(
         )));
     }
     let metrics = s.server.metrics.then(|| s.server.metrics_bind.clone());
-    if metrics.as_deref() == Some(s.server.bind.as_str()) {
+    if metrics_bind_named && metrics.as_deref() == Some(s.server.bind.as_str()) {
         return Err(ConfigError(format!(
             "`{} {}` is the API's `--server-bind`: metrics need their own listener",
             spelled("server", "metrics_bind"),

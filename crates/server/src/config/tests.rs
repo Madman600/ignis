@@ -2013,6 +2013,32 @@ fn metrics_bind_with_metrics_off_or_without_value_or_on_the_api_address_is_refus
     assert!(err.contains("--server-bind"), "{err}");
 }
 
+/// The host plan's refusal (core `residency/plan.rs`) spells its remedies
+/// as literals; each must be a flag a start accepts, or the refusal sends an
+/// operator to one that does not parse (5d85aed4 fixed one such).
+#[test]
+fn every_flag_the_host_plan_refusal_names_is_a_flag_a_start_accepts() {
+    for flag in [
+        "--ngram-hot-bytes",
+        "--qwen38flashnext-kv-disk-bytes",
+        "--qwen38flashnext-reuse-retained-host",
+        "--qwen38flashnext-reuse-kv-host-pool-bytes",
+        "--qwen38flashnext-model-host-margin-bytes",
+    ] {
+        let resolved = resolve(&args(&[flag, "0"]), no_env);
+        assert!(resolved.is_ok(), "{flag}: {:?}", resolved.err());
+    }
+}
+
+/// The default metrics address is never a reason not to start: an API bound
+/// there leaves the metrics listener to the warn path, with no flag named.
+#[test]
+fn an_api_on_the_default_metrics_address_starts_without_naming_a_metrics_flag() {
+    let resolved = config(&["--server-bind", DEFAULT_METRICS_BIND]);
+    assert_eq!(resolved.metrics.as_deref(), Some(DEFAULT_METRICS_BIND));
+    assert!(!resolved.metrics_bind_named);
+}
+
 /// ADR 0046: every field has its env var, metrics included — the drift
 /// (`IGNIS_PROMETHEUS` with no flag, `--metrics` with no env var) the one
 /// declaration per field exists to end. The old names stay without effect.

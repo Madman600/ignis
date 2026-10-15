@@ -94,6 +94,10 @@ ifeq ($(MODEL_FAMILY),image)
   ROPE_SCALING ?=
   VISION ?=
   KV_HOST_POOL_BYTES ?=
+  # A switch from here to the 27B takes the 27B's arena (--qwen38-reuse-kv-host-pool-bytes,
+  # the scoped spelling: the image model takes no general one), as a
+  # switch to Flash-Next takes FN_KV_HOST_POOL_BYTES, never the server's 2G.
+  IMAGE_27B_KV_HOST_POOL_BYTES ?= 8G
 endif
 
 # The .ninfer container (used with CUDA=1 only). See README "Models".

@@ -7,7 +7,7 @@ case. Standard library only.
     IGNIS_SERVER_API_KEY=... python scripts/decide-reuse-repro.py [http://127.0.0.1:8000] [http://127.0.0.1:9464]
 
 Run it against a server started with the issue's flags (`--vision-enabled --spec-backend
-dflash2 --server-metrics`, `--reuse-prompt` left on) and nothing else using it. Each
+dflash2`, `--reuse-prompt` left on; metrics are on by default) and nothing else using it. Each
 case sends N requests one after another (nothing concurrent), so only
 cross-request reuse and a fan-out's own head can help. Every case has its own
 text and its own picture, so no case is served by what an earlier one left

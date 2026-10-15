@@ -54,6 +54,7 @@ silently replaced.
   match `--metrics`. A default that cannot be changed through the environment
   is unusable in a container, which is where this one has to be.
 - The image's `CMD ["--ui"]` is gone: the server's own default is the image's.
-- `--metrics` is untouched and still opt-in. `/ui/metrics` now needs
-  `--metrics` and *not* `--no-ui`, which is the same condition written the
+- `--metrics` is untouched (opt-in then; on by default since ADR 0017's
+  amendment). `/ui/metrics` now needs
+  metrics on and *not* `--no-ui`, which is the same condition written the
   other way round.

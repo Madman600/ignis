@@ -463,10 +463,12 @@ async fn main() {
         },
     };
     // Where the metrics listener is, for the start line: the port a `:0`
-    // bind was given, or `off` when there is none.
+    // bind was given, `off` when metrics are off, or `unavailable` when the
+    // default address was taken (`/ui/metrics` still serves).
     let metrics_at = match metrics_listener.as_ref().map(tokio::net::TcpListener::local_addr) {
         Some(Ok(local)) => local.to_string(),
         Some(Err(_)) => metrics.clone().unwrap_or_default(),
+        None if metrics.is_some() => "unavailable".to_owned(),
         None => "off".to_owned(),
     };
 

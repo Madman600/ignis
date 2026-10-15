@@ -177,10 +177,15 @@ done
 has "FN_KV_HOST_POOL_BYTES=0" "$(flags FN_KV_HOST_POOL_BYTES=0)" "--qwen38flashnext-reuse-kv-host-pool-bytes 0"
 has "KV_HOST_POOL_BYTES=16G" "$(flags KV_HOST_POOL_BYTES=16G)" "--qwen38flashnext-reuse-kv-host-pool-bytes 2G"
 # The image model's start carries them too, for a switch to Flash-Next: it
-# makes no host plan of its own and takes no 27B arena.
+# makes no host plan of its own, and the 27B's 8G arena goes in its scoped spelling.
 out="$(flags MODEL=image)"
 has "MODEL=image arena" "$out" "--qwen38flashnext-reuse-kv-host-pool-bytes 2G"
 lacks "MODEL=image arena" "$out" "--reuse-kv-host-pool-bytes 8G"
+has "MODEL=image 27B arena" "$out" "--qwen38-reuse-kv-host-pool-bytes 8G"
+has "MODEL=image 27B arena off" "$(flags MODEL=image IMAGE_27B_KV_HOST_POOL_BYTES=0)" "--qwen38-reuse-kv-host-pool-bytes 0"
+for model in "" "MODEL=flash-next"; do
+    lacks "[$model] no scoped 27B arena" "$(flags $model)" "--qwen38-reuse-kv-host-pool-bytes"
+done
 has "MODEL=image HOST_MARGIN_BYTES=3G" "$(flags MODEL=image HOST_MARGIN_BYTES=3G)" "--model-host-margin-bytes 3G"
 # Metrics are on by default in the server itself (the owner, 2026-10-15):
 # METRICS=1 passes nothing, so a second server on the host whose default

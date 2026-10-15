@@ -260,16 +260,25 @@ fn metrics_are_on_by_default_and_the_start_names_the_bound_listener() {
 /// naming the address, and starts without the listener.
 #[test]
 fn a_taken_default_metrics_address_warns_and_the_start_goes_on() {
-    // Held here, unless a real server on this machine already holds it:
-    // taken either way.
-    let _held = std::net::TcpListener::bind(ignis_server::config::DEFAULT_METRICS_BIND).ok();
+    // Held here, unless a real server on this machine holds it for good:
+    // taken either way. A holder that lets go (a sibling worktree's run of
+    // this test) is waited out for ~2 s, so the child never finds it free.
+    let mut held = None;
+    for _ in 0..20 {
+        held = std::net::TcpListener::bind(ignis_server::config::DEFAULT_METRICS_BIND).ok();
+        if held.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _held = held;
     let records = launch_until(&[], &[], &["ignis.process.started"]);
     let warning = find(&records, "ignis.server.metrics_unavailable");
     assert_eq!(warning["severity_text"], "WARN");
     assert_eq!(warning["attributes"]["bind"], ignis_server::config::DEFAULT_METRICS_BIND);
     assert!(warning["attributes"]["error"].as_str().is_some(), "{warning}");
     let started = find(&records, "ignis.process.started");
-    assert_eq!(started["attributes"]["metrics"], "off", "{started}");
+    assert_eq!(started["attributes"]["metrics"], "unavailable", "{started}");
 }
 
 /// An address the operator named is theirs: taken, it refuses the start.

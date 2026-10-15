@@ -100,7 +100,7 @@ function hasLiveHistory(state: MonitorState): boolean {
 /**
  * Whether the page offers the Monitor: metrics answered, or answered 401
  * (the Monitor says the key is wanted), or answered before and stopped.
- * A server without --server-metrics never shows it.
+ * A server started with --server-metrics false never shows it.
  */
 export function monitorVisible(state: MonitorState): boolean {
   return hasLiveHistory(state) || state.availability === "unauthorized";

@@ -584,7 +584,7 @@ file per artifact remains. This cache is separate from prompt/KV reuse.
 
 Serving Flash-Next needs about **46-47 GB of available RAM**: 38 GB of pinned
 experts, 1 GB of n-gram hot rows, ~0.5 GB of staging (KV-disk's 64 MiB
-included: `--kv-disk-bytes 0` drops it), ~1 GB of retained host
+included: `--qwen38flashnext-kv-disk-bytes 0` drops it), ~1 GB of retained host
 slots, the 2 GiB KV-RAM arena and the 4 GiB margin the load refuses to dip into
 (`--model-host-margin-bytes`: it never lets reuse push Windows into paging). A load below that is refused
 in GiB, with how far short it fell and the plan line to shrink:
@@ -603,7 +603,7 @@ log event (every line, `available_bytes`, `margin_bytes`, `needed_bytes`,
 
 | Knob (`make`) | Flag | Saves | Costs |
 |---|---|---|---|
-| `RETAINED_HOST` | `--reuse-retained-host <n>` | ~125 MiB per slot below the default 8 | Fewer retained prompt checkpoints and shared prefixes: a returning agent or a subagent sharing a system block prefills what no slot kept. `0` retains nothing on the host. |
+| `RETAINED_HOST` | `--qwen38flashnext-reuse-retained-host <n>` | ~125 MiB per slot below the default 8 | Fewer retained prompt checkpoints and shared prefixes: a returning agent or a subagent sharing a system block prefills what no slot kept. `0` retains nothing on the host. |
 | `FN_KV_HOST_POOL_BYTES` | `--qwen38flashnext-reuse-kv-host-pool-bytes <n>` | up to the 2 GiB arena (`0` turns it off) | The KV-RAM tier holds fewer suspended requests: under VRAM pressure a request that cannot be parked there is evicted and prefilled again. |
 | `NGRAM_HOT_BYTES` | `--ngram-hot-bytes <n>` | up to the 1 GiB default (`0` holds none) | Each n-gram row not held in RAM is read from NVMe when a step needs it: more reads per token, and slower prefill. |
 | `HOST_MARGIN_BYTES` | `--model-host-margin-bytes <n>` | what it lowers the 4 GiB default by (`0` leaves none) | Less room for the rest of the machine to grow into: the plan's lines are pinned and cannot be paged, so once other applications outgrow what is left, Windows pages *them* out. |
