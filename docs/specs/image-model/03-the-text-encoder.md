@@ -612,3 +612,14 @@ The "As built" status lines above stand; this adds what the reviews of 320a and
   `[1152, 1152]` at T 17, is up to 1.7x faster. The server never runs the
   tower that narrow: it encodes each condition image at about 1024² of
   area, 4,096 patches, where `mma_r64_c128` is the fastest of the three.
+- **Gates** (0dfc97c, the GPU lock in timing mode):
+  - `kernel/build.ps1 -Test` with `IGNIS_GPU_PROFILE=1`: 125 of 125.
+  - The Rust GPU tests under the profile, 31 tests in 18 binaries, all
+    passing: the image tests (`image_attn_gpu`, `image_elementwise_gpu`,
+    `image_encoder_attn_gpu`, `image_encoder_gpu`, `image_gemm_gpu`,
+    `image_leaf_gpu`, `image_vae_gpu`, `image_encoder_edit_gpu`,
+    `image_leaf_ten_images_gpu`, `image_leaf_timing_gpu`,
+    `image_runner_gpu`) and the 27B's 7 vision tests.
+  - `CARGO_INCREMENTAL=0 cargo test --workspace`: 2,981 passed, 0 failed,
+    6 ignored. `cargo check -p ignis-server --features cuda --tests`
+    passes, with the earlier warnings only.
