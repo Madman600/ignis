@@ -453,3 +453,13 @@ Spec: `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
 - **Result** at the Makefile's 27B shape: cold 11,129 pages, then image, then
   27B 11,105 (−0.2%, the desktop's own drift between the two readings), and
   `vram_loaded`'s delta within 15 MB of `allocated_at_load` on both loads.
+- **Re-measured later on 2026-10-15** with the same counter, at the Makefile
+  defaults: `LOAD_RESIDUAL_BYTES` is 124,474,800 B (88,028,656 B since
+  2026-09-17; a cold start and a switch round trip held 123.7 and 124.5 MB
+  beyond the plan's other lines), and `QWEN27B_PROCESS_STATE_BYTES`
+  83,894,272 B on that build. Of the 27B's state, 6 MiB + 8 KiB is module
+  code CUDA loads lazily (gone under `CUDA_MODULE_LOADING=EAGER`, which loads
+  every module with the context); 74 MiB is per-context state that survives
+  eager loading and is not identified. It is not the stack reservation, the
+  stream-ordered or graph memory pools, freed small allocations or pinned
+  host mappings (the constants' docs say how each was ruled out).
