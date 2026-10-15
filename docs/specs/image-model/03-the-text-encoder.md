@@ -614,7 +614,7 @@ The "As built" status lines above stand; this adds what the reviews of 320a and
   area, 4,096 patches, where `mma_r64_c128` is the fastest of the three.
 - **Gates** (0dfc97c, the GPU lock in timing mode):
   - `kernel/build.ps1 -Test` with `IGNIS_GPU_PROFILE=1`: 125 of 125.
-  - The Rust GPU tests under the profile, 31 tests in 18 binaries, all
+  - The Rust GPU tests under the profile, 30 tests in 18 binaries, all
     passing: the image tests (`image_attn_gpu`, `image_elementwise_gpu`,
     `image_encoder_attn_gpu`, `image_encoder_gpu`, `image_gemm_gpu`,
     `image_leaf_gpu`, `image_vae_gpu`, `image_encoder_edit_gpu`,
