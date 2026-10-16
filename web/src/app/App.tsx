@@ -8,7 +8,7 @@ import { type OpenAgent, Transcript } from "../conversation/Transcript.tsx";
 import { contextUsage } from "../metrics/context.ts";
 import { Readout } from "../metrics/Readout.tsx";
 import { MonitorView } from "../monitor/MonitorView.tsx";
-import { useMonitor, useMonitorVisible } from "../monitor/useMonitor.ts";
+import { useMonitor, useMonitorVisible, useMetricsSettled } from "../monitor/useMonitor.ts";
 import { SessionLog } from "../sessions/SessionLog.tsx";
 import { SessionsPanel } from "../sessions/SessionsPanel.tsx";
 import { ImageView } from "../image/ImageView.tsx";
@@ -23,6 +23,7 @@ import { AGENT_SYSTEM_PROMPT, type AgentRun } from "../tools/agents/agents.ts";
 import { ALL_TOOLS, type ToolsState } from "../tools/index.ts";
 import { Header, type View } from "./Header.tsx";
 import { KeyPage } from "./KeyPage.tsx";
+import { initialView, withViewParam } from "./viewParam.ts";
 import { TransportNotice } from "./TransportNotice.tsx";
 import { STORED_FLAGS, useStoredFlag } from "./storedFlag.ts";
 import { useConversation } from "./useConversation.ts";
@@ -44,7 +45,7 @@ export function App() {
   const auth = useAuth();
   const [model, refreshModel] = useModel();
   const monitorVisible = useMonitorVisible();
-  const [view, setView] = useState<View>("chat");
+  const [view, setView] = useState<View>(() => initialView(globalThis.location?.search ?? ""));
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [tools, setTools] = useState<ToolsState>(ALL_TOOLS);
   const [markdown, setMarkdown] = useState(true);
@@ -86,9 +87,30 @@ export function App() {
   // Metrics going away drops back to the chat *from the Monitor*, so their
   // return never flips the page on its own — and a reader in the Decide tab,
   // which needs no metrics, is left where they are.
+  //
+  // Not before the first scrape has answered: a `?view=monitor` link arrives
+  // with the scrape still out, and demoting on that first render would send
+  // every such link to the chat, which is the whole thing the link is for.
+  const metricsSettled = useMetricsSettled();
   useEffect(() => {
+    if (!metricsSettled) return;
     if (!monitorVisible) setView((current) => (current === "monitor" ? "chat" : current));
-  }, [monitorVisible]);
+  }, [monitorVisible, metricsSettled]);
+
+  // The view switch keeps the address bar a link to what is on screen, so what
+  // you are looking at is what you can copy, bookmark or open elsewhere
+  // (`viewParam.ts`); the chat is written as the bare page.
+  const openView = useCallback((next: View) => {
+    if (next === "server") setServerOpened(true);
+    if (next === "image") setImageOpened(true);
+    setView(next);
+    try {
+      globalThis.history?.replaceState(null, "", withViewParam(globalThis.location.href, next));
+    } catch {
+      // A context without a history (a sandboxed frame) keeps the view it was
+      // given for this page, which is what happened before the URL meant anything.
+    }
+  }, []);
 
   useEffect(() => {
     if (!drawer) return;
@@ -142,11 +164,7 @@ export function App() {
         onForgetKey={auth.key ? forgetKey : undefined}
         onOpenMemory={() => setMemoryOpen(true)}
         view={monitoring ? "monitor" : deciding ? "decide" : serving ? "server" : imaging ? "image" : "chat"}
-        onView={(next) => {
-          if (next === "server") setServerOpened(true);
-          if (next === "image") setImageOpened(true);
-          setView(next);
-        }}
+        onView={openView}
         monitorAvailable={monitorVisible}
       />
 

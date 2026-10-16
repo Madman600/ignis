@@ -85,6 +85,17 @@ export function useMonitor(): MonitorState {
 
 const visible = () => monitorVisible(monitor.get());
 
+// Whether the first scrape has answered at all. While the store is still
+// `probing`, `useMonitorVisible` is false for a reason that means nothing: no
+// answer has arrived yet. A caller that treats that as "no metrics" flips a
+// linked view back to the chat before the page has had its first look.
+const settled = () => monitor.get().availability !== `probing`;
+
+/** Whether /ui/metrics has answered once, any answer: so "not offered" is a fact, not a gap. */
+export function useMetricsSettled(): boolean {
+  return useSyncExternalStore(monitor.subscribe, settled, settled);
+}
+
 /** Whether to offer the Monitor — a boolean, so its listeners re-render only when it flips. */
 export function useMonitorVisible(): boolean {
   return useSyncExternalStore(monitor.subscribe, visible, visible);
