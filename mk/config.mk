@@ -143,9 +143,12 @@ DEVELOPER_MESSAGE_POLICY ?= inplace
 DEFAULT_MAX_TOKENS ?=
 # Seconds with no request using the model before it is unloaded, the server
 # staying up (--model-idle-unload, ADR 0049); the next request loads it again.
-# Empty = the server's 300; 0 = never. A measurement (a bench, a gate leg, an
-# A/B leg) passes 0: a cold reload mid-run is not what it measures.
-IDLE_UNLOAD ?=
+# 0 = never, and this is 0 rather than empty on purpose: the binary's own
+# default (0.6.2) is 300, so an empty knob here would re-arm a five-minute
+# eviction of a loaded 27B on every start, however careful the script is. It is
+# passed explicitly (Makefile's $(if ...) is true for "0"), which also makes it
+# survive a binary whose default is 0. A measurement passes 0 too.
+IDLE_UNLOAD ?= 0
 
 # The GPU engine configuration (CUDA=1 only; the CPU mock gets none of it).
 # Defaults: a 524288-token context -- twice the checkpoint's trained 262,144

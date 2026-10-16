@@ -78,11 +78,12 @@ for model in "MODEL=flash-next" "MODEL=27b"; do
     out="$(flags $model)"
     lacks "$model default" "$out" "--model-default-max-tokens"
 done
-# ADR 0049: the idle unload reaches the server as named, 0 included (what a
-# measurement passes), and nothing when the knob is empty (the server's 300).
+# ADR 0049 as amended: the idle unload reaches the server as named, and the
+# default passes it explicitly as 0 (never) rather than leaving the knob empty,
+# because a binary that defaults to 300 must not re-arm an eviction (mk/config.mk).
 has "IDLE_UNLOAD=0" "$(flags IDLE_UNLOAD=0)" "--model-idle-unload 0"
 has "IDLE_UNLOAD=600" "$(flags MODEL=flash-next IDLE_UNLOAD=600)" "--model-idle-unload 600"
-lacks "idle default" "$(flags)" "--model-idle-unload"
+has "idle default is off" "$(flags)" "--model-idle-unload 0"
 out="$(flags MODEL=flash-next ALLOW_EXPERT_CACHE_BELOW_FLOOR=1)"
 has "ALLOW_EXPERT_CACHE_BELOW_FLOOR=1" "$out" "--vram-allow-expert-cache-below-floor"
 lacks "floor default" "$(flags MODEL=flash-next)" "--vram-allow-expert-cache-below-floor"

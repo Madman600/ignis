@@ -213,7 +213,7 @@ config: ## Print the resolved knobs and paths
 	@echo "API_KEY         $(if $(API_KEY),$(if $(filter auto,$(API_KEY)),auto (generated and printed at start),set),$(if $(EXPOSE),(none: auto, required by EXPOSE),(none: /v1 is open)))"
 	@echo "EXPOSE          $(or $(EXPOSE),(none: reachable at BIND only))"
 	@echo "MAX_TOKENS      default=$(or $(DEFAULT_MAX_TOKENS),(server default: 38912)) (a request that sends no max_tokens; 0 = up to the context)"
-	@echo "IDLE_UNLOAD     $(or $(IDLE_UNLOAD),(server default: 300)) (seconds unused before the model is unloaded; 0 = never)"
+	@echo "IDLE_UNLOAD     $(or $(IDLE_UNLOAD),(empty: an unset knob drops the flag and the binary's own default wins)) (seconds unused before the model is unloaded; 0 = never; 0 comes from mk/config.mk)"
 	@echo "MESSAGES        system=$(or $(SYSTEM_MESSAGE_POLICY),(server default: merge)) developer=$(or $(DEVELOPER_MESSAGE_POLICY),(server default: inplace))"
 	@echo "ARGS            $(ARGS)"
 	@echo "GPU_CHECK       $(GPU_CHECK)  (threshold $(GPU_THRESHOLD_MIB) MiB)"

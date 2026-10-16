@@ -72,3 +72,20 @@ a rule for leaving it.
   client would need retry logic for a state the server can leave by itself.
 - **Exiting the process** after the idle period: loses the API, the metrics
   and the Playground, and needs a supervisor to come back.
+
+## Amendment (2026-10-15)
+
+Decision 1's **default is now 0 (never unload)**; `DEFAULT_MODEL_IDLE_UNLOAD_SECS`
+in `crates/server/src/config.rs`. Everything else here stands: the mechanism,
+`unloaded`/`loading`, the load on demand, what counts as use, and the knob's
+flag, env, file key and ceiling are unchanged — a positive value still arms the
+clock, and the `Consequences` line about measurement targets holds even more
+directly now that 0 is where the server starts.
+
+Why: on this host the consequence in the first bullet is paid by whoever sends
+the next message — a 13–33 s cold load and no retained prefix — while the
+benefit (VRAM freed for another user of the card) is something the owner here
+asks for on purpose, with `IDLE_UNLOAD=<seconds>` or a live `PATCH`. A default
+that silently discards a loaded 27B after five minutes of an idle desktop was
+the wrong trade for a single-user machine; the ADR's own escape hatch became
+the safer default.

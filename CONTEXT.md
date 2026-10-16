@@ -337,7 +337,8 @@ When output names a domain concept, use the term as defined here.
   after the status itself has moved on. An **idle unload** and the load after
   it are not switches and leave it as it was.
 - **Idle unload** — tearing the loaded model down after `model.idle_unload`
-  seconds (default 300, 0 = never) with no request using it and the engine
+  seconds (default 0 = never, ADR 0049's amendment; a positive value opts in)
+  with no request using it and the engine
   empty, the way a switch tears one down, while the process and the API stay
   up (ADR 0049). `GET /v1/models` then reports `status: unloaded` under the
   same id; the next authenticated request that needs the model loads it again

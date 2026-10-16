@@ -354,7 +354,7 @@ change does not reach and a `null` removes.
 | `model download` / `model list` | — | — | Fetch catalog entries, or list them ([above](#fetching-one-ignis-server-model-download)). |
 | `--server-request-timeout <secs>` | `IGNIS_SERVER_REQUEST_TIMEOUT` | `30` (max `3600`) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
 | `--switch-drain-timeout <secs>` | `IGNIS_SWITCH_DRAIN_TIMEOUT` | `30` (max `3600`) | How long a model switch lets the old model's running requests finish before it cancels them (`0` cancels at once). |
-| `--model-idle-unload <secs>` | `IGNIS_MODEL_IDLE_UNLOAD` | `300` (max `604800`) | Seconds with no request using the model before it is unloaded, the server staying up; the next request loads it again ([below](#idle-unload)). `0` never unloads. Patchable live. |
+| `--model-idle-unload <secs>` | `IGNIS_MODEL_IDLE_UNLOAD` | `0` — never (max `604800`) | Seconds with no request using the model before it is unloaded, the server staying up; the next request loads it again ([below](#idle-unload)). Off unless you set it. Patchable live. |
 | `--model-host-margin-bytes <bytes>` | `IGNIS_MODEL_HOST_MARGIN_BYTES` | `4G` | What Flash-Next's host plan must leave of the RAM available at load (free plus standby): a load whose pinned lines leave less is refused, naming the line to shrink ([Host RAM for Flash-Next](#host-ram-for-flash-next)). Per family as `--qwen38flashnext-model-host-margin-bytes`, which a 27B or image-model start takes for a later switch; neither makes a host plan. (`make` knob `HOST_MARGIN_BYTES`.) |
 | `--switch-allow-implicit <true\|false>` | `IGNIS_SWITCH_ALLOW_IMPLICIT` | `true` | A request whose `model` names another model `--switch-known-models` lists switches the server to it, then is served on it. `false`: such a request is a `404 model_not_found`, as an unknown model is. `POST /v1/models/switch` is not affected. |
 | `--switch-known-models <id>=<path>` (repeatable) | `IGNIS_SWITCH_KNOWN_MODELS` (`;`-separated pairs) | the start model only | A model a request may switch to by naming it, and the artifact it loads from. The model the server starts on is always listed. Any flag replaces the env var whole; an id named twice is refused. |
@@ -761,7 +761,7 @@ tokens does not move the card.
 ### Idle unload
 
 A model nobody uses gives the card back. After `--model-idle-unload` seconds
-(file key `model.idle_unload`, default `300`) with no request in flight and
+(file key `model.idle_unload`, default `0` = never) with no request in flight and
 nothing waiting or running on the engine, the server unloads the model the way
 a switch does — VRAM, pinned host memory and KV-RAM all freed — and stays up:
 the API, `/metrics` and the Playground keep answering, and `GET /v1/models`
@@ -793,9 +793,12 @@ request begins after it are logged (`ignis.model.unloaded`,
 A `POST /v1/models/switch` or a reloading `PATCH /v1/config` while unloaded is
 still a switch or a reload, and is recorded in `last_switch` like any other.
 
-`0` never unloads. The value is patchable live — `PATCH /v1/config` with
+The default is `0`: the model is never unloaded unless you ask (`model.idle_unload`
+or `IDLE_UNLOAD=<seconds>`). This host's 27B takes 13–33 s to load and loses its
+retained prompt state when it goes, so giving the card back is a deliberate act,
+not a timer. The value is patchable live — `PATCH /v1/config` with
 `{"model": {"idle_unload": 600}}` takes effect at once, counting from the
-change. A measurement should not meet a cold reload: the Makefile's
+change. A measurement must never meet a cold reload: the Makefile's
 `IDLE_UNLOAD=0` passes `--model-idle-unload 0`, and the A/B and TTFT session
 scripts do so themselves.
 

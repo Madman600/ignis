@@ -113,10 +113,12 @@ pub const DEFAULT_SWITCH_DRAIN_TIMEOUT_SECS: u32 = 30;
 pub const MAX_SWITCH_DRAIN_TIMEOUT_SECS: u32 = 3600;
 
 /// How long the loaded model may go unused before it is unloaded, in seconds
-/// (`--model-idle-unload`, spec model-switch/02, ADR 0049): five minutes
-/// gives the card back to whoever else needs it without paying a cold load
-/// between the turns of one conversation. 0 never unloads.
-pub const DEFAULT_MODEL_IDLE_UNLOAD_SECS: u32 = 300;
+/// (`--model-idle-unload`, spec model-switch/02, ADR 0049). **0 — never
+/// unload** is the default (ADR 0049's amendment, 2026-10-15): this host's
+/// 27B costs 13–33 s to come back and loses its retained prompt state, and
+/// the card's other users ask for it by hand. A positive value is what gives
+/// the card back on its own, so an operator who wants that sets it.
+pub const DEFAULT_MODEL_IDLE_UNLOAD_SECS: u32 = 0;
 
 /// The upper bound `--model-idle-unload` accepts: a week, a ceiling against a
 /// fat-fingered value as [`MAX_SWITCH_DRAIN_TIMEOUT_SECS`] is for its flag —

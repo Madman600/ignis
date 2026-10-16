@@ -1190,13 +1190,14 @@ fn the_switch_drain_timeout_defaults_to_thirty_seconds_takes_zero_and_has_a_ceil
 
 // ── idle unload (spec model-switch/02, GitHub #317) ──────────────────────
 
-/// AC 1: `model.idle_unload` resolves from flag, env and file with the usual
-/// precedence, defaults to five minutes, takes 0 (never), refuses a value
-/// past its ceiling naming both, and is visible and patchable with no reload.
+/// AC 1 (as amended 2026-10-15): `model.idle_unload` resolves from flag, env
+/// and file with the usual precedence, defaults to 0 (never unload), takes a
+/// positive value, refuses one past its ceiling naming both, and is visible
+/// and patchable with no reload.
 #[test]
-fn the_idle_unload_defaults_to_five_minutes_takes_zero_and_has_a_ceiling() {
-    assert_eq!(config(&[]).idle_unload_secs, 300);
-    assert_eq!(DEFAULT_MODEL_IDLE_UNLOAD_SECS, 300);
+fn the_idle_unload_defaults_to_never_takes_a_positive_value_and_has_a_ceiling() {
+    assert_eq!(config(&[]).idle_unload_secs, 0, "off unless the operator asks (ADR 0049 amendment)");
+    assert_eq!(DEFAULT_MODEL_IDLE_UNLOAD_SECS, 0);
     let env = env_map(&[("IGNIS_MODEL_IDLE_UNLOAD", "90")]);
     assert_eq!(expect_config(resolve(&[], env).expect("resolve")).idle_unload_secs, 90);
     let env = env_map(&[("IGNIS_MODEL_IDLE_UNLOAD", "90")]);

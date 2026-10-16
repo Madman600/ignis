@@ -191,7 +191,7 @@ async fn the_fields_route_lists_idle_unload_patchable_with_no_reload() {
     let field = fields["data"].as_array().unwrap().iter().find(|field| field["file_key"] == "model.idle_unload").expect("listed");
     assert_eq!((field["patchable"].clone(), field["reload_required"].clone()), (json!(true), json!(false)), "{field}");
     assert_eq!((field["flag"].clone(), field["env"].clone()), (json!("--model-idle-unload"), json!("IGNIS_MODEL_IDLE_UNLOAD")));
-    assert_eq!(field["default"], 300, "{field}");
+    assert_eq!(field["default"], 0, "{field} (off unless configured, ADR 0049 amendment)");
 }
 
 /// AC 3: zero never unloads, however long the clock runs.

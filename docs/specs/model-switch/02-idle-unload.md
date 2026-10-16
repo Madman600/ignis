@@ -184,3 +184,12 @@ Where the implementation chose what the sections above leave open.
 - **Make.** No Make target starts a server for a measurement by itself; the
   knob is `IDLE_UNLOAD` (passed as `--model-idle-unload`), and
   `scripts/swarm-ab.sh` and `scripts/vision-ttft-session.sh` pass 0.
+
+## Amendment (2026-10-15)
+
+The **default is 0** (never unload) instead of the 300 this spec asked for; see
+ADR 0049's amendment. The AC 1 line above (`default 300`) is superseded on that
+point only: `config/tests.rs` and `/v1/config/fields` now expect `0`, and every
+other criterion — the clock, the statuses, the load on demand, what counts as
+use, the patchability, the ceiling — is unchanged and still tested. A positive
+`model.idle_unload` arms the clock exactly as before.
