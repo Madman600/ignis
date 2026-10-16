@@ -671,6 +671,13 @@ impl Server {
     /// (tests). A metrics listener without metrics on
     /// ([`Server::with_metrics`]) is refused with `InvalidInput` before
     /// anything is served.
+    ///
+    /// After the HTTP drain, the loaded model is shut down and its driver
+    /// thread is joined ([`ActiveModel::shut_down`]) before this returns.
+    /// Dropping the `JoinHandle` without joining would detach `ignis-model`;
+    /// on Linux that thread can hang in CUDA teardown and leave the process
+    /// a VRAM-holding zombie under init — so serve exit must join, the same
+    /// way a model switch does.
     pub async fn serve_on_until(
         self,
         listener: tokio::net::TcpListener,
@@ -684,11 +691,24 @@ impl Server {
         // Spec model-switch/02: an unused model leaves the card while this
         // serves; the clock stops when serving does.
         let _idle_clock = self.spawn_idle_clock(idle::IDLE_TICK);
-        let (metrics_listener, metrics_app) = match (metrics_listener, self.metrics_app()) {
-            (None, _) => {
-                return axum::serve(listener, app).with_graceful_shutdown(shutdown).await;
+        let serve_result = match (metrics_listener, self.metrics_app()) {
+            (None, _) => axum::serve(listener, app).with_graceful_shutdown(shutdown).await,
+            (Some(metrics_listener), Some(metrics_app)) => {
+                // One shutdown, fanned out to both listeners.
+                let (stop, stopped) = tokio::sync::watch::channel(());
+                let signal = async move {
+                    shutdown.await;
+                    let _ = stop.send(());
+                    Ok::<(), std::io::Error>(())
+                };
+                let wait = |mut stopped: tokio::sync::watch::Receiver<()>| async move {
+                    let _ = stopped.changed().await;
+                };
+                let api = axum::serve(listener, app).with_graceful_shutdown(wait(stopped.clone()));
+                let metrics =
+                    axum::serve(metrics_listener, metrics_app).with_graceful_shutdown(wait(stopped));
+                tokio::try_join!(signal, api.into_future(), metrics.into_future()).map(|_| ())
             }
-            (Some(metrics_listener), Some(metrics_app)) => (metrics_listener, metrics_app),
             (Some(_), None) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -696,19 +716,23 @@ impl Server {
                 ));
             }
         };
-        // One shutdown, fanned out to both listeners.
-        let (stop, stopped) = tokio::sync::watch::channel(());
-        let signal = async move {
-            shutdown.await;
-            let _ = stop.send(());
-            Ok::<(), std::io::Error>(())
-        };
-        let wait = |mut stopped: tokio::sync::watch::Receiver<()>| async move {
-            let _ = stopped.changed().await;
-        };
-        let api = axum::serve(listener, app).with_graceful_shutdown(wait(stopped.clone()));
-        let metrics = axum::serve(metrics_listener, metrics_app).with_graceful_shutdown(wait(stopped));
-        tokio::try_join!(signal, api.into_future(), metrics.into_future()).map(|_| ())
+        // Join before returning to `main`: `ignis.process.stopped` must stay
+        // the last log line (spec §28), and that is emitted after this returns.
+        self.join_active_model().await;
+        serve_result
+    }
+
+    /// Stop the loaded model and join its driver thread off the async
+    /// workers (same path as a model switch's teardown).
+    async fn join_active_model(&self) {
+        let model = self.active();
+        if let Err(panicked) = tokio::task::spawn_blocking(move || model.shut_down()).await {
+            tracing::error!(
+                name: "ignis.model.teardown_panicked",
+                error = %panicked,
+                "joining the model thread after serve panicked"
+            );
+        }
     }
 }
 
