@@ -184,6 +184,10 @@ pub use ffi::{IgnisModelReservations, IgnisModelStats};
 /// A loaded model handle (releases via `ignis_model_free` on [`Drop`]).
 pub struct Model {
     handle: *mut ffi::IgnisModel,
+    /// One token's gathered n-gram rows on a Flash-Next load (its table's
+    /// heads times its row bytes: 1,440 INT4, 2,592 FP8; spec flash-next/08);
+    /// 0 on a model without the n-gram embedding.
+    ngram_token_bytes: usize,
 }
 
 impl Model {
@@ -198,6 +202,11 @@ impl Model {
     /// The raw handle the step ABI (`crate::step`, GitHub #54) passes to
     /// `ignis_prefill` / `ignis_decode`. `pub(crate)`: never exposed outside
     /// this crate (mirrors the handle's own C-ABI opacity).
+    /// One token's n-gram row bytes, as this load's table stores them.
+    pub fn ngram_token_bytes(&self) -> usize {
+        self.ngram_token_bytes
+    }
+
     pub(crate) fn handle(&self) -> *mut ffi::IgnisModel {
         self.handle
     }
@@ -672,7 +681,7 @@ pub fn load_qwen38_27b_with_options(
         let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
         return Err(message.to_string_lossy().into_owned());
     }
-    Ok(Model { handle })
+    Ok(Model { handle, ngram_token_bytes: 0 })
 }
 
 /// What [`load_qwen38_27b_with_options`] would reserve beside the weights for
@@ -874,7 +883,15 @@ pub fn load_flash_next(
         let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
         return Err(message.to_string_lossy().into_owned());
     }
-    Ok(Model { handle })
+    Ok(Model { handle, ngram_token_bytes: flash_next_ngram_token_bytes(geometry, fn_plan.ngram_format)? })
+}
+
+/// One token's gathered n-gram rows, as the leaf reads them for a table of
+/// `format`: the heads times the row bytes (1,440 INT4, 2,592 FP8; spec
+/// flash-next/08).
+pub fn flash_next_ngram_token_bytes(geometry: &FlashNextGeometry, format: ignis_artifact::NumericFormat) -> Result<usize, String> {
+    let row = ignis_artifact::row_interleaved_geometry(format, &[1, geometry.ngram_head_dim]).map_err(|e| e.to_string())?;
+    Ok((geometry.ngram_heads() * row.row_bytes) as usize)
 }
 
 /// What a load of a Flash-Next artifact would reserve beside the weights,
@@ -949,6 +966,17 @@ pub fn plan_flash_next_reservations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec flash-next/08: the leaf's n-gram rows per token follow the bound
+    /// table's format (the FP8 A/B's first run refused 2,592-byte tokens
+    /// against a fixed 1,440).
+    #[test]
+    fn a_tokens_ngram_rows_follow_the_tables_format() {
+        let g = FlashNextGeometry::qwen38_flash_next();
+        assert_eq!(flash_next_ngram_token_bytes(&g, ignis_artifact::NumericFormat::Q4G32F16S).unwrap(), 1_440);
+        assert_eq!(flash_next_ngram_token_bytes(&g, ignis_artifact::NumericFormat::Fp8E4M3FnRowBf16S).unwrap(), 2_592);
+        assert!(flash_next_ngram_token_bytes(&g, ignis_artifact::NumericFormat::Bf16).is_err());
+    }
 
     /// GitHub #302: the descriptors this loader builds for the artifact
     /// crate's Flash-Next fixture artifact (packed from its converter work
