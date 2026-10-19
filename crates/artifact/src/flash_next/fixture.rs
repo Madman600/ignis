@@ -47,6 +47,9 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 pub struct WorkTree {
     root: PathBuf,
     pub geometry: FlashNextGeometry,
+    /// The n-gram table's format: the converter's INT4 (the default) or the
+    /// FP8 table carried verbatim (spec flash-next/08).
+    pub ngram_format: crate::NumericFormat,
 }
 
 impl WorkTree {
@@ -61,6 +64,7 @@ impl WorkTree {
         Ok(Self {
             root,
             geometry: FlashNextGeometry::fixture(),
+            ngram_format: crate::NumericFormat::Q4G32F16S,
         })
     }
 
@@ -156,16 +160,13 @@ impl WorkTree {
                 let table = dir.join("table");
                 std::fs::create_dir_all(&table).map_err(io(&table))?;
                 let name = super::ngram_table_name(g);
-                let row_bytes = crate::row_interleaved_geometry(
-                    crate::NumericFormat::Q4G32F16S,
-                    &[1, g.ngram_head_dim],
-                )?
-                .row_bytes;
+                let row_bytes = crate::row_interleaved_geometry(self.ngram_format, &[1, g.ngram_head_dim])?.row_bytes;
+                let ext = if self.ngram_format == crate::NumericFormat::Fp8E4M3FnRowBf16S { "fp8" } else { "int4" };
                 let bytes = pattern(&name, g.ngram_rows * row_bytes);
                 // Two shards, split on a row boundary.
                 let split = (g.ngram_rows / 2 * row_bytes) as usize;
-                write(&table.join("shard_000.int4"), &bytes[..split])?;
-                write(&table.join("shard_001.int4"), &bytes[split..])?;
+                write(&table.join(format!("shard_000.{ext}")), &bytes[..split])?;
+                write(&table.join(format!("shard_001.{ext}")), &bytes[split..])?;
                 mark_done(&table)?;
                 let words = |values: Vec<i64>| -> Vec<u8> {
                     values.iter().flat_map(|v| v.to_le_bytes()).collect()

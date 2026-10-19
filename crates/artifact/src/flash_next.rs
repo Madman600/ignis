@@ -367,6 +367,10 @@ fn host_vector(name: String, format: NumericFormat, shape: ShapeRule) -> Entry {
 }
 
 /// The table's object name.
+/// The n-gram table's formats a container may carry (spec flash-next/08):
+/// the converter's INT4 table, or Qwen's FP8 table carried verbatim.
+pub const NGRAM_TABLE_FORMATS: [NumericFormat; 2] = [NumericFormat::Q4G32F16S, NumericFormat::Fp8E4M3FnRowBf16S];
+
 pub fn ngram_table_name(geometry: &FlashNextGeometry) -> String {
     format!("layers.{}.ple.ple_embedding.ngram_embedding.weight", geometry.ple_layer)
 }
@@ -573,6 +577,9 @@ pub struct FlashNextPlan {
     pub experts: ExpertIndex,
     /// Every non-expert tensor and frontend resource, by name.
     pub handles: BTreeMap<String, ObjectHandle>,
+    /// The n-gram table's format, as the container stores it (one of
+    /// [`NGRAM_TABLE_FORMATS`]).
+    pub ngram_format: NumericFormat,
 }
 
 /// Bind a Flash-Next artifact: every object of the inventory is required
@@ -600,6 +607,8 @@ pub fn bind(reader: &Reader, geometry: &FlashNextGeometry) -> Result<FlashNextPl
     for layer in 0..geometry.layers {
         entries.extend(layer_entries(geometry, layer));
     }
+    let table_name = ngram_table_name(geometry);
+    let mut ngram_format = None;
     for entry in &entries {
         let shape = match &entry.shape {
             ShapeRule::Exact(shape) => shape.clone(),
@@ -611,7 +620,22 @@ pub fn bind(reader: &Reader, geometry: &FlashNextGeometry) -> Result<FlashNextPl
                 _ => return Err(fail(format!("required artifact object is missing: {}", entry.name))),
             },
         };
-        let handle = binder.require_tensor(&entry.name, entry.format, entry.layout, &shape)?;
+        let handle = if entry.name == table_name {
+            let (handle, format) = binder
+                .require_tensor_of(&entry.name, &NGRAM_TABLE_FORMATS, entry.layout, &shape)
+                .map_err(|_| match reader.find(&entry.name) {
+                    Some(Object::Tensor(t)) if !NGRAM_TABLE_FORMATS.contains(&t.format) => fail(format!(
+                        "n-gram table {} is {}: a Flash-Next container carries Q4G32_F16S or FP8_E4M3FN_ROW_BF16S",
+                        entry.name,
+                        t.format.name()
+                    )),
+                    _ => fail(format!("tensor descriptor does not match target contract: {}", entry.name)),
+                })?;
+            ngram_format = Some(format);
+            handle
+        } else {
+            binder.require_tensor(&entry.name, entry.format, entry.layout, &shape)?
+        };
         match entry.role {
             Role::Device => binder.materialize_on_device(handle)?,
             Role::Host => binder.retain_tensor_on_host(handle)?,
@@ -646,6 +670,7 @@ pub fn bind(reader: &Reader, geometry: &FlashNextGeometry) -> Result<FlashNextPl
 
     let plan = binder.finish()?;
     Ok(FlashNextPlan {
+        ngram_format: ngram_format.expect("the inventory names the n-gram table"),
         plan,
         experts: ExpertIndex {
             experts_per_layer: geometry.experts as usize,
@@ -849,6 +874,25 @@ mod tests {
         assert_eq!(i64::from_le_bytes(bytes[..8].try_into().unwrap()), 23_703_573_157_769);
         assert!(loaded.resource_bytes(multipliers).is_err(), "a tensor is not a resource");
         assert_eq!(loaded.stats().resource_count, 7, "the frontend only");
+    }
+
+    #[test]
+    fn an_fp8_table_binds_streamed_and_reports_its_format() {
+        // spec flash-next/08: the packer takes `.fp8` shards as FP8_E4M3FN_ROW_BF16S rows.
+        let mut tree = fixture::WorkTree::new("fp8-table").unwrap();
+        tree.ngram_format = NumericFormat::Fp8E4M3FnRowBf16S;
+        tree.write_all().unwrap();
+        let artifact = fixture::build_from(tree).unwrap();
+        let reader = open(&artifact);
+        let geometry = FlashNextGeometry::fixture();
+        let bound = bind(&reader, &geometry).unwrap();
+        assert_eq!(bound.ngram_format, NumericFormat::Fp8E4M3FnRowBf16S);
+        let streamed = bound.plan.streamed_objects[0];
+        assert_eq!(streamed.handle, bound.handles[&ngram_table_name(&geometry)]);
+        assert_eq!(streamed.bytes, geometry.ngram_rows * 162);
+
+        let int4 = fixture::build("int4-table").unwrap();
+        assert_eq!(bind(&open(&int4), &geometry).unwrap().ngram_format, NumericFormat::Q4G32F16S);
     }
 
     #[test]

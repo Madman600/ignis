@@ -808,10 +808,18 @@ fn plan_ngram(plan: &mut UnitPlan, done: &Done, geometry: &FlashNextGeometry) ->
     if shards.is_empty() {
         return Err(fail(format!("{} has no table shards", plan.dir.display())));
     }
+    // The extension names the table's format (spec flash-next/08): `.int4`
+    // the converter's INT4 rows, `.fp8` Qwen's FP8 rows carried verbatim.
+    let first = shards.keys().next().expect("checked non-empty");
+    let (ext, table_format) = if first.ends_with(".fp8") {
+        ("fp8", NumericFormat::Fp8E4M3FnRowBf16S)
+    } else {
+        ("int4", NumericFormat::Q4G32F16S)
+    };
     for (at, name) in shards.keys().enumerate() {
-        if *name != format!("shard_{at:03}.int4") {
+        if *name != format!("shard_{at:03}.{ext}") {
             return Err(fail(format!(
-                "table file {name} is not shard_{at:03}.int4: the shards must run 000.. without a gap"
+                "table file {name} is not shard_{at:03}.{ext}: the shards must run 000.. without a gap, in one format"
             )));
         }
     }
@@ -835,7 +843,7 @@ fn plan_ngram(plan: &mut UnitPlan, done: &Done, geometry: &FlashNextGeometry) ->
         table_done.insert(format!("table/{name}"), entry.clone());
     }
     let columns = geometry.ngram_head_dim;
-    let row_bytes = crate::row_interleaved_geometry(NumericFormat::Q4G32F16S, &[1, columns])?.row_bytes;
+    let row_bytes = crate::row_interleaved_geometry(table_format, &[1, columns])?.row_bytes;
     let mut slices = Vec::with_capacity(shards.len());
     let mut rows = 0u64;
     for name in shards.keys() {
@@ -858,7 +866,7 @@ fn plan_ngram(plan: &mut UnitPlan, done: &Done, geometry: &FlashNextGeometry) ->
     plan.objects.push(Planned {
         name: crate::flash_next::ngram_table_name(geometry),
         spec: Spec::Tensor {
-            format: NumericFormat::Q4G32F16S,
+            format: table_format,
             layout: StorageLayout::RowInterleavedV1,
             shape: vec![rows, columns],
         },
