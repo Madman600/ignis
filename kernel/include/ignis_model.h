@@ -121,16 +121,24 @@ struct ignis_indexer_topology {
   uint64_t budget;
 };
 
+/* The n-gram table's row formats (spec flash-next/08): the converter's INT4
+ * rows (layout.md 7.1), or Qwen's FP8 rows carried verbatim with the row's
+ * bf16 scale after them. */
+#define IGNIS_NGRAM_TABLE_Q4G32_F16S 0
+#define IGNIS_NGRAM_TABLE_FP8_E4M3FN_ROW_BF16S 1
+
 /* The device side of the n-gram embedding (its hashing is the host's): 2- to
  * `ngram_size`-grams of `heads_per_ngram` heads, concatenated to
  * `embed_dim`, a causal conv of `conv_kernel` at dilation `ngram_size`,
- * added to decoder layer `layer`'s input. */
+ * added to decoder layer `layer`'s input. `table_format` is how the gathered
+ * rows are stored, one of IGNIS_NGRAM_TABLE_*. */
 struct ignis_ngram_topology {
   uint64_t ngram_size;
   uint64_t heads_per_ngram;
   uint64_t embed_dim;
   uint64_t conv_kernel;
   uint64_t layer;
+  uint64_t table_format;
 };
 
 /* The text topology: layer kinds, head/rotary geometry, GDN state widths,
@@ -181,7 +189,7 @@ struct ignis_topology {
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(struct ignis_topology) == 288,
+static_assert(sizeof(struct ignis_topology) == 296,
               "ignis_topology drifted from crates/core/src/compute.rs IgnisTopology");
 static_assert(offsetof(struct ignis_topology, rms_norm_eps) == 128 &&
                   offsetof(struct ignis_topology, family) == 132 &&

@@ -849,7 +849,7 @@ pub fn load_flash_next(
         Ok((view.bytes, view.base as *const c_void))
     };
     let (_names, tensors) = build_flash_next_bound_tensors(fn_plan, geometry, placement)?;
-    let topology = ModelConfig::flash_next_from(geometry).topology_abi();
+    let topology = ModelConfig::flash_next_from(geometry).topology_abi().with_ngram_table_format(fn_plan.ngram_format);
     let mut options = flash_next_options(decode_lanes, residency.as_raw(), speculation);
     // Spec flash-next/07: the MTP head's tensors beside the trunk's, and its expert slots.
     let mut tensors = tensors;
@@ -918,7 +918,7 @@ pub fn plan_flash_next_reservations(
         None => (Vec::new(), Vec::new()),
     };
     tensors.extend(head);
-    let topology = ModelConfig::flash_next_from(geometry).topology_abi();
+    let topology = ModelConfig::flash_next_from(geometry).topology_abi().with_ngram_table_format(fn_plan.ngram_format);
     let options = flash_next_options(decode_lanes, std::ptr::null_mut(), speculation);
     let mut reservations = IgnisModelReservations::default();
     let rc = unsafe {

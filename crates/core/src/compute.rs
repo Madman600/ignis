@@ -928,6 +928,19 @@ pub struct IgnisIndexerTopology {
     pub budget: u64,
 }
 
+/// `IGNIS_NGRAM_TABLE_Q4G32_F16S`: the converter's INT4 table rows.
+pub const NGRAM_TABLE_Q4G32_F16S: u64 = 0;
+/// `IGNIS_NGRAM_TABLE_FP8_E4M3FN_ROW_BF16S`: Qwen's FP8 rows, verbatim (spec flash-next/08).
+pub const NGRAM_TABLE_FP8_E4M3FN_ROW_BF16S: u64 = 1;
+
+/// The `table_format` code of an artifact's n-gram table format.
+pub fn ngram_table_format_code(format: ignis_artifact::NumericFormat) -> u64 {
+    match format {
+        ignis_artifact::NumericFormat::Fp8E4M3FnRowBf16S => NGRAM_TABLE_FP8_E4M3FN_ROW_BF16S,
+        _ => NGRAM_TABLE_Q4G32_F16S,
+    }
+}
+
 /// 1:1 with `struct ignis_ngram_topology`: what the device side of the
 /// n-gram embedding is shaped by (the hashing is the host's, `crate::ngram`).
 /// All zero without an n-gram embedding.
@@ -939,6 +952,9 @@ pub struct IgnisNgramTopology {
     pub embed_dim: u64,
     pub conv_kernel: u64,
     pub layer: u64,
+    /// One of the `NGRAM_TABLE_*` codes: set from the bound artifact at load
+    /// ([`TopologyAbi::with_ngram_table_format`]), never from the checkpoint.
+    pub table_format: u64,
 }
 
 /// 1:1 with `struct ignis_topology` (`kernel/include/ignis_model.h`). Not
@@ -989,6 +1005,12 @@ impl TopologyAbi {
     pub fn raw(&self) -> &IgnisTopology {
         &self.raw
     }
+
+    /// The n-gram table's row format, as the bound artifact stores it.
+    pub fn with_ngram_table_format(mut self, format: ignis_artifact::NumericFormat) -> Self {
+        self.raw.ngram.table_format = ngram_table_format_code(format);
+        self
+    }
 }
 
 impl ModelConfig {
@@ -1022,6 +1044,7 @@ impl ModelConfig {
             embed_dim: ngram.embed_dim,
             conv_kernel: ngram.conv_kernel,
             layer: ngram.layer as u64,
+            table_format: NGRAM_TABLE_Q4G32_F16S,
         });
         let raw = IgnisTopology {
             num_layers: layer_kinds.len() as u32,
@@ -1299,8 +1322,12 @@ mod tests {
         );
         assert_eq!(
             raw.ngram,
-            IgnisNgramTopology { ngram_size: 3, heads_per_ngram: 8, embed_dim: 2560, conv_kernel: 4, layer: 1 }
+            IgnisNgramTopology { ngram_size: 3, heads_per_ngram: 8, embed_dim: 2560, conv_kernel: 4, layer: 1, table_format: 0 }
         );
+        let fp8 = ModelConfig::qwen38_flash_next()
+            .topology_abi()
+            .with_ngram_table_format(ignis_artifact::NumericFormat::Fp8E4M3FnRowBf16S);
+        assert_eq!(fp8.raw().ngram.table_format, NGRAM_TABLE_FP8_E4M3FN_ROW_BF16S);
     }
 
     /// `struct ignis_topology` has no `size` field, so both sides pin its
@@ -1318,7 +1345,7 @@ mod tests {
         assert_eq!(offset_of!(IgnisTopology, hyper), 192);
         assert_eq!(offset_of!(IgnisTopology, indexer), 208);
         assert_eq!(offset_of!(IgnisTopology, ngram), 248);
-        assert_eq!(size_of::<IgnisTopology>(), 288);
+        assert_eq!(size_of::<IgnisTopology>(), 296);
     }
 
     /// The artifact crate keeps its own Flash-Next geometry (it sits below

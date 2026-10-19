@@ -36,6 +36,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <algorithm>
 #include <cmath>
@@ -87,17 +88,26 @@ __device__ float block_sum(float value, float *shared) {
   return shared[0];
 }
 
-// e[r][h * head_dim + i] = bf16((nibble - 8) * scale): byte i / 2 of row h
-// holds value i in its low nibble when i is even, its high one when odd; the
-// fp16 scales follow the codes (layout.md 7.1).
+// INT4 rows (layout.md 7.1): e[r][h * head_dim + i] = bf16((nibble - 8) *
+// scale): byte i / 2 of row h holds value i in its low nibble when i is even,
+// its high one when odd; the fp16 scales follow the codes.
+// FP8 rows (spec flash-next/08): e = bf16(fp8_e4m3fn(byte i) * scale), the
+// row's bf16 scale after its head_dim bytes.
 __global__ void dequant_rows(const uint8_t *rows_int4, int32_t tokens, int32_t t0, int32_t n,
-                             int32_t heads, int32_t head_dim, int32_t row_bytes, __nv_bfloat16 *e) {
+                             int32_t heads, int32_t head_dim, int32_t row_bytes, bool fp8, __nv_bfloat16 *e) {
   const int32_t r = blockIdx.x;
   const int32_t width = heads * head_dim;
   const uint8_t *token = rows_int4 + source_row(r, n, tokens, t0) * heads * row_bytes;
   for (int32_t v = threadIdx.x; v < width; v += blockDim.x) {
     const uint8_t *row = token + static_cast<std::size_t>(v / head_dim) * row_bytes;
     const int32_t i = v % head_dim;
+    if (fp8) {
+      const __half_raw code = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(row[i]), __NV_E4M3);
+      const uint16_t bits = static_cast<uint16_t>(row[head_dim] | (row[head_dim + 1] << 8));
+      const float scale = __bfloat162float(__ushort_as_bfloat16(bits));
+      e[static_cast<std::size_t>(r) * width + v] = __float2bfloat16_rn(__half2float(__half(code)) * scale);
+      continue;
+    }
     const uint8_t byte = row[i / 2];
     const int32_t nibble = (i & 1) ? (byte >> 4) : (byte & 0xF);
     const uint8_t *scale_at = row + head_dim / 2 + 2 * (i / kScaleGroup);
@@ -249,6 +259,10 @@ std::string check(const Context &ctx, const NgramWeights &w, const Batch &batch)
     return "n-gram geometry: " + std::to_string(g.ngram_heads) + " heads of an embedding of " +
            std::to_string(g.ngram_embed_dim);
   }
+  if (g.ngram_table_format != IGNIS_NGRAM_TABLE_Q4G32_F16S &&
+      g.ngram_table_format != IGNIS_NGRAM_TABLE_FP8_E4M3FN_ROW_BF16S) {
+    return "unknown n-gram table format " + std::to_string(g.ngram_table_format);
+  }
   if (g.ngram_conv_kernel != kConvKernel || g.ngram_size != kDilation) {
     return "the n-gram conv is specialized on kernel 4 and dilation 3, the topology has kernel " +
            std::to_string(g.ngram_conv_kernel) + " and n-gram size " + std::to_string(g.ngram_size);
@@ -303,7 +317,7 @@ int32_t fn_ngram_add(const Context &ctx, const NgramWeights &w, const Batch &bat
       const int32_t n = std::min(per_lane, batch.tokens - t0);
       const int32_t window = batch.lanes * n;
       dequant_rows<<<window, kThreads, 0, stream>>>(rows, batch.tokens, t0, n, g.ngram_heads,
-                                                     g.ngram_head_dim(), g.ngram_row_bytes(), e);
+                                                     g.ngram_head_dim(), g.ngram_row_bytes(), g.ngram_table_fp8(), e);
       if (!launched("dequant")) return -1;
       if (fn_linear(w.key_proj, e, window, k, false, scratch, stream) != 0 ||
           fn_linear(w.value_proj, e, window, v, false, scratch, stream) != 0) {

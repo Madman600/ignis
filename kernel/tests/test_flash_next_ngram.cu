@@ -19,6 +19,8 @@
 //                slots and positions refreshed in place: bit for bit the eager rounds.
 //   windows      300 tokens in one call (two internal windows): matches 150 + 150.
 //   fresh        a slot left dirty by an earlier sequence: a call at position 0 ignores it.
+//   fp8 table    spec flash-next/08: FP8 E4M3FN rows with a bf16 row scale through the same
+//                call: one shot matches the host model's FP8 decode, chunked matches one shot.
 //
 // Every call's scratch arena is exactly fn_ngram_add_scratch_bytes(): the declaration is held.
 //
@@ -47,7 +49,7 @@ namespace {
 
 // ---- record.py's geometry and generation constants ----------------------------------------
 constexpr int kHidden = 2560, kStreams = 4, kWidth = kHidden * kStreams;
-constexpr int kEmbed = 2560, kHeads = 16, kHeadDim = 160, kRowBytes = 90;
+constexpr int kEmbed = 2560, kHeads = 16, kHeadDim = 160, kRowBytes = 90, kFp8RowBytes = 162;
 constexpr int kKernel = 4, kDilation = 3, kState = (kKernel - 1) * kDilation;
 constexpr int kTokens = 16;
 constexpr float kEps = 1e-6F;
@@ -91,6 +93,25 @@ std::vector<uint8_t> gathered_rows(uint32_t codes_stream, uint32_t scales_stream
   return raw;
 }
 
+// spec flash-next/08's rows: 160 hashed FP8 E4M3FN codes (never a NaN code), then the row's bf16
+// scale, sized so the values span about what the INT4 rows do.
+std::vector<uint8_t> gathered_fp8_rows(uint32_t codes_stream, uint32_t scales_stream, int tokens) {
+  const std::size_t n = static_cast<std::size_t>(tokens) * kHeads;
+  std::vector<uint8_t> raw(n * kFp8RowBytes);
+  for (std::size_t row = 0; row < n; ++row) {
+    uint8_t *out = &raw[row * kFp8RowBytes];
+    for (int b = 0; b < kHeadDim; ++b) {
+      uint8_t c = static_cast<uint8_t>(hash_u32(codes_stream, row * kHeadDim + b) & 0xFF);
+      if ((c & 0x7F) == 0x7F) c ^= 1u;
+      out[b] = c;
+    }
+    const float s = ROW_SCALE_MAG / 64.0F * (0.5F + std::fabs(hash_uniform(scales_stream, row, 1.0F)));
+    const uint16_t bits = f32_to_bf16(s);
+    std::memcpy(out + kHeadDim, &bits, 2);
+  }
+  return raw;
+}
+
 struct Weights {
   Fp8Matrix key, value;
   std::vector<uint16_t> norm_key, norm_query, norm_conv, conv;
@@ -113,13 +134,20 @@ Weights make_weights() {
 // layer's output; `contribution` (if given) receives that output before the residual add;
 // `columns` ([kState][kWidth], oldest first) is the conv state, carried.
 void host_ngram(const Weights &w, const uint8_t *rows, int tokens, std::vector<float> &hidden,
-                std::vector<float> &columns, std::vector<float> *contribution) {
+                std::vector<float> &columns, std::vector<float> *contribution, bool fp8 = false) {
   std::vector<double> e(kEmbed);
   std::vector<float> k(kWidth), v(kHidden);
+  const int row_bytes = fp8 ? kFp8RowBytes : kRowBytes;
   for (int t = 0; t < tokens; ++t) {
     for (int h = 0; h < kHeads; ++h) {
-      const uint8_t *row = rows + (static_cast<std::size_t>(t) * kHeads + h) * kRowBytes;
+      const uint8_t *row = rows + (static_cast<std::size_t>(t) * kHeads + h) * row_bytes;
       for (int i = 0; i < kHeadDim; ++i) {
+        if (fp8) {
+          uint16_t bits;
+          std::memcpy(&bits, row + kHeadDim, 2);
+          e[h * kHeadDim + i] = bf(e4m3_to_f32(row[i]) * bf16_to_f32(bits));
+          continue;
+        }
         const uint8_t byte = row[i / 2];
         const int nibble = (i & 1) ? (byte >> 4) : (byte & 0xF);
         uint16_t bits;
@@ -243,8 +271,9 @@ std::vector<float> to_float(const std::vector<uint16_t> &bits) {
 
 constexpr int kSlots = 4;
 
-fn::Geometry geometry() {
+fn::Geometry geometry(int32_t table_format = IGNIS_NGRAM_TABLE_Q4G32_F16S) {
   fn::Geometry g;
+  g.ngram_table_format = table_format;
   g.hidden = kHidden;
   g.streams = kStreams;
   g.ngram_size = kDilation;
@@ -260,9 +289,10 @@ struct Device {
   DeviceBytes key, value, norm_key, norm_query, norm_conv, conv, state;
   fn::NgramWeights w;
   fn::Context ctx;
+  int row_bytes;
 
-  explicit Device(const Weights &h)
-      : key(h.key.payload.size()), value(h.value.payload.size()), norm_key(kWidth * 2),
+  explicit Device(const Weights &h, int32_t table_format = IGNIS_NGRAM_TABLE_Q4G32_F16S)
+      : row_bytes(table_format == IGNIS_NGRAM_TABLE_FP8_E4M3FN_ROW_BF16S ? kFp8RowBytes : kRowBytes), key(h.key.payload.size()), value(h.value.payload.size()), norm_key(kWidth * 2),
         norm_query(kWidth * 2), norm_conv(kWidth * 2), conv(static_cast<std::size_t>(kWidth) * kKernel * 2),
         state(static_cast<std::size_t>(kSlots) * kState * kWidth * 2) {
     upload(key, h.key.payload);
@@ -281,7 +311,7 @@ struct Device {
     w.norm_query = norm_query.p;
     w.norm_conv = norm_conv.p;
     w.conv = conv.p;
-    ctx.g = geometry();
+    ctx.g = geometry(table_format);
     ctx.ngram.conv_columns = state.p;
   }
 
@@ -309,9 +339,9 @@ struct Device {
   }
 };
 
-// Rows [first, first + count) of a sequence's [tokens][kHeads][kRowBytes] rows.
-std::vector<uint8_t> row_slice(const std::vector<uint8_t> &rows, int first, int count) {
-  const std::size_t per = static_cast<std::size_t>(kHeads) * kRowBytes;
+// Rows [first, first + count) of a sequence's [tokens][kHeads][row_bytes] rows.
+std::vector<uint8_t> row_slice(const std::vector<uint8_t> &rows, int first, int count, int row_bytes = kRowBytes) {
+  const std::size_t per = static_cast<std::size_t>(kHeads) * row_bytes;
   return std::vector<uint8_t>(rows.begin() + first * per, rows.begin() + (first + count) * per);
 }
 
@@ -327,7 +357,7 @@ std::vector<uint16_t> run_chunks(Device &d, const std::vector<uint8_t> &rows, co
   int at = 0;
   for (const int count : chunks) {
     std::vector<uint16_t> h = hidden_slice(hidden, at, count);
-    d.call(row_slice(rows, at, count), h, 1, count, {slot}, {at});
+    d.call(row_slice(rows, at, count, d.row_bytes), h, 1, count, {slot}, {at});
     out.insert(out.end(), h.begin(), h.end());
     at += count;
   }
@@ -546,6 +576,27 @@ int main(int argc, char **argv) {
     const Diff d = diff(to_float(again), to_float(one_shot));
     report("fresh sequence in a used slot", d);
     check(d.max_abs == 0.0, "a sequence's first call ignores the slot's previous state");
+  }
+
+  std::printf("[device, FP8 table]\n");
+  {
+    check(geometry(IGNIS_NGRAM_TABLE_FP8_E4M3FN_ROW_BF16S).ngram_row_bytes() == kFp8RowBytes,
+          "an FP8 table row is 160 codes and a bf16 scale");
+    Device fp8_device(w, IGNIS_NGRAM_TABLE_FP8_E4M3FN_ROW_BF16S);
+    const auto fp8_rows = gathered_fp8_rows(S_ROW_CODES + 200, S_ROW_SCALES + 200, kTokens);
+    std::vector<float> fp8_host = to_float(hidden_in);
+    std::vector<float> columns(static_cast<std::size_t>(kState) * kWidth, 0.0F);
+    host_ngram(w, fp8_rows.data(), kTokens, fp8_host, columns, nullptr, /*fp8=*/true);
+    const auto fp8_one_shot = run_chunks(fp8_device, fp8_rows, hidden_in, {kTokens}, 2);
+    const Diff d = diff(to_float(fp8_one_shot), fp8_host);
+    report("fp8 one shot vs host model", d);
+    check(within_device(d), "FP8 table rows: one shot matches the host model's FP8 decode");
+    const auto fp8_chunked = run_chunks(fp8_device, fp8_rows, hidden_in, {5, 1, 1, 1, 2, 6}, 1);
+    const Diff c = diff(to_float(fp8_chunked), to_float(fp8_one_shot));
+    report("fp8 5+1+1+1+2+6 vs one shot", c);
+    check(within_device(c), "FP8 table rows: chunked prefill and decode match the one-shot call");
+    const Diff not_int4 = diff(to_float(fp8_one_shot), to_float(one_shot));
+    check(not_int4.max_abs > 0.0, "the FP8 rows are not decoded as INT4");
   }
 
   std::printf("%s\n", g_failed == 0 ? "PASS" : "FAIL");

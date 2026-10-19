@@ -117,6 +117,7 @@ struct Geometry {
   int32_t ngram_embed_dim = 0;
   int32_t ngram_conv_kernel = 0;
   int32_t ngram_layer = 0;
+  int32_t ngram_table_format = IGNIS_NGRAM_TABLE_Q4G32_F16S;
   float rms_norm_eps = 0.0F;
 
   int32_t residual_width() const { return streams * hidden; }
@@ -128,9 +129,13 @@ struct Geometry {
   // The n-gram conv's past columns: (kernel - 1) * dilation, dilation = ngram_size.
   int32_t ngram_conv_state_columns() const { return (ngram_conv_kernel - 1) * ngram_size; }
   // One table row's bytes: INT4 codes of a head_dim-wide row, then one fp16
-  // scale per 32 values (layout.md section 7.1: 90 on Flash-Next).
+  // scale per 32 values (layout.md section 7.1: 90 on Flash-Next); or one FP8
+  // byte a value, then the row's bf16 scale (spec flash-next/08: 162).
   int32_t ngram_head_dim() const { return ngram_embed_dim / ngram_heads; }
-  int32_t ngram_row_bytes() const { return ngram_head_dim() / 2 + ngram_head_dim() / 32 * 2; }
+  bool ngram_table_fp8() const { return ngram_table_format == IGNIS_NGRAM_TABLE_FP8_E4M3FN_ROW_BF16S; }
+  int32_t ngram_row_bytes() const {
+    return ngram_table_fp8() ? ngram_head_dim() + 2 : ngram_head_dim() / 2 + ngram_head_dim() / 32 * 2;
+  }
 
   static Geometry from(const ignis_topology &t) {
     Geometry g;
@@ -161,6 +166,7 @@ struct Geometry {
     g.ngram_embed_dim = static_cast<int32_t>(t.ngram.embed_dim);
     g.ngram_conv_kernel = static_cast<int32_t>(t.ngram.conv_kernel);
     g.ngram_layer = static_cast<int32_t>(t.ngram.layer);
+    g.ngram_table_format = static_cast<int32_t>(t.ngram.table_format);
     g.rms_norm_eps = t.rms_norm_eps;
     return g;
   }
