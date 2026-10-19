@@ -511,22 +511,26 @@ pub fn trellis_geometry(format: NumericFormat, shape: &[u64]) -> Result<TrellisG
 
 /// Geometry of a `row-interleaved-v1` payload for a (format, shape) tensor.
 ///
-/// Requires Q4G32_F16S and a positive rank-two shape whose column count is
-/// a multiple of 32.
+/// Requires Q4G32_F16S (4-bit codes, then one fp16 scale per 32 values) or
+/// FP8_E4M3FN_ROW_BF16S (one byte a value, then the row's bf16 scale; spec
+/// flash-next/08), and a positive rank-two shape whose column count is a
+/// multiple of 32.
 pub fn row_interleaved_geometry(
     format: NumericFormat,
     shape: &[u64],
 ) -> Result<RowInterleavedGeometry> {
-    if format != NumericFormat::Q4G32F16S {
-        return Err(fail("row-interleaved-v1 requires Q4G32_F16S"));
+    if !matches!(format, NumericFormat::Q4G32F16S | NumericFormat::Fp8E4M3FnRowBf16S) {
+        return Err(fail("row-interleaved-v1 requires Q4G32_F16S or FP8_E4M3FN_ROW_BF16S"));
     }
     require_rank2("row-interleaved-v1", shape)?;
     let (rows, columns) = (shape[0], shape[1]);
     if columns % 32 != 0 {
         return Err(fail("row-interleaved-v1 requires a column count divisible by 32"));
     }
-    let scale_offset = columns / 2;
-    let row_bytes = scale_offset + columns / 32 * 2;
+    let (scale_offset, row_bytes) = match format {
+        NumericFormat::Fp8E4M3FnRowBf16S => (columns, columns + 2),
+        _ => (columns / 2, columns / 2 + columns / 32 * 2),
+    };
     let encoded_bytes = checked_mul(rows, row_bytes, "row-interleaved tensor encoded size")?;
     Ok(RowInterleavedGeometry {
         rows,
@@ -1563,6 +1567,15 @@ mod tests {
             tensor_encoded_size(StorageLayout::ContiguousLeV1, NumericFormat::I64, &[16]).unwrap(),
             128
         );
+    }
+
+    #[test]
+    fn an_fp8_ngram_table_row_is_162_bytes() {
+        // spec flash-next/08: 160 FP8 bytes verbatim, then the row's bf16 scale.
+        let g = row_interleaved_geometry(NumericFormat::Fp8E4M3FnRowBf16S, &[320_001_536, 160]).unwrap();
+        assert_eq!(g.scale_offset, 160);
+        assert_eq!(g.row_bytes, 162);
+        assert_eq!(g.encoded_bytes, 51_840_248_832);
     }
 
     #[test]
