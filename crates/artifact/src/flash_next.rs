@@ -31,6 +31,7 @@ use crate::{fail, NumericFormat, Object, Reader, ResourceEncoding, Result, Stora
 
 pub mod fixture;
 pub mod mtp;
+pub mod retable;
 
 /// The container identity's `model_id` for every Flash-Next artifact.
 pub const MODEL_ID: &str = "qwen3.8-flash-next";

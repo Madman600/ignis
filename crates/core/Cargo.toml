@@ -82,3 +82,8 @@ required-features = ["cuda", "residual-tap"]
 [[example]]
 name = "flash_next_mtp_bench"
 required-features = ["cuda"]
+# Spec flash-next/08's A/B: perplexity, top-1 agreement and top-64 KL of two
+# containers that differ only in the n-gram table.
+[[example]]
+name = "flash_next_table_ab"
+required-features = ["cuda"]

@@ -45,14 +45,19 @@ to put it in an existing container and measure it.
 4. **Device** (`kernel/src/flash_next`): `Geometry` carries the table format;
    `ngram_row_bytes()` follows it; `dequant_rows` gains the FP8 branch. The kernel test
    decodes both formats against a host reference, bit for bit.
-5. **Retable tool** (`ignis-retable`, `crates/artifact/src/bin`): copies a packed main
+5. **Retable tool** (`ignis-artifact-retable`, `crates/artifact/src/flash_next/retable.rs`): copies a packed main
    container, replacing only the table object with one built from the FP8 source shards.
    Every other object's bytes are copied unchanged; offsets after the table move. The new
    container keeps `model_id`, takes `weights_id` + `-ngramfp8`, and gets a fresh sidecar
-   recording the source repo, revision and shard hashes. The hot list (`hot_rows`) is
-   copied: row ids do not change with the format.
+   copied from the old one: `artifact.bytes`, `objects.count`, `recipe_id`, the `ngram`
+   row size and format updated, and a `retable` record (the source container's
+   `weights_id`, `content_hash` and size; the table's rows, scale and a SHA-256 of each
+   source shard's FP8 bytes; a note that the sidecar's measurements were taken on the INT4
+   table). The hot list (`hot_rows`) is copied: row ids do not change with the format.
+   The packer also takes `.fp8` table shards, so a conversion can write the FP8 table
+   directly.
 6. **Companion re-pin**: the MTP companion pins the main container's `content_hash`
-   (layout.md §13.2), which the retable changes. `ignis-retable --companion` writes a copy of
+   (layout.md §13.2), which the retable changes. `--companion` writes a copy of
    the companion whose `pair.main` names the new container, and records in it that the head
    was calibrated on the INT4 table. A mismatched pair costs acceptance, never correctness;
    acceptance is measured (below), not assumed.
@@ -64,6 +69,19 @@ to put it in an existing container and measure it.
   `--ngram-hot-bytes` that held the INT4 hot list (2G) holds a ranked prefix of it; 3G holds
   all of it. The whole table no longer fits the host plan on a 64 GB machine either way.
 - NVMe: a missing row is 162 bytes instead of 90, inside the same 4 KiB sector reads.
+
+## Measurement
+
+The conversion's BF16 references (layout.md §10) are not published with the artifact
+(`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis` ships the containers and sidecars only),
+and the server serves no log probabilities (GitHub #288). The A/B therefore runs in
+process: `crates/core/examples/flash_next_table_ab.rs` teacher-forces held-out text
+(windows of 2,048 tokens, at most 8 a file) through [`FlashNextEngine::span_logits`] of
+each container and compares perplexity, top-1 agreement and a top-64 KL between the two.
+Perplexity is the quality signal; agreement and KL say how much the table moves the
+distribution. The corpus must not overlap the conversion's calibration (layout.md §9:
+the repo, the owner's samples, wikitext-103 train, Wikipedia, GSM8K, transformers
+sources, MMLU-Pro): the wikitext-103 **test** split and code from another project.
 
 ## Acceptance
 
