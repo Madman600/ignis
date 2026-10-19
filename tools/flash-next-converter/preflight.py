@@ -8,7 +8,8 @@ import os
 import shutil
 import subprocess
 
-LOCK_DIR = "F:/ai/opencode/.inference-qwen-worktrees/.swarm/gpu.lock"
+# The shared lock beside the worktrees; IGNIS_GPU_LOCK_DIR names it on a machine laid out differently.
+LOCK_DIR = os.environ.get("IGNIS_GPU_LOCK_DIR", "F:/ai/opencode/.inference-qwen-worktrees/.swarm/gpu.lock")
 GB = 1e9
 
 
