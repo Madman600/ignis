@@ -1,4 +1,4 @@
-# Qwen's FP8 n-gram table moves 4.5% of top-1 tokens, gains ~0.5% prose perplexity, and costs MTP acceptance
+# Qwen's FP8 n-gram table moves 4.5% of top-1 tokens, gains ~0.5% prose perplexity, and costs no measurable MTP acceptance
 
 - Kind: experiment
 - Status: current
@@ -43,6 +43,22 @@ generation ×3, a 29,192-token prefill ×2):
 | prefill | 4,605-4,615 tok/s | 3,908 (first, cold hot rows), 4,588 tok/s |
 | hot rows in RAM | 1.47 GB | 2.60 GB (whole hot list) |
 
+**Acceptance across prompts** (the single prompt above is one prompt: re-measured on six
+prompts, 512 greedy tokens each, scored on the five that ran to ≥ 500 tokens):
+
+| pair | acceptance | decode (6 prompts) |
+|---|---|---|
+| INT4 table + its own head (production) | 1,455 / 2,198 = 66.2% | 184.5 tok/s |
+| FP8 table + the same head, re-pinned | 1,479 / 2,144 = 69.0% | 189.3 tok/s |
+| FP8 table + a head re-calibrated on the FP8 trunk | 1,472 / 2,160 = 68.2% | 188.2 tok/s |
+
+Per prompt the acceptance moves both ways (the B-tree prompt 70.5% INT4 against 68.6% FP8;
+others the reverse). The re-calibrated head used a substitute corpus
+(`tools/flash-next-mtp/substitute_corpus.py`: 130 chunks, 266k tokens of the allowlisted
+sources; the study's token files are not published), took 11 min on the 5090 (rates 2.999
+bits, MoE −20.4 dB) and verified bit-identical; it is no better than the original head
+re-pinned.
+
 The G1 canary suite passes on the FP8 container; the kernel test's FP8 cases match the
 host model's FP8 decode within the device tolerance.
 
@@ -51,16 +67,16 @@ host model's FP8 decode within the device tolerance.
 The table's format is not a rounding detail: switching it flips the top-1 token at ~1 in
 22 positions, a KL the size of the whole conversion's FP8-only non-expert cost
 (0.026-0.06). Measured quality moves the community's way on prose (−0.5% perplexity, just
-short of significance at 16k positions) and not at all on code. The serving cost is MTP
-acceptance (79.4% → 70.2%, decode −6%): the head was calibrated on the INT4 table, so the
-re-pinned pair drafts against a trunk that has moved. Prefill and NVMe reads are unchanged
-within noise.
+short of significance at 16k positions) and not at all on code. Serving costs nothing
+measurable: across prompts the re-pinned head accepts as often on the FP8 trunk as on the
+INT4 one, decode and prefill are unchanged within noise. The one-prompt 79.4% → 70.2%
+first reading was that prompt, not the table. Re-calibrating the head's quantization on
+the FP8 trunk buys nothing: acceptance follows the trunk's distribution, which the head's
+expert quantization barely touches.
 
-The FP8 table is therefore a small quality gain bought with decode speed, until the MTP
-head is recalibrated on the FP8 trunk (spec flash-next/07 phase B,
-`flash_next_mtp_calibration`), which should recover most of the acceptance. Without BF16
-references (not published with the artifact) this cannot say how much of the conversion's
-MMLU gap (0.701 against 0.737) the table explains.
+The FP8 table is therefore a small quality gain at no serving cost but 23 GB of disk and
+1.1 GB of hot-row RAM. Without BF16 references (not published with the artifact) this
+cannot say how much of the conversion's MMLU gap (0.701 against 0.737) the table explains.
 
 ## Reuse
 
@@ -68,5 +84,6 @@ MMLU gap (0.701 against 0.737) the table explains.
   container: `flash_next_table_ab score <dir> <corpus> <out>` then `compare`.
 - A re-pinned companion is a measurement, not a free pass: compare `spec.accepted /
   spec.drafted` from `ignis.request.done` on the same prompt before switching.
-- One prompt's acceptance is deterministic but narrow; a production decision should repeat
-  it on a few prompts and recalibrate the head first.
+- One prompt's acceptance is deterministic but narrow: the first reading here (one prompt,
+  −9 points) did not survive six. Compare pairs on several prompts, the same ones, scored
+  only on requests that ran to length.
